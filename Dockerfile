@@ -8,7 +8,11 @@ WORKDIR /app
 ENV NODE_ENV=production
 
 COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev && npm cache clean --force
+# Full install (not --omit=dev): the build step below runs `remix vite:build`,
+# which needs @remix-run/dev and vite — both devDependencies. Runtime itself
+# only needs the regular dependencies (remix-serve, prisma client, etc.), but
+# this is a single-stage image, so devDependencies stay in the final image.
+RUN npm ci && npm cache clean --force
 # Remove CLI packages since we don't need them in production by default.
 # Remove this line if you want to run CLI commands in your container.
 RUN npm remove @shopify/cli 2>/dev/null || true

@@ -7,7 +7,7 @@
 # See docs/INSTALL.md for the full installation runbook, including how to
 # request access to the protected Subscriptions APIs and protected customer data.
 
-client_id = "REPLACE_WITH_YOUR_CLIENT_ID"
+client_id = "59c7f4893e8491dc5f6a047fcc6ccd08"
 name = "Cellexia Subscriptions"
 handle = "cellexia-subscriptions"
 application_url = "https://REPLACE_WITH_YOUR_APP_HOST"
