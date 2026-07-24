@@ -19,7 +19,12 @@ automatically_update_urls_on_dev = true
 [access_scopes]
 # Subscriptions require protected API access — request in Partner Dashboard:
 # App setup → API access → "Access Subscriptions APIs" + "Protected customer data access".
-scopes = "read_customers,write_customers,read_orders,read_products,write_products,read_purchase_options,write_purchase_options,read_own_subscription_contracts,write_own_subscription_contracts,read_customer_payment_methods,write_customer_payment_methods,read_locales,read_markets,read_inventory,read_fulfillments,read_discounts"
+# write_customer_payment_methods is not a real Shopify scope (rejected at
+# deploy validation) — the app only generates update links/emails for the
+# customer to change their own card via Shopify's hosted page
+# (customerPaymentMethodGetUpdateUrl / ...SendUpdateEmail), which read_
+# already covers; it never mutates payment method data directly.
+scopes = "read_customers,write_customers,read_orders,read_products,write_products,read_purchase_options,write_purchase_options,read_own_subscription_contracts,write_own_subscription_contracts,read_customer_payment_methods,read_locales,read_markets,read_inventory,read_fulfillments,read_discounts"
 
 [auth]
 redirect_urls = [

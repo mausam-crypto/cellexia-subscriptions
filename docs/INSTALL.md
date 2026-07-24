@@ -239,7 +239,7 @@ flyctl secrets set \
   SHOPIFY_API_KEY="<client id>" \
   SHOPIFY_API_SECRET="<client secret>" \
   SHOPIFY_APP_URL="https://cellexia-subscriptions.fly.dev" \
-  SCOPES="read_customers,write_customers,read_orders,read_products,write_products,read_purchase_options,write_purchase_options,read_own_subscription_contracts,write_own_subscription_contracts,read_customer_payment_methods,write_customer_payment_methods,read_locales,read_markets,read_inventory,read_fulfillments,read_discounts" \
+  SCOPES="read_customers,write_customers,read_orders,read_products,write_products,read_purchase_options,write_purchase_options,read_own_subscription_contracts,write_own_subscription_contracts,read_customer_payment_methods,read_locales,read_markets,read_inventory,read_fulfillments,read_discounts" \
   APP_SIGNING_SECRET="$(openssl rand -hex 32)" \
   CRON_SECRET="$(openssl rand -hex 32)" \
   DEFAULT_TIMEZONE="Europe/London" \
