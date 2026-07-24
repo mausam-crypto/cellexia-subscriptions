@@ -47,7 +47,15 @@ api_version = "2025-01"
     "customer_payment_methods/update",
     "customer_payment_methods/revoke",
     "orders/create",
-    "orders/fulfilled",
+    "orders/fulfilled"
+  ]
+  uri = "/webhooks"
+
+  # GDPR mandatory compliance topics use a separate declaration key
+  # (compliance_topics, not topics) — mixing them into the regular topics
+  # array is rejected by the API ("The following topic is invalid").
+  [[webhooks.subscriptions]]
+  compliance_topics = [
     "customers/data_request",
     "customers/redact",
     "shop/redact"
