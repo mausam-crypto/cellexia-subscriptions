@@ -308,7 +308,14 @@
   {%- comment -%} subscribe label (toggle/inline default embeds {percent}) {%- endcomment -%}
   {%- case cx_preset -%}
     {%- when 'toggle', 'inline' -%}
-      {%- capture cx_sub_label_default -%}{{ 'subscribe_save_percent' | t: percent: '{percent}' }}{%- endcapture -%}
+      {%- comment -%}
+        Liquid's own {{ }} tag can't contain literal brace characters in an
+        inline argument (confuses its tag-matching, not just a runtime
+        issue) — build the "{percent}" placeholder via string concatenation
+        first so the {{ }} tag's raw content never contains a bare brace.
+      {%- endcomment -%}
+      {%- assign cx_pct_placeholder = '{' | append: 'percent' | append: '}' -%}
+      {%- capture cx_sub_label_default -%}{{ 'subscribe_save_percent' | t: percent: cx_pct_placeholder }}{%- endcapture -%}
     {%- else -%}
       {%- capture cx_sub_label_default -%}{{ 'subscribe_save' | t }}{%- endcapture -%}
   {%- endcase -%}
@@ -346,7 +353,8 @@
   {%- capture cx_first_line_tpl -%}{%- render 'cx-design-text', t_loc: cx_t_loc, t_en: cx_t_en, key: 'firstOrderLine', fallback: cx_first_line_default -%}{%- endcapture -%}
   {%- capture cx_first_line -%}{%- render 'cx-tpl', tpl: cx_first_line_tpl, percent: cx_pct_str, amount: cx_onetime_fmt, frequency: cx_freq_str -%}{%- endcapture -%}
 
-  {%- capture cx_onetime_link_default -%}{{ 'or_buy_once' | t: amount: '{amount}' }}{%- endcapture -%}
+  {%- assign cx_amt_placeholder = '{' | append: 'amount' | append: '}' -%}
+  {%- capture cx_onetime_link_default -%}{{ 'or_buy_once' | t: amount: cx_amt_placeholder }}{%- endcapture -%}
   {%- capture cx_onetime_link_tpl -%}{%- render 'cx-design-text', t_loc: cx_t_loc, t_en: cx_t_en, key: 'oneTimeLinkLabel', fallback: cx_onetime_link_default -%}{%- endcapture -%}
   {%- capture cx_onetime_link -%}{%- render 'cx-tpl', tpl: cx_onetime_link_tpl, percent: cx_pct_str, amount: cx_onetime_fmt, frequency: cx_freq_str -%}{%- endcapture -%}
 
