@@ -5,13 +5,12 @@ RUN apk add --no-cache openssl
 EXPOSE 3000
 WORKDIR /app
 
-ENV NODE_ENV=production
-
 COPY package.json package-lock.json* ./
-# Full install (not --omit=dev): the build step below runs `remix vite:build`,
-# which needs @remix-run/dev and vite — both devDependencies. Runtime itself
-# only needs the regular dependencies (remix-serve, prisma client, etc.), but
-# this is a single-stage image, so devDependencies stay in the final image.
+# NODE_ENV=production is NOT set yet here — npm treats that env var as an
+# implicit --omit=dev regardless of the install flags used, and the build
+# step below (`remix vite:build`) needs @remix-run/dev and vite, both
+# devDependencies. It's set further down, right before CMD, so it only
+# affects the running app, not this install/build.
 RUN npm ci && npm cache clean --force
 # Remove CLI packages since we don't need them in production by default.
 # Remove this line if you want to run CLI commands in your container.
@@ -22,4 +21,5 @@ COPY . .
 RUN npx prisma generate
 RUN npm run build
 
+ENV NODE_ENV=production
 CMD ["npm", "run", "docker-start"]
