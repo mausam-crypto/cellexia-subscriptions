@@ -1,0 +1,34 @@
+{%- comment -%}
+  cx-sub-price-block — the subscription price cluster shared by the toggle,
+  tiles and value_stack presets: big first-order price (optionally with the
+  struck one-time compare-at), the "First order" microcopy, the "then …"
+  line and the per-delivery line. The classic branch keeps its original
+  inline markup for byte-stable fallback rendering.
+
+  All data-cx-* hooks match buy-box.js: data-cx-sub-price, data-cx-first-label,
+  data-cx-then, data-cx-per-delivery, data-cx-compare.
+
+  Params:
+    first          first-order price in cents
+    compare        one-time price in cents (only used when show_compare)
+    show_compare   layout.showCompareAt
+    first_line     resolved firstOrderLine copy (PRE-ESCAPED via cx-tpl)
+    first_line_tpl RAW firstOrderLine template (for data-cx-tpl re-resolution)
+    then_str       precomputed localized "then {price} every {frequency}"
+    pd_str         precomputed localized "{price} per delivery"
+    show_pd        layout.showPerDelivery
+{%- endcomment -%}
+<span class="cx-buybox__price-row">
+  <span class="cx-buybox__price cx-buybox__price--lg" data-cx-sub-price{% if show_compare %} data-cx-compare{% endif %}>
+    {%- if show_compare -%}
+      {%- render 'cx-price', cents: first, compare: compare -%}
+    {%- else -%}
+      {%- render 'cx-price', cents: first -%}
+    {%- endif -%}
+  </span>
+  <span class="cx-buybox__first-label" data-cx-first-label{% if first_line_tpl contains '{' %} data-cx-tpl="{{ first_line_tpl | escape }}"{% endif %} {% if then_str == blank %}hidden{% endif %}>{{ first_line }}</span>
+</span>
+<span class="cx-buybox__then" data-cx-then {% if then_str == blank %}hidden{% endif %}>{{ then_str }}</span>
+{%- if show_pd -%}
+  <span class="cx-buybox__per-delivery" data-cx-per-delivery {% if pd_str == blank %}hidden{% endif %}>{{ pd_str }}</span>
+{%- endif -%}

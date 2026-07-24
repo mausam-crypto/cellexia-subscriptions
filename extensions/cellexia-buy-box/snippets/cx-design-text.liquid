@@ -1,0 +1,33 @@
+{%- comment -%}
+  cx-design-text — resolve one text override from the published design config.
+
+  Resolution order (mirrors app/lib/widget/presets.ts resolveDesignText):
+    t_loc[key]  (config.text[current locale])
+    t_en[key]   (config.text.en)
+    fallback    (extension locale files / block settings — the v1.0.0 copy)
+
+  Params:
+    t_loc    config.text[request.locale.iso_code] or false
+    t_en     config.text.en or false
+    key      property name, e.g. 'heading', 'subscribeLabel'
+    fallback default string when the config has no usable override
+
+  Output is RAW (unescaped, placeholders like {percent} untouched) so callers
+  can keep the raw template for data-cx-tpl attributes. Escape at the point of
+  use, or pass through cx-tpl (which escapes before placeholder injection).
+  Blank overrides are treated as absent so an empty admin field can never
+  blank out storefront copy.
+{%- endcomment -%}
+{%- liquid
+  assign cx_dt_val = ''
+  if t_loc
+    assign cx_dt_val = t_loc[key] | default: ''
+  endif
+  if cx_dt_val == blank and t_en
+    assign cx_dt_val = t_en[key] | default: ''
+  endif
+  if cx_dt_val == blank
+    assign cx_dt_val = fallback | default: ''
+  endif
+  echo cx_dt_val
+-%}

@@ -1,0 +1,53 @@
+{%- comment -%}
+  cx-freq-control — the delivery-frequency selector, as a dropdown or as a
+  row of chips, wired to buy-box.js via data-cx-freq / data-cx-freq-chip.
+
+  Params:
+    group              the selling plan group
+    selected_plan      the initially selected selling plan
+    block_id           block.id (unique input name / select id)
+    style              'dropdown' | 'chips'
+    label              accessible label text (PRE-ESCAPED)
+    show_recommended   optional; when true, tag the recommended plan (planner)
+    recommended_plan_id optional; selling plan id carrying the tag
+    recommended_label  optional; tag text (PRE-ESCAPED), e.g. "Recommended"
+
+  Renders nothing when the group has a single plan — the one cadence is
+  used implicitly, exactly like the v1.0.0 dropdown behaviour.
+{%- endcomment -%}
+{%- if group.selling_plans.size > 1 -%}
+  {%- if style == 'chips' -%}
+    <fieldset class="cx-buybox__chips">
+      <legend class="cx-buybox__sr">{{ label }}</legend>
+      {%- for p in group.selling_plans -%}
+        <label class="cx-buybox__chip">
+          <input
+            type="radio"
+            class="cx-buybox__sr-input"
+            name="cx-freq-{{ block_id }}"
+            value="{{ p.id }}"
+            data-cx-freq-chip
+            {% if p.id == selected_plan.id %}checked{% endif %}
+          >
+          <span class="cx-buybox__chip-label">
+            {%- render 'cx-freq-label', selling_plan: p, part: 'freq' -%}
+            {%- if show_recommended and p.id == recommended_plan_id and recommended_label != blank -%}
+              <span class="cx-buybox__chip-tag">{{ recommended_label }}</span>
+            {%- endif -%}
+          </span>
+        </label>
+      {%- endfor -%}
+    </fieldset>
+  {%- else -%}
+    <div class="cx-buybox__freq">
+      <label class="cx-buybox__sr" for="cx-freq-{{ block_id }}">{{ label }}</label>
+      <select id="cx-freq-{{ block_id }}" class="cx-buybox__freq-select" data-cx-freq>
+        {%- for p in group.selling_plans -%}
+          <option value="{{ p.id }}" {% if p.id == selected_plan.id %}selected{% endif %}>
+            {%- render 'cx-freq-label', selling_plan: p, part: 'select' -%}
+          </option>
+        {%- endfor -%}
+      </select>
+    </div>
+  {%- endif -%}
+{%- endif -%}

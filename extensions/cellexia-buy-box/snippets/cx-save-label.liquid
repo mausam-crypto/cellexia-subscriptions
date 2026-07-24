@@ -1,0 +1,34 @@
+{%- comment -%}
+  cx-save-label — localized "Save X" label for the subscription card.
+
+  Params:
+    base       (required) undiscounted one-time price in cents (variant.price)
+    plan_price (required) subscription first-order price in cents (allocation.price)
+    format     (optional) "percent" | "absolute" | "both" (block setting
+               savings_format; defaults to percent)
+
+  Renders nothing when there is no positive saving, so callers can always
+  render it and hide empty output. If the percentage rounds below 1% the
+  label degrades to the absolute amount rather than showing "Save 0%".
+{%- endcomment -%}
+{%- liquid
+  assign save_cents = base | minus: plan_price
+-%}
+{%- if save_cents > 0 and base > 0 -%}
+  {%- assign save_pct = save_cents | times: 100.0 | divided_by: base | round -%}
+  {%- assign save_format = format | default: 'percent' -%}
+  {%- if save_pct < 1 -%}
+    {%- assign save_format = 'absolute' -%}
+  {%- endif -%}
+  {%- capture save_abs -%}{{ save_cents | money | strip_html }}{%- endcapture -%}
+  {%- case save_format -%}
+    {%- when 'absolute' -%}
+      {{- 'save_amount' | t: amount: save_abs -}}
+    {%- when 'both' -%}
+      {%- capture save_both -%}{{ save_abs }} ({{ save_pct }}%){%- endcapture -%}
+      {{- 'save_amount' | t: amount: save_both -}}
+    {%- else -%}
+      {%- capture save_pct_str -%}{{ save_pct }}%{%- endcapture -%}
+      {{- 'save_amount' | t: amount: save_pct_str -}}
+  {%- endcase -%}
+{%- endif -%}

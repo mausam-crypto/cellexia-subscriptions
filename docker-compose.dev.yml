@@ -1,0 +1,16 @@
+# Local development database only. Run: docker compose -f docker-compose.dev.yml up -d
+# Then set DATABASE_URL=postgresql://cellexia:cellexia@localhost:5432/cellexia
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: cellexia
+      POSTGRES_PASSWORD: cellexia
+      POSTGRES_DB: cellexia
+    ports:
+      - "5432:5432"
+    volumes:
+      - cellexia_pgdata:/var/lib/postgresql/data
+
+volumes:
+  cellexia_pgdata:

@@ -1,0 +1,784 @@
+/* ─────────────────────────────────────────────────────────────────────────────
+   Cellexia Buy Box — PDP subscription widget.
+
+   Namespace: .cx-buybox (BEM). Mobile-first, no webfonts, no layout shift:
+   the block is fully server-rendered and JS only swaps strings.
+
+   Theme override hooks (set on .cx-buybox or any ancestor). The app's
+   Buy box designer publishes these same properties via the block's inline
+   style, so defaults here ARE the v1.0.0 rendering:
+     --cx-accent        subscription accent (border, badge, radio) — also set
+                        inline from the block's "Accent color" setting
+     --cx-accent-soft   soft fill behind the subscription card (style.bgTint)
+     --cx-accent-text   text on accent surfaces: active tab, chips (style.accentText)
+     --cx-border        neutral card border color
+     --cx-border-width  card border width (layout.borderWidthPx)
+     --cx-bg            card background
+     --cx-text          main text color (style.text; defaults to inherit)
+     --cx-muted         secondary text color
+     --cx-badge-bg      badge background (style.badgeBg; defaults to accent)
+     --cx-badge-text    badge text color (style.badgeText)
+     --cx-radius        card corner radius (layout.radiusPx)
+     --cx-font-scale    typography multiplier (style.fontScale, 0.85–1.15)
+
+   Preset modifiers: .cx-buybox--classic (no extra rules — the base IS
+   classic), --toggle, --tiles, --inline, --value_stack, --planner.
+   ──────────────────────────────────────────────────────────────────────────── */
+
+.cx-buybox {
+  --cx-accent: #4a5d4a;
+  --cx-accent-soft: rgba(74, 93, 74, 0.07);
+  --cx-border: rgba(0, 0, 0, 0.16);
+  --cx-bg: transparent;
+  --cx-text: inherit;
+  --cx-muted: rgba(0, 0, 0, 0.55);
+  --cx-badge-text: #ffffff;
+  --cx-radius: 12px;
+
+  margin-block: 1rem;
+  color: var(--cx-text);
+  font-size: calc(0.9375rem * var(--cx-font-scale, 1));
+  line-height: 1.45;
+}
+
+.cx-buybox__heading {
+  margin: 0 0 0.75rem;
+  font-size: 1rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+/* Visually hidden but accessible (group label, select label, radio inputs). */
+.cx-buybox__sr,
+.cx-buybox__sr-input {
+  position: absolute !important;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.cx-buybox__group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  /* room for the badge pill overlapping the first card's top edge */
+  padding-block-start: 0.55em;
+}
+
+/* ── Option cards ─────────────────────────────────────────────────────────── */
+
+.cx-buybox__option {
+  position: relative;
+  border: var(--cx-border-width, 1px) solid var(--cx-border);
+  border-radius: var(--cx-radius);
+  background: var(--cx-bg);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease,
+    background-color 0.15s ease;
+}
+
+/* Subscription card is always visually distinct: accent border + soft fill. */
+.cx-buybox__option--sub {
+  border-color: var(--cx-accent);
+  background: var(--cx-accent-soft);
+}
+
+.cx-buybox__option.is-selected {
+  box-shadow: 0 0 0 1px var(--cx-border) inset;
+}
+
+.cx-buybox__option--sub.is-selected {
+  box-shadow: 0 0 0 1px var(--cx-accent) inset;
+}
+
+/* Focus ring — :focus-visible when :has() is supported, otherwise any focus. */
+.cx-buybox__option:has(.cx-buybox__radio:focus-visible) {
+  outline: 2px solid var(--cx-accent);
+  outline-offset: 2px;
+}
+
+@supports not selector(:has(*)) {
+  .cx-buybox__option:focus-within {
+    outline: 2px solid var(--cx-accent);
+    outline-offset: 2px;
+  }
+}
+
+/* Variant has no subscription allocation → hide the subscription card. */
+.cx-buybox--no-sub .cx-buybox__option--sub {
+  display: none;
+}
+
+/* ── Card label (whole surface clickable, ≥44px tap target) ──────────────── */
+
+.cx-buybox__card {
+  display: block;
+  min-height: 44px;
+  padding: 0.875rem 1rem;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.cx-buybox__card-body {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+}
+
+.cx-buybox__card-main {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* ── Custom radio control ────────────────────────────────────────────────── */
+
+.cx-buybox__control {
+  flex: 0 0 auto;
+  inline-size: 20px;
+  block-size: 20px;
+  margin-block-start: 0.1em;
+  border: 2px solid var(--cx-border);
+  border-radius: 50%;
+  position: relative;
+  transition: border-color 0.15s ease;
+}
+
+.cx-buybox__control::after {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  border-radius: 50%;
+  background: var(--cx-accent);
+  opacity: 0;
+  transform: scale(0.5);
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+
+.cx-buybox__radio:checked + .cx-buybox__card-body .cx-buybox__control {
+  border-color: var(--cx-accent);
+}
+
+.cx-buybox__radio:checked + .cx-buybox__card-body .cx-buybox__control::after {
+  opacity: 1;
+  transform: scale(1);
+}
+
+/* ── Card content ────────────────────────────────────────────────────────── */
+
+.cx-buybox__title-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.cx-buybox__title {
+  font-weight: 600;
+}
+
+.cx-buybox__save {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--cx-accent);
+  white-space: nowrap;
+}
+
+.cx-buybox__price-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.cx-buybox__price {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.cx-buybox__price--lg {
+  font-size: 1.375rem;
+  line-height: 1.2;
+}
+
+.cx-buybox__first-label {
+  font-size: 0.8125rem;
+  color: var(--cx-muted);
+}
+
+.cx-buybox__then,
+.cx-buybox__per-delivery {
+  font-size: 0.8125rem;
+  color: var(--cx-muted);
+}
+
+.cx-price__compare {
+  color: var(--cx-muted);
+  font-weight: 400;
+  margin-inline-start: 0.35em;
+}
+
+/* ── Frequency selector ──────────────────────────────────────────────────── */
+
+.cx-buybox__freq {
+  padding: 0 1rem 0.875rem;
+}
+
+.cx-buybox__freq-select {
+  display: block;
+  inline-size: 100%;
+  min-height: 44px;
+  padding: 0.5rem 2.25rem 0.5rem 0.75rem;
+  font: inherit;
+  color: inherit;
+  border: 1px solid var(--cx-border);
+  border-radius: calc(var(--cx-radius) - 4px);
+  background-color: #ffffff;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5' fill='none' stroke='%23555555' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.75rem center;
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+}
+
+[dir="rtl"] .cx-buybox__freq-select {
+  padding: 0.5rem 0.75rem 0.5rem 2.25rem;
+  background-position: left 0.75rem center;
+}
+
+.cx-buybox__freq-select:focus-visible {
+  outline: 2px solid var(--cx-accent);
+  outline-offset: 1px;
+}
+
+/* ── Badge pill ──────────────────────────────────────────────────────────── */
+
+.cx-buybox__badge {
+  position: absolute;
+  inset-block-start: -0.7em;
+  inset-inline-start: 1rem;
+  z-index: 1;
+  padding: 0.15em 0.7em;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--cx-badge-text);
+  background: var(--cx-badge-bg, var(--cx-accent));
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+/* ── Reassurance line ────────────────────────────────────────────────────── */
+
+.cx-buybox__reassurance {
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+  margin: 0;
+  padding: 0 1rem 0.875rem;
+  font-size: 0.8125rem;
+  color: var(--cx-muted);
+}
+
+.cx-buybox__check {
+  flex: 0 0 auto;
+  color: var(--cx-accent);
+}
+
+/* ── Compact mode ────────────────────────────────────────────────────────── */
+
+.cx-buybox--compact {
+  font-size: calc(0.875rem * var(--cx-font-scale, 1));
+}
+
+.cx-buybox--compact .cx-buybox__group {
+  gap: 0.5rem;
+}
+
+.cx-buybox--compact .cx-buybox__card {
+  padding: 0.625rem 0.875rem;
+}
+
+.cx-buybox--compact .cx-buybox__price--lg {
+  font-size: 1.125rem;
+}
+
+.cx-buybox--compact .cx-buybox__freq,
+.cx-buybox--compact .cx-buybox__reassurance {
+  padding: 0 0.875rem 0.625rem;
+}
+
+/* ── Wider screens: a touch more breathing room ──────────────────────────── */
+
+@media (min-width: 750px) {
+  .cx-buybox:not(.cx-buybox--compact) .cx-buybox__card {
+    padding: 1rem 1.25rem;
+  }
+
+  .cx-buybox:not(.cx-buybox--compact) .cx-buybox__freq,
+  .cx-buybox:not(.cx-buybox--compact) .cx-buybox__reassurance {
+    padding: 0 1.25rem 1rem;
+  }
+
+  .cx-buybox:not(.cx-buybox--compact) .cx-buybox__badge {
+    inset-inline-start: 1.25rem;
+  }
+}
+
+/* ═══ Design presets ══════════════════════════════════════════════════════
+   Everything below only applies behind a .cx-buybox--{preset} modifier or a
+   preset-specific element class, so the classic rendering above is
+   untouched. All presets are driven by the same custom properties. */
+
+/* ── Shared: subheading ──────────────────────────────────────────────────── */
+
+.cx-buybox__subheading {
+  margin: -0.4rem 0 0.75rem;
+  font-size: 0.875em;
+  color: var(--cx-muted);
+}
+
+/* ── Shared: frequency chips (frequencyStyle "chips" + planner) ─────────── */
+
+.cx-buybox__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0 1rem 0.875rem;
+  border: 0;
+}
+
+.cx-buybox__chip {
+  position: relative;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.cx-buybox__chip-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45em;
+  min-height: 40px;
+  padding: 0.35rem 0.85rem;
+  border: var(--cx-border-width, 1px) solid var(--cx-border);
+  border-radius: 999px;
+  background: var(--cx-bg);
+  font-size: 0.875em;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.cx-buybox__chip input:checked + .cx-buybox__chip-label {
+  border-color: var(--cx-accent);
+  background: var(--cx-accent-soft);
+  font-weight: 600;
+  box-shadow: 0 0 0 1px var(--cx-accent) inset;
+}
+
+.cx-buybox__chip:has(input:focus-visible) .cx-buybox__chip-label {
+  outline: 2px solid var(--cx-accent);
+  outline-offset: 2px;
+}
+
+@supports not selector(:has(*)) {
+  .cx-buybox__chip:focus-within .cx-buybox__chip-label {
+    outline: 2px solid var(--cx-accent);
+    outline-offset: 2px;
+  }
+}
+
+.cx-buybox__chip-tag {
+  display: inline-flex;
+  padding: 0.1em 0.55em;
+  font-size: 0.72em;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--cx-badge-text);
+  background: var(--cx-badge-bg, var(--cx-accent));
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+/* Chips rendered outside a card (planner) sit flush with the wrapper. */
+.cx-buybox__group--planner .cx-buybox__chips {
+  padding: 0 0 0.75rem;
+}
+
+/* ── Shared: benefit list ────────────────────────────────────────────────── */
+
+.cx-buybox__benefits {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  list-style: none;
+  margin: 0;
+  padding: 0.25rem 1rem 0.875rem;
+  font-size: 0.875em;
+}
+
+.cx-buybox__benefit {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45em;
+}
+
+.cx-buybox__benefit .cx-buybox__check {
+  margin-block-start: 0.2em;
+}
+
+/* ── Shared: compare rows (tiles) ────────────────────────────────────────── */
+
+.cx-buybox__rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-block-start: 0.5rem;
+  padding-block-start: 0.5rem;
+  border-block-start: 1px dashed var(--cx-border);
+  font-size: 0.8125em;
+}
+
+.cx-buybox__row {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.cx-buybox__row-label {
+  color: var(--cx-muted);
+}
+
+.cx-buybox__row-value {
+  text-align: end;
+  font-variant-numeric: tabular-nums;
+}
+
+.cx-buybox__row-value--accent {
+  color: var(--cx-accent);
+  font-weight: 600;
+}
+
+/* ── Toggle preset ───────────────────────────────────────────────────────── */
+
+.cx-buybox__tabs {
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  border: var(--cx-border-width, 1px) solid var(--cx-border);
+  border-radius: 999px;
+  background: var(--cx-bg);
+}
+
+.cx-buybox__tab {
+  flex: 1 1 0;
+  min-height: 44px;
+  min-width: 0;
+  padding: 0.5rem 0.75rem;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.cx-buybox__tab[aria-selected="true"] {
+  background: var(--cx-accent);
+  color: var(--cx-accent-text, #ffffff);
+}
+
+.cx-buybox__tab:focus-visible {
+  outline: 2px solid var(--cx-accent);
+  outline-offset: 2px;
+}
+
+.cx-buybox__panel {
+  /* vertical rhythm comes from the group's flex gap */
+  padding: 0.875rem 1rem;
+  border: var(--cx-border-width, 1px) solid var(--cx-border);
+  border-radius: var(--cx-radius);
+  background: var(--cx-bg);
+}
+
+.cx-buybox__panel.cx-buybox__option--sub {
+  border-color: var(--cx-accent);
+  background: var(--cx-accent-soft);
+}
+
+.cx-buybox__panel .cx-buybox__save {
+  display: block;
+  margin-block-end: 0.25rem;
+}
+
+/* Panel children were designed for cards — remove their card padding. */
+.cx-buybox__panel .cx-buybox__freq,
+.cx-buybox__panel .cx-buybox__reassurance,
+.cx-buybox__panel .cx-buybox__benefits {
+  padding-inline: 0;
+}
+
+.cx-buybox__panel .cx-buybox__freq {
+  padding-block: 0.6rem 0;
+}
+
+.cx-buybox__panel .cx-buybox__reassurance,
+.cx-buybox__panel .cx-buybox__benefits {
+  padding-block: 0.6rem 0;
+}
+
+/* Panel reveal animation — opt-in (behavior.animation) and motion-safe. */
+@media (prefers-reduced-motion: no-preference) {
+  .cx-buybox--toggle:not(.cx-buybox--no-anim) .cx-buybox__panel:not([hidden]) {
+    animation: cx-panel-in 0.18s ease;
+  }
+}
+
+@keyframes cx-panel-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.cx-buybox--no-sub .cx-buybox__tabs {
+  display: none;
+}
+
+/* ── Tiles preset ────────────────────────────────────────────────────────── */
+
+.cx-buybox__tiles {
+  display: grid;
+  grid-template-columns: 1fr;
+  align-items: stretch;
+}
+
+@media (min-width: 480px) {
+  .cx-buybox__tiles {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+.cx-buybox__tile {
+  display: flex;
+  flex-direction: column;
+}
+
+/* The subscription tile is elevated: stronger shadow + badge. */
+.cx-buybox--tiles .cx-buybox__option--sub {
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.08);
+}
+
+.cx-buybox--tiles .cx-buybox__option--sub.is-selected {
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.08), 0 0 0 1px var(--cx-accent) inset;
+}
+
+.cx-buybox__card--tile {
+  flex: 1 1 auto;
+}
+
+.cx-buybox__card-body--stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+/* ── Inline preset ───────────────────────────────────────────────────────── */
+
+.cx-buybox--inline {
+  margin-block: 0.5rem;
+}
+
+.cx-buybox__inline-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  min-height: 44px;
+  padding: 0.35rem 0;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.cx-buybox__inline-box {
+  flex: 0 0 auto;
+  inline-size: 18px;
+  block-size: 18px;
+  margin: 0.15em 0 0;
+  accent-color: var(--cx-accent);
+  cursor: pointer;
+}
+
+.cx-buybox__inline-box:focus-visible {
+  outline: 2px solid var(--cx-accent);
+  outline-offset: 2px;
+}
+
+.cx-buybox__inline-label {
+  font-weight: 600;
+}
+
+.cx-buybox__inline-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding-inline-start: calc(18px + 0.6rem);
+}
+
+.cx-buybox__inline-detail .cx-buybox__freq,
+.cx-buybox__inline-detail .cx-buybox__reassurance,
+.cx-buybox__inline-detail .cx-buybox__chips {
+  padding: 0.4rem 0 0;
+}
+
+.cx-buybox--no-sub .cx-buybox__inline-row,
+.cx-buybox--no-sub .cx-buybox__inline-detail,
+.cx-buybox--no-sub .cx-buybox__chips,
+.cx-buybox--no-sub .cx-buybox__planner-label {
+  display: none;
+}
+
+/* ── Value stack preset ──────────────────────────────────────────────────── */
+
+.cx-buybox__stack-panel .cx-buybox__benefits {
+  padding-block-start: 0;
+}
+
+.cx-buybox__stack-onetime {
+  display: block;
+  padding: 0.6rem 1rem;
+  text-align: center;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.cx-buybox__stack-onetime-link {
+  font-size: 0.875em;
+  color: var(--cx-muted);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.cx-buybox__stack-onetime.is-selected .cx-buybox__stack-onetime-link {
+  color: inherit;
+  font-weight: 600;
+}
+
+.cx-buybox__stack-onetime:has(input:focus-visible) {
+  outline: 2px solid var(--cx-accent);
+  outline-offset: 2px;
+  border-radius: calc(var(--cx-radius) - 4px);
+}
+
+@supports not selector(:has(*)) {
+  .cx-buybox__stack-onetime:focus-within {
+    outline: 2px solid var(--cx-accent);
+    outline-offset: 2px;
+  }
+}
+
+/* ── Planner preset ──────────────────────────────────────────────────────── */
+
+.cx-buybox__planner-label {
+  margin: 0 0 0.5rem;
+  font-size: 0.875em;
+  font-weight: 600;
+}
+
+.cx-buybox__planner-options {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  /* room for the badge pill overlapping the subscription card's top edge */
+  padding-block-start: 0.55em;
+}
+
+.cx-buybox__planner-onetime .cx-buybox__card--slim {
+  padding-block: 0.625rem;
+}
+
+/* ── Density (compact) for preset elements ───────────────────────────────── */
+
+.cx-buybox--compact .cx-buybox__panel {
+  padding: 0.625rem 0.875rem;
+}
+
+.cx-buybox--compact .cx-buybox__chips,
+.cx-buybox--compact .cx-buybox__benefits {
+  padding-block-end: 0.625rem;
+}
+
+.cx-buybox--compact .cx-buybox__chip-label {
+  min-height: 34px;
+  padding: 0.25rem 0.7rem;
+}
+
+.cx-buybox--compact .cx-buybox__tab {
+  min-height: 38px;
+}
+
+/* ── Animation kill switch (behavior.animation = false) ──────────────────── */
+
+.cx-buybox--no-anim *,
+.cx-buybox--no-anim *::before,
+.cx-buybox--no-anim *::after {
+  transition: none !important;
+  animation: none !important;
+}
+
+/* ── Reduced motion ──────────────────────────────────────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  .cx-buybox__option,
+  .cx-buybox__control,
+  .cx-buybox__control::after,
+  .cx-buybox__tab,
+  .cx-buybox__chip-label {
+    transition: none;
+  }
+}
+
+/* ── Launch gate & admin preview ─────────────────────────────────────────── */
+
+/* Setup mode: the block server-renders with [hidden][data-cx-gated] and must
+   stay invisible even when a theme's reset styles re-display [hidden]
+   elements. buy-box.js removes the attribute only after the signed preview
+   token validated server-side. */
+[data-cx-gated][hidden] {
+  display: none !important;
+}
+
+/* Slim ribbon shown only inside an admin preview session, so the admin can
+   tell the reveal worked (regular visitors never see the widget at all). */
+.cx-buybox__preview-ribbon {
+  display: inline-flex;
+  align-items: center;
+  margin: 0 0 0.75rem;
+  padding: 0.15em 0.7em;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--cx-badge-text);
+  background: var(--cx-accent);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+/* display:inline-flex would defeat the [hidden] default — restate it. */
+.cx-buybox__preview-ribbon[hidden] {
+  display: none;
+}

@@ -1,0 +1,70 @@
+# Cellexia Subscriptions — Shopify app configuration
+#
+# IMPORTANT (developer): after creating the app in the Partner Dashboard, run
+#   npm run config:link
+# to link this file to your app, which fills in client_id. Then `npm run deploy`.
+#
+# See docs/INSTALL.md for the full installation runbook, including how to
+# request access to the protected Subscriptions APIs and protected customer data.
+
+client_id = "REPLACE_WITH_YOUR_CLIENT_ID"
+name = "Cellexia Subscriptions"
+handle = "cellexia-subscriptions"
+application_url = "https://REPLACE_WITH_YOUR_APP_HOST"
+embedded = true
+
+[build]
+automatically_update_urls_on_dev = true
+include_config_on_deploy = true
+
+[access_scopes]
+# Subscriptions require protected API access — request in Partner Dashboard:
+# App setup → API access → "Access Subscriptions APIs" + "Protected customer data access".
+scopes = "read_customers,write_customers,read_orders,read_products,write_products,read_purchase_options,write_purchase_options,read_own_subscription_contracts,write_own_subscription_contracts,read_customer_payment_methods,write_customer_payment_methods,read_locales,read_markets,read_inventory,read_fulfillments,read_discounts"
+
+[auth]
+redirect_urls = [
+  "https://REPLACE_WITH_YOUR_APP_HOST/auth/callback",
+  "https://REPLACE_WITH_YOUR_APP_HOST/auth/shopify/callback",
+  "https://REPLACE_WITH_YOUR_APP_HOST/api/auth/callback"
+]
+
+[webhooks]
+api_version = "2025-01"
+
+  [[webhooks.subscriptions]]
+  topics = [
+    "app/uninstalled",
+    "app/scopes_update",
+    "subscription_contracts/create",
+    "subscription_contracts/update",
+    "subscription_billing_attempts/success",
+    "subscription_billing_attempts/failure",
+    "subscription_billing_attempts/challenged",
+    "subscription_billing_cycle_edits/create",
+    "subscription_billing_cycle_edits/update",
+    "subscription_billing_cycle_edits/delete",
+    "customer_payment_methods/create",
+    "customer_payment_methods/update",
+    "customer_payment_methods/revoke",
+    "orders/create",
+    "orders/fulfilled",
+    "customers/data_request",
+    "customers/redact",
+    "shop/redact"
+  ]
+  uri = "/webhooks"
+
+[app_proxy]
+# The customer portal is served on the shop's own domain at:
+#   https://<your-store-domain>/apps/cellexia-subscriptions/...
+# NOTE: "cellexia" alone is already owned by the AOV & LTV Booster app's
+# proxy on this store — reusing it here would collide with that app's
+# /apps/cellexia/* traffic (portal cookies, magic links, cancel flow, and
+# the buy-box preview endpoint all depend on this staying unique).
+url = "https://REPLACE_WITH_YOUR_APP_HOST/proxy"
+subpath = "cellexia-subscriptions"
+prefix = "apps"
+
+[pos]
+embedded = false

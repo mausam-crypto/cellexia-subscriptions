@@ -1,0 +1,16 @@
+{%- comment -%}
+  cx-price — money display helper for the Cellexia buy box.
+
+  Params:
+    cents   (required) integer cents (Liquid variant/allocation prices are cents)
+    compare (optional) integer cents; rendered struck-through after the price
+                       when strictly greater than `cents`
+    class   (optional) extra class list appended to the wrapper span
+
+  Renders nothing when `cents` is blank, so callers can pass through possibly
+  missing values without guarding.
+{%- endcomment -%}
+{%- if cents != blank -%}
+  <span class="cx-price{% if class != blank %} {{ class }}{% endif %}">{{ cents | money }}</span>
+  {%- if compare != blank and compare > cents %} <s class="cx-price__compare">{{ compare | money }}</s>{% endif -%}
+{%- endif -%}

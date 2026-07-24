@@ -1,0 +1,66 @@
+{
+  "name": "cellexia-subscriptions",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Cellexia private subscription engine for Shopify — selling plans, billing scheduler, dunning, portal, magic links, cancel-save flows, analytics.",
+  "type": "module",
+  "engines": {
+    "node": ">=20.10"
+  },
+  "scripts": {
+    "dev": "shopify app dev",
+    "build": "remix vite:build",
+    "start": "remix-serve ./build/server/index.js",
+    "setup": "prisma generate && prisma migrate deploy",
+    "docker-start": "npm run setup && npm run start",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prisma": "prisma",
+    "import:subscribers": "tsx scripts/import-subscribers.ts",
+    "seed:demo": "tsx scripts/seed-demo.ts",
+    "healthcheck": "tsx scripts/healthcheck.ts",
+    "shopify": "shopify",
+    "deploy": "shopify app deploy",
+    "env": "shopify app env",
+    "config:link": "shopify app config link"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.6.0",
+    "@remix-run/node": "^2.16.8",
+    "@remix-run/react": "^2.16.8",
+    "@remix-run/serve": "^2.16.8",
+    "@shopify/app-bridge-react": "^4.1.6",
+    "@shopify/polaris": "^13.9.5",
+    "@shopify/shopify-app-remix": "^3.8.2",
+    "@shopify/shopify-app-session-storage-prisma": "^6.0.5",
+    "date-fns": "^4.1.0",
+    "date-fns-tz": "^3.2.0",
+    "dotenv": "^16.6.1",
+    "isbot": "^5.1.17",
+    "nodemailer": "^6.10.0",
+    "prisma": "^6.6.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@remix-run/dev": "^2.16.8",
+    "@shopify/api-codegen-preset": "^1.1.1",
+    "@types/node": "^22.10.0",
+    "@types/nodemailer": "^6.4.17",
+    "@types/react": "^18.2.31",
+    "@types/react-dom": "^18.2.14",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.2.2",
+    "vite-tsconfig-paths": "^5.1.4",
+    "vitest": "^3.0.8"
+  },
+  "workspaces": [
+    "extensions/*"
+  ],
+  "trustedDependencies": [
+    "@shopify/plugin-cloudflare"
+  ]
+}
