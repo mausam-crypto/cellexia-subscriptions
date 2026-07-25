@@ -4,6 +4,61 @@ All notable changes to Cellexia Subscriptions. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [SemVer](https://semver.org) as contracted in [docs/UPDATE.md](docs/UPDATE.md).
 
+## [1.2.0] — 2026-07-24
+
+### Added
+
+- **App-embed install path for the buy box**: the widget now also ships as a
+  theme **app embed** (`blocks/buy-box-embed.liquid`, target `body`) enabled
+  with a single toggle — Theme editor → **Theme settings** → **App embeds** →
+  **"Cellexia Buy Box"** → Save. Built for themes whose product section does
+  not accept app blocks (the reason: cellexialabs.com's custom "Sleepify"
+  theme), it renders the identical widget (`snippets/cx-buybox-core.liquid`
+  is shared with the app block) and mounts itself into the product page
+  automatically. If the section app block is also present on a page, the
+  block wins and the embed stays dormant — never two widgets. The launch
+  gate is unchanged: even with the embed enabled, visitors see nothing until
+  go-live, and the `?cx_preview` token flow reveals it exactly as before.
+- **Automatic placement with custom-selector override**
+  (`assets/buy-box-embed.js`): the embed inserts the widget above the theme's
+  quantity/add-to-cart area via prioritized anchor heuristics (tuned first
+  for cellexialabs.com — before `.pdp__grey` — with generic OS 2.0 and
+  `/cart/add`-form fallbacks). Override precedence: the embed's theme-editor
+  **Custom anchor selector** setting > the designer's new **Placement**
+  section (`placement` in the design config: CSS selector +
+  before/after/prepend/append) > automatic. In a preview session, an
+  unmatched anchor shows an admin-only hint card instead of failing silently.
+- **Cart-request selling-plan injection for formless AJAX themes**: on pages
+  where the embed runs, `fetch`/`XMLHttpRequest` POSTs to `/cart/add(.js)`
+  get the selected `selling_plan` (and the `_cx_design` attribution property)
+  injected into any body shape — FormData, URLSearchParams, urlencoded
+  string, JSON `items[]`, flat JSON. Only lines matching the widget's own
+  product variants are touched; one-time selections, other vendors' cart
+  calls and unknown body shapes pass through byte-identical.
+- **Brand-matched defaults**: the designer's starting style tokens
+  (`DEFAULT_DESIGN_CONFIG`) are now matched to cellexialabs.com — near-black
+  `#1D1D1B` accents, `#F4F4F4` panel tint, white on accent, sharp 0px
+  corners — so publishing an untouched design already looks native there.
+  (The zero-config fallback is unchanged: with no published metafield the
+  widget still renders the v1.0.0 look.)
+- **Frequency-selector toggle** (`layout.showFrequency`, designer → Layout):
+  turning it off removes the delivery-frequency selector from **all six
+  presets** (the planner degrades to a single recommended-cadence line);
+  add-to-carts then use each plan's default frequency, and subscribers can
+  still change frequency any time in the portal.
+
+### Migration notes
+
+- **No database schema migration** — v1.2.0 ships no new Prisma migration.
+- **No breaking changes**: existing design revisions and the published
+  metafield JSON parse unchanged (the new `placement` and
+  `layout.showFrequency` fields carry field-level defaults). The section app
+  block keeps working exactly as installed.
+- The theme extension changed (new embed block + `buy-box-embed.js`) — run
+  `npm run deploy`. To use the embed path, enable it once in the theme
+  editor (Theme settings → App embeds → "Cellexia Buy Box" → Save); this is
+  safe on the live theme at any time (Setup mode keeps the widget hidden).
+
 ## [1.1.0] — 2026-07-23
 
 ### Added

@@ -16,6 +16,7 @@ import {
   ButtonGroup,
   Card,
   Checkbox,
+  ChoiceList,
   DataTable,
   Divider,
   InlineGrid,
@@ -57,11 +58,11 @@ import { BuyBoxPreview } from "~/components/buybox-preview";
  * Admin — Buy box designer.
  *
  * Configures the PDP subscription buy box: six design presets with deep
- * customization (layout / per-locale text / style / behavior), a live
- * preview, draft + publish with revision history (instant restore), and
- * per-design take-rate attribution. Publishing mirrors the config to the
- * cellexia.buybox_design shop metafield; a shop with no published revision
- * keeps rendering exactly as v1.0.0 did.
+ * customization (layout / per-locale text / style / behavior / app-embed
+ * placement), a live preview, draft + publish with revision history
+ * (instant restore), and per-design take-rate attribution. Publishing
+ * mirrors the config to the cellexia.buybox_design shop metafield; a shop
+ * with no published revision keeps rendering exactly as v1.0.0 did.
  */
 
 // ── Shared view types ────────────────────────────────────────────────────────
@@ -482,7 +483,7 @@ function ColorField({
           onChange={onChange}
           placeholder={inheritable ? "Inherit theme default" : undefined}
           error={
-            value !== "" && !valid ? "Use a hex color like #4a5d4a" : undefined
+            value !== "" && !valid ? "Use a hex color like #1d1d1b" : undefined
           }
           helpText={helpText}
           labelAction={
@@ -567,6 +568,12 @@ export default function BuyBoxDesignerPage() {
     key: K,
     value: WidgetDesignConfig["behavior"][K],
   ) => setDraft((d) => ({ ...d, behavior: { ...d.behavior, [key]: value } }));
+
+  const setPlacement = <K extends keyof WidgetDesignConfig["placement"]>(
+    key: K,
+    value: WidgetDesignConfig["placement"][K],
+  ) =>
+    setDraft((d) => ({ ...d, placement: { ...d.placement, [key]: value } }));
 
   const setTextField = (key: TextKey, value: string) =>
     setDraft((d) => {
@@ -731,6 +738,96 @@ export default function BuyBoxDesignerPage() {
           </BlockStack>
         </Card>
 
+        {/* ── Placement (app embed) ── */}
+        <Card>
+          <BlockStack gap="300">
+            <BlockStack gap="100">
+              <Text as="h2" variant="headingMd">
+                Placement
+              </Text>
+              <Text as="p" variant="bodySm" tone="subdued">
+                Where the widget mounts on the product page when it loads
+                through the &quot;Cellexia Buy Box&quot; app embed (Theme
+                editor → Theme settings → App embeds). If you added the
+                buy-box app block to the product template instead, it always
+                renders exactly where you placed it and this setting is
+                ignored. Saved and published with the rest of the design.
+              </Text>
+            </BlockStack>
+            <ChoiceList
+              title="Mount point"
+              titleHidden
+              choices={[
+                {
+                  label: "Automatic (recommended)",
+                  value: "auto",
+                  helpText:
+                    "The widget finds the buy column and inserts itself " +
+                    "between the product options and the add-to-cart panel. " +
+                    "Tuned for cellexialabs.com: it anchors just above the " +
+                    "grey purchase panel (quantity + add to cart), right " +
+                    "after the size selector, with generic fallbacks for " +
+                    "other themes.",
+                },
+                {
+                  label: "Custom CSS selector",
+                  value: "selector",
+                  helpText:
+                    "Anchor the widget to a specific element when the " +
+                    "automatic position isn't right for your theme.",
+                },
+              ]}
+              selected={[draft.placement.mode]}
+              onChange={(selected) =>
+                setPlacement(
+                  "mode",
+                  (selected[0] ??
+                    "auto") as WidgetDesignConfig["placement"]["mode"],
+                )
+              }
+            />
+            {draft.placement.mode === "selector" ? (
+              <InlineStack gap="300" blockAlign="start" wrap>
+                <Box minWidth="280px">
+                  <TextField
+                    label="CSS selector"
+                    autoComplete="off"
+                    value={draft.placement.selector}
+                    onChange={(v) => setPlacement("selector", v)}
+                    placeholder=".pdp__info .pdp__grey"
+                    maxLength={200}
+                    helpText='Example: ".pdp__info .pdp__grey" with position "Before the element" places the widget just above the quantity + add-to-cart panel on cellexialabs.com.'
+                  />
+                </Box>
+                <Box minWidth="220px">
+                  <Select
+                    label="Position"
+                    options={[
+                      { label: "Before the element", value: "before" },
+                      { label: "After the element", value: "after" },
+                      {
+                        label: "Inside, as first child (prepend)",
+                        value: "prepend",
+                      },
+                      {
+                        label: "Inside, as last child (append)",
+                        value: "append",
+                      },
+                    ]}
+                    value={draft.placement.position}
+                    onChange={(v) =>
+                      setPlacement(
+                        "position",
+                        v as WidgetDesignConfig["placement"]["position"],
+                      )
+                    }
+                  />
+                </Box>
+              </InlineStack>
+            ) : null}
+          </BlockStack>
+        </Card>
+
         {/* ── Editor + live preview ── */}
         <InlineGrid columns={{ xs: 1, lg: 2 }} gap="400" alignItems="start">
           <Card>
@@ -786,6 +883,12 @@ export default function BuyBoxDesignerPage() {
                     }
                     suffix={<Text as="span">{draft.layout.borderWidthPx}px</Text>}
                   />
+                  <Checkbox
+                    label="Show frequency selector"
+                    checked={draft.layout.showFrequency}
+                    onChange={(v) => setLayout("showFrequency", v)}
+                    helpText="Hiding it removes the frequency choice from every preset and uses each plan's default delivery frequency — one less decision on the product page. Subscribers can still change their frequency any time in the portal."
+                  />
                   <Select
                     label="Frequency selector style"
                     options={[
@@ -793,13 +896,18 @@ export default function BuyBoxDesignerPage() {
                       { label: "Chips", value: "chips" },
                     ]}
                     value={draft.layout.frequencyStyle}
+                    disabled={!draft.layout.showFrequency}
                     onChange={(v) =>
                       setLayout(
                         "frequencyStyle",
                         v as WidgetDesignConfig["layout"]["frequencyStyle"],
                       )
                     }
-                    helpText="The Routine planner preset always uses chips."
+                    helpText={
+                      draft.layout.showFrequency
+                        ? "The Routine planner preset always uses chips."
+                        : "The frequency selector is hidden — each plan's default frequency applies."
+                    }
                   />
                   <Divider />
                   <Checkbox
@@ -931,7 +1039,7 @@ export default function BuyBoxDesignerPage() {
                   <ColorField
                     label="Accent"
                     value={draft.style.accent}
-                    fallbackHex="#4a5d4a"
+                    fallbackHex="#1d1d1b"
                     onChange={(v) => setStyle("accent", v)}
                     helpText="Subscription border, badge, radio and savings color."
                   />
@@ -953,7 +1061,7 @@ export default function BuyBoxDesignerPage() {
                   <ColorField
                     label="Text color"
                     value={draft.style.text}
-                    fallbackHex="#1a1a1a"
+                    fallbackHex="#1d1d1b"
                     inheritable
                     onChange={(v) => setStyle("text", v)}
                     helpText="Inherit = the theme's own text color."
@@ -1094,10 +1202,11 @@ export default function BuyBoxDesignerPage() {
                   </div>
                 </Box>
                 <Text as="p" variant="bodySm" tone="subdued">
-                  Preview uses a sample product (Cellexia Renewal Serum, £68,
-                  20% first order / 10% ongoing, every 6–12 weeks). Final
-                  rendering can differ slightly by theme — always confirm with
-                  the storefront preview.
+                  Preview uses a sample product (Cellexia Renewal Serum,
+                  CHF 68.00, 20% first order / 10% ongoing, every 6–12 weeks)
+                  in a frame styled after cellexialabs.com. Final rendering
+                  can differ slightly by theme — always confirm with the
+                  storefront preview.
                 </Text>
                 <Box>
                   <Button url="/app/preview">View on your store</Button>

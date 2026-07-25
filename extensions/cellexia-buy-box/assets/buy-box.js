@@ -22,6 +22,11 @@
  *    data-cx-per-delivery, data-cx-first-label).
  *  - Re-resolve {percent}/{amount}/{frequency} text templates carried in
  *    data-cx-tpl attributes with per-plan values from the JSON island.
+ *  - Register each widget on window.CellexiaSubs (guarded global — the page
+ *    may carry OTHER vendors' "cx-*" ids; we never touch those) so the app
+ *    embed's companion script (buy-box-embed.js) can read the current
+ *    selection when patching JS-driven cart requests on themes that have no
+ *    /cart/add form, and can push variant changes back in.
  *
  * All displayed strings are precomputed, fully localized, in the block's
  * JSON island — this file never formats money or composes copy.
@@ -597,6 +602,74 @@
         applySellingPlan(false);
       }
       render();
+    }
+
+    /* ── Global handle: window.CellexiaSubs ──────────────────────────────────
+       Consumed by buy-box-embed.js (the app embed's mount + cart-request
+       patching script) on themes without a reachable /cart/add form.
+       getState() returns null while the widget is hidden — launch-gated
+       ([data-cx-gated][hidden]) or inside the unmounted [hidden] embed
+       wrapper — so nothing external ever acts for a widget the visitor
+       cannot see. Namespace note: this page may also carry ANOTHER vendor's
+       "cx-*" element ids; we only ever share state through this one guarded
+       global, never through DOM ids. */
+    try {
+      var subs = (window.CellexiaSubs = window.CellexiaSubs || {});
+      subs.widgets = subs.widgets || [];
+      subs.widgets.push({
+        getState: function () {
+          if (root.closest('[hidden]')) {
+            return null;
+          }
+          var statePlan = currentPlan();
+          return {
+            mode: state.mode,
+            design: preset,
+            variantId: String(state.variantId),
+            variantIds: Object.keys(data.variants),
+            sellingPlanId:
+              state.mode === 'subscription' && statePlan
+                ? String(state.planId)
+                : null
+          };
+        },
+        setVariant: function (variantId) {
+          onVariantMaybeChanged(variantId);
+        }
+      });
+      if (!subs.getState) {
+        /* First visible widget wins (there is at most one visible: the
+           section block suppresses the embed). */
+        subs.getState = function () {
+          for (var wi = 0; wi < subs.widgets.length; wi++) {
+            var widgetState = null;
+            try {
+              widgetState = subs.widgets[wi].getState();
+            } catch (err) {
+              widgetState = null;
+            }
+            if (widgetState) {
+              return widgetState;
+            }
+          }
+          return null;
+        };
+      }
+      if (!subs.setVariant) {
+        /* Unknown ids are ignored per widget (onVariantMaybeChanged checks
+           its own JSON island), so broadcasting is safe. */
+        subs.setVariant = function (variantId) {
+          for (var wj = 0; wj < subs.widgets.length; wj++) {
+            try {
+              subs.widgets[wj].setVariant(variantId);
+            } catch (err) {
+              /* never break the page over a variant sync */
+            }
+          }
+        };
+      }
+    } catch (err) {
+      /* the global handle is an embed nicety — never break the widget */
     }
 
     /* ── Wire up ─────────────────────────────────────────────────────────── */

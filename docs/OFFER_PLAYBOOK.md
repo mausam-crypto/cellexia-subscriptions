@@ -230,6 +230,21 @@ desktop-heavy traffic and cadence-obvious consumables respectively.
    design in one click; the storefront follows within minutes, with no theme
    edit and no downtime in either direction.
 
+**Hiding the frequency selector — a take-rate lever worth testing.** The
+designer's **Show frequency selector** toggle (v1.2.0, Layout tab) removes
+the frequency choice from every preset; add-to-carts then use each plan's
+default cadence. The CRO logic: every decision at the point of conversion
+costs completions, and "how often?" is the one question many first-time
+buyers cannot answer — hiding it turns the buy box into a single yes/no
+(subscribe or not) with your recommended cadence pre-decided. The usual cost
+of removing choice is churn from a wrong cadence, but here the portal
+preserves full flexibility — subscribers change frequency any time, and the
+upcoming-order email arrives before every renewal — so the mismatch risk is
+low. Test it like any design change (one lever, full traffic cycle, watch
+CVR *and* take-rate); it pairs naturally with `toggle`/`inline`, and note it
+neuters `planner` (whose whole pitch is the cadence choice — the preset
+degrades to a recommended-cadence line).
+
 **Preselection & ordering ethics.** The designer lets you combine
 `preselect: subscription` with `one_time_first` ordering — meaning the
 visually-first option is *not* the selected one. That combination reads as a

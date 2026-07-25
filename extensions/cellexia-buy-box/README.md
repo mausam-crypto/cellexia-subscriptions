@@ -1,14 +1,26 @@
 # Cellexia Buy Box — theme app extension
 
 The PDP subscription widget. Renders the product's selling plans as one of
-**six design presets** (classic stacked cards by default) and syncs the
-choice into the theme's own product form so the standard Add to Cart button
-just works. The active design is configured from the app's **Buy box
-designer** and published to a shop metafield — no theme edit or redeploy is
-needed to change it.
+**six design presets** (classic stacked cards by default) and carries the
+choice into the cart — through the theme's product form where one exists, or
+by patching the theme's JS cart requests where none does (see the app
+embed). The active design is configured from the app's **Buy box designer**
+and published to a shop metafield — no theme edit or redeploy is needed to
+change it.
+
+It ships in **two install shapes sharing one implementation**
+(`snippets/cx-buybox-core.liquid` renders the identical widget for both):
+
+- **App embed** (`blocks/buy-box-embed.liquid`, target `body`) —
+  **recommended: works on every theme**, one toggle, no template surgery.
+- **App block** (`blocks/buy-box.liquid`, target `section`) — for themes
+  whose product section accepts app blocks; renders exactly where the
+  merchant drags it.
 
 ```
-blocks/buy-box.liquid            the app block (target: section, product templates)
+blocks/buy-box.liquid            app block (target: section) — thin wrapper over cx-buybox-core
+blocks/buy-box-embed.liquid      app embed (target: body) — self-mounting wrapper over cx-buybox-core
+snippets/cx-buybox-core.liquid   THE widget: config resolution + all six presets + JSON island
 snippets/cx-price.liquid         money display helper
 snippets/cx-freq-label.liquid    localized "Delivery every N weeks" labels
 snippets/cx-save-label.liquid    localized "Save X" labels
@@ -18,12 +30,97 @@ snippets/cx-freq-control.liquid  frequency dropdown or chips (shared by presets)
 snippets/cx-benefit-list.liquid  check-mark benefit list
 snippets/cx-reassurance.liquid   reassurance line with check icon
 snippets/cx-sub-price-block.liquid  subscription price cluster (shared by presets)
-assets/buy-box.css               mobile-first styles (BEM namespace cx-buybox)
-assets/buy-box.js                vanilla JS, deferred, no dependencies
+assets/buy-box.css               mobile-first styles (BEM namespaces cx-buybox / cx-buybox-embed)
+assets/buy-box.js                widget behaviour: vanilla JS, deferred, no dependencies
+assets/buy-box-embed.js          embed-only: self-mounting + fetch/XHR cart-request patching
 locales/*.json                   storefront copy (en.default + 21 translations)
 ```
 
-## Adding the block in the theme editor
+## Install as app embed (recommended — works on every theme)
+
+Some themes — including the client's custom "Sleepify Theme" on
+cellexialabs.com — do not accept app blocks in their product section, so the
+app block below simply cannot be added there. The app embed is the
+everywhere-else answer, and it is **one toggle**:
+
+1. Deploy the app (`npm run deploy`) so the extension is available to the store.
+2. In the Shopify admin: **Online Store → Themes → Customize**.
+3. Open **Theme settings** (bottom-left) → **App embeds**.
+4. Switch **Cellexia Buy Box** on and press **Save**. Done.
+
+From then on, every product page whose product has a Cellexia selling plan
+gets the widget automatically: the embed server-renders it hidden at the end
+of `<body>` and `buy-box-embed.js` moves it into the buy column and unhides
+it. Placement is resolved in this order:
+
+1. the embed's **Custom anchor selector** setting (theme editor), combined
+   with its **Position** setting (before / after / inside-start / inside-end);
+2. the published design config's **Placement** (Buy box designer →
+   Placement, mode "CSS selector");
+3. automatic heuristics: `.pdp__info .pdp__grey` → insert before (the
+   cellexialabs.com buy column: after the size options, above quantity +
+   Add to cart), then `.product-form__buttons` → before (Dawn-family OS 2.0
+   themes), then the `/cart/add` form's submit button → before its closest
+   block-level wrapper, then the `/cart/add` form → inside-start, then a
+   `.pdp__price` / `.price` element → after.
+
+Embed behaviours worth knowing:
+
+- **The launch gate is identical to the app block's.** Enabling the embed
+  while the app is in setup mode shows **nothing** to visitors — the inner
+  widget renders `[hidden][data-cx-gated]` until the
+  `cellexia.launch_status` metafield says `"live"`, and only a validated
+  `?cx_preview=` token reveals it (same ribbon, same session behaviour —
+  see "Safe launch & preview" below). Mounting only unhides the embed
+  *wrapper*, never the gated widget inside it.
+- **The app block wins.** If the page also renders the section-targeted app
+  block, the embed stays hidden and dormant — never two widgets. Safe to
+  leave the embed enabled as a fallback on themes that support blocks.
+- **No `/cart/add` form? Still works.** On JS-driven themes (Sleepify posts
+  to `/cart/add.js` via jQuery XHR with no form), `buy-box-embed.js` wraps
+  `window.fetch` and `XMLHttpRequest` once and injects the selected
+  `selling_plan` (+ the `properties[_cx_design]` attribution) into
+  `/cart/add` and `/cart/add.js` POST bodies — FormData, urlencoded, JSON
+  `items[]` or flat JSON alike. Requests are matched against **this
+  product's variant ids**, so other vendors' cart calls (bundle widgets,
+  upsells) pass through byte-identical; so does everything when one-time is
+  selected, the widget is hidden, or anything at all errors. An add-to-cart
+  can never break.
+- **Variant tracking.** Beyond the standard form/URL handling in
+  `buy-box.js`, the embed listens to the Sleepify size picker
+  (`.pdp__options select/input`) and re-reads `?variant=` after changes —
+  no polling.
+
+### Anchor-selector troubleshooting
+
+- If the widget does not appear during preview, look for a small dark card
+  bottom-left: **"Cellexia buy box: no placement anchor found — set a
+  custom CSS selector in the Buy box designer → Placement."** That card is
+  admin-only (it requires the preview session's token); real visitors never
+  see it — for them a failed mount just means no widget, never breakage. A
+  `console.warn` with the same diagnosis is logged too.
+- Fix it by setting a selector: either on the embed (theme editor → App
+  embeds → Cellexia Buy Box → Custom anchor selector, e.g. `.pdp__grey`)
+  or centrally in the app (Buy box designer → Placement). The embed-level
+  selector wins over the app one.
+- A custom selector that matches nothing logs a warning and falls back to
+  the automatic heuristics after a 1.5s grace period (late-rendered PDPs
+  get two mount passes: DOM-ready and +1500ms).
+- Test selectors in the browser console with
+  `document.querySelector('...')` on the live PDP.
+
+### Namespace note (unrelated "cx-*" scripts on the page)
+
+cellexialabs.com already carries **another vendor's** scripts using element
+ids `cx-i18n`, `cx-cart-config`, `cx-pdp-config`, `cx-embed-config`, plus
+the `sm-rc-widget` bundle widget and Stamped reviews. Coexistence rules
+baked into this extension: our global is the single guarded
+`window.CellexiaSubs` object; our CSS/JS never queries `[id^="cx-"]` or any
+id selector; the embed introduces **no element ids at all**; and the cart
+patcher only ever touches requests carrying our own product's variant ids.
+Do not "clean up" any of that when editing.
+
+## Adding the block in the theme editor (themes that accept app blocks)
 
 1. Deploy the app (`npm run deploy`) so the extension is available to the store.
 2. In the Shopify admin: **Online Store → Themes → Customize**.
@@ -179,12 +276,35 @@ produced it.
 | **Heading** | "Choose your ritual" | Frames the choice as a routine, not a billing decision. Clear to hide. |
 | **Show badge / Badge text** | on / "Most popular" | Social proof on the subscription card. Leave the text empty to use the translated "Most popular" from the locale files. Only claim "Most popular" once it is true — unearned badges erode trust and reviews. |
 | **Preselect subscription** | on | Subscription-first ordering + preselection is the single biggest take-rate lever (defaults are sticky). **Ethics**: preselection is fine only because the card states the full ongoing price ("then X every Y weeks") and the reassurance line before add-to-cart — never hide the recurring commitment. **A/B guidance**: test preselect on vs off per traffic source; preselect can slightly depress overall conversion on cold traffic while lifting take-rate — judge on projected LTGP per session (take-rate x LTV vs conversion delta), not on either metric alone. The daily `takeRateNum/takeRateDen` rollups in the app give you the take-rate side. |
-| **Show frequency selector** | on | Letting customers pick a realistic cadence reduces "too much product" churn — the #1 voluntary cancel reason in replenishment categories. Hide it only for single-cadence offers; the recommended frequency then applies. |
+| **Show frequency selector** | on | Letting customers pick a realistic cadence reduces "too much product" churn — the #1 voluntary cancel reason in replenishment categories. Hide it only for single-cadence offers; the recommended frequency then applies. The app-level switch (Buy box designer → layout → "Show frequency selector", published as `layout.showFrequency`) **overrides this block setting in both directions** and also governs the embed — see "Removing the frequency selector" below. |
 | **Recommended frequency** | "8 weeks" | Matched against selling plan names; the matching plan is preselected. Set per product from real days-to-empty (the app's `ProductCadence` data), not an arbitrary monthly default — a cadence that matches actual usage prevents pantry-loading skips and cancels. |
 | **Savings display** | Percent | Percent reads stronger below ~£50 price points ("Save 20%"); absolute reads stronger on premium AOV ("Save £18"). "Both" is honest but busy — test it on your highest-traffic PDP before rolling out. The savings are computed live from the selling-plan allocation vs the variant price, so they can never drift from checkout reality. |
 | **Show reassurance** | on | "Skip, pause or cancel anytime." directly attacks commitment anxiety, the main psychological blocker to subscribing. Only show it if the portal genuinely offers all three (it does — skip/pause/cancel are one click in the Cellexia portal). |
 | **Accent color** | `#4a5d4a` | The subscription card's distinct border/fill/badge. Match the brand's primary CTA family but keep contrast ≥ 3:1 against the page background. Deeper overrides via CSS custom properties (`--cx-accent`, `--cx-accent-soft`, `--cx-border`, `--cx-radius`, ... — see the header of `assets/buy-box.css`). |
 | **Compact mode** | off | Tighter paddings for dense PDPs or drawer/quick-buy contexts. |
+
+### Removing the frequency selector (`layout.showFrequency`, v1.2.0)
+
+The Buy box designer can remove the delivery-frequency selector from the
+widget **entirely, across all six presets** (published as
+`layout.showFrequency: false` in the design config; a missing key means
+`true`, so pre-v1.2.0 configs are unaffected):
+
+- **classic / toggle / tiles / inline / value_stack** simply omit the
+  dropdown/chips row — nothing else moves.
+- **planner** would be pointless without its chips, so it degrades to a
+  single recommended-cadence line ("Delivery every 8 weeks", built from the
+  existing locale keys — no new strings) above the option cards.
+- The hidden `selling_plan` input (or the patched cart request, in embed
+  mode) still carries the **default plan**: the recommended frequency when
+  one matches, else the group's first selling plan. The "then {price} every
+  {frequency}" microcopy still states the cadence before add-to-cart, so
+  the recurring commitment is never hidden.
+- Subscribers can still change frequency later in the portal (portal
+  frequency controls are governed separately by the plan's
+  "allow frequency choice" setting on the Plans page).
+- Groups with a single selling plan never rendered a selector in any
+  version; this toggle just makes multi-plan groups behave the same way.
 
 ### Pricing display logic
 
@@ -227,6 +347,11 @@ locales.
   in every preset, never preset-specific classes.
 - A `cx:buybox:change` CustomEvent (detail: `variantId`, `sellingPlanId`,
   `mode`, `design`) bubbles from the block for pixels/analytics to hook into.
+- Each widget registers on the guarded `window.CellexiaSubs` global
+  (`getState()` / `setVariant()`); `getState()` returns `null` while the
+  widget is hidden (launch-gated or unmounted embed), which is what lets
+  `buy-box-embed.js` patch cart requests only for a selection the visitor
+  can actually see.
 
 ## Accessibility
 

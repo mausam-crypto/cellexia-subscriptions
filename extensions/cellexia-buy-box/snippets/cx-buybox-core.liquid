@@ -1,0 +1,968 @@
+{%- comment -%}
+  cx-buybox-core — the ENTIRE buy-box widget (config resolution + all six
+  design presets + JSON island + noscript fallback), shared verbatim by:
+
+    blocks/buy-box.liquid        the product-page app block (target: section)
+    blocks/buy-box-embed.liquid  the app embed (target: body) for themes whose
+                                 product section cannot take app blocks
+
+  Both wrappers are thin: they pass their settings (or, for the embed, the
+  section block's defaults) into this snippet, which renders the identical
+  widget markup either way — same launch gating ([hidden][data-cx-gated]
+  until cellexia.launch_status is "live"), same preview ribbon, same
+  selling-plan wiring and JSON island consumed by assets/buy-box.js.
+
+  Params:
+    render_context               'section' | 'embed'
+    product                      the product object
+    uid                          unique id suffix (block.id) — input names,
+                                 aria wiring, the scoped custom-css selector
+    section_id                   section.id ('section' context only; the
+                                 data-section-id attribute is omitted in the
+                                 embed so buy-box.js falls back to a
+                                 document-wide product-form lookup)
+    shopify_attributes           block.shopify_attributes (theme editor)
+    design_source                'app' or a forced preset key
+    heading                      heading text ('' hides it)
+    show_badge                   boolean
+    badge_text                   badge override ('' → translated default)
+    preselect_subscription       boolean
+    show_frequency_selector      boolean (config layout.showFrequency, when
+                                 published, wins in either direction)
+    recommended_frequency_handle e.g. '8 weeks'
+    savings_format               'percent' | 'absolute' | 'both'
+    show_reassurance             boolean
+    accent_color                 hex accent fallback when no published config
+    compact_mode                 boolean
+
+  Frequency selector removal (v1.2.0): when the resolved show-frequency flag
+  is false, NO dropdown/chips render in ANY preset — the planner degrades to
+  a single recommended-cadence line ("Delivery every 8 weeks") — and the
+  hidden selling_plan input simply keeps the default plan (recommended
+  frequency, else the group's first plan).
+{%- endcomment -%}
+
+{%- if product != blank and product.selling_plan_groups.size > 0 -%}
+
+  {%- liquid
+    # ── Launch gate: hidden for everyone until the app has gone live ───────
+    # The metafield drop exposes .value; the default fallback also covers a
+    # legacy raw-string access. Missing metafield => not live (fail closed).
+    assign cx_launch_status = shop.metafields.cellexia.launch_status.value | default: shop.metafields.cellexia.launch_status
+    assign cx_live = false
+    if cx_launch_status == 'live'
+      assign cx_live = true
+    endif
+
+    # ── Design config (published by the app's Buy box designer) ────────────
+    assign cx_cfg = shop.metafields.cellexia.buybox_design.value
+    assign cx_source = design_source | default: 'app'
+    assign cx_preset = 'classic'
+    assign cx_use_cfg = false
+    if cx_source != blank and cx_source != 'app'
+      assign cx_preset = cx_source
+    elsif cx_cfg and cx_cfg.preset
+      assign cx_preset = cx_cfg.preset
+      assign cx_use_cfg = true
+    endif
+    assign cx_known_presets = 'classic toggle tiles inline value_stack planner' | split: ' '
+    unless cx_known_presets contains cx_preset
+      assign cx_preset = 'classic'
+    endunless
+
+    # ── Pick the selling plan group ─────────────────────────────────────────
+    assign cx_group = product.selling_plan_groups | first
+    for g in product.selling_plan_groups
+      assign g_name = g.name | downcase
+      if g_name contains 'cellexia'
+        assign cx_group = g
+        break
+      endif
+    endfor
+
+    # ── Pick the preselected plan (recommended frequency, else first) ──────
+    assign cx_selected_plan = cx_group.selling_plans | first
+    assign cx_rec = recommended_frequency_handle | strip | downcase
+    if cx_rec != blank
+      assign cx_rec_found = false
+      for p in cx_group.selling_plans
+        unless cx_rec_found
+          assign p_hay = p.name | downcase
+          for opt in p.options
+            assign opt_val = opt.value | downcase
+            assign p_hay = p_hay | append: ' ' | append: opt_val
+          endfor
+          if p_hay contains cx_rec
+            assign cx_selected_plan = p
+            assign cx_rec_found = true
+          endif
+        endunless
+      endfor
+    endif
+    # The recommended plan keeps its tag (planner) even if the allocation
+    # fallback below moves the initial selection to another plan.
+    assign cx_rec_plan_id = cx_selected_plan.id
+
+    # ── Current variant (honours ?variant= deep links) ─────────────────────
+    assign cx_variant = product.selected_or_first_available_variant
+    if cx_variant == blank
+      assign cx_variant = product.variants | first
+    endif
+
+    # ── Allocation for current variant + selected plan (with fallback) ─────
+    assign cx_alloc = false
+    for a in cx_variant.selling_plan_allocations
+      if a.selling_plan.id == cx_selected_plan.id
+        assign cx_alloc = a
+        break
+      endif
+    endfor
+    unless cx_alloc
+      for a in cx_variant.selling_plan_allocations
+        if a.selling_plan_group_id == cx_group.id
+          assign cx_alloc = a
+          assign cx_selected_plan = a.selling_plan
+          break
+        endif
+      endfor
+    endunless
+
+    # ── Initial prices ─────────────────────────────────────────────────────
+    if cx_alloc
+      assign cx_first = cx_alloc.price
+      assign cx_adj_count = cx_alloc.price_adjustments | size
+      if cx_adj_count > 1
+        assign cx_last_adj = cx_alloc.price_adjustments | last
+        assign cx_ongoing = cx_last_adj.price
+      else
+        assign cx_ongoing = cx_alloc.price
+      endif
+      assign cx_pd_cents = cx_alloc.per_delivery_price
+    else
+      assign cx_first = cx_variant.price
+      assign cx_ongoing = cx_variant.price
+      assign cx_pd_cents = cx_variant.price
+    endif
+
+    # ── Layout knobs (defaults = the v1.0.0 rendering / block settings) ────
+    assign cx_order = 'sub_first'
+    assign cx_density_compact = compact_mode
+    assign cx_freq_style = 'dropdown'
+    assign cx_show_badge = show_badge
+    assign cx_show_savings = true
+    assign cx_show_pd = true
+    assign cx_show_compare = false
+    assign cx_show_reassurance = show_reassurance
+    assign cx_show_benefits = false
+    assign cx_benefit_count = 4
+    assign cx_show_freq = show_frequency_selector
+    if cx_use_cfg and cx_cfg.layout
+      assign cx_l = cx_cfg.layout
+      if cx_l.order == 'one_time_first'
+        assign cx_order = 'one_time_first'
+      endif
+      if cx_l.density == 'compact'
+        assign cx_density_compact = true
+      elsif cx_l.density == 'comfortable'
+        assign cx_density_compact = false
+      endif
+      if cx_l.frequencyStyle == 'chips'
+        assign cx_freq_style = 'chips'
+      endif
+      # v1.2.0 — remove the frequency selector entirely (all six presets).
+      # Read defensively: pre-v1.2.0 configs have no showFrequency key, and a
+      # missing key must mean "show" (the v1.1.0 behavior).
+      if cx_l.showFrequency == false
+        assign cx_show_freq = false
+      elsif cx_l.showFrequency == true
+        assign cx_show_freq = true
+      endif
+      if cx_l.showBadge == false
+        assign cx_show_badge = false
+      elsif cx_l.showBadge == true
+        assign cx_show_badge = true
+      endif
+      if cx_l.showSavings == false
+        assign cx_show_savings = false
+      endif
+      if cx_l.showPerDelivery == false
+        assign cx_show_pd = false
+      endif
+      if cx_l.showCompareAt == true
+        assign cx_show_compare = true
+      endif
+      if cx_l.showReassurance == false
+        assign cx_show_reassurance = false
+      elsif cx_l.showReassurance == true
+        assign cx_show_reassurance = true
+      endif
+      if cx_l.showBenefits == true
+        assign cx_show_benefits = true
+      endif
+      if cx_l.benefitCount != blank
+        assign cx_benefit_count = cx_l.benefitCount
+      endif
+    endif
+    # value_stack IS the benefit panel — its archetype always renders the list.
+    if cx_preset == 'value_stack'
+      assign cx_show_benefits = true
+      if cx_benefit_count < 1
+        assign cx_benefit_count = 4
+      endif
+    endif
+
+    # ── Behavior knobs ─────────────────────────────────────────────────────
+    assign cx_sub_checked = preselect_subscription
+    assign cx_anim = true
+    if cx_use_cfg and cx_cfg.behavior
+      if cx_cfg.behavior.preselect == 'subscription'
+        assign cx_sub_checked = true
+      elsif cx_cfg.behavior.preselect == 'one_time'
+        assign cx_sub_checked = false
+      endif
+      if cx_cfg.behavior.animation == false
+        assign cx_anim = false
+      endif
+    endif
+    if product.requires_selling_plan
+      assign cx_sub_checked = true
+    endif
+
+    # ── Style knobs → CSS custom properties (scoped via the inline style) ──
+    # "" color slots mean "inherit the v1.0.0 default" (see presets.ts).
+    assign cx_accent = accent_color | default: '#4a5d4a'
+    assign cx_style_extra = ''
+    assign cx_custom_css = ''
+    if cx_use_cfg
+      if cx_cfg.style.accent != blank
+        assign cx_accent = cx_cfg.style.accent
+      endif
+      if cx_cfg.style.bgTint != blank
+        assign cx_style_extra = cx_style_extra | append: ' --cx-accent-soft: ' | append: cx_cfg.style.bgTint | append: ';'
+      endif
+      if cx_cfg.style.text != blank
+        assign cx_style_extra = cx_style_extra | append: ' --cx-text: ' | append: cx_cfg.style.text | append: ';'
+      endif
+      if cx_cfg.style.badgeBg != blank
+        assign cx_style_extra = cx_style_extra | append: ' --cx-badge-bg: ' | append: cx_cfg.style.badgeBg | append: ';'
+      endif
+      if cx_cfg.style.badgeText != blank
+        assign cx_style_extra = cx_style_extra | append: ' --cx-badge-text: ' | append: cx_cfg.style.badgeText | append: ';'
+      endif
+      if cx_cfg.style.accentText != blank
+        assign cx_style_extra = cx_style_extra | append: ' --cx-accent-text: ' | append: cx_cfg.style.accentText | append: ';'
+      endif
+      if cx_cfg.style.fontScale and cx_cfg.style.fontScale != 1
+        assign cx_style_extra = cx_style_extra | append: ' --cx-font-scale: ' | append: cx_cfg.style.fontScale | append: ';'
+      endif
+      if cx_cfg.layout.radiusPx != blank and cx_cfg.layout.radiusPx != 12
+        assign cx_style_extra = cx_style_extra | append: ' --cx-radius: ' | append: cx_cfg.layout.radiusPx | append: 'px;'
+      endif
+      if cx_cfg.layout.borderWidthPx != blank and cx_cfg.layout.borderWidthPx != 1
+        assign cx_style_extra = cx_style_extra | append: ' --cx-border-width: ' | append: cx_cfg.layout.borderWidthPx | append: 'px;'
+      endif
+      # Server-sanitized before publish (sanitizeCustomCss); the replaces here
+      # are an idempotent belt-and-suspenders against hand-edited metafields.
+      if cx_cfg.style.customCss != blank
+        assign cx_custom_css = cx_cfg.style.customCss | replace: '<', '' | replace: '>', '' | replace: 'javascript:', '' | replace: '@import', ''
+      endif
+    endif
+    assign cx_style_extra = cx_style_extra | strip_html
+
+    # ── Template values for {percent}/{amount}/{frequency} ────────────────
+    assign cx_save_cents = cx_variant.price | minus: cx_first
+    assign cx_save_pct = 0
+    if cx_save_cents > 0 and cx_variant.price > 0
+      assign cx_save_pct = cx_save_cents | times: 100.0 | divided_by: cx_variant.price | round
+    endif
+  -%}
+
+  {%- capture cx_pct_str -%}{%- if cx_save_pct > 0 -%}{{ cx_save_pct }}%{%- endif -%}{%- endcapture -%}
+  {%- capture cx_onetime_fmt -%}{{ cx_variant.price | money | strip_html }}{%- endcapture -%}
+
+  {%- capture cx_freq_str -%}{%- render 'cx-freq-label', selling_plan: cx_selected_plan, part: 'freq' -%}{%- endcapture -%}
+  {%- assign cx_freq_str = cx_freq_str | strip -%}
+
+  {%- capture cx_ongoing_fmt -%}{{ cx_ongoing | money | strip_html }}{%- endcapture -%}
+  {%- capture cx_then -%}
+    {%- if cx_ongoing != cx_first -%}{{ 'then_price' | t: price: cx_ongoing_fmt, frequency: cx_freq_str }}{%- endif -%}
+  {%- endcapture -%}
+  {%- assign cx_then = cx_then | strip -%}
+
+  {%- capture cx_save -%}
+    {%- if cx_alloc -%}{%- render 'cx-save-label', base: cx_variant.price, plan_price: cx_first, format: savings_format -%}{%- endif -%}
+  {%- endcapture -%}
+  {%- assign cx_save = cx_save | strip -%}
+
+  {%- capture cx_pd -%}
+    {%- if cx_alloc and cx_alloc.per_delivery_price != cx_alloc.price -%}{{ cx_alloc.per_delivery_price | money | strip_html }} {{ 'per_delivery' | t }}{%- endif -%}
+  {%- endcapture -%}
+  {%- assign cx_pd = cx_pd | strip -%}
+
+  {%- comment -%} ── Config text lookup tables (locale → en → defaults) ── {%- endcomment -%}
+  {%- assign cx_t_loc = false -%}
+  {%- assign cx_t_en = false -%}
+  {%- if cx_use_cfg and cx_cfg.text -%}
+    {%- assign cx_t_loc = cx_cfg.text[request.locale.iso_code] -%}
+    {%- assign cx_t_en = cx_cfg.text['en'] -%}
+  {%- endif -%}
+
+  {%- comment -%} heading / subheading (raw → escaped+templated via cx-tpl) {%- endcomment -%}
+  {%- capture cx_heading_raw -%}{%- render 'cx-design-text', t_loc: cx_t_loc, t_en: cx_t_en, key: 'heading', fallback: heading -%}{%- endcapture -%}
+  {%- capture cx_heading -%}{%- render 'cx-tpl', tpl: cx_heading_raw, percent: cx_pct_str, amount: cx_onetime_fmt, frequency: cx_freq_str -%}{%- endcapture -%}
+  {%- capture cx_subheading_raw -%}{%- render 'cx-design-text', t_loc: cx_t_loc, t_en: cx_t_en, key: 'subheading', fallback: '' -%}{%- endcapture -%}
+  {%- capture cx_subheading -%}{%- render 'cx-tpl', tpl: cx_subheading_raw, percent: cx_pct_str, amount: cx_onetime_fmt, frequency: cx_freq_str -%}{%- endcapture -%}
+
+  {%- comment -%} badge (config → block setting → translated default) {%- endcomment -%}
+  {%- capture cx_badge_default -%}{{ 'most_popular' | t }}{%- endcapture -%}
+  {%- assign cx_badge_fallback = badge_text | default: cx_badge_default -%}
+  {%- capture cx_badge_raw -%}{%- render 'cx-design-text', t_loc: cx_t_loc, t_en: cx_t_en, key: 'badge', fallback: cx_badge_fallback -%}{%- endcapture -%}
+  {%- assign cx_badge = cx_badge_raw | escape -%}
+
+  {%- comment -%} subscribe label (toggle/inline default embeds {percent}) {%- endcomment -%}
+  {%- case cx_preset -%}
+    {%- when 'toggle', 'inline' -%}
+      {%- comment -%}
+        Liquid's own {{ }} tag can't contain literal brace characters in an
+        inline argument (confuses its tag-matching, not just a runtime
+        issue) — build the "{percent}" placeholder via string concatenation
+        first so the {{ }} tag's raw content never contains a bare brace.
+      {%- endcomment -%}
+      {%- assign cx_pct_placeholder = '{' | append: 'percent' | append: '}' -%}
+      {%- capture cx_sub_label_default -%}{{ 'subscribe_save_percent' | t: percent: cx_pct_placeholder }}{%- endcapture -%}
+    {%- else -%}
+      {%- capture cx_sub_label_default -%}{{ 'subscribe_save' | t }}{%- endcapture -%}
+  {%- endcase -%}
+  {%- capture cx_sub_label_tpl -%}{%- render 'cx-design-text', t_loc: cx_t_loc, t_en: cx_t_en, key: 'subscribeLabel', fallback: cx_sub_label_default -%}{%- endcapture -%}
+  {%- capture cx_sub_label -%}{%- render 'cx-tpl', tpl: cx_sub_label_tpl, percent: cx_pct_str, amount: cx_onetime_fmt, frequency: cx_freq_str -%}{%- endcapture -%}
+
+  {%- comment -%} one-time labels (full + short tab variant) {%- endcomment -%}
+  {%- capture cx_onetime_default -%}{{ 'one_time' | t }}{%- endcapture -%}
+  {%- capture cx_onetime_short_default -%}{{ 'one_time_short' | t }}{%- endcapture -%}
+  {%- capture cx_onetime_label_raw -%}{%- render 'cx-design-text', t_loc: cx_t_loc, t_en: cx_t_en, key: 'oneTimeLabel', fallback: cx_onetime_default -%}{%- endcapture -%}
+  {%- assign cx_onetime_label = cx_onetime_label_raw | escape -%}
+  {%- capture cx_onetime_short_raw -%}{%- render 'cx-design-text', t_loc: cx_t_loc, t_en: cx_t_en, key: 'oneTimeLabel', fallback: cx_onetime_short_default -%}{%- endcapture -%}
+  {%- assign cx_onetime_label_short = cx_onetime_short_raw | escape -%}
+
+  {%- comment -%} savings template (config-only; overrides cx_save display) {%- endcomment -%}
+  {%- capture cx_save_tpl -%}{%- render 'cx-design-text', t_loc: cx_t_loc, t_en: cx_t_en, key: 'savingsTemplate', fallback: '' -%}{%- endcapture -%}
+  {%- if cx_save != blank and cx_save_tpl != blank -%}
+    {%- capture cx_save -%}{%- render 'cx-tpl', tpl: cx_save_tpl, percent: cx_pct_str, amount: cx_onetime_fmt, frequency: cx_freq_str -%}{%- endcapture -%}
+  {%- endif -%}
+
+  {%- comment -%} reassurance / frequency label / first-order line / one-time link {%- endcomment -%}
+  {%- capture cx_reassurance_default -%}{{ 'reassurance' | t }}{%- endcapture -%}
+  {%- capture cx_reassurance_raw -%}{%- render 'cx-design-text', t_loc: cx_t_loc, t_en: cx_t_en, key: 'reassurance', fallback: cx_reassurance_default -%}{%- endcapture -%}
+  {%- capture cx_reassurance -%}{%- render 'cx-tpl', tpl: cx_reassurance_raw, percent: cx_pct_str, amount: cx_onetime_fmt, frequency: cx_freq_str -%}{%- endcapture -%}
+
+  {%- if cx_preset == 'planner' -%}
+    {%- capture cx_freq_label_default -%}{{ 'frequency_label' | t }}{%- endcapture -%}
+  {%- else -%}
+    {%- capture cx_freq_label_default -%}{{ 'delivery_every' | t }}{%- endcapture -%}
+  {%- endif -%}
+  {%- capture cx_freq_label_raw -%}{%- render 'cx-design-text', t_loc: cx_t_loc, t_en: cx_t_en, key: 'frequencyLabel', fallback: cx_freq_label_default -%}{%- endcapture -%}
+  {%- assign cx_freq_label = cx_freq_label_raw | escape -%}
+
+  {%- capture cx_first_line_default -%}{{ 'first_order' | t }}{%- endcapture -%}
+  {%- capture cx_first_line_tpl -%}{%- render 'cx-design-text', t_loc: cx_t_loc, t_en: cx_t_en, key: 'firstOrderLine', fallback: cx_first_line_default -%}{%- endcapture -%}
+  {%- capture cx_first_line -%}{%- render 'cx-tpl', tpl: cx_first_line_tpl, percent: cx_pct_str, amount: cx_onetime_fmt, frequency: cx_freq_str -%}{%- endcapture -%}
+
+  {%- assign cx_amt_placeholder = '{' | append: 'amount' | append: '}' -%}
+  {%- capture cx_onetime_link_default -%}{{ 'or_buy_once' | t: amount: cx_amt_placeholder }}{%- endcapture -%}
+  {%- capture cx_onetime_link_tpl -%}{%- render 'cx-design-text', t_loc: cx_t_loc, t_en: cx_t_en, key: 'oneTimeLinkLabel', fallback: cx_onetime_link_default -%}{%- endcapture -%}
+  {%- capture cx_onetime_link -%}{%- render 'cx-tpl', tpl: cx_onetime_link_tpl, percent: cx_pct_str, amount: cx_onetime_fmt, frequency: cx_freq_str -%}{%- endcapture -%}
+
+  {%- capture cx_recommended_label -%}{{ 'recommended_tag' | t }}{%- endcapture -%}
+
+  {%- comment -%} benefits (config array → four locale-file defaults) {%- endcomment -%}
+  {%- assign cx_benefits_arr = false -%}
+  {%- if cx_show_benefits -%}
+    {%- if cx_t_loc and cx_t_loc.benefits.size > 0 -%}
+      {%- assign cx_benefits_arr = cx_t_loc.benefits -%}
+    {%- elsif cx_t_en and cx_t_en.benefits.size > 0 -%}
+      {%- assign cx_benefits_arr = cx_t_en.benefits -%}
+    {%- else -%}
+      {%- capture cx_benefits_str -%}{{ 'benefit_first_order' | t }}||{{ 'benefit_ongoing' | t }}||{{ 'benefit_milestone_gift' | t }}||{{ 'benefit_flexibility' | t }}{%- endcapture -%}
+      {%- assign cx_benefits_arr = cx_benefits_str | split: '||' -%}
+    {%- endif -%}
+  {%- endif -%}
+
+  <div
+    id="cx-buybox-{{ uid }}"
+    class="cx-buybox cx-buybox--{{ cx_preset }}{% if cx_density_compact %} cx-buybox--compact{% endif %}{% unless cx_anim %} cx-buybox--no-anim{% endunless %}"
+    data-cx-buybox
+    data-cx-preset="{{ cx_preset }}"
+    data-block-id="{{ uid }}"
+    {% if render_context == 'section' %}data-section-id="{{ section_id }}"{% endif %}
+    {% unless cx_live %}hidden data-cx-gated="true"{% endunless %}
+    style="--cx-accent: {{ cx_accent }}; --cx-accent-soft: {{ cx_accent | color_modify: 'alpha', 0.07 }};{{ cx_style_extra }}"
+    {{ shopify_attributes }}
+  >
+    {%- if cx_custom_css != blank -%}
+      {%- comment -%}
+        Merchant custom CSS, sanitized server-side (sanitizeCustomCss) and
+        scoped to this widget instance via CSS nesting under the wrapper id.
+      {%- endcomment -%}
+      <style>#cx-buybox-{{ uid }} { {{ cx_custom_css }} }</style>
+    {%- endif -%}
+
+    {%- unless cx_live -%}
+      {%- comment -%} Shown only after buy-box.js validates a signed preview token. {%- endcomment -%}
+      <p class="cx-buybox__preview-ribbon" data-cx-preview-ribbon hidden>{{ 'preview_mode' | t }}</p>
+    {%- endunless -%}
+
+    {%- if cx_heading != blank -%}
+      <h3 class="cx-buybox__heading">{{ cx_heading }}</h3>
+    {%- endif -%}
+    {%- if cx_subheading != blank -%}
+      <p class="cx-buybox__subheading">{{ cx_subheading }}</p>
+    {%- endif -%}
+
+    <span class="cx-buybox__sr" id="cx-buybox-label-{{ uid }}">{{ 'purchase_options' | t }}</span>
+
+    {%- case cx_preset -%}
+
+      {%- when 'toggle' -%}
+        {%- comment -%} ══ TOGGLE — segmented pill tabs + detail panel ══ {%- endcomment -%}
+        <div class="cx-buybox__group cx-buybox__group--toggle">
+          {%- unless product.requires_selling_plan -%}
+            {%- capture cx_tab_sub -%}
+              <button
+                type="button"
+                class="cx-buybox__tab{% if cx_sub_checked %} is-selected{% endif %}"
+                role="tab"
+                id="cx-tab-sub-{{ uid }}"
+                aria-controls="cx-panel-sub-{{ uid }}"
+                aria-selected="{% if cx_sub_checked %}true{% else %}false{% endif %}"
+                {% unless cx_sub_checked %}tabindex="-1"{% endunless %}
+                data-cx-tab="subscription"
+              ><span class="cx-buybox__tab-label"{% if cx_sub_label_tpl contains '{' %} data-cx-tpl="{{ cx_sub_label_tpl | escape }}"{% endif %}>{{ cx_sub_label }}</span></button>
+            {%- endcapture -%}
+            {%- capture cx_tab_one -%}
+              <button
+                type="button"
+                class="cx-buybox__tab{% unless cx_sub_checked %} is-selected{% endunless %}"
+                role="tab"
+                id="cx-tab-one-{{ uid }}"
+                aria-controls="cx-panel-one-{{ uid }}"
+                aria-selected="{% unless cx_sub_checked %}true{% else %}false{% endunless %}"
+                {% if cx_sub_checked %}tabindex="-1"{% endif %}
+                data-cx-tab="one_time"
+              ><span class="cx-buybox__tab-label">{{ cx_onetime_label_short }}</span></button>
+            {%- endcapture -%}
+            <div class="cx-buybox__tabs" role="tablist" aria-label="{{ 'purchase_options' | t }}">
+              {%- if cx_order == 'one_time_first' -%}{{ cx_tab_one }}{{ cx_tab_sub }}{%- else -%}{{ cx_tab_sub }}{{ cx_tab_one }}{%- endif -%}
+            </div>
+          {%- endunless -%}
+
+          <div
+            class="cx-buybox__panel cx-buybox__option--sub"
+            role="tabpanel"
+            id="cx-panel-sub-{{ uid }}"
+            aria-labelledby="cx-tab-sub-{{ uid }}"
+            data-cx-panel="subscription"
+            {% unless cx_sub_checked %}hidden{% endunless %}
+          >
+            {%- if cx_show_savings -%}
+              <span class="cx-buybox__save" data-cx-save{% if cx_save_tpl != blank %} data-cx-tpl="{{ cx_save_tpl | escape }}"{% endif %} {% if cx_save == blank %}hidden{% endif %}>{{ cx_save }}</span>
+            {%- endif -%}
+            {%- render 'cx-sub-price-block', first: cx_first, compare: cx_variant.price, show_compare: cx_show_compare, first_line: cx_first_line, first_line_tpl: cx_first_line_tpl, then_str: cx_then, pd_str: cx_pd, show_pd: cx_show_pd -%}
+            {%- if cx_show_freq -%}
+              {%- render 'cx-freq-control', group: cx_group, selected_plan: cx_selected_plan, block_id: uid, style: cx_freq_style, label: cx_freq_label -%}
+            {%- endif -%}
+            {%- if cx_show_benefits -%}
+              {%- render 'cx-benefit-list', benefits: cx_benefits_arr, count: cx_benefit_count -%}
+            {%- endif -%}
+            {%- if cx_show_reassurance -%}
+              {%- render 'cx-reassurance', text: cx_reassurance -%}
+            {%- endif -%}
+          </div>
+
+          {%- unless product.requires_selling_plan -%}
+            <div
+              class="cx-buybox__panel"
+              role="tabpanel"
+              id="cx-panel-one-{{ uid }}"
+              aria-labelledby="cx-tab-one-{{ uid }}"
+              data-cx-panel="one_time"
+              {% if cx_sub_checked %}hidden{% endif %}
+            >
+              <span class="cx-buybox__title-row">
+                <span class="cx-buybox__title">{{ cx_onetime_label }}</span>
+                <span class="cx-buybox__price" data-cx-onetime-price>
+                  {%- render 'cx-price', cents: cx_variant.price -%}
+                </span>
+              </span>
+            </div>
+          {%- endunless -%}
+        </div>
+
+      {%- when 'tiles' -%}
+        {%- comment -%} ══ TILES — side-by-side comparison, subscription elevated ══ {%- endcomment -%}
+        {%- capture cx_tile_sub -%}
+          <div
+            class="cx-buybox__option cx-buybox__tile cx-buybox__option--sub{% if cx_sub_checked %} is-selected{% endif %}"
+            data-cx-option-wrap="subscription"
+          >
+            {%- if cx_show_badge and cx_badge != blank -%}
+              <span class="cx-buybox__badge">{{ cx_badge }}</span>
+            {%- endif -%}
+            <label class="cx-buybox__card cx-buybox__card--tile">
+              <input
+                type="radio"
+                class="cx-buybox__radio cx-buybox__sr-input"
+                name="cx-purchase-{{ uid }}"
+                value="subscription"
+                data-cx-option="subscription"
+                {% if cx_sub_checked %}checked aria-checked="true"{% else %}aria-checked="false"{% endif %}
+              >
+              <span class="cx-buybox__card-body cx-buybox__card-body--stack">
+                <span class="cx-buybox__card-main">
+                  <span class="cx-buybox__title"{% if cx_sub_label_tpl contains '{' %} data-cx-tpl="{{ cx_sub_label_tpl | escape }}"{% endif %}>{{ cx_sub_label }}</span>
+                  {%- render 'cx-sub-price-block', first: cx_first, compare: cx_variant.price, show_compare: cx_show_compare, first_line: cx_first_line, first_line_tpl: cx_first_line_tpl, then_str: cx_then, pd_str: '', show_pd: false -%}
+                  <span class="cx-buybox__rows">
+                    <span class="cx-buybox__row">
+                      <span class="cx-buybox__row-label">{{ 'per_delivery' | t }}</span>
+                      <span class="cx-buybox__row-value" data-cx-pd-price>{%- render 'cx-price', cents: cx_pd_cents -%}</span>
+                    </span>
+                    {%- if cx_show_savings -%}
+                      <span class="cx-buybox__row" data-cx-save-row {% if cx_save == blank %}hidden{% endif %}>
+                        <span class="cx-buybox__row-label">{{ 'tile_savings' | t }}</span>
+                        <span class="cx-buybox__row-value cx-buybox__row-value--accent" data-cx-save{% if cx_save_tpl != blank %} data-cx-tpl="{{ cx_save_tpl | escape }}"{% endif %}>{{ cx_save }}</span>
+                      </span>
+                    {%- endif -%}
+                    <span class="cx-buybox__row">
+                      <span class="cx-buybox__row-label">{{ 'tile_flexibility' | t }}</span>
+                      <span class="cx-buybox__row-value">{{ 'benefit_flexibility' | t }}</span>
+                    </span>
+                  </span>
+                </span>
+              </span>
+            </label>
+            {%- if cx_show_freq -%}
+              {%- render 'cx-freq-control', group: cx_group, selected_plan: cx_selected_plan, block_id: uid, style: cx_freq_style, label: cx_freq_label -%}
+            {%- endif -%}
+            {%- if cx_show_benefits -%}
+              {%- render 'cx-benefit-list', benefits: cx_benefits_arr, count: cx_benefit_count -%}
+            {%- endif -%}
+            {%- if cx_show_reassurance -%}
+              {%- render 'cx-reassurance', text: cx_reassurance -%}
+            {%- endif -%}
+          </div>
+        {%- endcapture -%}
+        {%- capture cx_tile_one -%}
+          {%- unless product.requires_selling_plan -%}
+            <div
+              class="cx-buybox__option cx-buybox__tile{% unless cx_sub_checked %} is-selected{% endunless %}"
+              data-cx-option-wrap="one_time"
+            >
+              <label class="cx-buybox__card cx-buybox__card--tile">
+                <input
+                  type="radio"
+                  class="cx-buybox__radio cx-buybox__sr-input"
+                  name="cx-purchase-{{ uid }}"
+                  value="one_time"
+                  data-cx-option="one_time"
+                  {% unless cx_sub_checked %}checked aria-checked="true"{% else %}aria-checked="false"{% endunless %}
+                >
+                <span class="cx-buybox__card-body cx-buybox__card-body--stack">
+                  <span class="cx-buybox__card-main">
+                    <span class="cx-buybox__title">{{ cx_onetime_label }}</span>
+                    <span class="cx-buybox__price-row">
+                      <span class="cx-buybox__price cx-buybox__price--lg" data-cx-onetime-price>
+                        {%- render 'cx-price', cents: cx_variant.price -%}
+                      </span>
+                    </span>
+                  </span>
+                </span>
+              </label>
+            </div>
+          {%- endunless -%}
+        {%- endcapture -%}
+        <div class="cx-buybox__group cx-buybox__tiles" role="radiogroup" aria-labelledby="cx-buybox-label-{{ uid }}">
+          {%- if cx_order == 'one_time_first' -%}{{ cx_tile_one }}{{ cx_tile_sub }}{%- else -%}{{ cx_tile_sub }}{{ cx_tile_one }}{%- endif -%}
+        </div>
+
+      {%- when 'inline' -%}
+        {%- comment -%} ══ INLINE — one checkbox row, near-zero visual weight ══ {%- endcomment -%}
+        <div class="cx-buybox__group cx-buybox__group--inline">
+          <label class="cx-buybox__inline-row{% if cx_sub_checked %} is-selected{% endif %}" data-cx-option-wrap="subscription">
+            <input
+              type="checkbox"
+              class="cx-buybox__inline-box"
+              data-cx-inline
+              {% if cx_sub_checked %}checked{% endif %}
+              {% if product.requires_selling_plan %}disabled{% endif %}
+              aria-describedby="cx-inline-detail-{{ uid }}"
+            >
+            <span class="cx-buybox__inline-label"{% if cx_sub_label_tpl contains '{' %} data-cx-tpl="{{ cx_sub_label_tpl | escape }}"{% endif %}>{{ cx_sub_label }}</span>
+          </label>
+          <div class="cx-buybox__inline-detail" id="cx-inline-detail-{{ uid }}" data-cx-panel="subscription" {% unless cx_sub_checked %}hidden{% endunless %}>
+            <span class="cx-buybox__price-row">
+              <span class="cx-buybox__price" data-cx-sub-price{% if cx_show_compare %} data-cx-compare{% endif %}>
+                {%- if cx_show_compare -%}
+                  {%- render 'cx-price', cents: cx_first, compare: cx_variant.price -%}
+                {%- else -%}
+                  {%- render 'cx-price', cents: cx_first -%}
+                {%- endif -%}
+              </span>
+              <span class="cx-buybox__first-label" data-cx-first-label{% if cx_first_line_tpl contains '{' %} data-cx-tpl="{{ cx_first_line_tpl | escape }}"{% endif %} {% if cx_then == blank %}hidden{% endif %}>{{ cx_first_line }}</span>
+            </span>
+            <span class="cx-buybox__then" data-cx-then {% if cx_then == blank %}hidden{% endif %}>{{ cx_then }}</span>
+            {%- if cx_show_pd -%}
+              <span class="cx-buybox__per-delivery" data-cx-per-delivery {% if cx_pd == blank %}hidden{% endif %}>{{ cx_pd }}</span>
+            {%- endif -%}
+            {%- if cx_show_freq -%}
+              {%- render 'cx-freq-control', group: cx_group, selected_plan: cx_selected_plan, block_id: uid, style: cx_freq_style, label: cx_freq_label -%}
+            {%- endif -%}
+            {%- if cx_show_reassurance -%}
+              {%- render 'cx-reassurance', text: cx_reassurance -%}
+            {%- endif -%}
+          </div>
+        </div>
+
+      {%- when 'value_stack' -%}
+        {%- comment -%} ══ VALUE STACK — benefit panel, one-time demoted to a link ══ {%- endcomment -%}
+        <div class="cx-buybox__group cx-buybox__group--stack" role="radiogroup" aria-labelledby="cx-buybox-label-{{ uid }}">
+          <div
+            class="cx-buybox__option cx-buybox__option--sub cx-buybox__stack-panel{% if cx_sub_checked %} is-selected{% endif %}"
+            data-cx-option-wrap="subscription"
+          >
+            {%- if cx_show_badge and cx_badge != blank -%}
+              <span class="cx-buybox__badge">{{ cx_badge }}</span>
+            {%- endif -%}
+            <label class="cx-buybox__card">
+              <input
+                type="radio"
+                class="cx-buybox__radio cx-buybox__sr-input"
+                name="cx-purchase-{{ uid }}"
+                value="subscription"
+                data-cx-option="subscription"
+                {% if cx_sub_checked %}checked aria-checked="true"{% else %}aria-checked="false"{% endif %}
+              >
+              <span class="cx-buybox__card-body cx-buybox__card-body--stack">
+                <span class="cx-buybox__card-main">
+                  <span class="cx-buybox__title-row">
+                    <span class="cx-buybox__title"{% if cx_sub_label_tpl contains '{' %} data-cx-tpl="{{ cx_sub_label_tpl | escape }}"{% endif %}>{{ cx_sub_label }}</span>
+                    {%- if cx_show_savings -%}
+                      <span class="cx-buybox__save" data-cx-save{% if cx_save_tpl != blank %} data-cx-tpl="{{ cx_save_tpl | escape }}"{% endif %} {% if cx_save == blank %}hidden{% endif %}>{{ cx_save }}</span>
+                    {%- endif -%}
+                  </span>
+                  {%- render 'cx-sub-price-block', first: cx_first, compare: cx_variant.price, show_compare: cx_show_compare, first_line: cx_first_line, first_line_tpl: cx_first_line_tpl, then_str: cx_then, pd_str: cx_pd, show_pd: cx_show_pd -%}
+                </span>
+              </span>
+            </label>
+            {%- render 'cx-benefit-list', benefits: cx_benefits_arr, count: cx_benefit_count -%}
+            {%- if cx_show_freq -%}
+              {%- render 'cx-freq-control', group: cx_group, selected_plan: cx_selected_plan, block_id: uid, style: cx_freq_style, label: cx_freq_label -%}
+            {%- endif -%}
+          </div>
+          {%- unless product.requires_selling_plan -%}
+            <label class="cx-buybox__stack-onetime{% unless cx_sub_checked %} is-selected{% endunless %}" data-cx-option-wrap="one_time">
+              <input
+                type="radio"
+                class="cx-buybox__radio cx-buybox__sr-input"
+                name="cx-purchase-{{ uid }}"
+                value="one_time"
+                data-cx-option="one_time"
+                {% unless cx_sub_checked %}checked aria-checked="true"{% else %}aria-checked="false"{% endunless %}
+              >
+              <span class="cx-buybox__stack-onetime-link" data-cx-tpl="{{ cx_onetime_link_tpl | escape }}">{{ cx_onetime_link }}</span>
+            </label>
+          {%- endunless -%}
+        </div>
+
+      {%- when 'planner' -%}
+        {%- comment -%} ══ PLANNER — frequency-forward chips, per-delivery framing ══ {%- endcomment -%}
+        <div class="cx-buybox__group cx-buybox__group--planner">
+          {%- if cx_group.selling_plans.size > 1 -%}
+            {%- if cx_show_freq -%}
+            <p class="cx-buybox__planner-label">{{ cx_freq_label }}</p>
+            {%- render 'cx-freq-control', group: cx_group, selected_plan: cx_selected_plan, block_id: uid, style: 'chips', label: cx_freq_label, show_recommended: true, recommended_plan_id: cx_rec_plan_id, recommended_label: cx_recommended_label -%}
+            {%- else -%}
+              {%- comment -%}
+                layout.showFrequency=false — the planner's chips would be its
+                whole point, so it degrades to a single recommended-cadence
+                line ("Delivery every 8 weeks", existing locale keys) and the
+                default plan is used.
+              {%- endcomment -%}
+            <p class="cx-buybox__planner-cadence">{%- render 'cx-freq-label', selling_plan: cx_selected_plan, part: 'select' -%}</p>
+            {%- endif -%}
+          {%- endif -%}
+          {%- capture cx_planner_sub -%}
+            <div
+              class="cx-buybox__option cx-buybox__option--sub{% if cx_sub_checked %} is-selected{% endif %}"
+              data-cx-option-wrap="subscription"
+            >
+              {%- if cx_show_badge and cx_badge != blank -%}
+                <span class="cx-buybox__badge">{{ cx_badge }}</span>
+              {%- endif -%}
+              <label class="cx-buybox__card">
+                <input
+                  type="radio"
+                  class="cx-buybox__radio cx-buybox__sr-input"
+                  name="cx-purchase-{{ uid }}"
+                  value="subscription"
+                  data-cx-option="subscription"
+                  {% if cx_sub_checked %}checked aria-checked="true"{% else %}aria-checked="false"{% endif %}
+                >
+                <span class="cx-buybox__card-body">
+                  <span class="cx-buybox__control" aria-hidden="true"></span>
+                  <span class="cx-buybox__card-main">
+                    <span class="cx-buybox__title-row">
+                      <span class="cx-buybox__title"{% if cx_sub_label_tpl contains '{' %} data-cx-tpl="{{ cx_sub_label_tpl | escape }}"{% endif %}>{{ cx_sub_label }}</span>
+                      {%- if cx_show_savings -%}
+                        <span class="cx-buybox__save" data-cx-save{% if cx_save_tpl != blank %} data-cx-tpl="{{ cx_save_tpl | escape }}"{% endif %} {% if cx_save == blank %}hidden{% endif %}>{{ cx_save }}</span>
+                      {%- endif -%}
+                    </span>
+                    <span class="cx-buybox__price-row">
+                      <span class="cx-buybox__price cx-buybox__price--lg" data-cx-pd-price>
+                        {%- render 'cx-price', cents: cx_pd_cents -%}
+                      </span>
+                      <span class="cx-buybox__first-label">{{ 'per_delivery' | t }}</span>
+                    </span>
+                    <span class="cx-buybox__then" data-cx-then {% if cx_then == blank %}hidden{% endif %}>{{ cx_then }}</span>
+                  </span>
+                </span>
+              </label>
+              {%- if cx_show_benefits -%}
+                {%- render 'cx-benefit-list', benefits: cx_benefits_arr, count: cx_benefit_count -%}
+              {%- endif -%}
+              {%- if cx_show_reassurance -%}
+                {%- render 'cx-reassurance', text: cx_reassurance -%}
+              {%- endif -%}
+            </div>
+          {%- endcapture -%}
+          {%- capture cx_planner_one -%}
+            {%- unless product.requires_selling_plan -%}
+              <div
+                class="cx-buybox__option cx-buybox__planner-onetime{% unless cx_sub_checked %} is-selected{% endunless %}"
+                data-cx-option-wrap="one_time"
+              >
+                <label class="cx-buybox__card cx-buybox__card--slim">
+                  <input
+                    type="radio"
+                    class="cx-buybox__radio cx-buybox__sr-input"
+                    name="cx-purchase-{{ uid }}"
+                    value="one_time"
+                    data-cx-option="one_time"
+                    {% unless cx_sub_checked %}checked aria-checked="true"{% else %}aria-checked="false"{% endunless %}
+                  >
+                  <span class="cx-buybox__card-body">
+                    <span class="cx-buybox__control" aria-hidden="true"></span>
+                    <span class="cx-buybox__card-main">
+                      <span class="cx-buybox__title-row">
+                        <span class="cx-buybox__title">{{ cx_onetime_label }}</span>
+                        <span class="cx-buybox__price" data-cx-onetime-price>
+                          {%- render 'cx-price', cents: cx_variant.price -%}
+                        </span>
+                      </span>
+                    </span>
+                  </span>
+                </label>
+              </div>
+            {%- endunless -%}
+          {%- endcapture -%}
+          <div class="cx-buybox__planner-options" role="radiogroup" aria-labelledby="cx-buybox-label-{{ uid }}">
+            {%- if cx_order == 'one_time_first' -%}{{ cx_planner_one }}{{ cx_planner_sub }}{%- else -%}{{ cx_planner_sub }}{{ cx_planner_one }}{%- endif -%}
+          </div>
+        </div>
+
+      {%- else -%}
+        {%- comment -%}
+          ══ CLASSIC — the v1.0.0 stacked full-width option cards ══
+          With no saved config this branch renders the v1.0.0 markup
+          unchanged (the resolved variables collapse to the old values).
+        {%- endcomment -%}
+        {%- capture cx_card_sub -%}
+      <div
+        class="cx-buybox__option cx-buybox__option--sub{% if cx_sub_checked %} is-selected{% endif %}"
+        data-cx-option-wrap="subscription"
+      >
+        {%- if cx_show_badge and cx_badge != blank -%}
+          <span class="cx-buybox__badge">{{ cx_badge }}</span>
+        {%- endif -%}
+
+        <label class="cx-buybox__card">
+          <input
+            type="radio"
+            class="cx-buybox__radio cx-buybox__sr-input"
+            name="cx-purchase-{{ uid }}"
+            value="subscription"
+            data-cx-option="subscription"
+            {% if cx_sub_checked %}checked aria-checked="true"{% else %}aria-checked="false"{% endif %}
+          >
+          <span class="cx-buybox__card-body">
+            <span class="cx-buybox__control" aria-hidden="true"></span>
+            <span class="cx-buybox__card-main">
+              <span class="cx-buybox__title-row">
+                <span class="cx-buybox__title"{% if cx_sub_label_tpl contains '{' %} data-cx-tpl="{{ cx_sub_label_tpl | escape }}"{% endif %}>{{ cx_sub_label }}</span>
+                {%- if cx_show_savings -%}
+                <span class="cx-buybox__save" data-cx-save{% if cx_save_tpl != blank %} data-cx-tpl="{{ cx_save_tpl | escape }}"{% endif %} {% if cx_save == blank %}hidden{% endif %}>{{ cx_save }}</span>
+                {%- endif -%}
+              </span>
+              <span class="cx-buybox__price-row">
+                <span class="cx-buybox__price cx-buybox__price--lg" data-cx-sub-price{% if cx_show_compare %} data-cx-compare{% endif %}>
+                  {%- if cx_show_compare -%}
+                    {%- render 'cx-price', cents: cx_first, compare: cx_variant.price -%}
+                  {%- else -%}
+                    {%- render 'cx-price', cents: cx_first -%}
+                  {%- endif -%}
+                </span>
+                <span class="cx-buybox__first-label" data-cx-first-label{% if cx_first_line_tpl contains '{' %} data-cx-tpl="{{ cx_first_line_tpl | escape }}"{% endif %} {% if cx_then == blank %}hidden{% endif %}>{{ cx_first_line }}</span>
+              </span>
+              <span class="cx-buybox__then" data-cx-then {% if cx_then == blank %}hidden{% endif %}>{{ cx_then }}</span>
+              {%- if cx_show_pd -%}
+              <span class="cx-buybox__per-delivery" data-cx-per-delivery {% if cx_pd == blank %}hidden{% endif %}>{{ cx_pd }}</span>
+              {%- endif -%}
+            </span>
+          </span>
+        </label>
+
+        {%- if cx_show_freq and cx_group.selling_plans.size > 1 -%}
+          {%- if cx_freq_style == 'chips' -%}
+            {%- render 'cx-freq-control', group: cx_group, selected_plan: cx_selected_plan, block_id: uid, style: 'chips', label: cx_freq_label -%}
+          {%- else -%}
+          <div class="cx-buybox__freq">
+            <label class="cx-buybox__sr" for="cx-freq-{{ uid }}">{{ cx_freq_label }}</label>
+            <select id="cx-freq-{{ uid }}" class="cx-buybox__freq-select" data-cx-freq>
+              {%- for p in cx_group.selling_plans -%}
+                <option value="{{ p.id }}" {% if p.id == cx_selected_plan.id %}selected{% endif %}>
+                  {%- render 'cx-freq-label', selling_plan: p, part: 'select' -%}
+                </option>
+              {%- endfor -%}
+            </select>
+          </div>
+          {%- endif -%}
+        {%- endif -%}
+
+        {%- if cx_show_reassurance -%}
+          <p class="cx-buybox__reassurance">
+            <svg class="cx-buybox__check" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
+              <path d="M6.5 11.3 3.4 8.2l1-1 2.1 2 5-5.1 1 1z" fill="currentColor"/>
+            </svg>
+            {{- cx_reassurance -}}
+          </p>
+        {%- endif -%}
+
+        {%- if cx_show_benefits -%}
+          {%- render 'cx-benefit-list', benefits: cx_benefits_arr, count: cx_benefit_count -%}
+        {%- endif -%}
+      </div>
+        {%- endcapture -%}
+        {%- capture cx_card_one -%}
+      {%- unless product.requires_selling_plan -%}
+        <div
+          class="cx-buybox__option cx-buybox__option--onetime{% unless cx_sub_checked %} is-selected{% endunless %}"
+          data-cx-option-wrap="one_time"
+        >
+          <label class="cx-buybox__card">
+            <input
+              type="radio"
+              class="cx-buybox__radio cx-buybox__sr-input"
+              name="cx-purchase-{{ uid }}"
+              value="one_time"
+              data-cx-option="one_time"
+              {% unless cx_sub_checked %}checked aria-checked="true"{% else %}aria-checked="false"{% endunless %}
+            >
+            <span class="cx-buybox__card-body">
+              <span class="cx-buybox__control" aria-hidden="true"></span>
+              <span class="cx-buybox__card-main">
+                <span class="cx-buybox__title-row">
+                  <span class="cx-buybox__title">{{ cx_onetime_label }}</span>
+                  <span class="cx-buybox__price" data-cx-onetime-price>
+                    {%- render 'cx-price', cents: cx_variant.price -%}
+                  </span>
+                </span>
+              </span>
+            </span>
+          </label>
+        </div>
+      {%- endunless -%}
+        {%- endcapture -%}
+        <div class="cx-buybox__group" role="radiogroup" aria-labelledby="cx-buybox-label-{{ uid }}">
+          {%- if cx_order == 'one_time_first' -%}{{ cx_card_one }}{{ cx_card_sub }}{%- else -%}{{ cx_card_sub }}{{ cx_card_one }}{%- endif -%}
+        </div>
+
+    {%- endcase -%}
+
+    {%- comment -%}
+      JSON island: fully localized price strings per variant x selling plan.
+      buy-box.js only swaps strings — it never formats money or builds copy.
+      "freq" and "savePct" feed the client-side {frequency}/{percent}
+      template re-resolution; "pd" feeds the per-delivery hooks.
+    {%- endcomment -%}
+    <script type="application/json" data-cx-data>
+      {
+        "initialVariant": "{{ cx_variant.id }}",
+        "initialPlan": "{{ cx_selected_plan.id }}",
+        "preselect": {% if cx_sub_checked %}true{% else %}false{% endif %},
+        "requiresSellingPlan": {% if product.requires_selling_plan %}true{% else %}false{% endif %},
+        "variants": {
+          {%- for v in product.variants -%}
+            "{{ v.id }}": {
+              "available": {% if v.available %}true{% else %}false{% endif %},
+              "oneTime": {{ v.price | money | strip_html | json }},
+              "plans": {
+                {%- assign cx_plan_i = 0 -%}
+                {%- for a in v.selling_plan_allocations -%}
+                  {%- if a.selling_plan_group_id == cx_group.id -%}
+                    {%- capture a_freq -%}{%- render 'cx-freq-label', selling_plan: a.selling_plan, part: 'freq' -%}{%- endcapture -%}
+                    {%- assign a_freq = a_freq | strip -%}
+                    {%- assign a_adj_count = a.price_adjustments | size -%}
+                    {%- if a_adj_count > 1 -%}
+                      {%- assign a_last_adj = a.price_adjustments | last -%}
+                      {%- assign a_ongoing = a_last_adj.price -%}
+                    {%- else -%}
+                      {%- assign a_ongoing = a.price -%}
+                    {%- endif -%}
+                    {%- capture a_ongoing_fmt -%}{{ a_ongoing | money | strip_html }}{%- endcapture -%}
+                    {%- capture a_then -%}
+                      {%- if a_ongoing != a.price -%}{{ 'then_price' | t: price: a_ongoing_fmt, frequency: a_freq }}{%- endif -%}
+                    {%- endcapture -%}
+                    {%- capture a_save -%}
+                      {%- render 'cx-save-label', base: v.price, plan_price: a.price, format: savings_format -%}
+                    {%- endcapture -%}
+                    {%- capture a_pd -%}
+                      {%- if a.per_delivery_price != a.price -%}{{ a.per_delivery_price | money | strip_html }} {{ 'per_delivery' | t }}{%- endif -%}
+                    {%- endcapture -%}
+                    {%- assign a_save_cents = v.price | minus: a.price -%}
+                    {%- assign a_pct = 0 -%}
+                    {%- if a_save_cents > 0 and v.price > 0 -%}
+                      {%- assign a_pct = a_save_cents | times: 100.0 | divided_by: v.price | round -%}
+                    {%- endif -%}
+                    {%- capture a_pct_str -%}{%- if a_pct > 0 -%}{{ a_pct }}%{%- endif -%}{%- endcapture -%}
+                    {%- if cx_plan_i > 0 -%},{%- endif -%}
+                    {%- assign cx_plan_i = cx_plan_i | plus: 1 -%}
+                    "{{ a.selling_plan.id }}": {
+                      "first": {{ a.price | money | strip_html | json }},
+                      "then": {{ a_then | strip | json }},
+                      "save": {{ a_save | strip | json }},
+                      "perDelivery": {{ a_pd | strip | json }},
+                      "pd": {{ a.per_delivery_price | money | strip_html | json }},
+                      "freq": {{ a_freq | json }},
+                      "savePct": {{ a_pct_str | json }}
+                    }
+                  {%- endif -%}
+                {%- endfor -%}
+              }
+            }{%- unless forloop.last -%},{%- endunless -%}
+          {%- endfor -%}
+        }
+      }
+    </script>
+
+    <noscript>
+      {%- comment -%}
+        Without JS the widget cannot write selling_plan into the product form;
+        showing it would promise a subscription the cart would not contain.
+      {%- endcomment -%}
+      <style>
+        #cx-buybox-{{ uid }} .cx-buybox__group,
+        #cx-buybox-{{ uid }} .cx-buybox__heading,
+        #cx-buybox-{{ uid }} .cx-buybox__subheading { display: none; }
+      </style>
+    </noscript>
+  </div>
+
+{%- endif -%}

@@ -24,7 +24,12 @@ conversion; minimise voluntary and involuntary churn.**
   impact on real visitors.
 - **Selling plans & buy box** — plan groups synced from app config (first-order
   vs ongoing discounts via pricing policies, never codes); theme app extension
-  PDP buy box with preselect, badge and savings display.
+  PDP buy box with preselect, badge and savings display. **One-click app-embed
+  install**: a single theme-editor toggle (App embeds → "Cellexia Buy Box")
+  mounts the widget automatically above the add-to-cart area and carries the
+  selling plan into JS-driven cart requests — so it works even on themes whose
+  product section takes no app blocks (a section app block remains available
+  for themes that do).
 - **Buy box designer** — six PDP design presets (classic cards, toggle tabs,
   comparison tiles, inline upgrade, value stack, routine planner) with deep
   layout/style/per-locale text customization, preview, revision history with
@@ -76,8 +81,9 @@ npx prisma migrate deploy       # against your PostgreSQL
 npm run config:link             # link shopify.app.toml to your app (fills client_id)
 npm run deploy                  # push config + webhooks + theme extension
 # Deploy the web process (Fly.io recipe in docs/INSTALL.md §3), install the app
-# on the store, add the "Cellexia Buy Box" theme block, create+sync a plan,
-# then place a test subscription (docs/TESTING.md).
+# on the store, enable the "Cellexia Buy Box" app embed (Theme settings →
+# App embeds; or add the theme block), create+sync a plan, then place a test
+# subscription (docs/TESTING.md).
 ```
 
 ## Documentation

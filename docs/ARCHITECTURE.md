@@ -47,7 +47,7 @@ flows, win-back, analytics.
 | Notifications | `app/lib/notifications/` | Channel router (Klaviyo event or SMTP fallback), templates, `NotificationLog`. |
 | Analytics | `app/lib/analytics/` | Daily rollups, cohort LTGP, survival curves, churn risk, predicted empty dates, forecasting, take rate. |
 | Admin UI | `app/routes/app.*` | Polaris pages: dashboard, analytics, subscribers, dunning, alerts, audit, bulk ops, plans, gifts, cancel-flow config, settings, import. |
-| Buy box | `extensions/cellexia-buy-box/` | Theme app extension for PDP. |
+| Buy box | `extensions/cellexia-buy-box/` | Theme app extension for the PDP, in two install shapes over one shared core snippet: a `section`-target app block, and (v1.2.0) a `body`-target **app embed** that self-mounts and patches JS cart requests for themes whose product section takes no app blocks. |
 | Widget design | `app/lib/widget/` | Buy-box design system: preset catalog + zod config schema + customCss sanitizer + text resolution (`presets.ts`, isomorphic — the admin designer imports it client-side), revision store / publish-to-metafield / restore (`design.server.ts`). Edited from the admin **Buy box designer** page. |
 | Launch & preview | `app/lib/launch/` | Install-dark launch mode (SETUP/LIVE), storefront PREVIEW tokens, go-live with overdue stagger; the gates live in jobs/notifications/Klaviyo/portal/buy box (see below). |
 | i18n | `app/lib/i18n/` | Framework (done) + locale catalogs. |
@@ -107,9 +107,26 @@ resolution fails, everything assumes SETUP and stays dark):
   `app/lib/portal/layout.server.ts`): the public portal serves a friendly
   "not yet available" page (200 + noindex) unless the portal session has
   `PortalSession.isPreview`.
-- **Buy box** (`extensions/cellexia-buy-box/blocks/buy-box.liquid`): unless the
-  `cellexia.launch_status` metafield equals `"live"`, the block renders with
-  `hidden data-cx-gated="true"` — invisible to every visitor.
+- **Buy box** (`extensions/cellexia-buy-box/blocks/buy-box.liquid` and
+  `blocks/buy-box-embed.liquid`): unless the `cellexia.launch_status`
+  metafield equals `"live"`, the widget renders with
+  `hidden data-cx-gated="true"` — invisible to every visitor, in both
+  install shapes.
+
+**App embed** (v1.2.0). Besides the `section`-target app block, the widget
+ships as a `body`-target app embed (`blocks/buy-box-embed.liquid`, one
+theme-editor toggle) for themes whose product section takes no app blocks.
+It renders the identical widget (shared `snippets/cx-buybox-core.liquid`)
+hidden at body-end; `assets/buy-box-embed.js` then mounts it into the buy
+column — anchor precedence: the embed's theme-editor selector setting → the
+published config's `placement` (designer → Placement) → automatic heuristics
+(tuned for cellexialabs.com: before `.pdp__grey`; then OS 2.0 / `/cart/add`
+form fallbacks) — unhiding only the wrapper, never the launch-gated widget
+inside. The same file wraps `fetch`/XHR once so `/cart/add(.js)` POSTs on
+formless AJAX themes get the selected `selling_plan` + `_cx_design` injected
+(own-variant matches only; anything else passes through byte-identical). If
+the section block is present the embed stays dormant, and state is shared
+solely via the guarded `window.CellexiaSubs` global.
 
 **Storefront preview (PREVIEW token).** Magic-token action `PREVIEW`,
 signature-verified but **never consumed** (TTL 7 days, generous max-use for

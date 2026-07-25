@@ -8,9 +8,15 @@ import { z } from "zod";
  * The config is published to the shop metafield cellexia.buybox_design
  * (type json) and read by extensions/cellexia-buy-box with null-safe
  * fallbacks: a shop with no saved config renders EXACTLY as v1.0.0 did.
- * DEFAULT_DESIGN_CONFIG below is that v1.0.0 rendering written out as
- * explicit knobs (accent #4a5d4a, 12px radius, 1px borders, stacked cards,
- * subscription first, dropdown frequency selector).
+ * DEFAULT_DESIGN_CONFIG below keeps the v1.0.0 archetype knobs (classic
+ * stacked cards, subscription first, dropdown frequency selector, 1px
+ * borders); as of v1.2.0 its STYLE tokens are brand-matched to
+ * cellexialabs.com (near-black #1D1D1B accents on white, #F4F4F4 panel
+ * tint, sharp 0px corners) so the widget looks native there out of the box.
+ *
+ * Schema evolution rule: every field added after version 1 shipped MUST
+ * carry a field-level .default() so older stored revisions (and the
+ * published metafield JSON) keep validating unchanged.
  */
 
 // ── Preset keys + CRO metadata ───────────────────────────────────────────────
@@ -125,7 +131,7 @@ const HEX_COLOR_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
 
 const hexColor = z
   .string()
-  .regex(HEX_COLOR_RE, "must be a hex color like #4a5d4a");
+  .regex(HEX_COLOR_RE, "must be a hex color like #1d1d1b");
 
 /**
  * Hex color, or "" meaning "inherit" — keep the v1.0.0 behavior for this slot
@@ -141,6 +147,53 @@ const LOCALE_KEY_RE = /^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$/;
 const localeKey = z
   .string()
   .regex(LOCALE_KEY_RE, "must be a locale code like \"en\" or \"pt-BR\"");
+
+/**
+ * Characters stripped from placement.selector: it is a CSS selector, never
+ * HTML, so angle brackets, quotes and backslashes have no legitimate use and
+ * removing them keeps the value inert wherever it is interpolated
+ * (data-attributes in Liquid, querySelector in the embed JS).
+ */
+const SELECTOR_UNSAFE_RE = /[<>"'`\\]/g;
+
+/** Sanitize a placement CSS selector (see SELECTOR_UNSAFE_RE). */
+export function sanitizePlacementSelector(selector: string): string {
+  return selector.replace(SELECTOR_UNSAFE_RE, "").trim();
+}
+
+const DEFAULT_PLACEMENT = {
+  mode: "auto",
+  selector: "",
+  position: "before",
+} as const;
+
+/**
+ * Where the APP-EMBED variant of the buy box mounts itself on the product
+ * page (the product-page app block, where the theme supports one, always
+ * renders exactly where the merchant placed it — this setting is ignored
+ * there). Added in v1.2.0 with object- and field-level defaults so every
+ * pre-existing stored config still validates.
+ *
+ * - auto: the embed JS walks a prioritized anchor list tuned for
+ *   cellexialabs.com (insert before .pdp__grey — after the size options,
+ *   above quantity + add to cart) with generic theme fallbacks.
+ * - selector: an explicit CSS selector + relative position for themes where
+ *   auto anchoring picks the wrong spot.
+ */
+const placementSchema = z
+  .object({
+    mode: z.enum(["auto", "selector"]).default("auto"),
+    selector: z
+      .string()
+      .max(200)
+      .default("")
+      .transform(sanitizePlacementSelector),
+    position: z
+      .enum(["before", "after", "prepend", "append"])
+      .default("before"),
+  })
+  .strict()
+  .default(DEFAULT_PLACEMENT);
 
 const textOverrideSchema = z
   .object({
@@ -172,6 +225,14 @@ export const widgetDesignConfigSchema = z
         radiusPx: z.number().int().min(0).max(24),
         borderWidthPx: z.number().int().min(1).max(3),
         frequencyStyle: z.enum(["dropdown", "chips"]),
+        /**
+         * Show the delivery-frequency selector. false removes it from ALL six
+         * presets (the planner keeps a single recommended-cadence line) and
+         * every add-to-cart uses the plan's default frequency; subscribers can
+         * still change frequency any time in the portal. Field-level default
+         * keeps pre-v1.2.0 stored configs valid.
+         */
+        showFrequency: z.boolean().default(true),
         showBadge: z.boolean(),
         showSavings: z.boolean(),
         showPerDelivery: z.boolean(),
@@ -200,6 +261,8 @@ export const widgetDesignConfigSchema = z
         animation: z.boolean(),
       })
       .strict(),
+    /** App-embed mount point (v1.2.0) — see placementSchema. */
+    placement: placementSchema,
     /** Per-locale overrides; resolution: current locale → "en" → extension locale files. */
     text: z.record(localeKey, textOverrideSchema),
   })
@@ -209,13 +272,21 @@ export type WidgetDesignConfig = z.infer<typeof widgetDesignConfigSchema>;
 export type WidgetDesignLayout = WidgetDesignConfig["layout"];
 export type WidgetDesignStyle = WidgetDesignConfig["style"];
 export type WidgetDesignBehavior = WidgetDesignConfig["behavior"];
+export type WidgetDesignPlacement = WidgetDesignConfig["placement"];
 export type WidgetDesignTextOverride = z.infer<typeof textOverrideSchema>;
 
 /**
- * v1.0.0 rendering as explicit knobs — publishing this config must be
- * pixel-identical to a shop with no config at all. "" color slots mean
- * "inherit" (theme text color, accent@7% tint, accent badge background),
- * matching the current buy-box.css custom-property defaults.
+ * The designer's starting config. Layout/behavior knobs are still the
+ * v1.0.0 classic archetype (stacked cards, subscription first, dropdown
+ * frequency selector, 1px borders), but as of v1.2.0 the STYLE tokens —
+ * accent/text #1D1D1B, panel tint #F4F4F4, white on accent, 0px radius —
+ * are brand-matched to cellexialabs.com (monochrome editorial: near-black
+ * on white, grey #F4F4F4 panels, sharp corners everywhere but the pill
+ * buttons), so publishing untouched already looks native there.
+ *
+ * The pixel-identical v1.0.0 fallback lives one layer down: a shop with NO
+ * published metafield at all keeps the Liquid/CSS built-in defaults, which
+ * remain the v1.0.0 rendering.
  */
 export const DEFAULT_DESIGN_CONFIG: WidgetDesignConfig = {
   version: 1,
@@ -223,9 +294,10 @@ export const DEFAULT_DESIGN_CONFIG: WidgetDesignConfig = {
   layout: {
     order: "sub_first",
     density: "comfortable",
-    radiusPx: 12,
+    radiusPx: 0,
     borderWidthPx: 1,
     frequencyStyle: "dropdown",
+    showFrequency: true,
     showBadge: true,
     showSavings: true,
     showPerDelivery: true,
@@ -235,18 +307,23 @@ export const DEFAULT_DESIGN_CONFIG: WidgetDesignConfig = {
     benefitCount: 4,
   },
   style: {
-    accent: "#4a5d4a",
-    accentText: "#ffffff",
-    bgTint: "",
-    text: "",
-    badgeBg: "",
-    badgeText: "#ffffff",
+    accent: "#1D1D1B",
+    accentText: "#FFFFFF",
+    bgTint: "#F4F4F4",
+    text: "#1D1D1B",
+    badgeBg: "#1D1D1B",
+    badgeText: "#FFFFFF",
     fontScale: 1,
     customCss: "",
   },
   behavior: {
     preselect: "inherit",
     animation: true,
+  },
+  placement: {
+    mode: "auto",
+    selector: "",
+    position: "before",
   },
   text: {},
 };

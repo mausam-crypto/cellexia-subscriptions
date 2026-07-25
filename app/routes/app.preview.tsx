@@ -675,12 +675,12 @@ export default function PreviewPage() {
               </ChecklistRow>
               <ChecklistRow
                 done={checklistItems.themeBlock}
-                title="Theme block added"
-                detail="In the theme editor, add the Cellexia subscription buy box block to your product template. It renders hidden until you go live, so this is safe at any time."
+                title="Buy box added to your theme"
+                detail="Easiest path: in the theme editor, open Theme settings → App embeds, switch on “Cellexia Buy Box” and save — it mounts itself into the product page automatically. If your theme supports app blocks on the product template, you can add the buy-box block instead. Either way it renders hidden until you go live, so this is safe at any time."
               >
                 <ChecklistCheckbox
                   field="confirmedThemeBlock"
-                  label="I added the buy-box block to my product page"
+                  label="App embed enabled (Theme settings → App embeds) or block added"
                   checked={launch.confirmedThemeBlock}
                 />
               </ChecklistRow>
@@ -745,7 +745,8 @@ export default function PreviewPage() {
             <Text as="p" variant="bodySm" tone="subdued">
               Opens the live product page with the subscription widget revealed
               — only in your own browser session. Store visitors keep seeing the
-              unchanged page.
+              unchanged page. Works the same whether the widget loads through
+              the app embed (Theme settings → App embeds) or the theme block.
             </Text>
             {products.length === 0 ? (
               <Banner
@@ -978,7 +979,7 @@ export default function PreviewPage() {
                 • The subscription widget becomes visible on your product pages
               </Text>
               <Text as="p" variant="bodySm">
-                • The customer portal opens at /apps/cellexia-subscriptions
+                • The customer portal opens at /apps/cellexia
               </Text>
               <Text as="p" variant="bodySm">
                 • Renewal billing, reminders, dunning and win-back start running

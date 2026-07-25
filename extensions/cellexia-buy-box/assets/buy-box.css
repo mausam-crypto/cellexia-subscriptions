@@ -1,12 +1,22 @@
 /* ─────────────────────────────────────────────────────────────────────────────
    Cellexia Buy Box — PDP subscription widget.
 
-   Namespace: .cx-buybox (BEM). Mobile-first, no webfonts, no layout shift:
-   the block is fully server-rendered and JS only swaps strings.
+   Namespace: .cx-buybox (BEM) + .cx-buybox-embed (app-embed wrapper).
+   Mobile-first, no webfonts, no layout shift: the block is fully
+   server-rendered and JS only swaps strings. No element-id selectors here —
+   the host page may carry another vendor's "cx-*" ids.
+
+   v1.2.0 — the fallback values below (used when no published design config
+   overrides them) are brand-matched to cellexialabs.com's monochrome
+   editorial look: near-black #1D1D1B on white, panel grey #F4F4F4, 12%-black
+   hairline borders, 0 corner radius, font-family inherited from the theme
+   (argumentum), body copy weight 300, pill-shaped chips/badges/tabs in
+   uppercase 12px/1px-letter-spaced/500 (mirroring the theme's button
+   typography).
 
    Theme override hooks (set on .cx-buybox or any ancestor). The app's
    Buy box designer publishes these same properties via the block's inline
-   style, so defaults here ARE the v1.0.0 rendering:
+   style:
      --cx-accent        subscription accent (border, badge, radio) — also set
                         inline from the block's "Accent color" setting
      --cx-accent-soft   soft fill behind the subscription card (style.bgTint)
@@ -26,25 +36,28 @@
    ──────────────────────────────────────────────────────────────────────────── */
 
 .cx-buybox {
-  --cx-accent: #4a5d4a;
-  --cx-accent-soft: rgba(74, 93, 74, 0.07);
-  --cx-border: rgba(0, 0, 0, 0.16);
-  --cx-bg: transparent;
-  --cx-text: inherit;
-  --cx-muted: rgba(0, 0, 0, 0.55);
+  --cx-accent: #1d1d1b;
+  --cx-accent-soft: #f4f4f4;
+  --cx-border: rgba(29, 29, 27, 0.12);
+  --cx-bg: #ffffff;
+  --cx-text: #1d1d1b;
+  --cx-muted: rgba(29, 29, 27, 0.55);
   --cx-badge-text: #ffffff;
-  --cx-radius: 12px;
+  --cx-radius: 0px;
 
   margin-block: 1rem;
   color: var(--cx-text);
+  font-family: inherit;
+  font-weight: 300;
   font-size: calc(0.9375rem * var(--cx-font-scale, 1));
   line-height: 1.45;
 }
 
+/* Headings stay modest (the host brand runs 16px light headings). */
 .cx-buybox__heading {
   margin: 0 0 0.75rem;
   font-size: 1rem;
-  font-weight: 600;
+  font-weight: 300;
   letter-spacing: 0.01em;
 }
 
@@ -182,12 +195,12 @@
 }
 
 .cx-buybox__title {
-  font-weight: 600;
+  font-weight: 500;
 }
 
 .cx-buybox__save {
   font-size: 0.8125rem;
-  font-weight: 600;
+  font-weight: 500;
   color: var(--cx-accent);
   white-space: nowrap;
 }
@@ -200,7 +213,7 @@
 }
 
 .cx-buybox__price {
-  font-weight: 600;
+  font-weight: 500;
   font-variant-numeric: tabular-nums;
 }
 
@@ -267,10 +280,11 @@
   inset-block-start: -0.7em;
   inset-inline-start: 1rem;
   z-index: 1;
-  padding: 0.15em 0.7em;
+  padding: 0.2em 0.8em;
   font-size: 0.75rem;
-  font-weight: 600;
-  letter-spacing: 0.02em;
+  font-weight: 500;
+  letter-spacing: 1px;
+  text-transform: uppercase;
   color: var(--cx-badge-text);
   background: var(--cx-badge-bg, var(--cx-accent));
   border-radius: 999px;
@@ -373,14 +387,17 @@
   border: var(--cx-border-width, 1px) solid var(--cx-border);
   border-radius: 999px;
   background: var(--cx-bg);
-  font-size: 0.875em;
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 1px;
+  text-transform: uppercase;
   transition: border-color 0.15s ease, background-color 0.15s ease;
 }
 
 .cx-buybox__chip input:checked + .cx-buybox__chip-label {
   border-color: var(--cx-accent);
   background: var(--cx-accent-soft);
-  font-weight: 600;
+  font-weight: 500;
   box-shadow: 0 0 0 1px var(--cx-accent) inset;
 }
 
@@ -400,8 +417,9 @@
   display: inline-flex;
   padding: 0.1em 0.55em;
   font-size: 0.72em;
-  font-weight: 600;
-  letter-spacing: 0.02em;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
   color: var(--cx-badge-text);
   background: var(--cx-badge-bg, var(--cx-accent));
   border-radius: 999px;
@@ -464,7 +482,7 @@
 
 .cx-buybox__row-value--accent {
   color: var(--cx-accent);
-  font-weight: 600;
+  font-weight: 500;
 }
 
 /* ── Toggle preset ───────────────────────────────────────────────────────── */
@@ -488,7 +506,10 @@
   background: transparent;
   color: inherit;
   font: inherit;
-  font-weight: 600;
+  font-size: 0.875rem;
+  font-weight: 500;
+  letter-spacing: 1px;
+  text-transform: uppercase;
   cursor: pointer;
   transition: background-color 0.15s ease, color 0.15s ease;
   -webkit-tap-highlight-color: transparent;
@@ -629,7 +650,7 @@
 }
 
 .cx-buybox__inline-label {
-  font-weight: 600;
+  font-weight: 500;
 }
 
 .cx-buybox__inline-detail {
@@ -675,7 +696,7 @@
 
 .cx-buybox__stack-onetime.is-selected .cx-buybox__stack-onetime-link {
   color: inherit;
-  font-weight: 600;
+  font-weight: 500;
 }
 
 .cx-buybox__stack-onetime:has(input:focus-visible) {
@@ -696,7 +717,15 @@
 .cx-buybox__planner-label {
   margin: 0 0 0.5rem;
   font-size: 0.875em;
-  font-weight: 600;
+  font-weight: 500;
+}
+
+/* Planner with the frequency selector removed (layout.showFrequency=false):
+   a single recommended-cadence line replaces the chips. */
+.cx-buybox__planner-cadence {
+  margin: 0 0 0.5rem;
+  font-size: 0.875em;
+  color: var(--cx-muted);
 }
 
 .cx-buybox__planner-options {
@@ -768,10 +797,11 @@
   display: inline-flex;
   align-items: center;
   margin: 0 0 0.75rem;
-  padding: 0.15em 0.7em;
+  padding: 0.2em 0.8em;
   font-size: 0.75rem;
-  font-weight: 600;
-  letter-spacing: 0.02em;
+  font-weight: 500;
+  letter-spacing: 1px;
+  text-transform: uppercase;
   color: var(--cx-badge-text);
   background: var(--cx-accent);
   border-radius: 999px;
@@ -781,4 +811,61 @@
 /* display:inline-flex would defeat the [hidden] default — restate it. */
 .cx-buybox__preview-ribbon[hidden] {
   display: none;
+}
+
+/* ── App-embed context (.cx-buybox-embed) ────────────────────────────────── */
+
+/* The wrapper is server-rendered [hidden] at body end; buy-box-embed.js
+   moves it into the PDP buy column (on cellexialabs.com: between
+   .pdp__options and .pdp__grey, in a ~394px column) and removes [hidden]
+   from the WRAPPER only — the inner .cx-buybox launch gate stays with
+   buy-box.js. Resets keep host-page section styles from leaking in. */
+.cx-buybox-embed {
+  display: block;
+  inline-size: 100%;
+  max-inline-size: 100%;
+  margin: 16px 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-align: start;
+  box-sizing: border-box;
+}
+
+.cx-buybox-embed *,
+.cx-buybox-embed *::before,
+.cx-buybox-embed *::after {
+  box-sizing: border-box;
+}
+
+/* Unmounted (or dormant because the section block is present) → invisible,
+   even against theme resets that re-display [hidden] elements. */
+.cx-buybox-embed[hidden] {
+  display: none !important;
+}
+
+/* The wrapper owns the vertical rhythm in embed context. */
+.cx-buybox-embed .cx-buybox {
+  margin-block: 0;
+}
+
+/* Admin-only diagnostic card, mounted at body end by buy-box-embed.js when
+   no placement anchor matched DURING A PREVIEW SESSION only (sessionStorage
+   preview token present) — a preview must never fail silently. Fixed
+   position: the card exists precisely because there is no in-page anchor. */
+.cx-buybox-diagnostic {
+  position: fixed;
+  inset-block-end: 16px;
+  inset-inline-start: 16px;
+  z-index: 2147483000;
+  max-inline-size: min(340px, calc(100vw - 32px));
+  padding: 12px 16px;
+  background: #1d1d1b;
+  color: #ffffff;
+  font: 400 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI",
+    "Helvetica Neue", Arial, sans-serif;
+  border-radius: 4px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.25);
 }

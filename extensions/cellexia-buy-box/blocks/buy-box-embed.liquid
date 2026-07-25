@@ -1,0 +1,120 @@
+{%- comment -%}
+  Cellexia Buy Box — APP EMBED (theme app extension block, target: body).
+
+  Why this exists: some themes (e.g. the custom "Sleepify Theme" on
+  cellexialabs.com) do not accept app blocks in their product section, so the
+  section-targeted blocks/buy-box.liquid cannot be installed there. This
+  embed is the one-toggle alternative: Theme editor → Theme settings →
+  App embeds → "Cellexia Buy Box" → Save. No template surgery, no code.
+
+  How it works:
+    - On product pages whose product has selling plan groups, it renders the
+      IDENTICAL widget (snippets/cx-buybox-core.liquid — same markup, same
+      JSON island, same launch gating and preview ribbon as the app block)
+      inside a [hidden] .cx-buybox-embed wrapper at the end of <body>.
+    - assets/buy-box-embed.js then MOVES the wrapper into the page (custom
+      anchor selector → published design config placement → automatic
+      heuristics, tuned first for cellexialabs.com: before .pdp__grey, i.e.
+      after the size options and above quantity + add to cart) and unhides
+      the WRAPPER only. The inner widget's launch gate
+      ([hidden][data-cx-gated] until cellexia.launch_status is "live") is
+      untouched: even with the embed enabled, visitors see nothing until
+      go-live, and the ?cx_preview= token flow reveals it exactly as it does
+      for the app block.
+    - buy-box-embed.js also patches fetch/XMLHttpRequest cart adds so
+      JS-driven themes with no <form action="/cart/add"> still carry the
+      selected selling plan (and the _cx_design attribution property).
+    - If the section-targeted app block is ALSO present on the page, the
+      embed stays dormant and hidden — the block wins, never two widgets.
+
+  Anchor precedence (resolved here, consumed by buy-box-embed.js):
+    1. this embed's "Custom anchor selector" setting (theme editor);
+    2. the published design config's placement { mode: "selector", ... }
+       (set from the app's Buy box designer → Placement);
+    3. blank → the JS automatic heuristics.
+
+  On non-product pages, products without selling plans, or themes where the
+  guard fails, this file renders NOTHING — no wrapper, no CSS, no JS.
+{%- endcomment -%}
+
+{%- if request.page_type == 'product' and product != blank and product.selling_plan_groups.size > 0 -%}
+
+  {%- liquid
+    # Anchor precedence: embed setting > published config placement > auto.
+    assign cx_embed_anchor = block.settings.custom_anchor_selector | strip
+    assign cx_embed_pos = block.settings.anchor_position | default: 'before'
+    if cx_embed_anchor == blank
+      assign cx_embed_cfg = shop.metafields.cellexia.buybox_design.value
+      if cx_embed_cfg and cx_embed_cfg.placement and cx_embed_cfg.placement.mode == 'selector' and cx_embed_cfg.placement.selector != blank
+        assign cx_embed_anchor = cx_embed_cfg.placement.selector
+        assign cx_embed_pos = cx_embed_cfg.placement.position | default: 'before'
+      endif
+    endif
+  -%}
+
+  {{ 'buy-box.css' | asset_url | stylesheet_tag }}
+
+  <div
+    class="cx-buybox-embed"
+    hidden
+    data-cx-embed
+    data-cx-anchor="{{ cx_embed_anchor | escape }}"
+    data-cx-anchor-pos="{{ cx_embed_pos | escape }}"
+  >
+    {%- render 'cx-buybox-core',
+      render_context: 'embed',
+      product: product,
+      uid: block.id,
+      section_id: '',
+      shopify_attributes: block.shopify_attributes,
+      design_source: 'app',
+      heading: 'Choose your ritual',
+      show_badge: true,
+      badge_text: '',
+      preselect_subscription: true,
+      show_frequency_selector: true,
+      recommended_frequency_handle: '8 weeks',
+      savings_format: 'percent',
+      show_reassurance: true,
+      accent_color: '#1D1D1B',
+      compact_mode: false
+    -%}
+  </div>
+
+  <script src="{{ 'buy-box.js' | asset_url }}" defer="defer"></script>
+  <script src="{{ 'buy-box-embed.js' | asset_url }}" defer="defer"></script>
+
+{%- endif -%}
+
+{% schema %}
+{
+  "name": "Cellexia Buy Box",
+  "target": "body",
+  "settings": [
+    {
+      "type": "paragraph",
+      "content": "One-toggle setup: enable this embed and press Save — the buy box then mounts itself automatically on every product page with a Cellexia subscription plan (above the add-to-cart area). Use this when your theme's product section cannot take app blocks; if the Cellexia Buy Box APP BLOCK is present on the page, the block wins and this embed stays dormant. Until the app goes live from the Cellexia admin, visitors see nothing either way."
+    },
+    {
+      "type": "text",
+      "id": "custom_anchor_selector",
+      "label": "Custom anchor selector",
+      "default": "",
+      "info": "Optional CSS selector for the element the widget should attach to, e.g. \".pdp__grey\". Overrides both the automatic placement and the app's Buy box designer → Placement setting. Leave empty for automatic placement."
+    },
+    {
+      "type": "select",
+      "id": "anchor_position",
+      "label": "Position relative to anchor",
+      "options": [
+        { "value": "before", "label": "Before the anchor" },
+        { "value": "after", "label": "After the anchor" },
+        { "value": "prepend", "label": "Inside, at the start" },
+        { "value": "append", "label": "Inside, at the end" }
+      ],
+      "default": "before",
+      "info": "Only used together with the custom anchor selector."
+    }
+  ]
+}
+{% endschema %}

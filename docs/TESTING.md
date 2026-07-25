@@ -222,6 +222,32 @@ widget only in your own browser session):
    available" page. Audit page: no customer notification sent (anything
    attempted shows as `SUPPRESSED`).
 
+**App-embed checks** (when the buy box is installed via the app embed —
+Theme settings → App embeds — rather than as a product-template block; run
+these inside the storefront preview session above):
+
+1. **Position**: the widget mounts inside the buy column, **above the
+   quantity + add-to-cart panel** (on cellexialabs.com: just above the grey
+   panel, right after the size selector) — not at the bottom of the page,
+   which would mean the embed failed to find an anchor and never unhid
+   itself. If it is missing or misplaced, set the placement selector — see
+   [INSTALL.md §11](./INSTALL.md#11-troubleshooting).
+2. **Subscription add-to-cart carries the plan**: select the subscription
+   option, add to cart, and verify the line **in the cart** shows the selling
+   plan (frequency text) at the correct **recurring subscription price** —
+   then proceed and verify the same **in checkout** (recurring terms shown
+   natively on the line). This is the critical embed path: on themes without
+   a `/cart/add` form the embed injects the plan into the theme's AJAX cart
+   request, so a silent failure here would sell one-time at full price.
+   `https://<store>/cart.js` must show the line's `selling_plan_allocation`
+   and the `_cx_design` property.
+3. **One-time add unaffected**: select one-time (or a product with no plan)
+   → add to cart → no selling plan, no `_cx_design` property, normal price —
+   the theme's own add-to-cart must behave exactly as before the embed.
+4. **Theme cart UX intact**: the mini-cart/cart drawer still opens and
+   updates normally after both kinds of add, and any other purchase widgets
+   on the page (e.g. a bundle app) still add their own products correctly.
+
 **Buy-box design QA** (repeat whenever you change the design in the **Buy box
 designer** — before launch via the preview link above, after launch on the
 live PDP):

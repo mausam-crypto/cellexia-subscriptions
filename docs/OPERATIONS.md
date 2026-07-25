@@ -298,3 +298,42 @@ rebuilt product template):
    CSS field and republish.
 4. Still wrong → the rebuilt template may simply have dropped the block;
    re-add it per [INSTALL.md](./INSTALL.md) §7.
+
+## 16. Buy box embed
+
+<a name="16-buy-box-embed"></a>
+
+When the buy box is installed as the **app embed** (Theme settings → App
+embeds, [INSTALL.md §7](./INSTALL.md#7-theme-setup-buy-box--portal-proxy))
+rather than as a product-template block, it finds its own place in the page
+at load time. Two things to know:
+
+**Placement precedence.** The mount anchor is resolved in this order — the
+first one set wins:
+
+1. the embed's **Custom anchor selector** setting in the theme editor;
+2. the designer's **Placement** section (published design config —
+   "Custom CSS selector" + position);
+3. **automatic heuristics** (tuned first for cellexialabs.com — insert just
+   above the grey quantity/ATC panel — with generic fallbacks for standard
+   OS 2.0 themes and `/cart/add` forms).
+
+So a selector typed into the theme editor silently overrides whatever the
+designer publishes — if a placement change from the designer seems to have no
+effect, check the embed's own setting first. If the section app block is also
+present on the page, the embed stays dormant entirely (the block wins).
+
+**After a theme redesign** (new theme, rebuilt product template, renamed CSS
+classes): re-check the anchor. Open a storefront preview link on a
+subscription product and confirm the widget still mounts above the
+add-to-cart area. A redesign can invalidate both the automatic heuristics and
+any explicit selector; if the widget is missing or misplaced, update the
+selector (designer → Placement, or the embed setting) to a stable element in
+the new markup and publish/save. Unmounted embeds fail safe — the widget
+simply stays hidden (with a hint card in preview sessions and a console
+warning) — but that means a silent theme redesign can silently remove your
+subscription offer: add the placement check to any theme-release checklist.
+Also re-run the app-embed cart checks in
+[TESTING.md §10](./TESTING.md#10-preview-based-qa-pre-launch-on-the-live-store)
+after a redesign — the embed injects the selling plan into the theme's cart
+requests, and a new theme means a new cart implementation.

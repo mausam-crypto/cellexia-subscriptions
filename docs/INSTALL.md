@@ -18,8 +18,9 @@ Related docs: [ARCHITECTURE.md](./ARCHITECTURE.md) (how it works),
 install starts in **Setup mode** and stays there until you press **Go live** on
 the admin **Preview & launch** page. Concretely, while in Setup mode:
 
-- The **buy-box widget renders hidden** for every visitor — you can add the
-  theme block to your live theme immediately, nobody will see it.
+- The **buy-box widget renders hidden** for every visitor — you can enable the
+  app embed (or add the theme block) on your live theme immediately, nobody
+  will see it.
 - **No customer is ever charged or messaged**: the billing, dunning, reminder,
   gift, win-back and lifecycle jobs all skip themselves (each run is still
   logged, marked `skipped: setup_mode`), customer notifications are suppressed
@@ -29,7 +30,7 @@ the admin **Preview & launch** page. Concretely, while in Setup mode:
   available" page) — only your own preview sessions get in.
 
 That means the whole setup is safe to do on the production store, in any order,
-over days if you like: sync selling plans (§9), add the theme block (§7),
+over days if you like: sync selling plans (§9), enable the buy box (§7),
 configure Klaviyo (§8), import your existing subscribers
 ([MIGRATION.md](./MIGRATION.md)) — none of it touches a real customer until
 go-live. When you are ready, the **Preview & launch** page lets you see the
@@ -71,7 +72,8 @@ The full order of operations — each step is a section below:
 4. Fill every environment variable (§4)
 5. Apply database migrations (§5)
 6. Link config, `npm run deploy`, install on the store (§6)
-7. Add the theme block; verify the app proxy (§7) — safe on the live theme
+7. Enable the buy box — app embed (one toggle) or theme block — and verify
+   the app proxy (§7) — safe on the live theme
 8. Wire Klaviyo flows (§8)
 9. Create + sync a selling plan; place a test subscription via preview (§9)
 10. Full E2E on a **separate dev-store deployment** ([TESTING.md](./TESTING.md)),
@@ -239,7 +241,7 @@ flyctl secrets set \
   SHOPIFY_API_KEY="<client id>" \
   SHOPIFY_API_SECRET="<client secret>" \
   SHOPIFY_APP_URL="https://cellexia-subscriptions.fly.dev" \
-  SCOPES="read_customers,write_customers,read_orders,read_products,write_products,read_purchase_options,write_purchase_options,read_own_subscription_contracts,write_own_subscription_contracts,read_customer_payment_methods,read_locales,read_markets,read_inventory,read_fulfillments,read_discounts" \
+  SCOPES="read_customers,write_customers,read_orders,read_products,write_products,read_purchase_options,write_purchase_options,read_own_subscription_contracts,write_own_subscription_contracts,read_customer_payment_methods,write_customer_payment_methods,read_locales,read_markets,read_inventory,read_fulfillments,read_discounts" \
   APP_SIGNING_SECRET="$(openssl rand -hex 32)" \
   CRON_SECRET="$(openssl rand -hex 32)" \
   DEFAULT_TIMEZONE="Europe/London" \
@@ -391,26 +393,59 @@ npx prisma migrate dev
 
 ## 7. Theme setup (buy box + portal proxy)
 
-1. Shopify admin → **Online Store → Themes → Customize** → open a **product
-   template** → in the product information section click **Add block** → under
-   *Apps*, add **"Cellexia Buy Box"**. Position it **above the buy buttons**.
-   This is safe to do on the **live theme**: while the app is in Setup mode the
-   block renders hidden for everyone — visitors see no change. You view it
-   through a preview link from the **Preview & launch** page (§10).
-2. Leave the theme's native buy buttons in place for now. Hide or replace them
+The buy box installs in one of two ways. **Use the app embed** (7a) — it is
+one toggle and works on every theme, including themes whose product section
+does not accept app blocks (custom themes like cellexialabs.com's are the
+reason it exists). The section block (7b) is the alternative for themes that
+do accept product-page app blocks, when you want to drag the widget to an
+exact spot yourself. Enable **one** of the two; if both end up active, the
+block wins and the embed stays dormant — you never get two widgets.
+
+### 7a. Primary path — the app embed (one toggle)
+
+1. Shopify admin → **Online Store → Themes → Customize** → **Theme settings**
+   (the paintbrush icon at the bottom of the left sidebar) → **App embeds** →
+   toggle **"Cellexia Buy Box"** on → **Save**. That is the whole install.
+2. This is safe to do on the **live theme**: while the app is in Setup mode
+   the widget renders hidden for everyone — visitors see no change. You view
+   it through a preview link from the **Preview & launch** page (§10).
+3. Once enabled, the embed mounts the widget **automatically** on every
+   product page whose product has a synced selling plan, placing it above the
+   theme's quantity/add-to-cart area (it also carries the selected plan into
+   the cart on themes whose add-to-cart is JavaScript-driven rather than a
+   plain form). If automatic placement picks the wrong spot — or no spot —
+   set an explicit CSS selector: app admin → **Buy box designer** →
+   **Placement**, or the embed's own **Custom anchor selector** setting in
+   the theme editor (the theme-editor setting wins). See Troubleshooting
+   (§11) for the cellexialabs.com selector.
+
+### 7b. Secondary path — the section app block (themes that support it)
+
+1. **Online Store → Themes → Customize** → open a **product template** → in
+   the product information section click **Add block** → under *Apps*, add
+   **"Cellexia Buy Box"**. Position it **above the buy buttons**. If *Apps*
+   offers no such block, your theme's product section does not accept app
+   blocks — use the app embed (7a) instead.
+2. The same Setup-mode safety applies: the block renders hidden until
+   go-live, so adding it to the live theme changes nothing for visitors.
+
+### 7c. Both paths
+
+1. Leave the theme's native buy buttons in place for now. Hide or replace them
    **only after** you have QA'd the buy box end-to-end (one-time purchase path,
    subscription path, frequency selector, price/savings display) via the
    preview pass — see [TESTING.md](./TESTING.md#10-preview-based-qa-pre-launch-on-the-live-store).
-3. **App proxy check**: visit `https://<store-domain>/apps/cellexia` in a private
+2. **App proxy check**: visit `https://<store-domain>/apps/cellexia` in a private
    window. While in Setup mode you should see the branded **"not yet
    available"** page, served on the store's own domain — that page *is* the
    proof the proxy works (after go-live the same URL renders the portal login,
    email → OTP). If you get a 404 or signature error, see Troubleshooting (§11).
-4. **Buy-box design is configured in the app, not the theme**: the admin
+3. **Buy-box design is configured in the app, not the theme**: the admin
    **Buy box designer** page picks one of six design presets and customizes
-   layout, style and per-locale text, publishing to a shop metafield the block
-   reads — so this one-time block add is the only theme change ever needed.
-   Until you publish a design, the widget renders its classic v1.0.0 layout.
+   layout, style, placement and per-locale text, publishing to a shop
+   metafield both install shapes read — so this one-time enable is the only
+   theme change ever needed. Until you publish a design, the widget renders
+   its classic v1.0.0 layout.
 
 ---
 
@@ -462,7 +497,7 @@ and the **Go live** button.
 | 2 | Scheduler ticking | `GET https://<app-host>/api/health` returns 200 and reports a recent job tick; the **Audit**/JobRun log shows `billing_run` entries (in Setup mode these are recorded as skipped — that still proves the scheduler is alive) |
 | 3 | Webhooks registered | Partner Dashboard → app → API health/webhooks shows the topics from `shopify.app.toml`; a test contract creation appears in Audit |
 | 4 | Plans synced | Plans page: every active plan `SYNCED` |
-| 5 | Theme block added | Buy box block on the product template (§7) — the Preview & launch checklist has a confirmation for this |
+| 5 | Buy box enabled in the theme | App embed toggled on (or block on the product template) per §7 — the Preview & launch checklist has a confirmation for this |
 | 6 | Klaviyo flows live | Flows from [KLAVIYO_SETUP.md](./KLAVIYO_SETUP.md) set to Live (no events arrive until go-live — that is by design) |
 | 7 | Dunning settings reviewed | Settings page → dunning ladder (`softRetryDays`, payday alignment, exhausted action) matches your policy |
 | 8 | Alert emails set | Settings → alerts → `emailTo` contains real operator addresses |
@@ -518,6 +553,24 @@ and the deployed host (https, no trailing slash, no path). After changing either
 re-run `npm run deploy` and reinstall. Also check the host clock (HMAC timestamps)
 and that you're not fronting the app with anything that strips the
 `Authorization` header.
+
+**Widget not appearing in preview after enabling the app embed.**
+First confirm the embed is actually on: Theme editor → Theme settings → App
+embeds → "Cellexia Buy Box" must be toggled **and the theme saved** — an
+un-saved editor session is the most common cause. Also confirm you are
+opening a `?cx_preview` link for a product in a **synced** plan (in Setup
+mode the widget only reveals inside a preview session, and the embed renders
+nothing at all on products without selling plans). If the embed is on and the
+page still shows no widget, the automatic placement found no anchor in your
+theme's markup (the embed then leaves the widget unmounted rather than guess
+— in a preview session it shows a small "no placement anchor found" hint
+card, and logs a console warning). Fix: app admin → **Buy box designer** →
+**Placement** → "Custom CSS selector" and enter the element to attach to —
+for cellexialabs.com that is `.pdp__info .pdp__grey` with position "Before
+the element" — then publish; alternatively set the same selector on the app
+embed itself in
+the theme editor (**Custom anchor selector**, which overrides the designer).
+Re-open the preview link after publishing/saving.
 
 **401 / signature error on `/apps/cellexia` (app proxy).**
 The proxy request signature is computed with your **client secret** — if

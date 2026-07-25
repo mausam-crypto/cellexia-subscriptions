@@ -14,6 +14,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  *    REST property shapes, and the ORDERS_CREATE handler logging
  *    widget.design_attributed
  *
+ * The v1.2.0 app-embed additions (layout.showFrequency, placement, selector
+ * sanitization, v1.1.0 backward-compat, brand-token defaults) are covered in
+ * tests/embed-config.test.ts.
+ *
  * The webhook module is DB/Shopify-heavy at import time, so everything
  * server-shaped is mocked (klaviyo-map.test.ts / launch-mode.test.ts pattern);
  * the suite never touches a database.

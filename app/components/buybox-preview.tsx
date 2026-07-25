@@ -11,8 +11,16 @@
  * preview.
  *
  * Dependency-free: no server imports, no Polaris, inline <style> only.
- * Sample product: "Cellexia Renewal Serum", £68 one-time, 20% first-order /
- * 10% ongoing offers, frequencies every 6/8/10/12 weeks, default 8.
+ * Sample product: "Cellexia Renewal Serum", CHF 68.00 one-time (the live
+ * shop sells in CHF via Shopify Markets), 20% first-order / 10% ongoing
+ * offers, frequencies every 6/8/10/12 weeks, default 8. The surrounding
+ * frame (product title, price, add-to-cart pill) is styled after the
+ * cellexialabs.com PDP so the v1.2.0 brand-matched defaults read in
+ * context.
+ *
+ * v1.2.0: honors layout.showFrequency=false in all six presets — the
+ * frequency control disappears and the planner shows a single
+ * recommended-cadence line instead of its chips.
  */
 import { useId } from "react";
 import {
@@ -28,12 +36,12 @@ import {
 
 const SAMPLE = {
   title: "Cellexia Renewal Serum",
-  /** £68.00 one-time. */
-  oneTime: "£68.00",
-  /** 20% first-order discount → £54.40. */
-  first: "£54.40",
-  /** 10% ongoing discount → £61.20 per renewal/delivery. */
-  ongoing: "£61.20",
+  /** CHF 68.00 one-time — Shopify Markets renders CHF like "CHF 64.00". */
+  oneTime: "CHF 68.00",
+  /** 20% first-order discount → CHF 54.40. */
+  first: "CHF 54.40",
+  /** 10% ongoing discount → CHF 61.20 per renewal/delivery. */
+  ongoing: "CHF 61.20",
   percent: "20%",
   frequenciesWeeks: [6, 8, 10, 12],
   defaultWeeks: 8,
@@ -88,7 +96,9 @@ function hexToRgba(hex: string, alpha: number): string {
       : raw;
   const n = Number.parseInt(full, 16);
   if (Number.isNaN(n) || full.length !== 6) {
-    return `rgba(74, 93, 74, ${alpha})`;
+    // Invalid hex (mid-typing in the designer): fall back to the brand
+    // accent #1D1D1B so the tint stays plausible.
+    return `rgba(29, 29, 27, ${alpha})`;
   }
   const r = (n >> 16) & 255;
   const g = (n >> 8) & 255;
@@ -264,8 +274,21 @@ export function BuyBoxPreview({
     </span>
   );
 
-  const freqControl =
-    layout.frequencyStyle === "chips" ? freqChips(false) : freqDropdown;
+  // showFrequency=false removes the control from every preset — the plan's
+  // default frequency applies (the "then …" line still names the cadence).
+  const freqControl = layout.showFrequency
+    ? layout.frequencyStyle === "chips"
+      ? freqChips(false)
+      : freqDropdown
+    : null;
+
+  /** Planner without chips: a single recommended-cadence statement. */
+  const plannerCadenceLine = (
+    <p className="cx-buybox__planner-cadence">
+      {EN.deliveryEvery} {SAMPLE_FREQ}
+      <span className="cx-buybox__chip-tag">{EN.recommended}</span>
+    </p>
+  );
 
   const benefitList = (items: string[]) =>
     items.length > 0 ? (
@@ -582,8 +605,14 @@ export function BuyBoxPreview({
       );
       body = (
         <div className="cx-buybox__group cx-buybox__group--planner">
-          <p className="cx-buybox__planner-label">{freqLabel}</p>
-          {freqChips(true)}
+          {layout.showFrequency ? (
+            <>
+              <p className="cx-buybox__planner-label">{freqLabel}</p>
+              {freqChips(true)}
+            </>
+          ) : (
+            plannerCadenceLine
+          )}
           <div className="cx-buybox__planner-options">
             {orderPair(plannerSub, plannerOne)}
           </div>
@@ -645,17 +674,25 @@ export function BuyBoxPreview({
 // viewport media queries become container queries so the page's
 // desktop/mobile width toggle behaves like a real viewport, and the
 // focus/gating/noscript rules are dropped (preview only).
+//
+// The .cx-prev-* frame is preview-only chrome, styled after the
+// cellexialabs.com PDP buy column (light editorial sans, near-black
+// #1D1D1B, pill UPPERCASE add-to-cart) so the brand-matched defaults are
+// judged in a realistic context. The real widget inherits the theme font
+// (font-family: inherit) — a generic light sans stands in for "argumentum"
+// here.
 
 const PREVIEW_CSS = `
 .cx-prev-frame {
   container-type: inline-size;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  color: #1a1a1a;
+  font-family: "Helvetica Neue", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-weight: 300;
+  color: #1d1d1b;
 }
 
 .cx-prev-context__title {
-  font-size: 1.15rem;
-  font-weight: 600;
+  font-size: 1rem;
+  font-weight: 300;
   letter-spacing: 0.01em;
 }
 
@@ -667,12 +704,14 @@ const PREVIEW_CSS = `
 
 .cx-prev-atc {
   margin-top: 0.25rem;
-  padding: 0.8rem 1rem;
-  border-radius: 8px;
-  background: #1a1a1a;
+  padding: 15px 20px;
+  border-radius: 70px;
+  background: #1d1d1b;
   color: #ffffff;
-  font-weight: 600;
-  font-size: 0.9375rem;
+  font-weight: 500;
+  font-size: 14px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
   text-align: center;
   opacity: 0.85;
 }
@@ -1190,6 +1229,16 @@ const PREVIEW_CSS = `
 
 .cx-buybox__planner-label {
   margin: 0 0 0.5rem;
+  font-size: 0.875em;
+  font-weight: 600;
+}
+
+/* showFrequency=false: the planner's single recommended-cadence line. */
+.cx-buybox__planner-cadence {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  margin: 0;
   font-size: 0.875em;
   font-weight: 600;
 }
