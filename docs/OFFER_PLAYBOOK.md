@@ -222,7 +222,7 @@ desktop-heavy traffic and cadence-obvious consumables respectively.
    scheduled email sends) before judging a design.
 3. **Watch two numbers, not one**: PDP conversion rate (Shopify analytics)
    *and* subscription take rate — on the designer's **performance card**
-   (take-rate by design, fed by the `_cx_design` attribution on every
+   (take-rate by design, fed by the `_cellexia_design` attribution on every
    subscription add-to-cart) and the **Analytics** tab
    (`takeRateNum/takeRateDen`). A take-rate lift that costs more conversions
    than it earns in LTGP is a loss — judge per §7, on cohort LTGP.

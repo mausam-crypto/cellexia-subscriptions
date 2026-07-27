@@ -560,17 +560,47 @@ embeds → "Cellexia Buy Box" must be toggled **and the theme saved** — an
 un-saved editor session is the most common cause. Also confirm you are
 opening a `?cx_preview` link for a product in a **synced** plan (in Setup
 mode the widget only reveals inside a preview session, and the embed renders
-nothing at all on products without selling plans). If the embed is on and the
-page still shows no widget, the automatic placement found no anchor in your
-theme's markup (the embed then leaves the widget unmounted rather than guess
-— in a preview session it shows a small "no placement anchor found" hint
-card, and logs a console warning). Fix: app admin → **Buy box designer** →
-**Placement** → "Custom CSS selector" and enter the element to attach to —
-for cellexialabs.com that is `.pdp__info .pdp__grey` with position "Before
-the element" — then publish; alternatively set the same selector on the app
-embed itself in
-the theme editor (**Custom anchor selector**, which overrides the designer).
-Re-open the preview link after publishing/saving.
+nothing at all on products without selling plans).
+
+If the embed is on and the page still shows no widget, the automatic
+placement found no anchor in your theme's markup: the embed leaves the widget
+unmounted rather than guess, logs a console warning naming the selector that
+failed, and — inside a validated preview session only — shows a small "no
+placement anchor found" hint card. **Do not "fix" this by entering
+`.pdp__info .pdp__grey`**: that selector is heuristic #1 in
+`assets/buy-box-embed.js`, so it has already been tried and matched nothing.
+The panel must have been renamed or restructured (a theme update). Inspect
+the buy column in devtools and pick a class that still exists — the buy
+column itself, `.pdp__info`, with position **"Inside, at the end"**, is the
+safe choice — then set it in app admin → **Buy box designer** → **Placement**
+→ "Custom CSS selector" and publish. The console warning tells you which
+selector was tried and whether a custom one was rejected.
+
+**Another app on the product page uses the same attribute names.**
+Since v1.2.3 the widget's storefront attributes are namespaced
+`data-cellexia-*`, and every lookup of our own markup is qualified by our own
+class as well (`.cx-buybox-embed[data-cellexia-embed]`,
+`.cx-buybox[data-cellexia-buybox]`). This is not cosmetic: cellexialabs.com
+already hosts an unrelated app that renders `<div class="cx
+cx--self-contained" data-cx-embed>` in the buy column, and while our
+attributes were also `data-cx-*` our own wrapper lookup returned **that app's
+element** — so the widget silently never mounted and the buy box was invisible
+on the storefront. If you ever add another app that uses `data-cellexia-*`
+attributes, tell us: the class qualification and the ownership assertion
+already protect against it, but we want to know. Never rename these attributes
+in the theme.
+
+**Widget mounts, but in the wrong place.**
+Same setting, different reason: the automatic heuristics matched an element
+that is not where you want the box. Set app admin → **Buy box designer** →
+**Placement** → "Custom CSS selector" to the element to attach to — for
+cellexialabs.com that is `.pdp__info .pdp__grey` with position "Before the
+element" (above quantity + add to cart) — then publish; alternatively set the
+same selector on the app embed itself in the theme editor (**Custom anchor
+selector**, which overrides the designer). Re-open the preview link after
+publishing/saving. A custom selector that matches nothing is *not* fatal: the
+embed waits 1.5s for late-rendered markup, then falls back to the automatic
+heuristics and warns in the console.
 
 **401 / signature error on `/apps/cellexia` (app proxy).**
 The proxy request signature is computed with your **client secret** — if

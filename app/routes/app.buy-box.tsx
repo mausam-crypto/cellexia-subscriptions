@@ -46,6 +46,7 @@ import {
 import {
   PRESET_KEYS,
   PRESET_META,
+  PRICE_SELECTOR_MAX_LENGTH,
   widgetDesignConfigSchema,
   type PresetKey,
   type PresetMeta,
@@ -575,6 +576,12 @@ export default function BuyBoxDesignerPage() {
   ) =>
     setDraft((d) => ({ ...d, placement: { ...d.placement, [key]: value } }));
 
+  const setThemeSync = <K extends keyof WidgetDesignConfig["themeSync"]>(
+    key: K,
+    value: WidgetDesignConfig["themeSync"][K],
+  ) =>
+    setDraft((d) => ({ ...d, themeSync: { ...d.themeSync, [key]: value } }));
+
   const setTextField = (key: TextKey, value: string) =>
     setDraft((d) => {
       const entry: WidgetDesignTextOverride = { ...(d.text[textLocale] ?? {}) };
@@ -824,6 +831,55 @@ export default function BuyBoxDesignerPage() {
                   />
                 </Box>
               </InlineStack>
+            ) : null}
+          </BlockStack>
+        </Card>
+
+        {/* ── Theme integration (add-to-cart price sync) ── */}
+        <Card>
+          <BlockStack gap="300">
+            <BlockStack gap="100">
+              <Text as="h2" variant="headingMd">
+                Theme integration
+              </Text>
+              <Text as="p" variant="bodySm" tone="subdued">
+                Many themes print the price inside their own Add to cart
+                button (&quot;ADD TO CART - CHF 64.00&quot;). That is the
+                one-time price, so with the subscription option selected the
+                shopper sees one price in the widget and a different one on
+                the button they are about to click.
+              </Text>
+            </BlockStack>
+            <Checkbox
+              label="Match the theme's Add to cart price to the selected option"
+              checked={draft.themeSync.syncAddToCartPrice}
+              onChange={(v) => setThemeSync("syncAddToCartPrice", v)}
+              helpText={
+                "Swaps the displayed price TEXT only — it never changes what " +
+                "is added to the cart, and it puts the theme's own text back " +
+                "the moment one-time is selected. If your theme's button " +
+                "does not show a price, this silently does nothing."
+              }
+            />
+            {draft.themeSync.syncAddToCartPrice ? (
+              <Box minWidth="280px">
+                <TextField
+                  label="Add to cart button selector (optional)"
+                  autoComplete="off"
+                  value={draft.themeSync.priceSelector}
+                  onChange={(v) => setThemeSync("priceSelector", v)}
+                  placeholder=".pdp__actions .btn--atc"
+                  maxLength={PRICE_SELECTOR_MAX_LENGTH}
+                  helpText={
+                    'Leave empty to use the built-in list (covers Dawn / OS 2.0 ' +
+                    'and most themes). Set it when the price on your button is ' +
+                    'not being updated — e.g. ".pdp__actions .btn--atc" for the ' +
+                    "Sleepify theme on cellexialabs.com. Test it first with " +
+                    "document.querySelector('…') in the browser console on a " +
+                    "product page."
+                  }
+                />
+              </Box>
             ) : null}
           </BlockStack>
         </Card>

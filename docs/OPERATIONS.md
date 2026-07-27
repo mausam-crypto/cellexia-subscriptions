@@ -337,3 +337,61 @@ Also re-run the app-embed cart checks in
 [TESTING.md §10](./TESTING.md#10-preview-based-qa-pre-launch-on-the-live-store)
 after a redesign — the embed injects the selling plan into the theme's cart
 requests, and a new theme means a new cart implementation.
+
+## 17. Buy box — theme add-to-cart price sync
+
+<a name="17-buy-box--theme-add-to-cart-price-sync"></a>
+
+Many themes print the price **inside their own Add to cart button** ("ADD TO
+CART - CHF 64.00"). That number is the one-time price, so with the
+subscription option selected the shopper reads CHF 51.20 in our widget and
+CHF 64.00 on the button they are about to click. The buy box fixes that
+itself: while subscription is selected it replaces the one-time **money
+string** with the subscription first-order one inside that button's text, and
+puts the theme's own text back the instant one-time is selected (or the widget
+is hidden, launch-gated or unmounted). It never changes what is added to the
+cart — the cart line is decided by the `selling_plan` field, not by button
+copy — and it re-applies automatically when the theme rewrites the label on a
+variant change.
+
+**Where to switch it on/off:** Buy box designer → **Theme integration** →
+"Match the theme's Add to cart price to the selected option" (published with
+the rest of the design, so no theme edit or redeploy). It is **on by default**,
+including for shops that never published a design.
+
+**It is silent by design.** The swap only ever happens when the button's text
+literally contains the one-time money string, formatted with the shop's own
+`money_format`. A theme whose button reads just "Add to cart" is left
+untouched, with no warning and no console noise — there is nothing to fix.
+
+**The button's price is not updating** (it still shows the one-time price with
+subscription selected):
+
+1. Confirm the toggle above is on and the design is **published** (not just
+   saved as a draft).
+2. Check the button actually prints a price, and that it matches the shop's
+   money format exactly — a theme that renders "CHF 64.-" or "64.00 CHF" while
+   Settings → Store details formats as "CHF 64.00" will never match, and
+   nothing can be done from here except aligning the theme's own formatting.
+3. Set a **custom selector**: Buy box designer → Theme integration → "Add to
+   cart button selector". Find it in the browser's inspector on a product
+   page, then verify it in the console before saving:
+   `document.querySelectorAll('.pdp__actions .btn--atc')` should return the
+   add-to-cart button (and nothing else). `.pdp__actions .btn--atc` is the
+   correct value for the Sleepify theme on cellexialabs.com; the built-in list
+   also covers `button[name="add"]`, `.product-form__submit`,
+   `[data-add-to-cart]` and `.btn--atc` (Dawn / OS 2.0 and most themes).
+4. Re-check after any theme redesign, exactly like the embed's placement
+   anchor (§16) — renamed CSS classes invalidate a custom selector.
+
+**The wrong element changed** (e.g. a price in the header or the cart drawer):
+this should be impossible — targets are only looked for inside the widget's
+own product area; the header/nav/footer/cart-drawer regions and every Cellexia
+widget are excluded outright (v1.2.3); and nothing is written at all unless
+the target literally contains the theme's own one-time money string. If it
+happens, switch the toggle off, republish, and report it with the theme name
+and the selector in use.
+
+**Emergency off switch.** Toggle off + Publish is instant and needs no theme
+work. Reverting to a design revision published before v1.2.2 also works: the
+setting simply defaults back to on, so if the goal is "off", use the toggle.

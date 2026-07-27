@@ -9,8 +9,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  *    extension-fallback chain; {percent}/{amount}/{frequency} templates must
  *    survive resolution intact for the client-side substitution layer
  *    (buy-box.js / cx-tpl) to fill
+ *  - themeSync (v1.2.2) — the theme add-to-cart price-sync config: safe
+ *    defaults for every pre-v1.2.2 revision, and priceSelector sanitization
  *  - PRESET_META — CRO metadata completeness for every preset key
- *  - design attribution — `_cx_design` line-property extraction from both
+ *  - design attribution — `_cellexia_design` line-property extraction from both
  *    REST property shapes, and the ORDERS_CREATE handler logging
  *    widget.design_attributed
  *
@@ -77,9 +79,11 @@ import {
   DEFAULT_DESIGN_CONFIG,
   PRESET_KEYS,
   PRESET_META,
+  PRICE_SELECTOR_MAX_LENGTH,
   resolveDesignBenefits,
   resolveDesignText,
   sanitizeCustomCss,
+  sanitizePlacementSelector,
   widgetDesignConfigSchema,
   type WidgetDesignConfig,
 } from "~/lib/widget/presets";
@@ -265,6 +269,147 @@ describe("widgetDesignConfigSchema", () => {
 
   it("rejects unknown top-level keys (strict)", () => {
     const config = { ...configWith({}), extra: true };
+    expect(widgetDesignConfigSchema.safeParse(config).success).toBe(false);
+  });
+});
+
+// ── themeSync (v1.2.2 — theme add-to-cart price sync) ────────────────────────
+
+/**
+ * The config half of the feature that keeps the THEME's own add-to-cart
+ * button ("ADD TO CART - CHF 64.00") showing the price the shopper actually
+ * selected. Rendering is covered in tests/liquid/theme-sync.test.ts; here:
+ * the schema shape, the safe defaults every pre-v1.2.2 revision inherits, and
+ * the selector sanitization (the value is printed into a data-attribute and
+ * then handed to querySelectorAll on the storefront).
+ */
+describe("themeSync", () => {
+  /** Deep clone with free-form surgery on the themeSync object. */
+  function looseConfig(): Record<string, unknown> & {
+    themeSync?: Record<string, unknown>;
+  } {
+    return structuredClone(DEFAULT_DESIGN_CONFIG) as unknown as Record<
+      string,
+      unknown
+    > & { themeSync?: Record<string, unknown> };
+  }
+
+  function parseOk(input: unknown): WidgetDesignConfig {
+    const result = widgetDesignConfigSchema.safeParse(input);
+    if (!result.success) {
+      throw new Error(`expected config to parse: ${result.error.message}`);
+    }
+    return result.data;
+  }
+
+  it("DEFAULT_DESIGN_CONFIG ships the sync ON with the built-in selector list", () => {
+    expect(DEFAULT_DESIGN_CONFIG.themeSync).toEqual({
+      syncAddToCartPrice: true,
+      priceSelector: "",
+    });
+  });
+
+  it("a config with NO themeSync key parses and defaults to ON", () => {
+    // Every WidgetDesignRevision published before v1.2.2 — and the live
+    // cellexia.buybox_design metafield — has this shape. A parse failure here
+    // would blank the storefront widget for the whole shop.
+    const config = looseConfig();
+    delete config.themeSync;
+    expect(parseOk(config).themeSync).toEqual({
+      syncAddToCartPrice: true,
+      priceSelector: "",
+    });
+  });
+
+  it("survives the metafield JSON round-trip", () => {
+    const config = looseConfig();
+    delete config.themeSync;
+    const parsed = parseOk(JSON.parse(JSON.stringify(config)));
+    expect(parsed.themeSync.syncAddToCartPrice).toBe(true);
+  });
+
+  it("fills field-level defaults inside a PARTIAL themeSync object", () => {
+    const config = looseConfig();
+    config.themeSync = { syncAddToCartPrice: false };
+    expect(parseOk(config).themeSync).toEqual({
+      syncAddToCartPrice: false,
+      priceSelector: "",
+    });
+  });
+
+  it("accepts and preserves an explicit opt-out plus a custom selector", () => {
+    const config = looseConfig();
+    config.themeSync = {
+      syncAddToCartPrice: false,
+      priceSelector: ".pdp__actions .btn--atc",
+    };
+    expect(parseOk(config).themeSync).toEqual({
+      syncAddToCartPrice: false,
+      priceSelector: ".pdp__actions .btn--atc",
+    });
+  });
+
+  it("rejects a non-boolean flag", () => {
+    for (const value of ["true", 1, null]) {
+      const config = looseConfig();
+      config.themeSync = { syncAddToCartPrice: value, priceSelector: "" };
+      expect(
+        widgetDesignConfigSchema.safeParse(config).success,
+        String(value),
+      ).toBe(false);
+    }
+  });
+
+  it("sanitizes priceSelector on parse — angle brackets, quotes, backslashes", () => {
+    const config = looseConfig();
+    config.themeSync = {
+      syncAddToCartPrice: true,
+      priceSelector: '  [data-atc="1"] .btn<script>\\  ',
+    };
+    const selector = parseOk(config).themeSync.priceSelector;
+    expect(selector).toBe("[data-atc=1] .btnscript");
+    expect(selector).not.toMatch(/[<>"'`\\]/);
+  });
+
+  it("sanitizes exactly like placement.selector (one rule, two fields)", () => {
+    const hostile = '.a"> <b\'c`\\d';
+    const config = looseConfig();
+    config.themeSync = { syncAddToCartPrice: true, priceSelector: hostile };
+    (config as { placement: Record<string, unknown> }).placement = {
+      mode: "selector",
+      selector: hostile,
+      position: "before",
+    };
+    const parsed = parseOk(config);
+    expect(parsed.themeSync.priceSelector).toBe(sanitizePlacementSelector(hostile));
+    expect(parsed.themeSync.priceSelector).toBe(parsed.placement.selector);
+  });
+
+  it("caps priceSelector at PRICE_SELECTOR_MAX_LENGTH (301 rejected, 300 kept)", () => {
+    const over = looseConfig();
+    over.themeSync = {
+      syncAddToCartPrice: true,
+      priceSelector: "a".repeat(PRICE_SELECTOR_MAX_LENGTH + 1),
+    };
+    expect(widgetDesignConfigSchema.safeParse(over).success).toBe(false);
+
+    const at = looseConfig();
+    at.themeSync = {
+      syncAddToCartPrice: true,
+      priceSelector: "a".repeat(PRICE_SELECTOR_MAX_LENGTH),
+    };
+    expect(parseOk(at).themeSync.priceSelector).toBe(
+      "a".repeat(PRICE_SELECTOR_MAX_LENGTH),
+    );
+  });
+
+  it("rejects unknown keys inside themeSync (strict)", () => {
+    const config = looseConfig();
+    config.themeSync = {
+      syncAddToCartPrice: true,
+      priceSelector: "",
+      onSwap: "alert(1)",
+    };
     expect(widgetDesignConfigSchema.safeParse(config).success).toBe(false);
   });
 });
@@ -477,39 +622,39 @@ describe("PRESET_META", () => {
   });
 });
 
-// ── Design attribution (_cx_design) ─────────────────────────────────────────
+// ── Design attribution (_cellexia_design) ─────────────────────────────────────────
 
-describe("lineProperty (_cx_design extraction)", () => {
+describe("lineProperty (_cellexia_design extraction)", () => {
   it("reads the array-of-{name,value} REST shape", () => {
     const li = {
       properties: [
         { name: "_gift_note", value: "hi" },
-        { name: "_cx_design", value: "toggle" },
+        { name: "_cellexia_design", value: "toggle" },
       ],
     };
-    expect(lineProperty(li, "_cx_design")).toBe("toggle");
+    expect(lineProperty(li, "_cellexia_design")).toBe("toggle");
   });
 
   it("reads the flattened object shape", () => {
-    expect(lineProperty({ properties: { _cx_design: "tiles" } }, "_cx_design")).toBe(
+    expect(lineProperty({ properties: { _cellexia_design: "tiles" } }, "_cellexia_design")).toBe(
       "tiles",
     );
   });
 
   it("returns null when absent, empty, or non-string", () => {
-    expect(lineProperty({}, "_cx_design")).toBeNull();
-    expect(lineProperty({ properties: [] }, "_cx_design")).toBeNull();
-    expect(lineProperty({ properties: {} }, "_cx_design")).toBeNull();
+    expect(lineProperty({}, "_cellexia_design")).toBeNull();
+    expect(lineProperty({ properties: [] }, "_cellexia_design")).toBeNull();
+    expect(lineProperty({ properties: {} }, "_cellexia_design")).toBeNull();
     expect(
-      lineProperty({ properties: [{ name: "other", value: "x" }] }, "_cx_design"),
+      lineProperty({ properties: [{ name: "other", value: "x" }] }, "_cellexia_design"),
     ).toBeNull();
     expect(
-      lineProperty({ properties: { _cx_design: "" } }, "_cx_design"),
+      lineProperty({ properties: { _cellexia_design: "" } }, "_cellexia_design"),
     ).toBeNull();
     expect(
-      lineProperty({ properties: { _cx_design: 42 } }, "_cx_design"),
+      lineProperty({ properties: { _cellexia_design: 42 } }, "_cellexia_design"),
     ).toBeNull();
-    expect(lineProperty({ properties: "oops" }, "_cx_design")).toBeNull();
+    expect(lineProperty({ properties: "oops" }, "_cellexia_design")).toBeNull();
   });
 });
 
@@ -553,7 +698,7 @@ describe("ORDERS_CREATE design attribution", () => {
         {
           product_id: 111,
           selling_plan_id: 777,
-          properties: [{ name: "_cx_design", value: "value_stack" }],
+          properties: [{ name: "_cellexia_design", value: "value_stack" }],
         },
       ]),
     );
@@ -565,12 +710,12 @@ describe("ORDERS_CREATE design attribution", () => {
     });
   });
 
-  it("ignores _cx_design on one-time lines (no selling-plan marker)", async () => {
+  it("ignores _cellexia_design on one-time lines (no selling-plan marker)", async () => {
     await run(
       orderPayload([
         {
           product_id: 111,
-          properties: [{ name: "_cx_design", value: "planner" }],
+          properties: [{ name: "_cellexia_design", value: "planner" }],
         },
       ]),
     );
@@ -583,12 +728,12 @@ describe("ORDERS_CREATE design attribution", () => {
         {
           product_id: 111,
           selling_plan_id: 777,
-          properties: [{ name: "_cx_design", value: "toggle" }],
+          properties: [{ name: "_cellexia_design", value: "toggle" }],
         },
         {
           product_id: 222,
           selling_plan: { id: 777 },
-          properties: { _cx_design: "toggle" },
+          properties: { _cellexia_design: "toggle" },
         },
       ]),
     );
@@ -599,10 +744,70 @@ describe("ORDERS_CREATE design attribution", () => {
     );
   });
 
-  it("subscription lines without _cx_design log nothing (pre-v1.1.0 carts)", async () => {
+  it("subscription lines without _cellexia_design log nothing (pre-v1.1.0 carts)", async () => {
     await run(
       orderPayload([{ product_id: 111, selling_plan_id: 777, properties: [] }]),
     );
     expect(attributedEvents()).toHaveLength(0);
+  });
+
+  /**
+   * Backward compatibility across the v1.2.3 namespace rename. The property
+   * was `_cx_design` until the widget's whole storefront namespace was moved
+   * off "cx" (another vendor owns it on the client's live store). Orders that
+   * were placed — or carts that were already open — before the merchant
+   * updated the theme extension still carry the old name, so attribution must
+   * keep working for them.
+   */
+  it("still attributes the legacy _cx_design property (orders from before the rename)", async () => {
+    await run(
+      orderPayload([
+        {
+          product_id: 111,
+          selling_plan_id: 777,
+          properties: [{ name: "_cx_design", value: "tiles" }],
+        },
+      ]),
+    );
+    const events = attributedEvents();
+    expect(events).toHaveLength(1);
+    expect((events[0].payload as Record<string, unknown>).designKey).toBe(
+      "tiles",
+    );
+  });
+
+  it("reads the legacy name in the flattened property shape too", async () => {
+    await run(
+      orderPayload([
+        {
+          product_id: 111,
+          selling_plan: { id: 777 },
+          properties: { _cx_design: "planner" },
+        },
+      ]),
+    );
+    expect(
+      (attributedEvents()[0].payload as Record<string, unknown>).designKey,
+    ).toBe("planner");
+  });
+
+  it("prefers the current name when a line somehow carries both", async () => {
+    await run(
+      orderPayload([
+        {
+          product_id: 111,
+          selling_plan_id: 777,
+          properties: [
+            { name: "_cx_design", value: "classic" },
+            { name: "_cellexia_design", value: "value_stack" },
+          ],
+        },
+      ]),
+    );
+    const events = attributedEvents();
+    expect(events).toHaveLength(1);
+    expect((events[0].payload as Record<string, unknown>).designKey).toBe(
+      "value_stack",
+    );
   });
 });

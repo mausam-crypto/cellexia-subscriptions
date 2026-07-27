@@ -3,7 +3,11 @@ import { adminClientForShop } from "~/shopify.server";
 import { requireShop } from "~/lib/shop/install.server";
 import { getSetting, setSetting } from "~/lib/settings/settings.server";
 import type { SettingsValue } from "~/lib/settings/registry.server";
-import { setShopMetafield } from "~/lib/graphql/metafields.server";
+import type { AdminClient } from "~/lib/graphql/client.server";
+import {
+  getShopMetafield,
+  setShopMetafield,
+} from "~/lib/graphql/metafields.server";
 import { createMagicToken } from "~/lib/crypto/tokens.server";
 import { addDaysTz } from "~/lib/dates.server";
 import { logEvent } from "~/lib/events/log.server";
@@ -56,15 +60,27 @@ export async function isSetupMode(shopId: string): Promise<boolean> {
 
 // ── Metafield mirror ─────────────────────────────────────────────────────────
 
+/** Outcome of a launch_status metafield write — never an exception. */
+export interface LaunchSyncResult {
+  ok: boolean;
+  /** Failure reason, for the admin toast / audit payload. */
+  error?: string;
+}
+
 /**
  * Mirror the launch mode into the cellexia.launch_status shop metafield so
- * Liquid can gate rendering. Never throws — a metafield sync failure must
- * never break install or the go-live action (the app-side gates still hold).
+ * Liquid can gate rendering. Never throws — install must not fail because a
+ * metafield write failed — but it does REPORT: this metafield is the only
+ * thing the storefront reads, so a caller that changes the launch mode has to
+ * know whether the storefront actually followed (goLive/revertToSetup roll
+ * their setting back when it did not). Fire-and-forget callers (install)
+ * simply ignore the result; the Preview & launch page reads the flag back and
+ * offers a re-sync.
  */
 export async function syncLaunchMetafield(
   shopDomain: string,
   mode: LaunchMode,
-): Promise<void> {
+): Promise<LaunchSyncResult> {
   try {
     const admin = await adminClientForShop(shopDomain);
     await setShopMetafield(admin, {
@@ -73,9 +89,60 @@ export async function syncLaunchMetafield(
       type: "single_line_text_field",
       value: mode.toLowerCase(),
     });
+    return { ok: true };
   } catch (err) {
     console.error("[launch] launch_status metafield sync failed", shopDomain, err);
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
+}
+
+/**
+ * The launch_status metafield as Liquid sees it ("setup" | "live" | null when
+ * it was never written). Throws on a read failure — callers decide whether a
+ * failed read is fatal (the Preview page contains it and shows nothing).
+ */
+export async function readLaunchMetafield(
+  admin: AdminClient,
+): Promise<string | null> {
+  const metafield = await getShopMetafield(
+    admin,
+    LAUNCH_METAFIELD_NAMESPACE,
+    LAUNCH_METAFIELD_KEY,
+  );
+  return metafield ? metafield.value : null;
+}
+
+/**
+ * Does the storefront flag disagree with the launch mode?
+ *
+ * Compared BYTE-FOR-BYTE the way the buy box compares it. The gate in
+ * cx-buybox-core.liquid is
+ *
+ *     assign cx_launch_status = shop.metafields.cellexia.launch_status.value …
+ *     if cx_launch_status == 'live'
+ *
+ * — a plain Liquid string equality: no trim, no case folding. ONLY the exact
+ * value "live" renders the widget; anything else (missing metafield included)
+ * fails closed. So a missing flag while in SETUP is not a divergence — the
+ * store is dark either way — but a "live" flag while in SETUP is, and so is
+ * any non-"live" flag while LIVE.
+ *
+ * This comparison must therefore NOT normalise. It used to `.trim()` and
+ * `.toLowerCase()`, which made the detector blind in the one direction that
+ * matters: a hand-edited metafield of " Live " with the app in LIVE was
+ * reported as in-sync, while Liquid read it as not-live and every product
+ * page rendered the widget `hidden data-cellexia-gated`. The merchant saw a
+ * green "Live" page over a dark store — exactly the state the banner on
+ * app/routes/app.preview.tsx exists to surface. Normalising here can only
+ * ever hide a dark store; being stricter can only ever offer a re-sync that
+ * rewrites the flag to the canonical value. Keep it exact.
+ */
+export function launchFlagDiverged(
+  mode: LaunchMode,
+  metafieldValue: string | null,
+): boolean {
+  const storefrontLive = metafieldValue === "live";
+  return storefrontLive !== (mode === "LIVE");
 }
 
 // ── Checklist ────────────────────────────────────────────────────────────────
@@ -164,6 +231,14 @@ export interface GoLiveOptions {
  * (round-robin, shop timezone) so going live never triggers a burst of
  * charges. Shift failures are contained per contract — going live must not
  * abort halfway because one contract edit failed.
+ *
+ * The metafield write is NOT contained: it is the only signal the storefront
+ * has, so if it fails the setting is rolled back and the error rethrown (the
+ * design-publish contract in app/lib/widget/design.server.ts). Otherwise the
+ * admin would see "You're live" while every product page still renders the
+ * widget hidden — a go-live that lied, with nothing to detect it. The
+ * metafield is written BEFORE any contract is touched, so a failed go-live
+ * never leaves shifted billing dates behind either.
  */
 export async function goLive(
   shopDomain: string,
@@ -179,7 +254,15 @@ export async function goLive(
     { ...state, mode: "LIVE", wentLiveAt: now.toISOString() },
     options.actor,
   );
-  await syncLaunchMetafield(shopDomain, "LIVE");
+  const sync = await syncLaunchMetafield(shopDomain, "LIVE");
+  if (!sync.ok) {
+    // Roll back so the app never claims to be live while the storefront is
+    // dark; the admin gets a real error and can retry.
+    await setSetting(shop.id, "launch", state, options.actor);
+    throw new Error(
+      `Storefront flag not updated (cellexia.launch_status): ${sync.error ?? "unknown error"}. Nothing was changed — retry.`,
+    );
+  }
 
   let shifted = 0;
   if (options.shiftOverdue) {
@@ -221,7 +304,15 @@ export async function goLive(
   return { shifted };
 }
 
-/** Back to SETUP (dark): setting + metafield + audit event. */
+/**
+ * Back to SETUP (dark): setting + metafield + audit event.
+ *
+ * Same contract as goLive, and it matters more here: this is the kill switch.
+ * If the metafield write fails the setting is rolled back to LIVE and the
+ * error rethrown, because the alternative — app-side dark, storefront still
+ * selling subscriptions — is worse than an honest failure the admin can
+ * retry (or work around by switching the app embed off in the theme editor).
+ */
 export async function revertToSetup(
   shopDomain: string,
   actor: string,
@@ -229,7 +320,13 @@ export async function revertToSetup(
   const shop = await requireShop(shopDomain);
   const state = await getLaunchState(shop.id);
   await setSetting(shop.id, "launch", { ...state, mode: "SETUP" }, actor);
-  await syncLaunchMetafield(shopDomain, "SETUP");
+  const sync = await syncLaunchMetafield(shopDomain, "SETUP");
+  if (!sync.ok) {
+    await setSetting(shop.id, "launch", state, actor);
+    throw new Error(
+      `Storefront flag not updated (cellexia.launch_status): ${sync.error ?? "unknown error"}. The store is still live — retry, or switch the Cellexia app embed off in the theme editor.`,
+    );
+  }
   await logEvent({
     shopId: shop.id,
     type: "admin.action",

@@ -187,7 +187,7 @@ function itemsCardHtml(
       if (editable && !line.isGift) {
         const canRemove = line.isOneTimeAddon || recurringCount > 1;
         const removeForm = canRemove
-          ? `<form method="post" action="${api(ctx, "remove_line")}" data-cx-confirm="${escapeHtml(t(locale, "portal.items.remove_confirm", { title: line.title }))}">${hiddenFields([...baseFields(ctx), ["lineId", line.id]])}<button type="submit" class="cx-btn cx-btn--danger cx-btn--small">${escapeHtml(t(locale, "portal.items.remove"))}</button></form>`
+          ? `<form method="post" action="${api(ctx, "remove_line")}" data-cellexia-confirm="${escapeHtml(t(locale, "portal.items.remove_confirm", { title: line.title }))}">${hiddenFields([...baseFields(ctx), ["lineId", line.id]])}<button type="submit" class="cx-btn cx-btn--danger cx-btn--small">${escapeHtml(t(locale, "portal.items.remove"))}</button></form>`
           : "";
         const stepper = line.isOneTimeAddon ? "" : stepperHtml(ctx, line);
         const swap = line.isOneTimeAddon

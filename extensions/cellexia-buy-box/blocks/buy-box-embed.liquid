@@ -17,13 +17,13 @@
       heuristics, tuned first for cellexialabs.com: before .pdp__grey, i.e.
       after the size options and above quantity + add to cart) and unhides
       the WRAPPER only. The inner widget's launch gate
-      ([hidden][data-cx-gated] until cellexia.launch_status is "live") is
+      ([hidden][data-cellexia-gated] until cellexia.launch_status is "live") is
       untouched: even with the embed enabled, visitors see nothing until
       go-live, and the ?cx_preview= token flow reveals it exactly as it does
       for the app block.
     - buy-box-embed.js also patches fetch/XMLHttpRequest cart adds so
       JS-driven themes with no <form action="/cart/add"> still carry the
-      selected selling plan (and the _cx_design attribution property).
+      selected selling plan (and the _cellexia_design attribution property).
     - If the section-targeted app block is ALSO present on the page, the
       embed stays dormant and hidden — the block wins, never two widgets.
 
@@ -35,6 +35,14 @@
 
   On non-product pages, products without selling plans, or themes where the
   guard fails, this file renders NOTHING — no wrapper, no CSS, no JS.
+
+  HARD RULE — the render below must stay in MARKUP position (directly inside
+  the .cx-buybox-embed wrapper). Shopify wraps the output of every
+  app-snippet render in "BEGIN/END app snippet" HTML comments; there they are
+  invisible comments between elements. Assigning or capturing this render
+  into a variable would pull those markers into a string and print them on
+  the page. Never capture a render. See the header of
+  snippets/cx-buybox-core.liquid.
 {%- endcomment -%}
 
 {%- if request.page_type == 'product' and product != blank and product.selling_plan_groups.size > 0 -%}
@@ -57,9 +65,9 @@
   <div
     class="cx-buybox-embed"
     hidden
-    data-cx-embed
-    data-cx-anchor="{{ cx_embed_anchor | escape }}"
-    data-cx-anchor-pos="{{ cx_embed_pos | escape }}"
+    data-cellexia-embed
+    data-cellexia-anchor="{{ cx_embed_anchor | escape }}"
+    data-cellexia-anchor-pos="{{ cx_embed_pos | escape }}"
   >
     {%- render 'cx-buybox-core',
       render_context: 'embed',
@@ -99,6 +107,7 @@
       "type": "text",
       "id": "custom_anchor_selector",
       "label": "Custom anchor selector",
+      "default": "",
       "info": "Optional CSS selector for the element the widget should attach to, e.g. \".pdp__grey\". Overrides both the automatic placement and the app's Buy box designer → Placement setting. Leave empty for automatic placement."
     },
     {

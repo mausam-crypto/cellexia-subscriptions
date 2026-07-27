@@ -1071,6 +1071,28 @@ async function handlePaymentMethodRevoke({
 // ── Orders ───────────────────────────────────────────────────────────────────
 
 /**
+ * The buy-box widget's design-attribution line property.
+ *
+ * It was named `_cx_design` up to v1.2.2 and was renamed together with the
+ * widget's whole storefront namespace (the client's live store hosts another
+ * vendor that owns "cx"). BOTH names are read, the current one preferred:
+ * orders placed before the merchant updated the theme extension — and carts
+ * that were already open at that moment — carry the old name, and take-rate
+ * attribution must not develop a hole across the upgrade. Reading is all this
+ * costs; the widget only ever writes the current name.
+ */
+const DESIGN_PROPERTY = "_cellexia_design";
+/** Pre-v1.2.3 name of the same property — read-only backward compatibility. */
+const DESIGN_PROPERTY_LEGACY = "_cx_design";
+
+/** A line's design key under the current property, else the legacy one. */
+export function designPropertyOf(li: Payload): string | null {
+  return (
+    lineProperty(li, DESIGN_PROPERTY) ?? lineProperty(li, DESIGN_PROPERTY_LEGACY)
+  );
+}
+
+/**
  * ORDERS_CREATE
  * Payload: order (REST-shaped) — `id`, `admin_graphql_api_id`, `name`,
  * `email`, `line_items[]` (`product_id`, and — when Shopify includes them —
@@ -1091,12 +1113,14 @@ async function handlePaymentMethodRevoke({
  * denominator with renewal traffic; acceptable for a trend metric.
  *
  * Design attribution feed: the buy-box widget stamps subscription
- * add-to-carts with a hidden line property `_cx_design` = active design
+ * add-to-carts with a hidden line property `_cellexia_design` = active design
  * preset key. When a line carries both that property and a selling-plan
  * marker, one "widget.design_attributed" event is logged per distinct design
  * key so analytics can report take-rate by design
  * (getDesignPerformance in app/lib/analytics/queries.server.ts). The type is
  * analytics-only: the Klaviyo events-map ignores unmapped types by design.
+ * Both the current and the legacy property name are accepted — see
+ * designPropertyOf above.
  */
 async function handleOrdersCreate({
   shopDomain,
@@ -1110,13 +1134,13 @@ async function handleOrdersCreate({
 
   const hasSellingPlanLine = lineItems.some(hasSellingPlanMarker);
 
-  // ── Design attribution (_cx_design hidden line property) ──────────────────
+  // ── Design attribution (_cellexia_design hidden line property) ────────────
   const orderGid = toGid("Order", pick(payload, "admin_graphql_api_id", "id"));
   const orderEmail = asString(pick(payload, "email", "contact_email"));
   const designKeys = new Set<string>();
   for (const li of lineItems) {
     if (!hasSellingPlanMarker(li)) continue; // one-time line: not a subscription add
-    const designKey = lineProperty(li, "_cx_design");
+    const designKey = designPropertyOf(li);
     if (designKey) designKeys.add(designKey);
   }
   for (const designKey of designKeys) {

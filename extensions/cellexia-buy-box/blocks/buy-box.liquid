@@ -16,11 +16,18 @@
       that preset, ignoring the app config entirely (emergency override).
     - selling-plan wiring: buy-box.js writes the chosen plan into the
       product form's hidden `selling_plan` input;
-    - launch gating: [hidden][data-cx-gated] until cellexia.launch_status is
+    - launch gating: [hidden][data-cellexia-gated] until cellexia.launch_status is
       "live", revealed only by a validated ?cx_preview= token;
-    - variant-change price updates via the JSON island + data-cx-* hooks;
-    - design attribution via the hidden `properties[_cx_design]` line
+    - variant-change price updates via the JSON island + data-cellexia-* hooks;
+    - design attribution via the hidden `properties[_cellexia_design]` line
       property, consumed by the ORDERS_CREATE webhook.
+
+  HARD RULE — the render below must stay in MARKUP position. Shopify wraps
+  the output of every app-snippet render in "BEGIN/END app snippet" HTML
+  comments; here they are invisible comments between elements. Assigning or
+  capturing this render into a variable would pull those markers into a
+  string and print them on the page. Never capture a render. See the header
+  of snippets/cx-buybox-core.liquid.
 {%- endcomment -%}
 
 {%- render 'cx-buybox-core',
@@ -129,7 +136,8 @@
       "type": "color",
       "id": "accent_color",
       "label": "Accent color",
-      "default": "#4a5d4a"
+      "default": "#1d1d1b",
+      "info": "Used for the subscription card's border, badge, radio and check marks. This value is always written into the widget's inline style, so it overrides the stylesheet default — it must match the brand, not a sample palette. The app embed and the Buy box designer both default to the same near-black."
     },
     {
       "type": "checkbox",

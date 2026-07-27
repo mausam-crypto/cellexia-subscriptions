@@ -149,14 +149,20 @@ const localeKey = z
   .regex(LOCALE_KEY_RE, "must be a locale code like \"en\" or \"pt-BR\"");
 
 /**
- * Characters stripped from placement.selector: it is a CSS selector, never
+ * Characters stripped from every merchant-authored CSS selector
+ * (`placement.selector`, `themeSync.priceSelector`): a selector is never
  * HTML, so angle brackets, quotes and backslashes have no legitimate use and
  * removing them keeps the value inert wherever it is interpolated
- * (data-attributes in Liquid, querySelector in the embed JS).
+ * (data-attributes in Liquid, querySelector in the storefront JS).
  */
 const SELECTOR_UNSAFE_RE = /[<>"'`\\]/g;
 
-/** Sanitize a placement CSS selector (see SELECTOR_UNSAFE_RE). */
+/**
+ * Sanitize a merchant-authored CSS selector (see SELECTOR_UNSAFE_RE). Used by
+ * both selector fields in the config — `placement.selector` (where the app
+ * embed mounts) and `themeSync.priceSelector` (which of the theme's elements
+ * carry the add-to-cart price).
+ */
 export function sanitizePlacementSelector(selector: string): string {
   return selector.replace(SELECTOR_UNSAFE_RE, "").trim();
 }
@@ -194,6 +200,47 @@ const placementSchema = z
   })
   .strict()
   .default(DEFAULT_PLACEMENT);
+
+export const PRICE_SELECTOR_MAX_LENGTH = 300;
+
+const DEFAULT_THEME_SYNC = {
+  syncAddToCartPrice: true,
+  priceSelector: "",
+} as const;
+
+/**
+ * Theme integration (v1.2.2) — keeping the THEME's own add-to-cart button
+ * honest about the price the shopper actually selected.
+ *
+ * Most themes print the price inside the button ("ADD TO CART - CHF 64.00").
+ * That string is the one-time price, so with the subscription option selected
+ * the widget says CHF 51.20 while the button the shopper is about to click
+ * still says CHF 64.00 — two prices for one action.
+ *
+ * `syncAddToCartPrice` lets `assets/buy-box.js` replace the one-time MONEY
+ * STRING with the subscription one inside that button's text nodes (never a
+ * re-render, never innerHTML, reverted the moment one-time is selected). It
+ * is inherently safe: if the button does not contain the exact one-time money
+ * string, nothing happens at all.
+ *
+ * `priceSelector` is the escape hatch for a theme the built-in selector list
+ * does not cover (e.g. `.pdp__actions .btn--atc`); "" means "use the built-in
+ * list". Sanitized exactly like `placement.selector`.
+ *
+ * Added in v1.2.2 with object- AND field-level defaults, so every stored
+ * revision and the live `cellexia.buybox_design` metafield keep validating.
+ */
+const themeSyncSchema = z
+  .object({
+    syncAddToCartPrice: z.boolean().default(true),
+    priceSelector: z
+      .string()
+      .max(PRICE_SELECTOR_MAX_LENGTH)
+      .default("")
+      .transform(sanitizePlacementSelector),
+  })
+  .strict()
+  .default(DEFAULT_THEME_SYNC);
 
 const textOverrideSchema = z
   .object({
@@ -263,6 +310,8 @@ export const widgetDesignConfigSchema = z
       .strict(),
     /** App-embed mount point (v1.2.0) — see placementSchema. */
     placement: placementSchema,
+    /** Theme add-to-cart price sync (v1.2.2) — see themeSyncSchema. */
+    themeSync: themeSyncSchema,
     /** Per-locale overrides; resolution: current locale → "en" → extension locale files. */
     text: z.record(localeKey, textOverrideSchema),
   })
@@ -273,6 +322,7 @@ export type WidgetDesignLayout = WidgetDesignConfig["layout"];
 export type WidgetDesignStyle = WidgetDesignConfig["style"];
 export type WidgetDesignBehavior = WidgetDesignConfig["behavior"];
 export type WidgetDesignPlacement = WidgetDesignConfig["placement"];
+export type WidgetDesignThemeSync = WidgetDesignConfig["themeSync"];
 export type WidgetDesignTextOverride = z.infer<typeof textOverrideSchema>;
 
 /**
@@ -324,6 +374,10 @@ export const DEFAULT_DESIGN_CONFIG: WidgetDesignConfig = {
     mode: "auto",
     selector: "",
     position: "before",
+  },
+  themeSync: {
+    syncAddToCartPrice: true,
+    priceSelector: "",
   },
   text: {},
 };

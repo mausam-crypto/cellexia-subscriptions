@@ -207,16 +207,27 @@ const SCRIPT = `
     var clean=location.search.replace(/[?&]session=[^&]*/,"").replace(/^&/,"?");
     history.replaceState(null,"",location.pathname+(clean==="?"?"":clean)+location.hash);
   }
-  var toast=document.querySelector(".cx-toast");
+  // The ONE document-level lookup on this page, qualified by our class AND
+  // our attribute. The portal is served through the app proxy, so this markup
+  // is injected into the MERCHANT'S THEME: the theme's own markup and every
+  // storefront app on the shop — including the other "cx" vendor this app was
+  // renamed away from — share this document. A bare ".cx-toast" or
+  // ".cx-portal form" lookup is the same mistake that made the buy box bind to
+  // a foreign wrapper in v1.2.2. Everything below is rooted at this node, so
+  // nothing outside our own subtree is ever read, and — for the submit
+  // handlers, which DISABLE buttons — never written either.
+  var root=document.querySelector(".cx-portal[data-cellexia-portal]");
+  if(!root){return;}
+  var toast=root.querySelector(".cx-toast[data-cellexia-toast]");
   if(toast){
     setTimeout(function(){toast.classList.add("cx-toast--hide")},7000);
   }
-  document.querySelectorAll("form[data-cx-confirm]").forEach(function(f){
+  root.querySelectorAll("form[data-cellexia-confirm]").forEach(function(f){
     f.addEventListener("submit",function(e){
-      if(!window.confirm(f.getAttribute("data-cx-confirm"))){e.preventDefault();}
+      if(!window.confirm(f.getAttribute("data-cellexia-confirm"))){e.preventDefault();}
     });
   });
-  document.querySelectorAll(".cx-portal form").forEach(function(f){
+  root.querySelectorAll("form").forEach(function(f){
     f.addEventListener("submit",function(){
       setTimeout(function(){
         f.querySelectorAll("button[type=submit],input[type=submit]").forEach(function(b){b.disabled=true;});
@@ -243,7 +254,7 @@ export function portalPage(input: PortalPageInput): string {
       </nav>`;
 
   const toast = input.toast
-    ? `<div class="cx-toast" role="status">${escapeHtml(input.toast.text)}${input.toast.html ?? ""}</div>`
+    ? `<div class="cx-toast" data-cellexia-toast role="status">${escapeHtml(input.toast.text)}${input.toast.html ?? ""}</div>`
     : "";
 
   const back = input.backHref
@@ -255,7 +266,7 @@ export function portalPage(input: PortalPageInput): string {
     ? `<style>body{padding-top:42px !important}</style><div class="cx-preview-bar" role="status">${escapeHtml(t(locale, "portal.preview.banner"))}</div>`
     : "";
 
-  return `<div class="cx-portal">
+  return `<div class="cx-portal" data-cellexia-portal>
 <style>${STYLE}</style>
 ${previewBar}
 <div class="cx-shell">

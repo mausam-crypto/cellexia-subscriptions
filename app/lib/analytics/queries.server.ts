@@ -410,7 +410,7 @@ export interface DesignPerformance {
  * Subscription take-rate contribution per buy-box design over the trailing
  * `rangeDays` window. Feed: "widget.design_attributed" events, logged by the
  * ORDERS_CREATE webhook when an order line carries both a selling plan and
- * the widget's hidden `_cx_design` property (payload {designKey, orderId}).
+ * the widget's hidden `_cellexia_design` property (payload {designKey, orderId}).
  * Grouping happens in JS because the key lives inside the JSON payload.
  * Resilient to zero data: empty rows, zero totals.
  */

@@ -110,8 +110,13 @@ resolution fails, everything assumes SETUP and stays dark):
 - **Buy box** (`extensions/cellexia-buy-box/blocks/buy-box.liquid` and
   `blocks/buy-box-embed.liquid`): unless the `cellexia.launch_status`
   metafield equals `"live"`, the widget renders with
-  `hidden data-cx-gated="true"` — invisible to every visitor, in both
-  install shapes.
+  `hidden data-cellexia-gated="true"` — invisible to every visitor, in both
+  install shapes. The comparison is a plain Liquid `==`: **exact**, no trim and
+  no case folding, so `" Live "` is a dark store. Anything in the app that
+  models this gate must compare the same way — `launchFlagDiverged()` normalised
+  the value until v1.2.3 and consequently reported a near-miss flag as in-sync
+  while every product page rendered the widget hidden. Both halves are pinned
+  (`tests/liquid/render.test.ts`, `tests/launch-sync.test.ts`).
 
 **App embed** (v1.2.0). Besides the `section`-target app block, the widget
 ships as a `body`-target app embed (`blocks/buy-box-embed.liquid`, one
@@ -122,11 +127,88 @@ column — anchor precedence: the embed's theme-editor selector setting → the
 published config's `placement` (designer → Placement) → automatic heuristics
 (tuned for cellexialabs.com: before `.pdp__grey`; then OS 2.0 / `/cart/add`
 form fallbacks) — unhiding only the wrapper, never the launch-gated widget
-inside. The same file wraps `fetch`/XHR once so `/cart/add(.js)` POSTs on
-formless AJAX themes get the selected `selling_plan` + `_cx_design` injected
+inside, and leaving even the wrapper `[hidden]` while that widget is gated
+(an empty full-width wrapper would change the live PDP's layout before
+go-live; a validated preview reveal unhides the mounted wrapper with the
+widget). The same file wraps `fetch`/XHR once so `/cart/add(.js)` POSTs on
+formless AJAX themes get the selected `selling_plan` + `_cellexia_design` injected
 (own-variant matches only; anything else passes through byte-identical). If
 the section block is present the embed stays dormant, and state is shared
 solely via the guarded `window.CellexiaSubs` global.
+
+**Storefront namespace (v1.2.3) — `data-cellexia-*`, class-qualified.** The
+widget's DOM hooks are attributes prefixed `data-cellexia-`
+(`-embed`, `-buybox`, `-preset`, `-gated`, `-mounted`, `-anchor(-pos)`,
+`-tpl`, `-selling-plan`, `-plan-input`, `-design-prop`, `-money-onetime`/
+`-sub`, `-price-sync`/`-selector`, `-save`, `-init`, `-preview`, `-data`, …);
+CSS class names stay `cx-buybox*`. They were `data-cx-*` until the client's
+live PDP turned out to already host an unrelated vendor owning "cx" — a
+`<div class="cx cx--self-contained" data-cx-embed>` inside the buy column,
+plus `cx-i18n` / `cx-cart-config` / `cx-pdp-config` / `cx-embed-config` script
+ids. `buy-box-embed.js` looked its own wrapper up by attribute alone, adopted
+THAT element (mutating DOM we do not own), and then believed itself mounted
+for ever, so our wrapper never left body-end: an invisible buy box on the one
+store that matters. Three layers now, all load-bearing: (1) the
+`data-cellexia-*` prefix; (2) every document-level lookup of our own markup is
+qualified by our own class too — `.cx-buybox-embed[data-cellexia-embed]`,
+`.cx-buybox[data-cellexia-buybox]`, hoisted into `OWN_WRAPPER` / `OWN_WIDGET`
+constants in both asset files — while every other lookup is rooted at a node
+already proven ours; (3) `classList.contains('cx-buybox-embed')` /
+`'cx-buybox'` is asserted before anything is moved, marked or unhidden, and
+the code bails out silently otherwise. Element ids were already uid-suffixed
+for the same reason. `tests/liquid/lint.test.ts` §5 enforces all of it
+statically — no `data-cx-*` and no `_cx_design` in any file the extension
+serves to a storefront (`assets/`, `blocks/`, `snippets/`, `locales/` and the
+extension TOML; source comments documenting the history are blanked first, and
+the maintainer `README.md`, which Shopify never serves, is the one exempted
+file — §5b pins both facts so the exemption cannot grow), and no
+document-level or `closest()`/`matches()` lookup of `data-cellexia-*` that is
+not class-qualified. "Document-level" means every root that reaches the whole
+page — `document`, `document.body`, `document.documentElement`,
+`document.head` — not just a bare `document.` receiver: matching only the
+latter left `document.body.querySelector('[data-cellexia-embed]')`, the
+outage's own shape one property access away, invisible to the rule. §5c also
+covers `getElementById` / `getElementsBy*`, which take one bare string and
+cannot be class-qualified at all: those may not name our `cx-*` namespace
+(shared with that vendor's ids), and the single legitimate call —
+`'shopify-section-' + sectionId`, the platform's id, used to narrow a search —
+is pinned so a new one fails until a human has read it. Comments are blanked by
+a scanner, not a regex, so a `//` or `#` inside a string literal cannot hide an
+occurrence from the rule; §5d tests the scanner, and every widened receiver,
+against exactly that. §1–§2 forbid the captured-render shape in both Liquid
+forms — the tag form and the bare line form inside a `{% liquid %}` block,
+which no `{%\s*render` pattern can see — and for both spellings of the tag:
+the legacy `{% include %}` gets the same BEGIN/END app-snippet wrapping and,
+unlike `render`, shares the caller's scope, so a rule keyed on the word
+"render" alone would have waved the more dangerous form through. Two suites
+reproduce the collision behaviourally: `tests/embed-mount.test.ts` (mount
+lifecycle, hand-built tree) and `tests/embed-hostile-neighbour.test.ts`,
+which parses the REAL server-rendered embed markup into a copy of the
+client's PDP — foreign `.cx.cx--self-contained[data-cx-embed]` first in the
+buy column, the `cx-*` config script ids, no `/cart/add` form — runs both
+real asset files over it and asserts our wrapper mounts before `.pdp__grey`,
+the foreign element is byte-for-byte untouched, every `data-cellexia-*`
+attribute in the document is inside our wrapper, and the theme's jQuery XHR
+cart add carries `selling_plan` + `_cellexia_design` (and is byte-identical
+on one-time). Its vacuity guards put the defect back — the bare pre-rename
+lookup, then the same lookup with `isOwnWrapper()` neutered — and assert the
+live failure modes, so the layers cannot quietly stop being load-bearing.
+
+The buy box is not the only surface that puts markup and a `<script>` on a
+storefront page. **The customer portal is served through the app proxy**, so
+`portalPage()` output is injected into the *merchant's theme*: the theme's own
+markup and every storefront app — including that `cx` vendor — share the
+portal's document too. §5e applies the same rule there. Its script now makes
+exactly **one** document-level query, `.cx-portal[data-cellexia-portal]`
+(class **and** attribute), and roots everything else at that node. Before the
+1.2.3 sweep it used `document.querySelector('.cx-toast')` and
+`document.querySelectorAll('.cx-portal form')` — class-only, unqualified — and
+the second one *writes* (it disables submit buttons on submit), so a foreign
+`.cx-portal` would have had its forms disabled by us. Identical failure mode to
+v1.2.2, in a different directory, which is exactly why the extension-scoped
+rules never saw it. §5e also pins the selector↔markup pairing across files: the
+confirm forms are rendered by `app/routes/proxy.*.tsx`, so renaming one side
+would silently unbind the handler rather than raise anything.
 
 **Storefront preview (PREVIEW token).** Magic-token action `PREVIEW`,
 signature-verified but **never consumed** (TTL 7 days, generous max-use for
@@ -168,8 +250,18 @@ diverge silently). **Restore** copies an old revision's config into a new
 revision and publishes it — every change is reversible without touching the
 theme. The block's `design_source` setting is a theme-editor emergency
 override that can force a preset, bypassing the published config.
+**Theme integration** (v1.2.2, `config.themeSync`): where a theme prints the
+price inside its own Add to cart button ("ADD TO CART - CHF 64.00"),
+`buy-box.js` swaps that one-time money *string* for the subscription
+first-order one inside the button's text nodes while subscription is selected,
+and restores the theme's text on one-time / hidden / gated. Both strings come
+from Liquid (root `data-cellexia-money-onetime` / `data-cellexia-money-sub`, then the JSON
+island on variant/plan change), so the JS still never formats money; the swap
+is a no-op unless the button literally contains the one-time string.
 Attribution: on subscription add-to-carts the widget JS stamps the hidden line
-property `_cx_design` = the active preset key; the ORDERS_CREATE webhook logs
+property `_cellexia_design` = the active preset key (`_cx_design` before
+v1.2.3 — the ORDERS_CREATE handler reads both names, preferring the current
+one, so attribution is continuous across the upgrade); the webhook logs
 one `widget.design_attributed` event (`{designKey, orderId}`) per distinct
 design on the order, and `getDesignPerformance`
 (`app/lib/analytics/queries.server.ts`) aggregates those into take-rate by

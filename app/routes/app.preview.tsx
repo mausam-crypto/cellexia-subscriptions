@@ -38,13 +38,20 @@ import {
   getLaunchState,
   getOverdueContracts,
   goLive,
+  launchFlagDiverged,
   markChecklist,
+  readLaunchMetafield,
   revertToSetup,
+  syncLaunchMetafield,
 } from "~/lib/launch/launch.server";
 import { createDemoContract } from "~/lib/portal/demo.server";
 import { buildMagicUrl } from "~/lib/magiclinks/builder.server";
 import { isKlaviyoConfigured } from "~/lib/klaviyo/client.server";
-import { getProducts } from "~/lib/graphql/index.server";
+import {
+  getProducts,
+  getSubscribableProducts,
+} from "~/lib/graphql/index.server";
+import type { AdminClient, ShopifyProduct } from "~/lib/graphql/index.server";
 
 /**
  * Admin — Preview & launch.
@@ -67,6 +74,13 @@ interface ProductOption {
   id: string;
   title: string;
   handle: string;
+  /**
+   * Why "Preview on product page" cannot work for this product, or null when
+   * it can. See previewBlockedReason() — offering an option that opens a 404
+   * or a page the widget legitimately never renders on, while ticking the
+   * "Storefront previewed" checklist item, is worse than not offering it.
+   */
+  blockedReason: string | null;
 }
 
 interface SubscriberMatch {
@@ -74,6 +88,23 @@ interface SubscriberMatch {
   name: string | null;
   status: string;
 }
+
+/**
+ * The cellexia.launch_status metafield read back from Shopify — the ONLY
+ * thing the storefront gates on. `readable: false` means the lookup itself
+ * failed, in which case nothing is claimed (never cry wolf over a hiccup).
+ */
+interface StorefrontFlag {
+  value: string | null;
+  readable: boolean;
+  diverged: boolean;
+}
+
+const UNREAD_STOREFRONT_FLAG: StorefrontFlag = {
+  value: null,
+  readable: false,
+  diverged: false,
+};
 
 interface ActionData {
   intent: string;
@@ -95,6 +126,89 @@ function actorFromSession(session: {
   onlineAccessInfo?: { associated_user?: { email?: string | null } } | null;
 }): string {
   return session.onlineAccessInfo?.associated_user?.email ?? `admin@${session.shop}`;
+}
+
+/**
+ * Why the storefront preview cannot work for this product, or null.
+ *
+ * Two silent dead ends, both reachable from a perfectly normal setup and both
+ * previously offered as if they were fine:
+ *
+ *  - NOT ACTIVE. Keeping the subscription product in DRAFT until launch is a
+ *    normal way to prepare one. buildStorefrontPreviewUrl happily returns
+ *    https://<shop>/products/<handle>?cx_preview=…, the tab opens the
+ *    storefront 404 page, and the "Storefront previewed" checklist item ticks
+ *    itself anyway — the app then claims a preview that never happened.
+ *  - NO SELLING PLAN GROUP ATTACHED (the config row says SYNCED but the group
+ *    was detached in Shopify, or the sync half-failed). Both block files guard
+ *    on `product.selling_plan_groups.size > 0`, so that product page renders
+ *    NOTHING from this app — no wrapper, no CSS and, critically, no <script>,
+ *    which means buy-box-embed.js never loads and its "no placement anchor
+ *    found" diagnostic cannot fire either. The admin sees an ordinary product
+ *    page and cannot tell "embed not enabled" from "plan not on this product"
+ *    from "widget broken".
+ *
+ * Only PROVEN blockers are reported: an unreadable status or an attachment
+ * lookup that failed (attachedProductIds === null) never invents a reason, so
+ * a Shopify hiccup can never empty the picker.
+ */
+function previewBlockedReason(
+  product: ShopifyProduct,
+  attachedProductIds: Set<string> | null,
+): string | null {
+  const status = (product.status ?? "").toUpperCase();
+  if (status === "DRAFT") {
+    return "Draft in Shopify — publish it before previewing";
+  }
+  if (status === "ARCHIVED") {
+    return "Archived in Shopify — its product page returns 404";
+  }
+  if (attachedProductIds && !attachedProductIds.has(product.id)) {
+    return "No subscription plan attached in Shopify — re-sync it from Plans";
+  }
+  return null;
+}
+
+/**
+ * The storefront-preview picker: every synced product, each annotated with the
+ * reason it cannot be previewed (null = it can). Both Shopify reads are
+ * contained independently — a failure degrades the annotation, never the list.
+ */
+async function loadPreviewProducts(
+  admin: AdminClient,
+  productIds: string[],
+): Promise<ProductOption[]> {
+  if (productIds.length === 0) return [];
+
+  const [attachedProductIds, fetched] = await Promise.all([
+    getSubscribableProducts(admin).then(
+      (rows) => new Set(rows.map((row) => row.id)),
+      (err: unknown) => {
+        console.error("[preview] selling-plan attachment lookup failed", err);
+        return null;
+      },
+    ),
+    getProducts(admin, productIds).then(
+      (rows) => rows,
+      (err: unknown) => {
+        console.error("[preview] product lookup failed", err);
+        return [] as ShopifyProduct[];
+      },
+    ),
+  ]);
+
+  return fetched.flatMap((p) =>
+    p.handle
+      ? [
+          {
+            id: p.id,
+            title: p.title,
+            handle: p.handle,
+            blockedReason: previewBlockedReason(p, attachedProductIds),
+          },
+        ]
+      : [],
+  );
 }
 
 // ── Loader ───────────────────────────────────────────────────────────────────
@@ -143,20 +257,36 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         : Promise.resolve([]),
     ]);
 
-  // Product titles/handles for the storefront preview picker. Skipped for
-  // subscriber-search fetcher requests (?q=) so typing never hits Shopify; a
-  // lookup failure must never break the page (failures are contained).
+  // Product titles/handles for the storefront preview picker, each annotated
+  // with the reason it cannot be previewed (see previewBlockedReason).
+  // Skipped for subscriber-search fetcher requests (?q=) so typing never hits
+  // Shopify; a lookup failure must never break the page (failures are
+  // contained inside loadPreviewProducts).
   let products: ProductOption[] = [];
   if (query.length < SEARCH_MIN_CHARS) {
     const productIds = [
       ...new Set(syncedConfigs.flatMap((c) => parseJsonStringArray(c.productIds))),
     ];
+    products = await loadPreviewProducts(admin, productIds);
+  }
+
+  // Storefront flag read-back. The launch setting is what the admin sees, but
+  // the metafield is what every product page actually reads — if they disagree
+  // (a metafield write that failed, an interrupted go-live) the store is dark
+  // while the app says LIVE, or still selling while the app says SETUP.
+  // Contained like the product lookup: a failed read never breaks the page and
+  // never claims a divergence. Skipped for subscriber-search fetcher requests.
+  let storefrontFlag: StorefrontFlag = UNREAD_STOREFRONT_FLAG;
+  if (query.length < SEARCH_MIN_CHARS) {
     try {
-      products = (await getProducts(admin, productIds)).flatMap((p) =>
-        p.handle ? [{ id: p.id, title: p.title, handle: p.handle }] : [],
-      );
+      const value = await readLaunchMetafield(admin);
+      storefrontFlag = {
+        value,
+        readable: true,
+        diverged: launchFlagDiverged(launch.mode, value),
+      };
     } catch (err) {
-      console.error("[preview] product lookup failed", err);
+      console.error("[preview] launch_status metafield read failed", err);
     }
   }
 
@@ -169,6 +299,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   return json({
     storeDomain: shop.primaryDomain ?? shop.domain,
     launch,
+    storefrontFlag,
     checklist: {
       plansSynced: syncedConfigs.length > 0,
       schedulerHealthy: recentJobRun != null,
@@ -271,6 +402,33 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         toast: `Revert failed: ${message}`,
       });
     }
+  }
+
+  if (intent === "resync-launch-flag") {
+    // Push the launch mode into cellexia.launch_status again. Used when the
+    // read-back banner shows the storefront flag disagreeing with the mode —
+    // e.g. a metafield write that failed after the setting was saved.
+    const launch = await getLaunchState(shop.id);
+    const sync = await syncLaunchMetafield(shop.domain, launch.mode);
+    await logEvent({
+      shopId: shop.id,
+      type: "admin.action",
+      source: "ADMIN",
+      actor,
+      payload: {
+        action: "launch_flag_resynced",
+        mode: launch.mode,
+        ok: sync.ok,
+        error: sync.error ?? null,
+      },
+    });
+    return json<ActionData>({
+      intent,
+      ok: sync.ok,
+      toast: sync.ok
+        ? `Storefront flag re-synced — the store is now ${launch.mode === "LIVE" ? "live" : "dark"}`
+        : `Re-sync failed: ${sync.error ?? "unknown error"}`,
+    });
   }
 
   if (intent === "preview-storefront") {
@@ -550,6 +708,11 @@ export default function PreviewPage() {
 
   const { launch, checklist, overdueCount, overdueSample, products } = data;
   const isLive = launch.mode === "LIVE";
+  const storefrontFlag = data.storefrontFlag;
+
+  // Storefront flag re-sync (shown only when the read-back disagrees).
+  const resyncFetcher = useFetcher<ActionData>();
+  useFetcherToast(resyncFetcher);
 
   // Go-live / revert modals (navigation-form submits, toast via actionData).
   const [goLiveOpen, setGoLiveOpen] = useState(false);
@@ -570,9 +733,14 @@ export default function PreviewPage() {
   const navIntent = navigation.formData?.get("intent");
   const busy = navigation.state !== "idle";
 
-  // Storefront preview.
+  // Storefront preview. Only products whose page can actually show the widget
+  // are selectable — the rest stay listed, disabled, with the reason on the
+  // option, so "why is my product missing?" never becomes a support question.
   const storefrontFetcher = useFetcher<ActionData>();
-  const [productHandle, setProductHandle] = useState(products[0]?.handle ?? "");
+  const previewableProducts = products.filter((p) => p.blockedReason === null);
+  const [productHandle, setProductHandle] = useState(
+    previewableProducts[0]?.handle ?? "",
+  );
   useOpenPreviewUrl(storefrontFetcher);
   useFetcherToast(storefrontFetcher);
 
@@ -649,6 +817,27 @@ export default function PreviewPage() {
                 </Button>
               )}
             </InlineStack>
+            {storefrontFlag.diverged ? (
+              <Banner
+                tone="critical"
+                title="Your store isn't showing what this page says"
+                action={{
+                  content: "Re-sync storefront flag",
+                  loading: resyncFetcher.state !== "idle",
+                  onAction: () =>
+                    resyncFetcher.submit(
+                      { intent: "resync-launch-flag" },
+                      { method: "post" },
+                    ),
+                }}
+              >
+                <p>
+                  {isLive
+                    ? "The app is LIVE, but the cellexia.launch_status flag your theme reads is still “setup” — the subscription widget is hidden on every product page. Re-sync it to finish going live."
+                    : "The app is in SETUP, but the cellexia.launch_status flag your theme reads is still “live” — the subscription widget is visible and purchasable to every visitor. Re-sync it to go dark."}
+                </p>
+              </Banner>
+            ) : null}
             <Text as="p" variant="bodyMd">
               {isLive
                 ? `Live${launch.wentLiveAt ? ` since ${launch.wentLiveAt.slice(0, 10)}` : ""}: the buy-box widget, customer portal, renewal billing and customer notifications are all on.`
@@ -759,6 +948,27 @@ export default function PreviewPage() {
                   a product with a subscribe option.
                 </p>
               </Banner>
+            ) : previewableProducts.length === 0 ? (
+              /* Every synced product is a dead end. Saying so — with the
+                 reason per product — beats offering a link that opens a 404
+                 or a product page this app deliberately renders nothing on. */
+              <Banner
+                tone="warning"
+                title="No product can be previewed yet"
+                action={{ content: "Open Plans", url: "/app/plans" }}
+              >
+                <BlockStack gap="100">
+                  <p>
+                    The plan is synced, but none of its products can show the
+                    widget on the storefront right now:
+                  </p>
+                  {products.map((p) => (
+                    <Text as="p" variant="bodySm" key={p.id}>
+                      {`${p.title} — ${p.blockedReason}`}
+                    </Text>
+                  ))}
+                </BlockStack>
+              </Banner>
             ) : (
               <BlockStack gap="300">
                 <InlineStack gap="300" blockAlign="end" wrap>
@@ -766,8 +976,11 @@ export default function PreviewPage() {
                     <Select
                       label="Product"
                       options={products.map((p) => ({
-                        label: p.title,
+                        label: p.blockedReason
+                          ? `${p.title} — ${p.blockedReason}`
+                          : p.title,
                         value: p.handle,
+                        disabled: p.blockedReason !== null,
                       }))}
                       value={productHandle}
                       onChange={setProductHandle}
@@ -775,6 +988,7 @@ export default function PreviewPage() {
                   </Box>
                   <Button
                     variant="primary"
+                    disabled={!productHandle}
                     loading={storefrontFetcher.state !== "idle"}
                     onClick={() =>
                       storefrontFetcher.submit(

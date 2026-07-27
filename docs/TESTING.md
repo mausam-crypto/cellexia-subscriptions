@@ -240,13 +240,22 @@ these inside the storefront preview session above):
    a `/cart/add` form the embed injects the plan into the theme's AJAX cart
    request, so a silent failure here would sell one-time at full price.
    `https://<store>/cart.js` must show the line's `selling_plan_allocation`
-   and the `_cx_design` property.
+   and the `_cellexia_design` property.
 3. **One-time add unaffected**: select one-time (or a product with no plan)
-   → add to cart → no selling plan, no `_cx_design` property, normal price —
+   → add to cart → no selling plan, no `_cellexia_design` property, normal price —
    the theme's own add-to-cart must behave exactly as before the embed.
 4. **Theme cart UX intact**: the mini-cart/cart drawer still opens and
    updates normally after both kinds of add, and any other purchase widgets
    on the page (e.g. a bundle app) still add their own products correctly.
+5. **Namespace isolation** (cellexialabs.com hosts another app that owns the
+   `cx` prefix — this is what made the widget invisible before v1.2.3). In
+   devtools on the PDP:
+   `document.querySelectorAll('.cx-buybox-embed[data-cellexia-embed]')` must
+   return **exactly one** node, and it must be the one inside the buy column
+   carrying `data-cellexia-mounted="true"`. Then check the other app is
+   untouched: `document.querySelector('.cx.cx--self-contained')` must still be
+   in its original place with **no** `data-cellexia-*` attribute on it, and its
+   own widget must still render and function.
 
 **Buy-box design QA** (repeat whenever you change the design in the **Buy box
 designer** — before launch via the preview link above, after launch on the
@@ -261,13 +270,13 @@ live PDP):
    must follow the selected variant in every preset.
 3. Select the subscription option → add to cart → the cart line carries the
    **selling plan** (frequency text visible on the line) *and* the hidden
-   **`_cx_design` line property** = the active preset key. It is
+   **`_cellexia_design` line property** = the active preset key. It is
    underscore-prefixed, so themes and checkout hide it from customers —
    verify it via `https://<store>/cart.js` (JSON) or on the resulting test
    order's line properties. After the order, the Audit page logs
    `widget.design_attributed`.
 4. **One-time path unaffected**: select one-time → add to cart → the line has
-   **no** selling plan and **no** `_cx_design` property, and checkout is the
+   **no** selling plan and **no** `_cellexia_design` property, and checkout is the
    theme's normal flow.
 5. Know your rollback before you need it: there is **no unpublish** — once a
    design has been published you cannot return to "no config" from the
