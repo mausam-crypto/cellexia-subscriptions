@@ -2,14 +2,8 @@
 
 name = "Cellexia Continuous Treatment"
 handle = "cellexia-continuous-treatment"
-# Set via `shopify app config link` after creating the app in the Partner Dashboard
-client_id = "REPLACE_WITH_CLIENT_ID"
-# PRODUCTION: replace every https://example.com in this file (application_url,
-# [auth].redirect_urls, [app_proxy].url — keep the /proxy path) with the real
-# app host BEFORE the first `shopify app deploy`. include_config_on_deploy
-# pushes this config live as-is; `automatically_update_urls_on_dev` rewrites
-# URLs only during `shopify app dev`, never on deploy.
-application_url = "https://example.com"
+client_id = "82fdbdf7947dce298a06cb43afb6a678"
+application_url = "https://cellexia-subscriptions.onrender.com"
 embedded = true
 
 [build]
@@ -21,9 +15,9 @@ scopes = "read_customers,write_customers,read_orders,read_products,write_product
 
 [auth]
 redirect_urls = [
-  "https://example.com/auth/callback",
-  "https://example.com/auth/shopify/callback",
-  "https://example.com/api/auth/callback"
+  "https://cellexia-subscriptions.onrender.com/auth/callback",
+  "https://cellexia-subscriptions.onrender.com/auth/shopify/callback",
+  "https://cellexia-subscriptions.onrender.com/api/auth/callback"
 ]
 
 [webhooks]
@@ -60,7 +54,7 @@ api_version = "2025-10"
 # on this store — reusing it here would collide with that app's /apps/cellexia/*
 # traffic. Keep this subpath unique across every app installed on the store.
 [app_proxy]
-url = "https://example.com/proxy"
+url = "https://cellexia-subscriptions.onrender.com/proxy"
 prefix = "apps"
 subpath = "cellexia-subscriptions"
 
