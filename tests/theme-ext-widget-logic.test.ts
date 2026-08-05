@@ -711,12 +711,14 @@ describe("treatment-choice.liquid seam contracts", () => {
     expect(liquid).toMatch(/data-cxw-ultra-back-template/);
     expect(liquid).toMatch(/cellexia\.ultra\.basic_link/);
     expect(liquid).toMatch(/cellexia\.ultra\.basic_back/);
-    // merchant overrides use {price}
+    // merchant overrides use {price}, held in a variable so the literal
+    // brace never sits inside a {{ }} output tag (breaks Shopify's validator)
+    expect(liquid).toMatch(/assign cxw_price_placeholder = '\{price\}'/);
     expect(liquid).toMatch(
-      /ultra_link_copy \| replace: '\{price\}', '__PRICE__'/,
+      /ultra_link_copy \| replace: cxw_price_placeholder, '__PRICE__'/,
     );
     expect(liquid).toMatch(
-      /ultra_link_back_copy \| replace: '\{price\}', '__PRICE__'/,
+      /ultra_link_back_copy \| replace: cxw_price_placeholder, '__PRICE__'/,
     );
     // the link renders (hidden or not) for max AND ultra
     expect(liquid).toMatch(/unless cxw_style == 'max' or cxw_style == 'ultra' %\}hidden/);
