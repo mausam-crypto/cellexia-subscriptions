@@ -20,7 +20,8 @@
     "deploy": "shopify app deploy",
     "config:link": "shopify app config link",
     "prisma": "prisma",
-    "setup:postgres": "prisma generate --schema prisma/postgres/schema.prisma && prisma migrate deploy --schema prisma/postgres/schema.prisma"
+    "setup:postgres": "prisma generate --schema prisma/postgres/schema.prisma && prisma migrate deploy --schema prisma/postgres/schema.prisma",
+    "docker-start": "npm run setup:postgres && npm run start"
   },
   "dependencies": {
     "@prisma/client": "^6.6.0",
