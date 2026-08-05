@@ -1,6 +1,6 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
-name = "Cellexia Continuous Treatment"
+name = "Cellexia Subscriptions"
 handle = "cellexia-continuous-treatment"
 client_id = "82fdbdf7947dce298a06cb43afb6a678"
 application_url = "https://cellexia-subscriptions.onrender.com"
