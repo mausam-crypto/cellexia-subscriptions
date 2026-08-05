@@ -1,4 +1,0 @@
-email,first_name,last_name,phone,variant_id,quantity,interval_weeks,next_charge_date,status,price_cents,currency,address1,address2,city,province_code,zip,country_code,payment_method_id,origin
-sophie.turner@example.com,Sophie,Turner,+447700900123,gid://shopify/ProductVariant/45067234871123,1,8,2026-08-04,ACTIVE,4050,GBP,12 Larkspur Road,Flat 2,London,ENG,SW11 6QF,GB,gid://shopify/CustomerPaymentMethod/0a1b2c3d4e5f60718293a4b5c6d7e8f9,recharge
-mei.chen@example.com,Mei,Chen,,gid://shopify/ProductVariant/45067234871456,2,6,2026-08-11,ACTIVE,7290,GBP,88 Marine Parade,,Brighton,ENG,BN2 1AD,GB,gid://shopify/CustomerPaymentMethod/1f2e3d4c5b6a79808f9e0d1c2b3a4958,skio
-amelia.osei@example.com,Amelia,Osei,+447700900456,gid://shopify/ProductVariant/45067234871789,1,12,2026-09-01,PAUSED,3825,GBP,5 Castle Wynd,,Edinburgh,SCT,EH1 2NE,GB,,appstle

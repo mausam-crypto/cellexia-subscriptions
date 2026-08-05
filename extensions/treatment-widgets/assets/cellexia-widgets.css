@@ -1,0 +1,609 @@
+/* Cellexia Continuous Treatment — storefront widget styles.
+   Namespaced .cxw-*; zero global selectors. Fonts come from the theme
+   (@font-face Gobold / argumentum already loaded by the theme bundle). */
+
+.cxw {
+  --cxw-ink: #1d1d1b;
+  --cxw-accent: #b1cded;
+  --cxw-line: #d8d8d8;
+  --cxw-band: #f4f4f4;
+  --cxw-muted: #bababa;
+  --cxw-white: #ffffff;
+  font-family: "argumentum", "Helvetica Neue", Arial, sans-serif;
+  color: var(--cxw-ink);
+  margin: 0 0 20px;
+}
+.cxw *,
+.cxw *::before,
+.cxw *::after {
+  box-sizing: border-box;
+}
+.cxw p,
+.cxw ul,
+.cxw h3 {
+  margin: 0;
+  padding: 0;
+}
+/* The hidden attribute must always beat our own display rules (author CSS
+   otherwise outranks the UA's [hidden] { display: none }). */
+.cxw[hidden],
+.cxw [hidden] {
+  display: none !important;
+}
+
+/* ── Headline ─────────────────────────────────────────────────────────── */
+.cxw-heading {
+  font-family: "Gobold", "Arial Black", sans-serif;
+  font-size: 20px;
+  font-weight: 400;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  margin: 0 0 16px;
+}
+
+/* ── Buttons: pixel parity with theme .btn / .btn--primary ────────────── */
+.cxw-btn {
+  font-family: "argumentum", "Helvetica Neue", Arial, sans-serif;
+  padding: 15px 20px;
+  text-align: center;
+  font-weight: 600;
+  min-width: 175px;
+  font-size: 14px;
+  text-decoration: none;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  display: inline-block;
+  border: none;
+  border-radius: 70px;
+  min-height: 50px;
+  cursor: pointer;
+  transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+}
+.cxw-btn--primary {
+  background: var(--cxw-ink);
+  color: var(--cxw-white);
+  border: 1px solid var(--cxw-ink);
+}
+.cxw-btn--primary:hover {
+  background: var(--cxw-white);
+  color: var(--cxw-ink);
+}
+.cxw-btn--secondary {
+  background: var(--cxw-white);
+  color: var(--cxw-ink);
+  border: 1px solid var(--cxw-ink);
+}
+.cxw-btn--secondary:hover {
+  background: var(--cxw-accent);
+  border-color: var(--cxw-accent);
+}
+.cxw-btn--sm {
+  min-width: 0;
+  min-height: 40px;
+  padding: 10px 18px;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.cxw-btn[disabled],
+.cxw-btn:disabled {
+  cursor: not-allowed;
+  pointer-events: none;
+  opacity: 0.2;
+}
+.cxw-btn:focus-visible,
+.cxw-pill:focus-visible,
+.cxw-card:focus-visible,
+.cxw-linkbtn:focus-visible,
+.cxw-nudge__close:focus-visible {
+  outline: 2px solid var(--cxw-accent);
+  outline-offset: 2px;
+}
+
+/* ── Widget A: choice cards ───────────────────────────────────────────── */
+.cxw-cards {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 14px;
+  margin: 0 0 18px;
+}
+@media (min-width: 700px) {
+  .cxw-cards {
+    grid-template-columns: 3fr 2fr;
+    align-items: stretch;
+  }
+}
+.cxw-card {
+  position: relative;
+  background: var(--cxw-white);
+  border: 1px solid var(--cxw-line);
+  border-radius: 8px;
+  padding: 20px 18px 18px;
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+}
+.cxw-card--treatment {
+  padding: 26px 20px 22px;
+}
+.cxw-card.is-selected {
+  border: 2px solid var(--cxw-ink);
+  /* keep layout stable when border grows 1px → 2px */
+  padding: calc(20px - 1px) calc(18px - 1px) calc(18px - 1px);
+}
+.cxw-card--treatment.is-selected {
+  padding: calc(26px - 1px) calc(20px - 1px) calc(22px - 1px);
+}
+.cxw-card--basic {
+  color: var(--cxw-muted);
+}
+.cxw-card--basic .cxw-price__current {
+  color: var(--cxw-muted);
+}
+.cxw-ribbon {
+  position: absolute;
+  top: -11px;
+  left: 16px;
+  background: var(--cxw-accent);
+  color: var(--cxw-ink);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  padding: 4px 12px;
+  border-radius: 70px;
+}
+.cxw-card__title {
+  display: block;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  margin: 0 0 8px;
+}
+.cxw-card--treatment .cxw-card__title {
+  font-size: 16px;
+}
+.cxw-card__price {
+  display: block;
+  margin: 0 0 2px;
+}
+.cxw-card__per {
+  display: block;
+  font-size: 12px;
+  color: var(--cxw-muted);
+  margin: 0 0 10px;
+}
+.cxw-card__bullets {
+  list-style: none;
+  margin: 10px 0 0;
+}
+.cxw-card__bullets li {
+  position: relative;
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 4px 0;
+}
+.cxw-card__bullets li::before {
+  content: "\2713"; /* check */
+  position: absolute;
+  left: 0;
+  top: 0;
+  font-size: 12px;
+}
+.cxw-card__bullets--muted li::before {
+  content: "\2013"; /* en dash */
+}
+
+/* ── Committed Treatment card (third choice) ──────────────────────────── */
+/* three-up layout when the committed card is on (after the base rules so
+   the equal-specificity override wins) */
+@media (min-width: 700px) {
+  .cxw-cards--triple {
+    grid-template-columns: 1fr 1fr 1fr;
+    align-items: stretch;
+  }
+}
+/* thin brand-blue accent that survives the is-selected border swap */
+.cxw-card--committed::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  border-radius: 8px 8px 0 0;
+  background: var(--cxw-accent);
+}
+.cxw-card--committed .cxw-card__title {
+  padding-right: 26px; /* room for the "?" button */
+}
+.cxw-terms-btn {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 1px solid var(--cxw-ink);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--cxw-ink);
+  opacity: 0.55; /* muted until engaged */
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: help;
+}
+.cxw-terms-btn:hover,
+.cxw-terms-btn[aria-expanded="true"] {
+  opacity: 1;
+}
+.cxw-terms-btn:focus-visible {
+  outline: 2px solid var(--cxw-accent);
+  outline-offset: 2px;
+  opacity: 1;
+}
+/* anchored inside the (position:relative) card; the left+right clamp keeps
+   it inside the card — and so inside the viewport — on small screens, and
+   margin-left:auto right-aligns it under the "?" when there is room */
+.cxw-tooltip {
+  position: absolute;
+  top: 42px;
+  left: 8px;
+  right: 8px;
+  z-index: 30; /* above sibling cards */
+  margin-left: auto;
+  max-width: 280px;
+  background: var(--cxw-white);
+  border: 1px solid var(--cxw-line);
+  border-radius: 8px;
+  box-shadow: 0 4px 14px rgba(29, 29, 27, 0.12);
+  padding: 12px 14px;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.5;
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--cxw-ink);
+  cursor: auto;
+}
+.cxw-card__terms {
+  font-size: 13px;
+  line-height: 1.5;
+  color: #808080;
+  margin: 8px 0 0;
+}
+.cxw-tooltip[hidden],
+.cxw-card__terms[hidden] {
+  display: none;
+}
+
+/* ── Subscription Max style (.cxw--max): one confident plan path ──────── */
+/* The treatment card IS the purchase path: full width, slightly roomier.
+   Specificity (.cxw--max .cxw-cards) beats the 700px column rules above.
+   When the committed card also renders (--triple), the two plan cards sit
+   side by side — still no basic card. */
+.cxw--max .cxw-cards {
+  grid-template-columns: 1fr;
+}
+@media (min-width: 700px) {
+  .cxw--max .cxw-cards--triple {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+.cxw--max .cxw-card--treatment {
+  padding: 30px 24px 26px;
+}
+.cxw--max .cxw-card--treatment.is-selected {
+  padding: calc(30px - 1px) calc(24px - 1px) calc(26px - 1px);
+}
+/* Alone, the plan card needs no "Recommended" ribbon (nothing to be
+   recommended over); it stays when the committed card renders too. */
+.cxw--max .cxw-cards:not(.cxw-cards--triple) .cxw-ribbon {
+  display: none;
+}
+/* The demoted one-time purchase: a quiet, honest text link — never a card. */
+.cxw-basic-link {
+  display: block;
+  margin: 10px auto 0;
+  padding: 0;
+  background: none;
+  border: none;
+  font-family: inherit;
+  font-size: 13px;
+  color: #808080;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.cxw-basic-link:focus-visible {
+  outline: 2px solid var(--cxw-accent);
+  outline-offset: 2px;
+}
+.cxw-basic-link[aria-pressed="true"] {
+  color: #1d1d1b;
+}
+
+/* ── Subscription Max Ultra (.cxw--ultra): no subscription concept ────── */
+/* No card chrome at all: Liquid-ultra renders no heading/cards/nudge; the
+   class rules below are defensive for config-restyled DOM (JS also stamps
+   [hidden]) so choice-rendered markup can never flash its cards in ultra. */
+.cxw--ultra .cxw-heading,
+.cxw--ultra .cxw-cards,
+.cxw--ultra .cxw-nudge {
+  display: none;
+}
+/* The minimal price line: the plan price simply IS the price — plain ink,
+   no compare, no badge. */
+.cxw-ultra-price {
+  font-family: "argumentum", "Helvetica Neue", Arial, sans-serif;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--cxw-ink);
+  margin: 0 0 10px;
+}
+
+/* ── Price display ────────────────────────────────────────────────────── */
+.cxw-price__current {
+  font-weight: 700;
+  font-size: 18px;
+}
+.cxw-price__compare {
+  color: var(--cxw-muted);
+  font-size: 14px;
+  margin-left: 8px;
+}
+
+/* ── Widget B: quantity pills + cadence ───────────────────────────────── */
+.cxw-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  margin: 0 0 8px;
+}
+.cxw-qty {
+  margin: 0 0 18px;
+}
+.cxw-pills {
+  display: inline-flex;
+  gap: 4px;
+  padding: 4px;
+  background: var(--cxw-white);
+  border: 1px solid var(--cxw-line);
+  border-radius: 70px;
+}
+.cxw-pill {
+  min-width: 48px;
+  min-height: 42px;
+  padding: 0 16px;
+  border: 1px solid transparent;
+  border-radius: 70px;
+  background: transparent;
+  color: var(--cxw-ink);
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+.cxw-pill:hover {
+  background: var(--cxw-band);
+}
+.cxw-pill.is-selected {
+  background: var(--cxw-ink);
+  color: var(--cxw-white);
+}
+.cxw-cadence {
+  font-size: 14px;
+  line-height: 1.5;
+  margin: 10px 0 0;
+}
+.cxw-permonth {
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 4px 0 0;
+  color: #808080;
+}
+.cxw-permonth[hidden] {
+  display: none;
+}
+.cxw-advanced {
+  margin: 10px 0 0;
+}
+.cxw-advanced__toggle {
+  font-size: 12px;
+  color: var(--cxw-muted);
+  cursor: pointer;
+  text-decoration: underline;
+  list-style: none;
+}
+.cxw-advanced__toggle::-webkit-details-marker {
+  display: none;
+}
+.cxw-advanced[open] .cxw-advanced__toggle {
+  color: var(--cxw-ink);
+  margin-bottom: 8px;
+}
+.cxw-select {
+  font-family: inherit;
+  font-size: 14px;
+  color: var(--cxw-ink);
+  background: var(--cxw-white);
+  border: 1px solid var(--cxw-line);
+  border-radius: 6px;
+  padding: 10px 12px;
+  max-width: 100%;
+}
+.cxw-variant {
+  margin: 0 0 16px;
+}
+
+/* ── Widget E: inline comparison nudge ────────────────────────────────── */
+.cxw-nudge {
+  margin: 0 0 18px;
+}
+.cxw-nudge__band {
+  position: relative;
+  background: var(--cxw-band);
+  border: 1px solid var(--cxw-line);
+  border-radius: 8px;
+  padding: 16px 44px 16px 16px;
+}
+.cxw-nudge__close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  color: var(--cxw-ink);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 50%;
+}
+.cxw-nudge__close:hover {
+  background: var(--cxw-line);
+}
+.cxw-nudge__title {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  margin: 0 0 10px;
+}
+.cxw-nudge__compare {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+  margin: 0 0 8px;
+}
+.cxw-nudge__label {
+  display: block;
+  font-size: 11px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--cxw-muted);
+}
+.cxw-nudge__value {
+  font-size: 15px;
+  font-weight: 700;
+}
+.cxw-nudge__saving {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0 0 8px;
+}
+.cxw-nudge__saving:empty {
+  display: none;
+}
+.cxw-nudge__line {
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 0 0 6px;
+}
+.cxw-linkbtn {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 6px 0 0;
+  color: var(--cxw-ink);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* ── Add to cart ──────────────────────────────────────────────────────── */
+.cxw-atc {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+}
+.cxw-atc__price {
+  font-weight: 700;
+}
+.cxw-assurance {
+  font-size: 12px;
+  color: var(--cxw-muted);
+  text-align: center;
+  margin: 8px 0 0;
+}
+.cxw-error {
+  font-size: 13px;
+  color: #9c3a2e;
+  text-align: center;
+  margin: 8px 0 0;
+}
+
+/* ── Widget F: cart conversion rows ───────────────────────────────────── */
+.cxw-convrow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  background: var(--cxw-band);
+  border: 1px solid var(--cxw-line);
+  border-radius: 8px;
+  padding: 12px 16px;
+  margin: 8px 0;
+}
+.cxw-convrow__title {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+.cxw-convrow__line {
+  display: block;
+  font-size: 13px;
+  line-height: 1.4;
+  margin: 2px 0 0;
+}
+.cxw-convrow__flex {
+  display: block;
+  font-size: 11px;
+  color: var(--cxw-muted);
+  margin: 2px 0 0;
+}
+.cxw-convrow.is-done .cxw-convrow__line {
+  font-weight: 600;
+}
+@media (max-width: 540px) {
+  .cxw-convrow {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .cxw-convrow .cxw-btn--sm {
+    width: 100%;
+  }
+}
+
+/* ── Editor note ──────────────────────────────────────────────────────── */
+.cxw-editor-note {
+  border: 1px dashed var(--cxw-line);
+  border-radius: 8px;
+  padding: 16px;
+  font-size: 13px;
+  color: var(--cxw-muted);
+}
+
+/* ── Motion preferences ───────────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  .cxw *,
+  .cxw *::before,
+  .cxw *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+}

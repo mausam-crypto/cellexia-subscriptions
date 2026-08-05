@@ -1,0 +1,672 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cellexia — Storefront Widget Preview</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="./preview.css?v=20260802b">
+  <link rel="stylesheet" href="./cellexia-widgets.css?v=20260802b">
+</head>
+<body>
+
+  <header class="demo-header">
+    <span class="demo-header__wordmark">Cellexia</span>
+  </header>
+
+  <!-- Preview-only chrome: switch between the three widget styles. On a live
+       shop this is the block's default_style / market_styles settings. -->
+  <nav
+    class="demo-stylebar"
+    data-demo-stylebar
+    aria-label="Widget style preview"
+    style="max-width: 1080px; margin: 16px auto 0; padding: 0 20px; font-size: 13px; color: #808080;"
+  >
+    Widget style:
+    <a data-demo-style="choice" href="./widget.html" style="color: inherit; margin-left: 8px;">Choice</a>
+    <a data-demo-style="max" href="./widget.html?style=max" style="color: inherit; margin-left: 8px;">Subscription Max</a>
+    <a data-demo-style="ultra" href="./widget.html?style=ultra" style="color: inherit; margin-left: 8px;">Max Ultra</a>
+  </nav>
+
+  <main class="pdp">
+    <div class="pdp-grid">
+
+      <div class="pdp-media" aria-hidden="true">
+        <span class="pdp-media__initial">C</span>
+      </div>
+
+      <div class="pdp-info">
+        <h1 class="pdp-title">Cellexia Regenerating Serum</h1>
+        <p class="pdp-price">&euro;79,00</p>
+        <p class="pdp-desc">
+          Peptide-complex serum for daily cellular regeneration.
+          Clinically balanced, fragrance-free. 30&nbsp;ml.
+        </p>
+
+        <!-- ================================================================
+          Widgets A + B + E — hand-transcribed output of
+          extensions/treatment-widgets/blocks/treatment-choice.liquid for:
+            product  "Cellexia Regenerating Serum", id 8801929003123
+            variant  "Default Title", id 44120000123456, €79.00 (7900 cents)
+            plans    "Every 4 weeks"  (id 690000000101, 15% off → 6715)
+                     "Every 8 weeks"  (id 690000000102, 15% off → 6715)
+                     "Every 12 weeks" (id 690000000103, 15% off → 6715)
+                     "Committed — every 4 weeks"  (id 690000000201, 20% → 6320)
+                     "Committed — every 8 weeks"  (id 690000000202, 20% → 6320)
+                     "Committed — every 12 weeks" (id 690000000203, 20% → 6320)
+                     (uniform % across cadences — longer intervals must never
+                      discount less, or more units would cost more per unit)
+            one-time allowed (requires_selling_plan = false), not B2B,
+            money_format "€{{amount_with_comma_separator}}", block.id "demo",
+            block settings at schema defaults EXCEPT enable_committed = true
+            (committed_position "2", committed_plan_match "commit" → pool
+            201/202/203 via name match; committed card renders second).
+          Liquid default-plan rule (interval closest to the qty-1 cadence of
+          4 weeks, committed names excluded from the standard pool) picks
+          "Every 4 weeks" → first-paint price €67,15, 15%; the committed
+          default is "Committed — every 4 weeks" → €63,20, 20%.
+          Style: default_style "choice" / empty market_styles resolve to
+          cxw_style "choice" (data-cxw-style + cxw--choice class below); the
+          quiet one-time link after the add-to-cart button and the minimal
+          ultra price line are rendered hidden in this style (Liquid keeps
+          both in the DOM so a config restyle to "max"/"ultra" only has to
+          unhide them). New line settings at schema defaults:
+          quantity_label "Units per delivery", show_cadence_line /
+          show_permonth_line / show_price_line all true (data-show-* attrs).
+          The ?style=max preview toggle (inline snippet before the widget
+          JS) re-stamps this markup into the exact "max" Liquid output:
+          basic card and nudge not rendered, link visible. ?style=ultra
+          re-stamps it into the exact "ultra" Liquid output: heading, ALL
+          cards (committed included — never in ultra) and nudge not
+          rendered, price line visible, committed options absent from the
+          rhythm select, link visible with the NEUTRAL ultra copy, and the
+          qty label set to "Units" (simulating the merchant's
+          quantity_label setting for ultra).
+          {{ block.shopify_attributes }} is omitted: theme-editor-only.
+        ================================================================= -->
+        <div
+          class="cxw cxw-choice cxw--choice"
+          data-cxw-choice
+          data-cxw-style="choice"
+          data-product-id="8801929003123"
+          data-selected-variant="44120000123456"
+          data-requires-plan="false"
+          data-money-format="&euro;{{amount_with_comma_separator}}"
+          data-default-percent="15"
+          data-cadence-defaults='{"1": 4, "2": 8, "3": 12}'
+          data-enable-a="true"
+          data-enable-b="true"
+          data-enable-e="true"
+          data-enable-nudge-in-max="false"
+          data-show-cadence-line="true"
+          data-show-permonth-line="true"
+          data-show-price-line="true"
+          data-committed-enabled="true"
+          data-committed-position="2"
+          data-committed-plan-match="commit"
+          style="--cxw-ink: #1D1D1B; --cxw-accent: #B1CDED; --cxw-line: #D8D8D8; --cxw-band: #F4F4F4;"
+        >
+          <script type="application/json" data-cxw-plans>
+            [
+              {"id": 690000000101, "name": "Every 4 weeks", "option": "4 weeks", "valueType": "percentage", "value": 15.0},
+              {"id": 690000000102, "name": "Every 8 weeks", "option": "8 weeks", "valueType": "percentage", "value": 15.0},
+              {"id": 690000000103, "name": "Every 12 weeks", "option": "12 weeks", "valueType": "percentage", "value": 15.0},
+              {"id": 690000000201, "name": "Committed — every 4 weeks", "option": "4 weeks", "valueType": "percentage", "value": 20.0},
+              {"id": 690000000202, "name": "Committed — every 8 weeks", "option": "8 weeks", "valueType": "percentage", "value": 20.0},
+              {"id": 690000000203, "name": "Committed — every 12 weeks", "option": "12 weeks", "valueType": "percentage", "value": 20.0}
+            ]
+          </script>
+          <script type="application/json" data-cxw-committed-plans>
+            [690000000201, 690000000202, 690000000203]
+          </script>
+          <script type="application/json" data-cxw-variants>
+            [
+              {"id": 44120000123456, "title": "Default Title", "available": true, "priceCents": 7900, "compareAtCents": 0, "planPrices": {
+                "690000000101": 6715,
+                "690000000102": 6715,
+                "690000000103": 6715,
+                "690000000201": 6320,
+                "690000000202": 6320,
+                "690000000203": 6320
+              }}
+            ]
+          </script>
+
+          <h3 class="cxw-heading" data-cxw-heading>Choose your treatment</h3>
+
+          <!-- Widget A: treatment choice cards (committed at position 2) -->
+          <div class="cxw-cards cxw-cards--triple" role="radiogroup" aria-label="Treatment options">
+            <div
+              class="cxw-card cxw-card--treatment is-selected"
+              role="radio"
+              aria-checked="true"
+              tabindex="0"
+              data-cxw-mode="treatment"
+            >
+              <span class="cxw-ribbon">Recommended</span>
+              <span class="cxw-card__title">Continuous Treatment</span>
+              <span class="cxw-price cxw-card__price">
+                <span class="cxw-price__current" data-cxw-treatment-price>&euro;67,15</span><s class="cxw-price__compare" data-cxw-treatment-compare>&euro;79,00</s>
+              </span>
+              <span class="cxw-card__per">per delivery</span>
+              <ul class="cxw-card__bullets">
+                <li>Designed for continued visible improvement</li>
+                <li
+                  data-cxw-savings-copy
+                  data-cxw-savings-template="Save __PERCENT__%"
+                >Save 15%</li>
+                <li>Adjust, delay or cancel online</li>
+              </ul>
+            </div>
+
+            <div
+              class="cxw-card cxw-card--committed"
+              role="radio"
+              aria-checked="false"
+              tabindex="-1"
+              data-cxw-mode="committed"
+            >
+              <span class="cxw-card__title">Committed Treatment</span>
+              <button
+                type="button"
+                class="cxw-terms-btn"
+                data-cxw-terms-toggle
+                aria-label="About the Committed Treatment Plan terms"
+                aria-describedby="cxw-terms-demo"
+                aria-expanded="false"
+              >?</button>
+              <div class="cxw-tooltip" role="tooltip" id="cxw-terms-demo" hidden>The Committed Treatment Plan gives you our best price in exchange for your first 3 deliveries arriving as scheduled. During the commitment your delivery schedule stays fixed &mdash; pausing, delaying, skipping and cancelling unlock after your 3rd delivery. From then on, full flexibility: adjust, delay or cancel online.</div>
+              <span class="cxw-price cxw-card__price">
+                <span class="cxw-price__current" data-cxw-committed-price>&euro;63,20</span><s class="cxw-price__compare" data-cxw-committed-compare>&euro;79,00</s>
+              </span>
+              <span class="cxw-card__per">per delivery</span>
+              <ul class="cxw-card__bullets">
+                <li>Our best price on every delivery</li>
+                <li>Everything in Continuous Treatment</li>
+                <li>Full flexibility after 3 deliveries</li>
+              </ul>
+              <p class="cxw-card__terms" data-cxw-committed-terms hidden>Commit to at least 3 deliveries and get 20% off</p>
+            </div>
+
+            <div
+              class="cxw-card cxw-card--basic"
+              role="radio"
+              aria-checked="false"
+              tabindex="-1"
+              data-cxw-mode="basic"
+            >
+              <span class="cxw-card__title">Basic Purchase</span>
+              <span class="cxw-price cxw-card__price">
+                <span class="cxw-price__current" data-cxw-basic-price>&euro;79,00</span>
+              </span>
+              <ul class="cxw-card__bullets cxw-card__bullets--muted">
+                <li>One delivery</li>
+                <li>Standard price</li>
+                <li>No ongoing treatment benefits</li>
+              </ul>
+            </div>
+          </div>
+
+          <!-- Ultra: minimal price line — plan unit price, plain, no compare.
+               Liquid renders it hidden in choice/max; ?style=ultra (or a
+               widget-config restyle) unhides it. -->
+          <p class="cxw-ultra-price" data-cxw-ultra-price hidden>&euro;67,15</p>
+
+          <!-- Widget E: inline comparison (revealed when Basic Purchase is selected) -->
+          <div
+            class="cxw-nudge"
+            data-cxw-nudge
+            data-cxw-annual-template="Estimated saving over a year: __AMOUNT__"
+            hidden
+          >
+            <div class="cxw-nudge__band" role="note">
+              <button type="button" class="cxw-nudge__close" data-cxw-nudge-dismiss aria-label="Dismiss this comparison">&times;</button>
+              <p class="cxw-nudge__title">A quick comparison before you decide</p>
+              <div class="cxw-nudge__compare">
+                <div class="cxw-nudge__col">
+                  <span class="cxw-nudge__label">Basic Purchase</span>
+                  <span class="cxw-nudge__value" data-cxw-nudge-basic>&euro;79,00</span>
+                </div>
+                <div class="cxw-nudge__col">
+                  <span class="cxw-nudge__label">Continuous Treatment</span>
+                  <span class="cxw-nudge__value" data-cxw-nudge-plan>&euro;67,15</span>
+                </div>
+              </div>
+              <p class="cxw-nudge__saving" data-cxw-nudge-annual></p>
+              <p class="cxw-nudge__line">Results build with continuity &mdash; a steady routine protects the progress you make between deliveries.</p>
+              <p class="cxw-nudge__line">You stay in control: adjust, delay or cancel online, anytime.</p>
+              <button type="button" class="cxw-linkbtn" data-cxw-nudge-switch>Switch to Continuous Treatment</button>
+            </div>
+          </div>
+
+          <!-- Own variant selector: NOT rendered — the demo product has a
+               single variant (Liquid guard: product.variants.size > 1). -->
+
+          <!-- Widget B: quantity → cadence -->
+          <div class="cxw-qty" data-cxw-qty-widget>
+            <span class="cxw-label" id="cxw-qty-label-demo">Units per delivery</span>
+            <div class="cxw-pills" role="radiogroup" aria-labelledby="cxw-qty-label-demo">
+              <button type="button" class="cxw-pill is-selected" role="radio" aria-checked="true" tabindex="0" data-cxw-qty="1" aria-label="1 unit per delivery">1</button>
+              <button type="button" class="cxw-pill" role="radio" aria-checked="false" tabindex="-1" data-cxw-qty="2" aria-label="2 units per delivery">2</button>
+              <button type="button" class="cxw-pill" role="radio" aria-checked="false" tabindex="-1" data-cxw-qty="3" aria-label="3 units per delivery">3</button>
+            </div>
+            <p
+              class="cxw-cadence"
+              data-cxw-cadence
+              data-cxw-cadence-template="Delivered every __WEEKS__ weeks &mdash; adjust anytime"
+              data-cxw-cadence-committed-template="Delivered every __WEEKS__ weeks &mdash; on schedule for your first 3 deliveries"
+              aria-live="polite"
+            >
+              Delivered every 4 weeks &mdash; adjust anytime
+            </p>
+            <p
+              class="cxw-permonth"
+              data-cxw-permonth
+              data-cxw-permonth-template="About __MONTHLY__ a month"
+              data-cxw-permonth-multi-template="__QTY__ &times; __UNIT__ per delivery &mdash; still about __MONTHLY__ a month, with fewer deliveries"
+              aria-live="polite"
+              hidden
+            ></p>
+            <details class="cxw-advanced" data-cxw-advanced>
+              <summary class="cxw-advanced__toggle">Prefer a different rhythm?</summary>
+              <label class="cxw-label" for="cxw-plan-demo">Delivery rhythm</label>
+              <select id="cxw-plan-demo" class="cxw-select" data-cxw-plan-select>
+                <option value="690000000101">Every 4 weeks</option>
+                <option value="690000000102">Every 8 weeks</option>
+                <option value="690000000103">Every 12 weeks</option>
+                <option value="690000000201">Committed &mdash; every 4 weeks</option>
+                <option value="690000000202">Committed &mdash; every 8 weeks</option>
+                <option value="690000000203">Committed &mdash; every 12 weeks</option>
+              </select>
+            </details>
+          </div>
+
+          <!-- Add to cart -->
+          <div class="cxw-atc-row">
+            <button
+              type="button"
+              class="cxw-btn cxw-btn--primary cxw-atc"
+              data-cxw-atc
+              data-label-add="Add to cart"
+              data-label-adding="Adding&hellip;"
+              data-label-added="Added to cart"
+              data-label-oos="Sold out"
+            >
+              <span data-cxw-atc-label>Add to cart</span>
+              <span class="cxw-atc__price" data-cxw-atc-price>&euro;67,15</span>
+            </button>
+            <!-- Quiet one-time link (Subscription Max + Max Ultra). In the
+                 choice style Liquid renders it hidden; ?style=max/ultra (or
+                 a widget-config style override) reveals it. Both template
+                 sets are stamped — the ultra pair is NEUTRAL (never names
+                 the plan; ultra_link_copy settings blank → locale
+                 cellexia.ultra.* defaults). -->
+            <button
+              type="button"
+              class="cxw-basic-link"
+              data-cxw-basic-link
+              aria-pressed="false"
+              data-cxw-basic-link-template="Prefer a single delivery? Buy once for __PRICE__"
+              data-cxw-basic-back-template="Buying once at __PRICE__ &mdash; switch back to Continuous Treatment"
+              data-cxw-ultra-link-template="Prefer a single delivery? Buy once for __PRICE__"
+              data-cxw-ultra-back-template="Buying once at __PRICE__ &mdash; switch back"
+              hidden
+            >Prefer a single delivery? Buy once for &euro;79,00</button>
+            <p
+              class="cxw-assurance"
+              data-cxw-assurance
+              data-cxw-assurance-default="Adjust, delay or cancel online"
+              data-cxw-assurance-committed="Full flexibility after your first 3 deliveries &mdash; then adjust, delay or cancel online"
+            >Adjust, delay or cancel online</p>
+            <p class="cxw-error" data-cxw-error role="alert" hidden>Something didn't go through &mdash; please try again.</p>
+          </div>
+        </div>
+        <!-- ============================ end widgets A/B/E ================ -->
+      </div>
+    </div>
+
+    <section class="cart-preview" aria-labelledby="cart-preview-heading">
+      <h2 class="cart-preview__heading" id="cart-preview-heading">Cart preview</h2>
+
+      <!-- Mock cart line: same product added as a one-time purchase (the
+           state widget F targets). Demo chrome, not extension output. -->
+      <div class="cart-line">
+        <div class="cart-line__thumb" aria-hidden="true">C</div>
+        <div class="cart-line__info">
+          <span class="cart-line__title">Cellexia Regenerating Serum</span>
+          <span class="cart-line__meta">One-time purchase &middot; Qty 1</span>
+        </div>
+        <span class="cart-line__price">&euro;79,00</span>
+      </div>
+
+      <!-- ================================================================
+        Widget F — hand-transcribed output of
+        extensions/treatment-widgets/blocks/cart-conversion.liquid for a
+        cart holding the line above (no selling plan applied). The Liquid
+        picks the cheapest allocation in the product's first group:
+        "Every 4 weeks" → 6715 vs 7900 → 15%. data-line is forloop.index
+        (1-based). Not B2B; block color settings at schema defaults.
+      ================================================================= -->
+      <div
+        class="cxw cxw-cartconv"
+        data-cxw-cart
+        style="--cxw-ink: #1D1D1B; --cxw-accent: #B1CDED; --cxw-line: #D8D8D8; --cxw-band: #F4F4F4;"
+      >
+        <div
+          class="cxw-convrow"
+          data-cxw-convrow
+          data-line="1"
+          data-quantity="1"
+          data-plan-id="690000000101"
+          data-percent="15"
+          data-product-id="8801929003123"
+          data-variant-id="44120000123456"
+        >
+          <div class="cxw-convrow__copy">
+            <span class="cxw-convrow__title">Cellexia Regenerating Serum</span>
+            <span class="cxw-convrow__line">Make this a Continuous Treatment and save 15% today</span>
+            <span class="cxw-convrow__flex">Adjust, delay or cancel online</span>
+          </div>
+          <button
+            type="button"
+            class="cxw-btn cxw-btn--secondary cxw-btn--sm"
+            data-cxw-convert
+            data-label-done="Done &mdash; this delivery is now part of your treatment plan"
+          >
+            Save 15%
+          </button>
+        </div>
+      </div>
+      <!-- ============================ end widget F ===================== -->
+    </section>
+  </main>
+
+  <!-- Presence of a .mini-cart node routes the widget's afterCartMutation()
+       into its mini-cart refresh branch (see shim below) instead of the
+       redirect-to-/cart fallback. Empty on purpose. -->
+  <div class="mini-cart" hidden aria-hidden="true"></div>
+
+  <p class="demo-footnote">
+    Local preview &mdash; real assets from <code>extensions/treatment-widgets</code>;
+    on Shopify this renders as an app block in the theme editor.
+  </p>
+
+  <script>
+    /* Style toggle — runs BEFORE cellexia-widgets.js so the widget boots
+       against Liquid-identical first-paint DOM. ?style=max re-stamps the
+       choice transcription above into the EXACT output
+       treatment-choice.liquid produces for cxw_style "max": root class +
+       data-cxw-style swapped, basic card not rendered, Widget E nudge not
+       rendered (enable_nudge_in_max defaults to false), quiet one-time
+       link visible. ?style=ultra re-stamps it into the EXACT "ultra"
+       output: no heading, no cards AT ALL (committed included — cards are
+       choice-framing), no nudge, minimal price line visible
+       (show_price_line default true), committed options absent from the
+       rhythm select, neutral link copy visible, and the qty label "Units"
+       (the merchant's quantity_label setting for ultra). */
+    (function () {
+      'use strict';
+      var m = window.location.search.match(/[?&]style=(max|ultra)(?:&|$)/);
+      var style = m ? m[1] : 'choice';
+      var bar = document.querySelector('[data-demo-stylebar]');
+      if (bar) {
+        var links = bar.querySelectorAll('a[data-demo-style]');
+        for (var i = 0; i < links.length; i++) {
+          if (links[i].getAttribute('data-demo-style') === style) {
+            links[i].setAttribute('aria-current', 'true');
+            links[i].style.fontWeight = '700';
+            links[i].style.textDecoration = 'none';
+          }
+        }
+      }
+      if (style === 'choice') return;
+      var root = document.querySelector('[data-cxw-choice]');
+      if (!root) return;
+      root.setAttribute('data-cxw-style', style);
+      root.classList.remove('cxw--choice');
+      root.classList.add('cxw--' + style);
+      var nudge = root.querySelector('[data-cxw-nudge]');
+      if (nudge) nudge.parentNode.removeChild(nudge);
+      var link = root.querySelector('[data-cxw-basic-link]');
+      if (link) link.removeAttribute('hidden');
+      if (style === 'max') {
+        var basic = root.querySelector('.cxw-card--basic');
+        if (basic) basic.parentNode.removeChild(basic);
+        return;
+      }
+      /* ultra: the subscription is not presented as a concept at all */
+      var heading = root.querySelector('[data-cxw-heading]');
+      if (heading) heading.parentNode.removeChild(heading);
+      var cards = root.querySelector('.cxw-cards');
+      if (cards) cards.parentNode.removeChild(cards);
+      var price = root.querySelector('[data-cxw-ultra-price]');
+      if (price) price.removeAttribute('hidden');
+      var qtyLabel = document.getElementById('cxw-qty-label-demo');
+      if (qtyLabel) qtyLabel.textContent = 'Units';
+      var planSel = root.querySelector('[data-cxw-plan-select]');
+      if (planSel) {
+        for (var j = planSel.options.length - 1; j >= 0; j--) {
+          if (/commit/i.test(planSel.options[j].text)) planSel.remove(j);
+        }
+      }
+      /* first-paint link text: ultra locale default (same string as max's
+         link state; only the back state differs — it never names the plan) */
+      if (link) link.textContent = 'Prefer a single delivery? Buy once for €79,00';
+    })();
+  </script>
+
+  <script>
+    /* Cellexia demo shim — mocks the Shopify storefront surface so the REAL
+       widget JS (./cellexia-widgets.js?v=20260802b, unmodified copy) runs end-to-end
+       without a store. Must execute before cellexia-widgets.js loads. */
+    (function () {
+      'use strict';
+
+      var TAG = '[cellexia demo]';
+
+      /* ── (b) Shopify globals the widget reads ──────────────────────────
+         shopRoot() reads window.Shopify.routes.root. Money is formatted by
+         the widget itself (CX.formatMoney + the data-money-format attr), so
+         no Shopify money helper is strictly required — one is provided
+         anyway as a guard for any theme script that expects it. */
+      window.Shopify = window.Shopify || {};
+      window.Shopify.routes = window.Shopify.routes || {};
+      if (!window.Shopify.routes.root) window.Shopify.routes.root = '/';
+      if (!window.Shopify.formatMoney) {
+        window.Shopify.formatMoney = function (cents) {
+          return '€' + (Math.round(cents || 0) / 100).toFixed(2).replace('.', ',');
+        };
+      }
+
+      /* Fresh demo on every reload: the real JS shows the Widget E nudge
+         only once per session (sessionStorage "cxw_nudge_<productId>").
+         Clearing the flag here lets every reload demonstrate the full
+         Basic-Purchase → comparison flow while still exercising the real
+         once-per-session code path within a single page view. */
+      try {
+        for (var i = window.sessionStorage.length - 1; i >= 0; i--) {
+          var key = window.sessionStorage.key(i);
+          if (key && key.indexOf('cxw_nudge_') === 0) window.sessionStorage.removeItem(key);
+        }
+      } catch (e) { /* storage unavailable — nudge then simply stays hidden */ }
+
+      /* ── Branded toast ────────────────────────────────────────────────── */
+      var toastEl = null;
+      var toastTimer = null;
+      function toast(message) {
+        if (!toastEl) {
+          toastEl = document.createElement('div');
+          toastEl.className = 'cxw-demo-toast';
+          toastEl.setAttribute('role', 'status');
+          document.body.appendChild(toastEl);
+        }
+        toastEl.textContent = message;
+        toastEl.classList.remove('is-visible');
+        void toastEl.offsetWidth; /* restart the transition */
+        toastEl.classList.add('is-visible');
+        window.clearTimeout(toastTimer);
+        toastTimer = window.setTimeout(function () {
+          toastEl.classList.remove('is-visible');
+        }, 2600);
+      }
+
+      /* ── Mock plumbing ────────────────────────────────────────────────── */
+      function delay(ms) {
+        return new Promise(function (resolve) { window.setTimeout(resolve, ms); });
+      }
+      function jsonResponse(body, status) {
+        try {
+          return new Response(JSON.stringify(body), {
+            status: status,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        } catch (e) {
+          /* environments without the Response constructor */
+          return {
+            ok: status >= 200 && status < 300,
+            status: status,
+            json: function () { return Promise.resolve(body); }
+          };
+        }
+      }
+      function parseBody(init) {
+        var body = init && init.body;
+        if (typeof body !== 'string') return body || null;
+        try { return JSON.parse(body); } catch (e) { return body; }
+      }
+
+      /* Demo cart state returned by GET /cart.js after a mutation. */
+      var demoCart = {
+        token: 'demo-cart-token',
+        currency: 'EUR',
+        item_count: 1,
+        total_price: 7900,
+        items: [
+          {
+            id: 44120000123456,
+            product_id: 8801929003123,
+            variant_id: 44120000123456,
+            product_title: 'Cellexia Regenerating Serum',
+            quantity: 1,
+            final_line_price: 7900,
+            selling_plan_allocation: null
+          }
+        ]
+      };
+
+      /* ── (a) fetch mock: /cart/add.js, /cart/change.js, /cart.js and the
+         /apps/cellexia-subscriptions/ app proxy. Everything else passes through. ─────── */
+      var realFetch = window.fetch ? window.fetch.bind(window) : null;
+      window.fetch = function (input, init) {
+        var url = typeof input === 'string' ? input : ((input && input.url) || '');
+
+        if (url.indexOf('/cart/add.js') !== -1) {
+          var addPayload = parseBody(init);
+          console.log(TAG + ' POST /cart/add.js (mock)', addPayload);
+          return delay(300).then(function () {
+            toast('Added to your treatment — demo');
+            var item = addPayload && addPayload.items && addPayload.items[0];
+            if (item) {
+              demoCart.items[0].quantity = item.quantity || 1;
+              demoCart.items[0].selling_plan_allocation = item.selling_plan
+                ? { selling_plan: { id: item.selling_plan } }
+                : null;
+            }
+            return jsonResponse({ ok: true, items: (addPayload && addPayload.items) || [] }, 200);
+          });
+        }
+
+        if (url.indexOf('/cart/change.js') !== -1) {
+          var changePayload = parseBody(init);
+          console.log(TAG + ' POST /cart/change.js (mock)', changePayload);
+          return delay(300).then(function () {
+            toast('Converted to Continuous Treatment — demo');
+            if (changePayload && changePayload.selling_plan) {
+              demoCart.items[0].selling_plan_allocation = {
+                selling_plan: { id: changePayload.selling_plan }
+              };
+            }
+            return jsonResponse({ ok: true, items: demoCart.items }, 200);
+          });
+        }
+
+        if (url.indexOf('/cart.js') !== -1) {
+          console.log(TAG + ' GET /cart.js (mock)');
+          return delay(60).then(function () { return jsonResponse(demoCart, 200); });
+        }
+
+        if (url.indexOf('/apps/cellexia-subscriptions/api/widget-config') !== -1) {
+          /* Intentional 404: exercises the widget's real fallback path — it
+             keeps its Liquid-rendered defaults, exactly as a live shop does
+             when no enhancement config is published for the product. */
+          console.info(TAG + ' GET ' + url.split('?')[0] +
+            ' → 404 (intentional): widget falls back to Liquid defaults');
+          return delay(120).then(function () {
+            return jsonResponse({ error: 'demo harness: no widget config' }, 404);
+          });
+        }
+
+        if (url.indexOf('/apps/cellexia-subscriptions/') !== -1) {
+          /* Telemetry via fetch (sendBeacon-less browsers). */
+          console.log(TAG + ' POST ' + url + ' (mock telemetry)', parseBody(init));
+          return delay(50).then(function () { return jsonResponse({ ok: true }, 200); });
+        }
+
+        if (realFetch) return realFetch(input, init);
+        return Promise.reject(new TypeError(TAG + ' fetch unavailable for ' + url));
+      };
+
+      /* Telemetry normally leaves via navigator.sendBeacon — intercept it so
+         the REAL impression / selection / conversion payloads are visible in
+         the console instead of hitting the network. */
+      if (window.navigator && window.navigator.sendBeacon) {
+        var realBeacon = window.navigator.sendBeacon.bind(window.navigator);
+        window.navigator.sendBeacon = function (url, data) {
+          if (String(url).indexOf('/apps/cellexia-subscriptions/') !== -1) {
+            if (data && typeof data.text === 'function') {
+              data.text().then(function (text) {
+                var parsed;
+                try { parsed = JSON.parse(text); } catch (e) { parsed = text; }
+                console.log(TAG + ' telemetry beacon → ' + url, parsed);
+              });
+            } else {
+              console.log(TAG + ' telemetry beacon → ' + url, data);
+            }
+            return true;
+          }
+          return realBeacon(url, data);
+        };
+      }
+
+      /* ── (c) navigation stubs ─────────────────────────────────────────
+         The widget's afterCartMutation() can navigate two ways:
+         1. location.reload() — only when location.pathname starts with
+            "/cart", which is never true for this page, so no reload fires.
+            A defensive override is attempted anyway (silently impossible in
+            browsers where Location is unforgeable — the pathname guard is
+            the real protection).
+         2. location.href = "/cart" — only when NO ".mini-cart" element
+            exists. The hidden .mini-cart node in this page plus this
+            refreshMiniCart hook route the real code into the mini-cart
+            refresh branch: GET /cart.js (mocked above) then this stub. */
+      window.refreshMiniCart = function (cart) {
+        console.log(TAG + ' mini-cart refresh (stub) — cart state:', cart);
+      };
+      try {
+        Object.defineProperty(window.location, 'reload', {
+          value: function () { console.warn(TAG + ' location.reload() suppressed'); }
+        });
+      } catch (e) { /* expected in modern browsers; see note above */ }
+
+      /* Surface the widget's cart:refresh custom event. */
+      document.addEventListener('cart:refresh', function () {
+        console.log(TAG + ' cart:refresh event dispatched by widget');
+      });
+
+      console.info(TAG + ' shim active — cart + app-proxy endpoints mocked; ' +
+        'widget assets are unmodified copies of extensions/treatment-widgets/assets/');
+    })();
+  </script>
+  <script src="./cellexia-widgets.js?v=20260802b"></script>
+</body>
+</html>

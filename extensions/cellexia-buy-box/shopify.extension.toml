@@ -1,6 +1,0 @@
-# Cellexia Buy Box — PDP subscription widget (theme app extension).
-# Deployed together with the app via `npm run deploy`.
-
-name = "Cellexia Buy Box"
-type = "theme"
-uid = "ea13070f-a66c-ddf0-98f1-e611ff3a86be537a1727"

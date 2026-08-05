@@ -1,0 +1,10 @@
+# Cellexia Treatment Widgets — theme app extension.
+# Storefront widgets A (treatment choice), B (quantity → cadence),
+# E (basic-purchase comparison nudge) and F (cart conversion rows).
+
+api_version = "2025-10"
+
+[[extensions]]
+type = "theme"
+name = "Cellexia Treatment Widgets"
+handle = "treatment-widgets"

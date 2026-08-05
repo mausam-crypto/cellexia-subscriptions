@@ -1,99 +1,72 @@
+/**
+ * Single webhook endpoint for every topic declared in shopify.app.toml.
+ *
+ * Flow: authenticate.webhook → replay guard (ProcessedWebhook by webhookId)
+ * → dispatch → 200 fast. Handler errors are logged; only retryable failures
+ * (transient infra) return 500 so Shopify redelivers — and the replay-guard
+ * row is released first so the redelivery is not skipped.
+ */
 import type { ActionFunctionArgs } from "@remix-run/node";
-import { createHash } from "node:crypto";
-import { Prisma } from "@prisma/client";
 import prisma from "~/db.server";
 import { authenticate } from "~/shopify.server";
-import { webhookHandlers } from "~/lib/webhooks/handlers.server";
-
-/**
- * Single endpoint for every Shopify webhook topic (configured in
- * shopify.app.toml).
- *
- * Contract:
- * - `authenticate.webhook` verifies the HMAC. An invalid signature makes it
- *   throw the 401 Response Shopify expects — that Response propagates
- *   naturally and never reaches the receipt table.
- * - Idempotency: a WebhookReceipt row is created for the unique
- *   X-Shopify-Webhook-Id BEFORE any work happens. A P2002 unique violation
- *   means this delivery was already accepted (Shopify retry or double
- *   delivery) → 200 SKIPPED_DUPLICATE immediately, no handler runs.
- * - Outcomes land on the receipt: success → PROCESSED + processedAt; failure
- *   → FAILED + error. Failures STILL return 200: Shopify disables webhooks
- *   that keep 5xx-ing, so recovery is driven by our own alerting over FAILED
- *   receipts (see the alerts job), not by Shopify retries.
- * - Handlers run inline and must stay under a few seconds; anything heavier
- *   belongs in the jobs pipeline.
- */
-
-function isUniqueViolation(err: unknown): boolean {
-  return (
-    err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002"
-  );
-}
+import {
+  dispatchWebhook,
+  isRetryableWebhookError,
+} from "~/services/core/webhooks/handlers.server";
+import type { AdminGraphql } from "~/services/core/shopifyClient.server";
+import { logger } from "~/lib/logger.server";
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { topic, shop, payload, webhookId } =
+  const { topic, shop, payload, admin, webhookId } =
     await authenticate.webhook(request);
 
-  const payloadRecord = (payload ?? {}) as Record<string, unknown>;
-  const payloadHash = createHash("sha256")
-    .update(JSON.stringify(payloadRecord))
-    .digest("hex");
-
-  // Claim the webhook id before doing any work; the unique index is the lock.
-  try {
-    await prisma.webhookReceipt.create({
-      data: {
-        topic,
-        shopDomain: shop,
-        webhookId,
-        payloadHash,
-        status: "PROCESSED", // provisional; processedAt marks actual completion
-      },
-    });
-  } catch (err) {
-    if (isUniqueViolation(err)) {
-      return new Response("SKIPPED_DUPLICATE", { status: 200 });
+  // Replay protection: first delivery wins; duplicates return 200 untouched.
+  if (webhookId) {
+    try {
+      await prisma.processedWebhook.create({
+        data: { webhookId, topic, shop },
+      });
+    } catch (e: unknown) {
+      const code = (e as { code?: string }).code;
+      if (code === "P2002") {
+        logger.info("webhook replay skipped", { topic, shop, webhookId });
+        return new Response(null, { status: 200 });
+      }
+      throw e;
     }
-    // Receipt table unavailable (DB down): nothing was processed, so a 5xx is
-    // safe here and lets Shopify redeliver later.
-    throw err;
-  }
-
-  const handler = webhookHandlers[topic];
-  if (!handler) {
-    console.warn(`[webhooks] no handler registered for topic ${topic}`);
-    await prisma.webhookReceipt
-      .update({
-        where: { webhookId },
-        data: { processedAt: new Date() },
-      })
-      .catch((updateErr) =>
-        console.error("[webhooks] receipt update failed", updateErr),
-      );
-    return new Response("UNHANDLED", { status: 200 });
   }
 
   try {
-    await handler({ shopDomain: shop, payload: payloadRecord, webhookId });
-    await prisma.webhookReceipt.update({
-      where: { webhookId },
-      data: { status: "PROCESSED", processedAt: new Date() },
+    await dispatchWebhook({
+      topic,
+      shop,
+      payload: (payload ?? {}) as Record<string, unknown>,
+      graphql: admin ? (admin.graphql as unknown as AdminGraphql) : null,
     });
-    return new Response("PROCESSED", { status: 200 });
-  } catch (err) {
-    const message =
-      err instanceof Error ? (err.stack ?? err.message) : String(err);
-    console.error(`[webhooks] ${topic} handler failed`, err);
-    await prisma.webhookReceipt
-      .update({
-        where: { webhookId },
-        data: { status: "FAILED", error: message.slice(0, 4000) },
-      })
-      .catch((updateErr) =>
-        console.error("[webhooks] receipt update failed", updateErr),
-      );
-    // 200 on purpose — see module note: our alert-based recovery owns retries.
-    return new Response("FAILED", { status: 200 });
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : String(e);
+    if (isRetryableWebhookError(e)) {
+      logger.error("webhook handler failed (retryable)", {
+        topic,
+        shop,
+        webhookId,
+        error: message,
+      });
+      // Release the replay guard so Shopify's redelivery is processed.
+      if (webhookId) {
+        await prisma.processedWebhook
+          .delete({ where: { webhookId } })
+          .catch(() => undefined);
+      }
+      return new Response(null, { status: 500 });
+    }
+    logger.error("webhook handler failed (non-retryable, acked)", {
+      topic,
+      shop,
+      webhookId,
+      error: message,
+    });
   }
+
+  return new Response(null, { status: 200 });
 };

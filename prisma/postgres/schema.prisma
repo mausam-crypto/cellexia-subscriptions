@@ -1,0 +1,575 @@
+// PRODUCTION (Postgres) schema — models are IDENTICAL to prisma/schema.prisma
+// (the SQLite dev schema); only the datasource provider differs. Keep the two
+// files in sync: any model change goes into BOTH, and the Postgres migration
+// is regenerated via the command documented in docs/DEPLOYMENT-CHECKLIST.md.
+// Deploy: npm run setup:postgres  (prisma migrate deploy --schema this file)
+
+// Cellexia Continuous Treatment — data model.
+//
+// Conventions:
+// - SQLite in dev, Postgres in production: no native enums or Json columns.
+//   Enum-like fields are String and MUST use the const unions in app/types/domain.ts.
+//   *Json fields hold JSON.stringify'd payloads.
+// - All money is integer minor units (cents) + a currencyCode.
+// - Shopify GIDs are stored verbatim (e.g. "gid://shopify/SubscriptionContract/1").
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────────── Shopify session (template requirement) ──
+
+model Session {
+  id            String    @id
+  shop          String
+  state         String
+  isOnline      Boolean   @default(false)
+  scope         String?
+  expires       DateTime?
+  accessToken   String
+  userId        BigInt?
+  firstName     String?
+  lastName      String?
+  email         String?
+  accountOwner  Boolean   @default(false)
+  locale        String?
+  collaborator  Boolean?  @default(false)
+  emailVerified Boolean?  @default(false)
+}
+
+// ───────────────────────────── Shop-level settings ─────────────────────
+
+model ShopSettings {
+  id                     String   @id @default(cuid())
+  shop                   String   @unique
+  currencyCode           String   @default("EUR")
+  klaviyoEnabled         Boolean  @default(false)
+  // Klaviyo key is stored encrypted at rest (AES-256-GCM via lib/crypto.server)
+  klaviyoApiKeyEncrypted String?
+  // JSON: default guardrails, pre-dunning lead days, grace period rules, etc.
+  settingsJson           String   @default("{}")
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+}
+
+// Role-based permissions for staff using the admin + CS console.
+model StaffRole {
+  id        String   @id @default(cuid())
+  shop      String
+  email     String
+  // domain.ts StaffRoleName: OWNER | ADMIN | CS_AGENT | ANALYST
+  role      String
+  createdAt DateTime @default(now())
+
+  @@unique([shop, email])
+}
+
+// ───────────────────────────── Selling plans (versioned rules) ─────────
+
+model SellingPlanConfig {
+  id                   String   @id @default(cuid())
+  shop                 String
+  shopifyGroupId       String? // gid://shopify/SellingPlanGroup/...
+  name                 String
+  merchantCode         String
+  // Current version number; every rule change bumps this and appends a version row.
+  version              Int      @default(1)
+  // JSON: array of plan definitions {name, intervalWeeks, percentOff, shopifyPlanId}
+  plansJson            String
+  // JSON: quantity -> default cadence map, e.g. {"1": 4, "2": 8, "3": 12} (weeks); per-product overrides
+  quantityDefaultsJson String   @default("{}")
+  active               Boolean  @default(true)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  versions SellingPlanConfigVersion[]
+
+  @@index([shop])
+}
+
+model SellingPlanConfigVersion {
+  id        String   @id @default(cuid())
+  configId  String
+  version   Int
+  snapshot  String // full JSON snapshot of the config at this version
+  changedBy String // staff email or "system"
+  createdAt DateTime @default(now())
+
+  config SellingPlanConfig @relation(fields: [configId], references: [id])
+
+  @@unique([configId, version])
+}
+
+// Products covered by a selling plan config + product-level metadata.
+model ProductMeta {
+  id                 String   @id @default(cuid())
+  shop               String
+  shopifyProductId   String
+  title              String
+  handle             String?
+  // grams or ml per unit and estimated daily usage in same unit -> depletion engine
+  unitContents       Float?
+  defaultDailyUsage  Float?
+  // margin as fraction of price, e.g. 0.78
+  grossMarginPercent Float?
+  // unit cost in minor units for contribution-margin math
+  unitCostCents      Int?
+  // domain.ts TimeOfDay: AM | PM | BOTH
+  timeOfDay          String   @default("BOTH")
+  // primary skin concern slug (hydration, firmness, brightening, ...)
+  concern            String?
+  heroRank           Int? // 1 = hero treatment for graduated routine expansion
+  subscribable       Boolean  @default(true)
+  active             Boolean  @default(true)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@unique([shop, shopifyProductId])
+}
+
+// Routine compatibility graph edge (directed where relation implies order).
+model CompatibilityEdge {
+  id               String   @id @default(cuid())
+  shop             String
+  fromProductId    String // shopify product gid
+  toProductId      String
+  // domain.ts CompatibilityRelation: PAIRS_WITH | STAGGER | REDUNDANT | ROUTINE_STEP_BEFORE | SENSITIVITY_CONFLICT
+  relation         String
+  strength         Float    @default(1)
+  notes            String?
+  createdAt        DateTime @default(now())
+
+  @@unique([shop, fromProductId, toProductId, relation])
+  @@index([shop, fromProductId])
+}
+
+model RoutineTemplate {
+  id          String   @id @default(cuid())
+  shop        String
+  name        String
+  concern     String // primary concern slug this routine addresses
+  description String?
+  // JSON: ordered steps [{productId, role, timeOfDay, optional}]
+  stepsJson   String
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([shop, concern])
+}
+
+// ───────────────────────────── Subscription contracts (mirror) ─────────
+
+model SubscriptionContract {
+  id                     String    @id @default(cuid())
+  shop                   String
+  shopifyContractId      String    @unique
+  shopifyCustomerId      String
+  customerEmail          String?
+  // domain.ts ContractStatus: ACTIVE | PAUSED | CANCELLED | EXPIRED | FAILED
+  status                 String
+  currencyCode           String
+  intervalWeeks          Int
+  nextBillingDate        DateTime?
+  nextDeliveryDate       DateTime?
+  deliveryAddressJson    String?
+  paymentMethodId        String?
+  cardBrand              String?
+  cardLastDigits         String?
+  cardExpiryMonth        Int?
+  cardExpiryYear         Int?
+  // running totals maintained by webhook handlers
+  successfulOrders       Int       @default(0)
+  failedAttempts         Int       @default(0)
+  totalRevenueCents      Int       @default(0)
+  // treatment framing
+  treatmentStartedAt     DateTime?
+  pausedUntil            DateTime?
+  cancelledAt            DateTime?
+  cancelReason           String?
+  // scores (denormalised latest values; history in ScoreSnapshot)
+  qualityScore           Float?
+  churnRiskScore         Float?
+  expectedLtvCents       Int?
+  // autopilot
+  autopilotEnabled       Boolean   @default(false)
+  // JSON: {maxChargeCents, askBeforeAdding, minIntervalWeeks, notifyDaysBefore}
+  guardrailsJson         String?
+  // acquisition attribution captured at creation
+  acquisitionJson        String?
+  originOrderId          String?
+  firstOrderAovCents     Int?
+  initialDiscountPercent Float?
+  widgetVersion          String?
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+
+  lines           ContractLine[]
+  billingAttempts BillingAttempt[]
+  dunningState    DunningState?
+  milestones      Milestone[]
+  addOns          AddOnItem[]
+
+  @@index([shop, status])
+  @@index([shop, shopifyCustomerId])
+  @@index([shop, nextBillingDate])
+}
+
+model ContractLine {
+  id                 String   @id @default(cuid())
+  contractId         String
+  shopifyLineId      String?
+  shopifyProductId   String
+  shopifyVariantId   String
+  title              String
+  quantity           Int
+  currentPriceCents  Int
+  sellingPlanId      String?
+  sellingPlanName    String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  contract  SubscriptionContract @relation(fields: [contractId], references: [id])
+  depletion DepletionEstimate?
+
+  @@index([contractId])
+}
+
+// One-time / limited-run additions to upcoming deliveries.
+model AddOnItem {
+  id                  String   @id @default(cuid())
+  contractId          String
+  shopifyProductId    String
+  shopifyVariantId    String
+  title               String
+  quantity            Int      @default(1)
+  priceCents          Int
+  // domain.ts AddOnMode: NEXT_ONLY | RECURRING | N_DELIVERIES
+  mode                String
+  remainingDeliveries Int?
+  // how it was added (portal, pre-shipment email, cs-console)
+  source              String
+  // Fulfillment tracking (offers/addOnFulfillment.server.ts): appliedAt is
+  // stamped when the add-on has been injected into the contract as a real
+  // ContractLine; appliedLineId records the local line id created at
+  // application time (consumption falls back to a variant match when Shopify
+  // rewrites line ids on later draft commits). RECURRING rows are deleted on
+  // application instead — they become permanent lines.
+  appliedAt           DateTime?
+  appliedLineId       String?
+  createdAt           DateTime @default(now())
+
+  contract SubscriptionContract @relation(fields: [contractId], references: [id])
+
+  @@index([contractId])
+}
+
+// ───────────────────────────── Billing, dunning, recovery ──────────────
+
+model BillingAttempt {
+  id                      String    @id @default(cuid())
+  shop                    String
+  contractId              String
+  shopifyBillingAttemptId String?   @unique
+  idempotencyKey          String    @unique
+  // domain.ts BillingAttemptStatus: PENDING | SUCCESS | FAILURE | CHALLENGED
+  status                  String
+  errorCode               String?
+  // domain.ts DeclineCategory (derived from errorCode)
+  declineCategory         String?
+  orderId                 String?
+  amountCents             Int?
+  attemptNumber           Int       @default(1)
+  isRetry                 Boolean   @default(false)
+  occurredAt              DateTime  @default(now())
+
+  contract SubscriptionContract @relation(fields: [contractId], references: [id])
+
+  @@index([shop, status])
+  @@index([contractId])
+}
+
+model DunningState {
+  id             String    @id @default(cuid())
+  contractId     String    @unique
+  // domain.ts DunningPhase: NONE | PRE_DUNNING | RETRYING | GRACE | FINAL_NOTICE | RESOLVED | EXHAUSTED
+  phase          String    @default("NONE")
+  declineCategory String?
+  retryCount     Int       @default(0)
+  nextRetryAt    DateTime?
+  lastFailureAt  DateTime?
+  graceUntil     DateTime?
+  // JSON: DunningHistoryEntry[] — [{at, type, stepIndex?, action?, template?, errorCode?, declineCategory?, note?}]
+  historyJson    String    @default("[]")
+  updatedAt      DateTime  @updatedAt
+
+  contract SubscriptionContract @relation(fields: [contractId], references: [id])
+
+  @@index([nextRetryAt])
+}
+
+// ───────────────────────────── Retention ───────────────────────────────
+
+model CancellationSession {
+  id             String    @id @default(cuid())
+  shop           String
+  contractId     String
+  // domain.ts CancelReason
+  reason         String?
+  reasonDetail   String?
+  // JSON: offers presented [{type, params, costCents}]
+  offersJson     String    @default("[]")
+  // domain.ts CancelOutcome: SAVED | CANCELLED | ABANDONED | IN_PROGRESS
+  outcome        String    @default("IN_PROGRESS")
+  savedByOffer   String?
+  saveCostCents  Int?
+  maxSaveCostCents Int? // profit-aware ceiling computed at session start
+  startedAt      DateTime  @default(now())
+  resolvedAt     DateTime?
+
+  @@index([shop, outcome])
+  @@index([contractId])
+}
+
+model ScoreSnapshot {
+  id         String   @id @default(cuid())
+  shop       String
+  contractId String
+  // domain.ts ScoreKind: QUALITY | CHURN_RISK | LTV
+  kind       String
+  value      Float
+  // JSON: feature breakdown for explainability
+  factorsJson String  @default("{}")
+  computedAt DateTime @default(now())
+
+  @@index([contractId, kind])
+}
+
+// ───────────────────────────── Treatment engine ────────────────────────
+
+model DepletionEstimate {
+  id                 String    @id @default(cuid())
+  contractLineId     String    @unique
+  estimatedDailyUsage Float
+  lastDeliveryAt     DateTime?
+  unitsOnHand        Float?
+  predictedRunOutAt  DateTime?
+  confidence         Float     @default(0.5)
+  // JSON: signal log [{at, signal, adjustment}] — delays, skips, add-ons, survey answers
+  signalsJson        String    @default("[]")
+  updatedAt          DateTime  @updatedAt
+
+  line ContractLine @relation(fields: [contractLineId], references: [id])
+}
+
+model AdherenceSurvey {
+  id                String   @id @default(cuid())
+  shop              String
+  contractId        String
+  shopifyCustomerId String
+  // domain.ts AdherenceQuestion keys -> answers
+  answersJson       String
+  sentAt            DateTime @default(now())
+  respondedAt       DateTime?
+
+  @@index([contractId])
+}
+
+model Milestone {
+  id         String   @id @default(cuid())
+  contractId String
+  // domain.ts MilestoneType: TREATMENT_STARTED | FIRST_MONTH | NINETY_DAYS | SIX_DELIVERIES | ONE_YEAR
+  type       String
+  achievedAt DateTime @default(now())
+  // domain.ts MilestoneRewardStatus: PENDING | GRANTED | NOTIFIED
+  rewardStatus String @default("PENDING")
+  rewardJson String?
+
+  contract SubscriptionContract @relation(fields: [contractId], references: [id])
+
+  @@unique([contractId, type])
+}
+
+// ───────────────────────────── Offers & experiments ────────────────────
+
+model WidgetConfig {
+  id            String   @id @default(cuid())
+  shop          String
+  // domain.ts WidgetType: TREATMENT_CHOICE | QUANTITY_CADENCE | ROUTINE_BUILDER | POST_ONE_TIME | CART_CONVERSION
+  widgetType    String
+  name          String
+  // JSON: targeting {productIds, markets, trafficSources, returningOnly, intentBands}
+  targetingJson String   @default("{}")
+  // JSON: widget-specific copy/settings overrides
+  settingsJson  String   @default("{}")
+  priority      Int      @default(0)
+  active        Boolean  @default(true)
+  experimentId  String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([shop, widgetType, active])
+}
+
+model Experiment {
+  id          String   @id @default(cuid())
+  shop        String
+  name        String
+  // JSON: variants [{key, weight, settingsJson}]
+  variantsJson String
+  // domain.ts ExperimentStatus: DRAFT | RUNNING | COMPLETED
+  status      String   @default("DRAFT")
+  startedAt   DateTime?
+  endedAt     DateTime?
+  createdAt   DateTime @default(now())
+
+  assignments ExperimentAssignment[]
+}
+
+model ExperimentAssignment {
+  id           String   @id @default(cuid())
+  experimentId String
+  // anonymous visitor token or shopify customer id
+  subjectKey   String
+  variantKey   String
+  assignedAt   DateTime @default(now())
+
+  experiment Experiment @relation(fields: [experimentId], references: [id])
+
+  @@unique([experimentId, subjectKey])
+}
+
+// ───────────────────────────── Analytics event warehouse ───────────────
+
+model AnalyticsEvent {
+  id                String   @id @default(cuid())
+  shop              String
+  // domain.ts LifecycleEvent name
+  name              String
+  contractId        String?
+  shopifyCustomerId String?
+  payloadJson       String   @default("{}")
+  // Replay protection: set only when the emitter passes an explicit
+  // dedupeKey — a redelivered webhook then cannot write a second row.
+  dedupeKey         String?  @unique
+  occurredAt        DateTime @default(now())
+
+  @@index([shop, name, occurredAt])
+  @@index([contractId])
+}
+
+// Outbox for Klaviyo (and any future destination): at-least-once with replay safety.
+model OutboundEvent {
+  id           String    @id @default(cuid())
+  shop         String
+  destination  String    @default("KLAVIYO")
+  eventName    String
+  // dedupe key so retries never double-send
+  dedupeKey    String    @unique
+  profileEmail String?
+  payloadJson  String
+  // domain.ts OutboxStatus: PENDING | SENT | FAILED | DEAD
+  status       String    @default("PENDING")
+  attempts     Int       @default(0)
+  lastError    String?
+  nextAttemptAt DateTime @default(now())
+  sentAt       DateTime?
+  createdAt    DateTime  @default(now())
+
+  @@index([status, nextAttemptAt])
+}
+
+model ForecastSnapshot {
+  id           String   @id @default(cuid())
+  shop         String
+  computedAt   DateTime @default(now())
+  horizonWeeks Int      @default(13)
+  // JSON: [{weekStart, sku, market, contractedUnits, probabilityAdjustedUnits,
+  //         expectedSkips, expectedPauses, expectedCancellations, expectedFailedPayments,
+  //         expectedAddOnUnits, revenueCents, marginCents, ciLowCents, ciHighCents}]
+  rowsJson     String
+
+  @@index([shop, computedAt])
+}
+
+// Learned model parameters (docs/LEARNING-DATA-V2.md §1). Append-only: each
+// recalibration writes version + 1; the newest version wins, and callers
+// treat a missing row as "use static defaults".
+model ModelState {
+  id          String   @id @default(cuid())
+  shop        String
+  // learning.server LearnedModel:
+  // CHURN_CALIBRATION | DUNNING_RECOVERY | FORECAST_PROPENSITY | DEPLETION_USAGE
+  model       String
+  version     Int
+  paramsJson  String   // learned parameters (shape per model, see learning.server)
+  metricsJson String   @default("{}") // quality metrics (brier, lift, n)
+  sampleSize  Int
+  computedAt  DateTime @default(now())
+
+  @@unique([shop, model, version])
+  @@index([shop, model])
+}
+
+// ───────────────────────────── Operational safeguards ──────────────────
+
+// Immutable, hash-chained audit log. Rows are append-only; prevHash links entries
+// per shop so tampering is detectable.
+model AuditLog {
+  id         String   @id @default(cuid())
+  shop       String
+  seq        Int
+  actorType  String // SYSTEM | STAFF | CUSTOMER | WEBHOOK
+  actorId    String?
+  action     String
+  subjectType String?
+  subjectId  String?
+  payloadJson String  @default("{}")
+  prevHash   String?
+  hash       String
+  createdAt  DateTime @default(now())
+
+  @@unique([shop, seq])
+  @@index([shop, subjectType, subjectId])
+}
+
+model IdempotencyKey {
+  id          String   @id @default(cuid())
+  key         String   @unique
+  scope       String
+  resultJson  String?
+  createdAt   DateTime @default(now())
+  expiresAt   DateTime
+}
+
+// Webhook replay protection: Shopify webhook ids we have already processed.
+model ProcessedWebhook {
+  id          String   @id @default(cuid())
+  webhookId   String   @unique
+  topic       String
+  shop        String
+  processedAt DateTime @default(now())
+
+  @@index([shop, topic])
+}
+
+model MagicLinkToken {
+  id                String    @id @default(cuid())
+  shop              String
+  shopifyCustomerId String
+  email             String
+  tokenHash         String    @unique
+  expiresAt         DateTime
+  usedAt            DateTime?
+  createdAt         DateTime  @default(now())
+
+  @@index([shop, shopifyCustomerId])
+  // requestMagicLink's one-live-link-per-address cooldown (and its
+  // enumeration-defence decoy twin) look up by (shop, email).
+  @@index([shop, email])
+}

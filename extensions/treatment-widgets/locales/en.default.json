@@ -1,0 +1,72 @@
+{
+  "cellexia": {
+    "choice": {
+      "heading": "Choose your treatment",
+      "recommended": "Recommended",
+      "continuous_title": "Continuous Treatment",
+      "continuous_bullet_improvement": "Designed for continued visible improvement",
+      "continuous_bullet_save": "Save {{ percent }}%",
+      "continuous_bullet_flexibility": "Adjust, delay or cancel online",
+      "basic_title": "Basic Purchase",
+      "basic_bullet_one_delivery": "One delivery",
+      "basic_bullet_standard_price": "Standard price",
+      "basic_bullet_no_benefits": "No ongoing treatment benefits",
+      "committed_title": "Committed Treatment",
+      "committed_bullet_best_price": "Our best price on every delivery",
+      "committed_bullet_everything": "Everything in Continuous Treatment",
+      "committed_bullet_flexibility": "Full flexibility after {{ count }} deliveries",
+      "per_delivery": "per delivery"
+    },
+    "cadence": {
+      "quantity_label": "Units per delivery",
+      "one_unit": "1 unit per delivery",
+      "many_units": "{{ count }} units per delivery",
+      "delivered_every": "Delivered every {{ weeks }} weeks — adjust anytime",
+      "delivered_every_committed": "Delivered every {{ weeks }} weeks — on schedule for your first {{ min }} deliveries",
+      "about_monthly": "About {{ monthly }} a month",
+      "multi_breakdown": "{{ qty }} × {{ unit }} per delivery — still about {{ monthly }} a month, with fewer deliveries",
+      "advanced_toggle": "Prefer a different rhythm?",
+      "plan_label": "Delivery rhythm"
+    },
+    "nudge": {
+      "title": "A quick comparison before you decide",
+      "basic_price_label": "Basic Purchase",
+      "treatment_price_label": "Continuous Treatment",
+      "annual_saving": "Estimated saving over a year: {{ amount }}",
+      "continuity": "Results build with continuity — a steady routine protects the progress you make between deliveries.",
+      "flexibility": "You stay in control: adjust, delay or cancel online, anytime.",
+      "switch": "Switch to Continuous Treatment",
+      "dismiss": "Dismiss this comparison"
+    },
+    "max": {
+      "basic_link": "Prefer a single delivery? Buy once for {{ price }}",
+      "basic_back": "Buying once at {{ price }} — switch back to Continuous Treatment"
+    },
+    "ultra": {
+      "basic_link": "Prefer a single delivery? Buy once for {{ price }}",
+      "basic_back": "Buying once at {{ price }} — switch back"
+    },
+    "atc": {
+      "add": "Add to cart",
+      "adding": "Adding…",
+      "added": "Added to cart",
+      "oos": "Sold out",
+      "error": "Something didn't go through — please try again.",
+      "assurance_committed": "Full flexibility after your first {{ min }} deliveries — then adjust, delay or cancel online"
+    },
+    "cart": {
+      "convert_row": "Make this a Continuous Treatment and save {{ percent }}% today",
+      "convert_row_generic": "Make this a Continuous Treatment",
+      "convert_button": "Save {{ percent }}%",
+      "convert_button_generic": "Make it continuous",
+      "flexibility": "Adjust, delay or cancel online",
+      "converted": "Done — this delivery is now part of your treatment plan"
+    },
+    "a11y": {
+      "choice_group": "Treatment options",
+      "quantity_group": "Units per delivery",
+      "variant_label": "Option",
+      "committed_terms": "About the Committed Treatment Plan terms"
+    }
+  }
+}

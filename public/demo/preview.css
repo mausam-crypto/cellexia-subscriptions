@@ -1,0 +1,235 @@
+/* Cellexia storefront widget harness — PDP scaffold, fonts, toast, footnote.
+   Demo-only chrome; the widgets themselves are styled exclusively by
+   ./cellexia-widgets.css (preview copy of the real theme-extension asset). */
+
+/* ── Fonts ────────────────────────────────────────────────────────────────
+   Gobold is copied from the live theme ("existing shopify theme/assets/").
+   The theme registers the face at font-weight: bold — mirrored exactly so
+   headline rendering matches the storefront.
+   Body copy on the storefront is Argumentum, which the theme loads from an
+   external licensed source we do not redistribute here; "Helvetica Neue"
+   stands in locally — the same graceful fallback the app portal uses per
+   docs/BRAND.md ("argumentum", "Helvetica Neue", Arial, sans-serif). */
+@font-face {
+  font-family: "Gobold";
+  src: url("./fonts/Gobold.woff2") format("woff2"),
+       url("./fonts/Gobold.woff") format("woff");
+  font-weight: bold;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ── Brand tokens (docs/BRAND.md) ─────────────────────────────────────── */
+:root {
+  --cx-ink: #1d1d1b;
+  --cx-blue: #b1cded;
+  --cx-white: #ffffff;
+  --cx-grey-bg: #f4f4f4;
+  --cx-grey-line: #d8d8d8;
+  --cx-grey-mid: #bababa;
+}
+
+* {
+  box-sizing: border-box;
+}
+html {
+  -webkit-text-size-adjust: 100%;
+}
+body {
+  margin: 0;
+  background: var(--cx-white);
+  color: var(--cx-ink);
+  font-family: "argumentum", "Helvetica Neue", Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* ── Header ───────────────────────────────────────────────────────────── */
+.demo-header {
+  border-bottom: 1px solid var(--cx-grey-line);
+  padding: 22px 24px;
+  text-align: center;
+}
+.demo-header__wordmark {
+  font-family: "Gobold", "Arial Black", sans-serif;
+  font-size: 22px;
+  letter-spacing: 4px;
+  text-transform: uppercase;
+}
+
+/* ── PDP scaffold ─────────────────────────────────────────────────────── */
+.pdp {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 48px 24px 140px;
+}
+.pdp-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 40px;
+}
+@media (min-width: 880px) {
+  .pdp-grid {
+    grid-template-columns: 1fr 1fr;
+    gap: 64px;
+    align-items: start;
+  }
+}
+.pdp-media {
+  background: var(--cx-grey-bg);
+  aspect-ratio: 4 / 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.pdp-media__initial {
+  font-family: "Gobold", "Arial Black", sans-serif;
+  font-size: 140px;
+  line-height: 1;
+  color: var(--cx-grey-line);
+  user-select: none;
+}
+.pdp-title {
+  font-family: "Gobold", "Arial Black", sans-serif;
+  font-size: 28px;
+  font-weight: 400;
+  line-height: 1.25;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  margin: 0 0 10px;
+}
+.pdp-price {
+  font-size: 18px;
+  font-weight: 700;
+  margin: 0 0 14px;
+}
+.pdp-desc {
+  font-size: 14px;
+  line-height: 1.6;
+  margin: 0 0 28px;
+  max-width: 44ch;
+}
+
+/* ── Cart preview section ─────────────────────────────────────────────── */
+.cart-preview {
+  margin-top: 80px;
+  border-top: 1px solid var(--cx-grey-line);
+  padding-top: 44px;
+}
+.cart-preview__heading {
+  font-family: "Gobold", "Arial Black", sans-serif;
+  font-size: 20px;
+  font-weight: 400;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  margin: 0 0 20px;
+}
+.cart-line {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  border: 1px solid var(--cx-grey-line);
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin: 0 0 12px;
+  background: var(--cx-white);
+}
+.cart-line__thumb {
+  width: 64px;
+  height: 64px;
+  flex-shrink: 0;
+  background: var(--cx-grey-bg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: "Gobold", "Arial Black", sans-serif;
+  font-size: 28px;
+  color: var(--cx-grey-line);
+  user-select: none;
+}
+.cart-line__info {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.cart-line__title {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+.cart-line__meta {
+  display: block;
+  font-size: 12px;
+  color: var(--cx-grey-mid);
+  margin-top: 2px;
+}
+.cart-line__price {
+  font-size: 15px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+/* ── Demo toast (shown by the mock-cart shim) ─────────────────────────── */
+.cxw-demo-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 64px;
+  transform: translateX(-50%) translateY(8px);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--cx-ink);
+  color: var(--cx-white);
+  border: 1px solid var(--cx-ink);
+  border-radius: 70px;
+  padding: 13px 24px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.25s ease, transform 0.25s ease;
+  z-index: 60;
+  max-width: calc(100vw - 32px);
+}
+.cxw-demo-toast::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--cx-blue);
+  flex-shrink: 0;
+}
+.cxw-demo-toast.is-visible {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+/* ── Fixed footer note ────────────────────────────────────────────────── */
+.demo-footnote {
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  margin: 0;
+  background: rgba(244, 244, 244, 0.95);
+  border: 1px solid var(--cx-grey-line);
+  border-radius: 70px;
+  padding: 7px 16px;
+  font-size: 11px;
+  letter-spacing: 0.3px;
+  color: #75756f;
+  z-index: 50;
+  max-width: calc(100vw - 24px);
+}
+.demo-footnote code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  color: inherit;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cxw-demo-toast {
+    transition: none;
+  }
+}
