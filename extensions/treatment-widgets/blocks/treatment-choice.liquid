@@ -576,11 +576,12 @@
           falls back to the cellexia.ultra.* locale defaults. {%- endcomment -%}
       {%- if cxw_has_plans and cxw_product.requires_selling_plan != true and customer.b2b? != true -%}
         {%- assign cxw_once_price = cxw_variant.price | money -%}
+        {%- assign cxw_price_placeholder = '{price}' -%}
         {%- capture cxw_ultra_link_tpl -%}
-          {%- if block.settings.ultra_link_copy != blank -%}{{ block.settings.ultra_link_copy | replace: '{price}', '__PRICE__' }}{%- else -%}{{ 'cellexia.ultra.basic_link' | t: price: '__PRICE__' }}{%- endif -%}
+          {%- if block.settings.ultra_link_copy != blank -%}{{ block.settings.ultra_link_copy | replace: cxw_price_placeholder, '__PRICE__' }}{%- else -%}{{ 'cellexia.ultra.basic_link' | t: price: '__PRICE__' }}{%- endif -%}
         {%- endcapture -%}
         {%- capture cxw_ultra_back_tpl -%}
-          {%- if block.settings.ultra_link_back_copy != blank -%}{{ block.settings.ultra_link_back_copy | replace: '{price}', '__PRICE__' }}{%- else -%}{{ 'cellexia.ultra.basic_back' | t: price: '__PRICE__' }}{%- endif -%}
+          {%- if block.settings.ultra_link_back_copy != blank -%}{{ block.settings.ultra_link_back_copy | replace: cxw_price_placeholder, '__PRICE__' }}{%- else -%}{{ 'cellexia.ultra.basic_back' | t: price: '__PRICE__' }}{%- endif -%}
         {%- endcapture -%}
         <button
           type="button"
@@ -621,7 +622,7 @@
   "stylesheet": "cellexia-widgets.css",
   "settings": [
     { "type": "header", "content": "Style" },
-    { "type": "select", "id": "default_style", "label": "Widget style", "options": [ { "value": "choice", "label": "Choice — plan and basic purchase cards" }, { "value": "max", "label": "Subscription Max — one confident plan card" }, { "value": "ultra", "label": "Subscription Max Ultra — the plan price is the price" } ], "default": "choice", "info": "Subscription Max shows the Continuous Treatment plan as the purchase path: no Basic Purchase card, buying once becomes a quiet text link under add-to-cart. Subscription Max Ultra removes the subscription framing entirely: no card, no heading, no plan name, no savings claims — just the price, the quantity pills and the delivery lines; the comparison nudge and the Committed Treatment card never render. Tip: set the Quantity label to \"Units\" for Ultra." },
+    { "type": "select", "id": "default_style", "label": "Widget style", "options": [ { "value": "choice", "label": "Choice — plan and basic purchase cards" }, { "value": "max", "label": "Subscription Max — one confident plan card" }, { "value": "ultra", "label": "Subscription Max Ultra — plan price is the price" } ], "default": "choice", "info": "Subscription Max shows the Continuous Treatment plan as the purchase path: no Basic Purchase card, buying once becomes a quiet text link under add-to-cart. Subscription Max Ultra removes the subscription framing entirely: no card, no heading, no plan name, no savings claims — just the price, the quantity pills and the delivery lines; the comparison nudge and the Committed Treatment card never render. Tip: set the Quantity label to \"Units\" for Ultra." },
     { "type": "text", "id": "market_styles", "label": "Style per market", "info": "market-handle:style pairs, e.g. fr:max, us:ultra, de:choice — overrides the default for those markets." },
     { "type": "checkbox", "id": "enable_nudge_in_max", "label": "Show the comparison nudge in Subscription Max", "default": false, "info": "Off by default — the Max style avoids comparison framing on purpose. Never applies to Subscription Max Ultra." },
     { "type": "checkbox", "id": "show_price_line", "label": "Show the price line (Ultra)", "default": true, "info": "Subscription Max Ultra only: a minimal plan-price line where the cards would be — plain, no compare price, no savings claim." },

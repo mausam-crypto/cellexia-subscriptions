@@ -15,6 +15,7 @@ api_version = "2025-07"
 type = "ui_extension"
 name = "customer-portal-link"
 handle = "cellexia-portal-link"
+uid = "536347a9-0d88-09fd-2bb3-7f6b25f9d4b5bd913e7a"
 description = "Entry card to the Cellexia treatment portal inside customer accounts"
 
   [[extensions.targeting]]
