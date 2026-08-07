@@ -7,15 +7,14 @@
 # See docs/INSTALL.md for the full installation runbook, including how to
 # request access to the protected Subscriptions APIs and protected customer data.
 
-client_id = "REPLACE_WITH_YOUR_CLIENT_ID"
+client_id = "662f81be113f022464adc792a6517fc4"
 name = "Cellexia Subscriptions"
 handle = "cellexia-subscriptions"
-application_url = "https://REPLACE_WITH_YOUR_APP_HOST"
+application_url = "https://cellexia-subscriptions.onrender.com"
 embedded = true
 
 [build]
 automatically_update_urls_on_dev = true
-include_config_on_deploy = true
 
 [access_scopes]
 # Subscriptions require protected API access — request in Partner Dashboard:
@@ -34,9 +33,9 @@ scopes = "read_customers,write_customers,read_orders,write_orders,write_order_ed
 
 [auth]
 redirect_urls = [
-  "https://REPLACE_WITH_YOUR_APP_HOST/auth/callback",
-  "https://REPLACE_WITH_YOUR_APP_HOST/auth/shopify/callback",
-  "https://REPLACE_WITH_YOUR_APP_HOST/api/auth/callback"
+  "https://cellexia-subscriptions.onrender.com/auth/callback",
+  "https://cellexia-subscriptions.onrender.com/auth/shopify/callback",
+  "https://cellexia-subscriptions.onrender.com/api/auth/callback"
 ]
 
 [webhooks]
@@ -79,7 +78,7 @@ api_version = "2025-01"
 [app_proxy]
 # The customer portal is served on the shop's own domain at:
 #   https://<your-store-domain>/apps/cellexia-subscriptions/...
-url = "https://REPLACE_WITH_YOUR_APP_HOST/proxy"
+url = "https://cellexia-subscriptions.onrender.com/proxy"
 subpath = "cellexia-subscriptions"
 prefix = "apps"
 
