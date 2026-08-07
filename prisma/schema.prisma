@@ -1,22 +1,22 @@
-// Cellexia Continuous Treatment — data model.
+// Cellexia Subscriptions — data model
 //
 // Conventions:
-// - SQLite in dev, Postgres in production: no native enums or Json columns.
-//   Enum-like fields are String and MUST use the const unions in app/types/domain.ts.
-//   *Json fields hold JSON.stringify'd payloads.
-// - All money is integer minor units (cents) + a currencyCode.
-// - Shopify GIDs are stored verbatim (e.g. "gid://shopify/SubscriptionContract/1").
+//  - All money is stored as integer cents (`amountCents`) plus a `currencyCode`.
+//  - All Shopify IDs are stored as full GIDs (e.g. "gid://shopify/SubscriptionContract/1").
+//  - All timestamps are UTC; scheduling math converts through the shop's IANA timezone.
+//  - Shopify is the source of truth for contracts/payment state; these tables are a
+//    mirror + extension (dunning, gifts, analytics, magic links live only here).
 
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
-// ───────────────────────────── Shopify session (template requirement) ──
+// ── Shopify OAuth session storage (managed by @shopify/shopify-app-session-storage-prisma)
 
 model Session {
   id            String    @id
@@ -36,534 +36,820 @@ model Session {
   emailVerified Boolean?  @default(false)
 }
 
-// ───────────────────────────── Shop-level settings ─────────────────────
+model Shop {
+  id             String    @id @default(cuid())
+  domain         String    @unique // my-store.myshopify.com
+  name           String?
+  primaryDomain  String? // www.cellexia.com
+  currencyCode   String    @default("GBP")
+  ianaTimezone   String    @default("Europe/London")
+  contactEmail   String?
+  installedAt    DateTime  @default(now())
+  uninstalledAt  DateTime?
+  enabledLocales Json? // [{locale:"en", primary:true}, ...] synced from shop
+  lastFullSyncAt DateTime?
 
-model ShopSettings {
-  id                     String   @id @default(cuid())
-  shop                   String   @unique
-  currencyCode           String   @default("EUR")
-  klaviyoEnabled         Boolean  @default(false)
-  // Klaviyo key is stored encrypted at rest (AES-256-GCM via lib/crypto.server)
-  klaviyoApiKeyEncrypted String?
-  // JSON: default guardrails, pre-dunning lead days, grace period rules, etc.
-  settingsJson           String   @default("{}")
-  createdAt              DateTime @default(now())
-  updatedAt              DateTime @updatedAt
+  settings    Setting[]
+  contracts   SubscriptionContract[]
+  planConfigs SellingPlanConfig[]
 }
 
-// Role-based permissions for staff using the admin + CS console.
-model StaffRole {
+// Typed key/value settings; keys + defaults defined in app/lib/settings/registry.server.ts
+model Setting {
   id        String   @id @default(cuid())
-  shop      String
-  email     String
-  // domain.ts StaffRoleName: OWNER | ADMIN | CS_AGENT | ANALYST
-  role      String
-  createdAt DateTime @default(now())
+  shopId    String
+  key       String
+  value     Json
+  updatedAt DateTime @updatedAt
+  updatedBy String? // admin user email / "system"
 
-  @@unique([shop, email])
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@unique([shopId, key])
 }
 
-// ───────────────────────────── Selling plans (versioned rules) ─────────
+// ── Selling plans ─────────────────────────────────────────────────────────────
 
 model SellingPlanConfig {
-  id                   String   @id @default(cuid())
-  shop                 String
-  shopifyGroupId       String? // gid://shopify/SellingPlanGroup/...
-  name                 String
-  merchantCode         String
-  // Current version number; every rule change bumps this and appends a version row.
-  version              Int      @default(1)
-  // JSON: array of plan definitions {name, intervalWeeks, percentOff, shopifyPlanId}
-  plansJson            String
-  // JSON: quantity -> default cadence map, e.g. {"1": 4, "2": 8, "3": 12} (weeks); per-product overrides
-  quantityDefaultsJson String   @default("{}")
-  active               Boolean  @default(true)
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @updatedAt
+  id                         String   @id @default(cuid())
+  shopId                     String
+  name                       String // "Cellexia Subscribe & Save"
+  shopifyGroupId             String?  @unique // gid://shopify/SellingPlanGroup/...
+  // Every selling plan GID this group has ever exposed (append-only union,
+  // refreshed on each sync). This is the app's OWNERSHIP evidence: a contract
+  // whose lines carry one of these plan ids is ours, anything else is another
+  // app's. Retained across plan deletions so a re-sync that drops a frequency
+  // can never orphan (and silently un-bill) our own live subscribers.
+  shopifyPlanIds             Json? // ["gid://shopify/SellingPlan/...", ...]
+  merchantCode               String   @unique @default(cuid())
+  productIds                 Json // ["gid://shopify/Product/..."] products this group applies to
+  // Frequency options offered, in weeks: e.g. [4,6,8,10,12]
+  frequenciesWeeks           Json
+  defaultFrequencyWeeks      Int      @default(8)
+  allowFrequencyChoice       Boolean  @default(true)
+  // Offer architecture — discounts are baked into plan pricing policies (never codes)
+  firstOrderDiscountPct      Int      @default(20)
+  ongoingDiscountPct         Int      @default(10)
+  firstOrderGiftVariantId    String? // optional gift instead of / on top of first-order discount
+  // Prepaid (bill once, ship N times). Modeled now; can launch later.
+  prepaidEnabled             Boolean  @default(false)
+  prepaidDeliveriesPerCharge Int      @default(3)
+  prepaidDiscountPct         Int      @default(15)
+  // Buy-box presentation
+  badgeText                  String?  @default("Most popular")
+  showBadge                  Boolean  @default(true)
+  preselectSubscription      Boolean  @default(true)
+  active                     Boolean  @default(true)
+  syncStatus                 String   @default("PENDING") // PENDING | SYNCED | ERROR
+  syncError                  String?
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
 
-  versions SellingPlanConfigVersion[]
-
-  @@index([shop])
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
 }
 
-model SellingPlanConfigVersion {
-  id        String   @id @default(cuid())
-  configId  String
-  version   Int
-  snapshot  String // full JSON snapshot of the config at this version
-  changedBy String // staff email or "system"
-  createdAt DateTime @default(now())
+// Per-product cadence intelligence: real empty dates, not arbitrary monthly.
+model ProductCadence {
+  id                  String  @id @default(cuid())
+  shopId              String
+  productId           String // gid
+  variantId           String? // optional per-variant override
+  title               String?
+  estDaysToEmpty      Int     @default(56) // drives recommended frequency + win-back timing
+  recommendedWeeks    Int     @default(8)
+  substituteVariantId String? // used by stockout policy SUBSTITUTE
+  stockoutPolicy      String? // null = shop default; DELAY | SKIP_NOTIFY | SUBSTITUTE
+  // Merchant-entered COGS override (cents). Beats Shopify inventoryItem cost in
+  // the analytics cost resolution (see app/lib/analytics/costs.server.ts):
+  // ContractLine.unitCostCents → this override → costModel.cogsFallbackPctOfPrice.
+  unitCostCentsOverride Int?
 
-  config SellingPlanConfig @relation(fields: [configId], references: [id])
-
-  @@unique([configId, version])
+  @@unique([shopId, productId, variantId])
 }
 
-// Products covered by a selling plan config + product-level metadata.
-model ProductMeta {
-  id                 String   @id @default(cuid())
-  shop               String
-  shopifyProductId   String
-  title              String
-  handle             String?
-  // grams or ml per unit and estimated daily usage in same unit -> depletion engine
-  unitContents       Float?
-  defaultDailyUsage  Float?
-  // margin as fraction of price, e.g. 0.78
-  grossMarginPercent Float?
-  // unit cost in minor units for contribution-margin math
-  unitCostCents      Int?
-  // domain.ts TimeOfDay: AM | PM | BOTH
-  timeOfDay          String   @default("BOTH")
-  // primary skin concern slug (hydration, firmness, brightening, ...)
-  concern            String?
-  heroRank           Int? // 1 = hero treatment for graduated routine expansion
-  subscribable       Boolean  @default(true)
-  active             Boolean  @default(true)
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
+// ── Contracts (mirror of Shopify + local state machine extensions) ────────────
 
-  @@unique([shop, shopifyProductId])
+enum ContractStatus {
+  ACTIVE
+  PAUSED
+  CANCELLED
+  FAILED
+  EXPIRED
 }
-
-// Routine compatibility graph edge (directed where relation implies order).
-model CompatibilityEdge {
-  id               String   @id @default(cuid())
-  shop             String
-  fromProductId    String // shopify product gid
-  toProductId      String
-  // domain.ts CompatibilityRelation: PAIRS_WITH | STAGGER | REDUNDANT | ROUTINE_STEP_BEFORE | SENSITIVITY_CONFLICT
-  relation         String
-  strength         Float    @default(1)
-  notes            String?
-  createdAt        DateTime @default(now())
-
-  @@unique([shop, fromProductId, toProductId, relation])
-  @@index([shop, fromProductId])
-}
-
-model RoutineTemplate {
-  id          String   @id @default(cuid())
-  shop        String
-  name        String
-  concern     String // primary concern slug this routine addresses
-  description String?
-  // JSON: ordered steps [{productId, role, timeOfDay, optional}]
-  stepsJson   String
-  active      Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
-  @@index([shop, concern])
-}
-
-// ───────────────────────────── Subscription contracts (mirror) ─────────
 
 model SubscriptionContract {
-  id                     String    @id @default(cuid())
-  shop                   String
-  shopifyContractId      String    @unique
-  shopifyCustomerId      String
-  customerEmail          String?
-  // domain.ts ContractStatus: ACTIVE | PAUSED | CANCELLED | EXPIRED | FAILED
-  status                 String
-  currencyCode           String
-  intervalWeeks          Int
-  nextBillingDate        DateTime?
-  nextDeliveryDate       DateTime?
-  deliveryAddressJson    String?
-  paymentMethodId        String?
-  cardBrand              String?
-  cardLastDigits         String?
-  cardExpiryMonth        Int?
-  cardExpiryYear         Int?
-  // running totals maintained by webhook handlers
-  successfulOrders       Int       @default(0)
-  failedAttempts         Int       @default(0)
-  totalRevenueCents      Int       @default(0)
-  // treatment framing
-  treatmentStartedAt     DateTime?
-  pausedUntil            DateTime?
-  cancelledAt            DateTime?
-  cancelReason           String?
-  // scores (denormalised latest values; history in ScoreSnapshot)
-  qualityScore           Float?
-  churnRiskScore         Float?
-  expectedLtvCents       Int?
-  // autopilot
-  autopilotEnabled       Boolean   @default(false)
-  // JSON: {maxChargeCents, askBeforeAdding, minIntervalWeeks, notifyDaysBefore}
-  guardrailsJson         String?
-  // acquisition attribution captured at creation
-  acquisitionJson        String?
-  originOrderId          String?
-  firstOrderAovCents     Int?
-  initialDiscountPercent Float?
-  widgetVersion          String?
-  createdAt              DateTime  @default(now())
-  updatedAt              DateTime  @updatedAt
+  id                String         @id @default(cuid())
+  shopId            String
+  shopifyContractId String         @unique
+  customerId        String // gid://shopify/Customer/...
+  email             String
+  phone             String?
+  firstName         String?
+  lastName          String?
+  status            ContractStatus @default(ACTIVE)
+  locale            String         @default("en")
 
+  currencyCode                String
+  // Cadence. intervalWeeks is the whole-week APPROXIMATION (MONTH≈4wk,
+  // DAY→ceil/7) that scheduling/portal/consolidation surfaces key off; the
+  // exact Shopify billing policy is mirrored alongside so money math (MRR)
+  // never pays the approximation error. Null on rows mirrored before v1.4.0
+  // until their next sync — consumers must fall back to intervalWeeks.
+  intervalWeeks               Int
+  billingIntervalUnit         String? // DAY | WEEK | MONTH | YEAR (Shopify SellingPlanInterval)
+  billingIntervalCount        Int?
+  nextBillingDate             DateTime?
+  // Pause state
+  pausedAt                    DateTime?
+  resumeAt                    DateTime? // auto-resume date (pause is 1–3 months)
+  // Cancel state
+  cancelledAt                 DateTime?
+  cancelReason                String?
+  cancelSource                String? // CUSTOMER | ADMIN | DUNNING | SYSTEM
+  // Failure / dunning
+  failedAt                    DateTime?
+  consecutiveFailures         Int       @default(0)
+  // Prepaid
+  isPrepaid                   Boolean   @default(false)
+  prepaidDeliveriesPerCharge  Int?
+  prepaidDeliveriesRemaining  Int?
+  // Payment
+  paymentMethodId             String? // gid://shopify/CustomerPaymentMethod/...
+  backupPaymentMethodId       String?
+  cardBrand                   String?
+  cardLast4                   String?
+  cardExpiryMonth             Int?
+  cardExpiryYear              Int?
+  // Delivery
+  deliveryAddress             Json?
+  deliveryPriceCents          Int       @default(0)
+  deliveryMethodTitle         String?
+  // Origin + lifecycle
+  originOrderId               String?
+  originOrderName             String?
+  // Origin (checkout) order money mirror (migration 0006). The first payment
+  // never becomes a BillingAttempt, so before these columns cohort/LTGP/rollup
+  // revenue was structurally renewals-only. Captured from getOrderSummary when
+  // the contract is mirrored (create webhook / sync) and backfilled by the
+  // daily origin_order_backfill job; null = not captured yet. Money semantics
+  // mirror BillingAttempt: originOrderTotalCents is the amount as charged
+  // (never rewritten), originOrderRefundedCents accumulates REFUNDS_CREATE
+  // refunds matched by originOrderId and analytics net it out. NOTE:
+  // lifetimeRevenueCents deliberately KEEPS its renewals-only meaning
+  // (revenue billed by this app) — origin money is added in cohort/LTGP and
+  // rollup aggregates from these columns instead.
+  originOrderTotalCents           Int?
+  originOrderDiscountCents        Int?
+  originOrderShippingChargedCents Int?
+  originOrderRefundedCents        Int       @default(0)
+  originOrderProcessedAt          DateTime?
+  originOrderCurrencyCode         String?
+  // Terminal marker for the daily origin MONEY capture (migration 0011):
+  // stamped by origin_order_backfill when getOrderSummary conclusively
+  // reports the origin order unfetchable (order-not-found: deleted,
+  // GDPR-erased, or older than the 60-day order-access horizon without the
+  // read_all_orders scope) for a contract mirrored longer ago than
+  // ORIGIN_CAPTURE_GRACE_MS. Stamped rows leave the capped oldest-first
+  // pending window so permanently unfetchable orders cannot starve it —
+  // the money-pass twin of acqPickupExhaustedAt below. The capture-at-sync
+  // path deliberately ignores this marker: a later successful fetch still
+  // fills the mirror via its atomic originOrderTotalCents-null claim, so a
+  // premature stamp is self-healing.
+  originCaptureExhaustedAt        DateTime?
+  // Acquisition & behavior data foundation (migration 0006, additive-only
+  // ingest — see docs/DATA_FOUNDATION.md). Captured from the origin order's
+  // ORDERS_CREATE payload + customer record, SANITIZED before persistence
+  // (URLs keep host + path + utm_* only; never raw IP, never the full user
+  // agent). All nulled by the CUSTOMERS_REDACT anonymizer.
+  acqReferringSite            String?
+  acqLandingSite              String?
+  acqSourceName               String?
+  acqUtm                      Json? // {source,medium,campaign,term,content}
+  acqCountryCode              String?
+  acqCity                     String?
+  acqProvinceCode             String?
+  acqDeviceType               String? // "mobile" | "desktop" | "tablet" | null
+  acqTimeToPurchaseSeconds    Int? // customer created_at → origin order processed_at
+  acqUnitsFirstOrder          Int?
+  acqOrderValueBand           String? // decile-friendly band label (raw total kept alongside)
+  acqRaw                      Json? // whole sanitized bundle for future mining — additive only, never repurposed
+  // Terminal marker for the daily acquisition stash pickup (migration 0010):
+  // stamped by origin_order_backfill once the stash-race horizon has passed
+  // and no "acquisition.captured" stash exists for this contract (pre-0006
+  // rows whose ORDERS_CREATE predates the stash feature can never grow one),
+  // and by CUSTOMERS_REDACT (the stash payloads are cleared with the
+  // identity). Stamped rows leave the capped acqPending window so unfillable
+  // rows cannot starve it. The ORDERS_CREATE direct-persist path deliberately
+  // ignores this marker — a genuinely late order webhook still lands its data.
+  acqPickupExhaustedAt        DateTime?
+  firstChargeAt               DateTime?
+  ordersCount                 Int       @default(0) // successful cycles billed
+  // Renewal revenue collected on this contract, NET of recorded refunds since
+  // v1.4.0 (REFUNDS_CREATE decrements it, clamped at zero). DELIBERATELY
+  // renewals-only ("billed by this app"): the origin (checkout) payment is
+  // mirrored separately in originOrderTotalCents below, and cohort/LTGP/rollup
+  // aggregates add it from there — this column's meaning never changed.
+  lifetimeRevenueCents        Int       @default(0)
+  lifetimeDiscountCents       Int       @default(0)
+  // DEPRECATED (dead column): no code writes it — per-contract gross profit
+  // is derived from BillingAttempt rows via the shared cost model instead
+  // (app/lib/analytics/costs.server.ts). Kept because migrations are
+  // additive-only; do not read.
+  estLifetimeGrossProfitCents Int       @default(0)
+  // Offer/discount bookkeeping
+  grandfatheredPricing        Boolean   @default(false)
+  // Consolidation ("routine box"): contracts sharing a mergeGroupId + date bill together
+  mergeGroupId                String?
+  // Risk & prediction (analytics jobs keep these fresh)
+  churnRiskScore              Float?    @default(0)
+  predictedEmptyDate          DateTime?
+  skipCount                   Int       @default(0)
+  lastSkippedAt               DateTime?
+  // Save/win-back bookkeeping
+  savedAt                     DateTime? // last time a cancel was averted
+  winbackEligibleAt           DateTime?
+  // Local-only demo contract for the admin portal preview: fake
+  // shopifyContractId ("gid://cellexia/demo/..."), never billed, excluded from
+  // jobs/analytics/Klaviyo. Portal queries include it on purpose.
+  isDemo                      Boolean   @default(false)
+  // Which app owns this contract. The shop may run another subscription app
+  // (e.g. Joy) whose contracts arrive on the same SUBSCRIPTION_CONTRACTS_*
+  // webhooks and get mirrored here. Only OURS is billable / emailable /
+  // analysable / manageable in the portal; UNKNOWN is fail-safe (treated as
+  // NOT ours everywhere it matters) until an admin claims it.
+  // OURS | FOREIGN | UNKNOWN — see app/lib/ownership/ownership.server.ts.
+  //
+  // The DEFAULT IS THE FAIL-SAFE VALUE, not the common one. Every insert path
+  // writes this column explicitly (the webhook mirror classifies it, both
+  // import paths and the portal demo fixture stamp OURS), so the default is
+  // never the deciding vote for a contract the app knowingly creates — it is
+  // only ever reached by a `create()` that FORGOT the column. Defaulting that
+  // mistake to OURS would enrol an unclassified contract into the billing
+  // sweep, which is the one failure this column exists to prevent; defaulting
+  // it to UNKNOWN makes the same mistake cost a renewal that waits until
+  // reclassifyContracts() decides it. Wrong-and-recoverable beats
+  // wrong-and-charged-twice, so the column leans UNKNOWN.
+  ownership                   String    @default("UNKNOWN")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  shop            Shop              @relation(fields: [shopId], references: [id], onDelete: Cascade)
   lines           ContractLine[]
   billingAttempts BillingAttempt[]
-  dunningState    DunningState?
-  milestones      Milestone[]
-  addOns          AddOnItem[]
+  dunningCases    DunningCase[]
+  giftGrants      GiftGrant[]
+  discountGrants  DiscountGrant[]
+  cancelSessions  CancelSession[]
+  events          SubscriberEvent[]
 
-  @@index([shop, status])
-  @@index([shop, shopifyCustomerId])
-  @@index([shop, nextBillingDate])
+  @@index([shopId, status])
+  @@index([shopId, nextBillingDate])
+  @@index([shopId, email])
+  @@index([customerId])
+  @@index([mergeGroupId])
+  // Billing/reminder/dunning sweeps all filter shopId + ownership + status and
+  // range-scan nextBillingDate; the leading columns also serve the plain
+  // ownership counts on the admin pages.
+  @@index([shopId, ownership, status, nextBillingDate])
 }
 
 model ContractLine {
-  id                 String   @id @default(cuid())
-  contractId         String
-  shopifyLineId      String?
-  shopifyProductId   String
-  shopifyVariantId   String
-  title              String
-  quantity           Int
-  currentPriceCents  Int
-  sellingPlanId      String?
-  sellingPlanName    String?
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
-
-  contract  SubscriptionContract @relation(fields: [contractId], references: [id])
-  depletion DepletionEstimate?
-
-  @@index([contractId])
-}
-
-// One-time / limited-run additions to upcoming deliveries.
-model AddOnItem {
   id                  String   @id @default(cuid())
   contractId          String
-  shopifyProductId    String
-  shopifyVariantId    String
+  shopifyLineId       String?
+  productId           String
+  variantId           String
   title               String
+  variantTitle        String?
+  sku                 String?
+  imageUrl            String?
   quantity            Int      @default(1)
-  priceCents          Int
-  // domain.ts AddOnMode: NEXT_ONLY | RECURRING | N_DELIVERIES
-  mode                String
-  remainingDeliveries Int?
-  // how it was added (portal, pre-shipment email, cs-console)
-  source              String
-  // Fulfillment tracking (offers/addOnFulfillment.server.ts): appliedAt is
-  // stamped when the add-on has been injected into the contract as a real
-  // ContractLine; appliedLineId records the local line id created at
-  // application time (consumption falls back to a variant match when Shopify
-  // rewrites line ids on later draft commits). RECURRING rows are deleted on
-  // application instead — they become permanent lines.
-  appliedAt           DateTime?
-  appliedLineId       String?
+  // Selling plan this line rides on, mirrored from Shopify. The ownership
+  // evidence in local form: whose subscription app this contract belongs to is
+  // decided by whether these plan ids are in SellingPlanConfig.shopifyPlanIds.
+  // Null on lines created without a plan (atomicCreate imports, gifts).
+  sellingPlanId       String? // gid://shopify/SellingPlan/...
+  sellingPlanName     String?
+  currentPriceCents   Int
+  compareAtPriceCents Int? // undiscounted price, for "you save X" display
+  unitCostCents       Int? // COGS from Shopify inventoryItem, for LTGP
+  isGift              Boolean  @default(false)
+  isOneTimeAddon      Boolean  @default(false) // remove after ITS cycle settles (addonCycleIndex)
+  // The Shopify billing-cycle index this one-time add-on was staged onto
+  // (migration 0012). consumeCycleOnSuccess clears an add-on mirror only when
+  // ITS cycle settles — a contract-scoped clear used to delete an add-on the
+  // customer staged for cycle N+1 while cycle N's charge was still in flight
+  // (nextBillingDate advances optimistically at attempt creation), freeing its
+  // addClaimKey and letting the same variant be staged AND charged twice.
+  // Null on non-add-on lines and on legacy add-on rows (cleared on any
+  // settlement, the old behavior).
+  addonCycleIndex     Int?
+  addedVia            String   @default("CHECKOUT") // CHECKOUT | PORTAL | MAGIC_LINK | ADMIN | GIFT_ENGINE | SWAP
+  // Atomic add claim (migration 0009): addOneTimeAddon / addLine create the
+  // mirror row FIRST, keyed "addon:{contractId}:{variantId}" respectively
+  // "line:{contractId}:{variantId}", and only then run the multi-second
+  // Shopify edit (deleting the row if that edit fails). A concurrent
+  // double-tap therefore loses on P2002 and is treated as already-staged —
+  // the old read-then-act guard let both requests stage the same add-on and
+  // charge the customer twice. Null on every other ingest path (checkout
+  // sync, gifts, imports), which stay free to mirror whatever Shopify holds.
+  addClaimKey         String?  @unique
   createdAt           DateTime @default(now())
 
-  contract SubscriptionContract @relation(fields: [contractId], references: [id])
+  contract SubscriptionContract @relation(fields: [contractId], references: [id], onDelete: Cascade)
 
   @@index([contractId])
 }
 
-// ───────────────────────────── Billing, dunning, recovery ──────────────
+// ── Billing ───────────────────────────────────────────────────────────────────
+
+enum BillingAttemptStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  CHALLENGED
+  EXPIRED
+}
 
 model BillingAttempt {
-  id                      String    @id @default(cuid())
-  shop                    String
-  contractId              String
-  shopifyBillingAttemptId String?   @unique
-  idempotencyKey          String    @unique
-  // domain.ts BillingAttemptStatus: PENDING | SUCCESS | FAILURE | CHALLENGED
-  status                  String
-  errorCode               String?
-  // domain.ts DeclineCategory (derived from errorCode)
-  declineCategory         String?
-  orderId                 String?
-  amountCents             Int?
-  attemptNumber           Int       @default(1)
-  isRetry                 Boolean   @default(false)
-  occurredAt              DateTime  @default(now())
-
-  contract SubscriptionContract @relation(fields: [contractId], references: [id])
-
-  @@index([shop, status])
-  @@index([contractId])
-}
-
-model DunningState {
-  id             String    @id @default(cuid())
-  contractId     String    @unique
-  // domain.ts DunningPhase: NONE | PRE_DUNNING | RETRYING | GRACE | FINAL_NOTICE | RESOLVED | EXHAUSTED
-  phase          String    @default("NONE")
-  declineCategory String?
-  retryCount     Int       @default(0)
-  nextRetryAt    DateTime?
-  lastFailureAt  DateTime?
-  graceUntil     DateTime?
-  // JSON: DunningHistoryEntry[] — [{at, type, stepIndex?, action?, template?, errorCode?, declineCategory?, note?}]
-  historyJson    String    @default("[]")
-  updatedAt      DateTime  @updatedAt
-
-  contract SubscriptionContract @relation(fields: [contractId], references: [id])
-
-  @@index([nextRetryAt])
-}
-
-// ───────────────────────────── Retention ───────────────────────────────
-
-model CancellationSession {
-  id             String    @id @default(cuid())
-  shop           String
-  contractId     String
-  // domain.ts CancelReason
-  reason         String?
-  reasonDetail   String?
-  // JSON: offers presented [{type, params, costCents}]
-  offersJson     String    @default("[]")
-  // domain.ts CancelOutcome: SAVED | CANCELLED | ABANDONED | IN_PROGRESS
-  outcome        String    @default("IN_PROGRESS")
-  savedByOffer   String?
-  saveCostCents  Int?
-  maxSaveCostCents Int? // profit-aware ceiling computed at session start
-  startedAt      DateTime  @default(now())
-  resolvedAt     DateTime?
-
-  @@index([shop, outcome])
-  @@index([contractId])
-}
-
-model ScoreSnapshot {
-  id         String   @id @default(cuid())
-  shop       String
-  contractId String
-  // domain.ts ScoreKind: QUALITY | CHURN_RISK | LTV
-  kind       String
-  value      Float
-  // JSON: feature breakdown for explainability
-  factorsJson String  @default("{}")
-  computedAt DateTime @default(now())
-
-  @@index([contractId, kind])
-}
-
-// ───────────────────────────── Treatment engine ────────────────────────
-
-model DepletionEstimate {
-  id                 String    @id @default(cuid())
-  contractLineId     String    @unique
-  estimatedDailyUsage Float
-  lastDeliveryAt     DateTime?
-  unitsOnHand        Float?
-  predictedRunOutAt  DateTime?
-  confidence         Float     @default(0.5)
-  // JSON: signal log [{at, signal, adjustment}] — delays, skips, add-ons, survey answers
-  signalsJson        String    @default("[]")
-  updatedAt          DateTime  @updatedAt
-
-  line ContractLine @relation(fields: [contractLineId], references: [id])
-}
-
-model AdherenceSurvey {
-  id                String   @id @default(cuid())
-  shop              String
+  id                String               @id @default(cuid())
   contractId        String
-  shopifyCustomerId String
-  // domain.ts AdherenceQuestion keys -> answers
-  answersJson       String
-  sentAt            DateTime @default(now())
-  respondedAt       DateTime?
+  shopifyAttemptId  String?              @unique
+  // Idempotency: unique per (contract, cycle, retry) — Shopify dedupes on this key,
+  // making double charges impossible even if the scheduler crashes mid-run.
+  idempotencyKey    String               @unique
+  cycleIndex        Int // Shopify billing cycle index
+  attemptNumber     Int                  @default(1) // 1 = scheduled charge, >1 = dunning retry
+  status            BillingAttemptStatus @default(PENDING)
+  scheduledFor      DateTime
+  startedAt         DateTime?
+  completedAt       DateTime?
+  orderId           String?
+  orderName         String?
+  amountCents       Int?
+  currencyCode      String?
+  errorCode         String? // Shopify processing error code
+  errorMessage      String?
+  declineCategory   String? // SOFT | HARD | AUTH_REQUIRED | null
+  // Success-settlement completion marker — the success-side analogue of the
+  // failure path's declineCategory-written-LAST contract. Stamped only after
+  // EVERY post-claim side effect of a successful charge has run (dunning
+  // close, lifecycle, order confirmation, event log). status SUCCESS with
+  // settledAt NULL = the process died mid-settlement; a redelivered success
+  // webhook re-drives the missing side effects instead of returning early.
+  settledAt         DateTime?
+  // Failure-engine concurrency lease (migration 0008): onBillingAttemptFailed
+  // claims the attempt atomically at entry (updateMany gated on
+  // declineCategory IS NULL and a null/expired lease) so a delayed FAILURE
+  // webhook racing the stale-attempt sweep cannot run the engine twice —
+  // which used to double consecutiveFailures, duplicate the payment-failed
+  // email and open two dunning cases. declineCategory stays the
+  // processing-COMPLETE marker: a crashed run leaves it null and the lease
+  // expires, so a redelivery still re-drives the failure.
+  dunningClaimedAt  DateTime?
+  originatingAction String               @default("SCHEDULER") // SCHEDULER | DUNNING_RETRY | ADMIN_MANUAL | BACKUP_FALLBACK
+  usedBackupPayment Boolean              @default(false)
+  // Σ cents refunded against this attempt's order (REFUNDS_CREATE webhook).
+  // amountCents keeps the amount originally charged; analytics report
+  // revenue net of this column, so the charge history is never rewritten.
+  refundedCents     Int                  @default(0)
+  // Compliance evidence: stored-credential/MIT flags, 3DS outcome, consent snapshot
+  mitEvidence       Json?
+  // Churn-episode release marker (migration 0013): stamped on terminal
+  // attempts (FAILED/CHALLENGED/EXPIRED) when a win-back reactivation closes
+  // the churn episode they belong to AND no dunning case is open. The billing
+  // sweep's cycle-history guard ignores superseded rows when deciding whether
+  // a cycle's history still owns it — so a reactivated contract whose next
+  // billing date lands back inside the still-unbilled failed cycle gets the
+  // fresh FIRST attempt it was promised instead of being held forever.
+  // History stays append-only: the row and its outcome are preserved, attempt
+  // numbering still counts superseded rows (idempotency keys stay unique) —
+  // only the row's guard-blocking power is retired.
+  supersededAt      DateTime?
 
+  contract SubscriptionContract @relation(fields: [contractId], references: [id], onDelete: Cascade)
+
+  @@index([contractId, cycleIndex])
+  @@index([status, scheduledFor])
+}
+
+enum DunningState {
+  OPEN
+  RETRYING
+  AWAITING_CUSTOMER
+  AWAITING_3DS
+  RECOVERED
+  EXHAUSTED
+  CANCELLED
+}
+
+model DunningCase {
+  id                 String       @id @default(cuid())
+  contractId         String
+  openedAt           DateTime     @default(now())
+  state              DunningState @default(OPEN)
+  triggerAttemptId   String? // the failed attempt that opened the case
+  declineCode        String?
+  declineCategory    String? // SOFT | HARD | AUTH_REQUIRED
+  ladderStep         Int          @default(0) // index into retry schedule
+  nextRetryAt        DateTime?
+  paydayAligned      Boolean      @default(false)
+  emailsSent         Int          @default(0)
+  smsSent            Int          @default(0)
+  lastNotifiedAt     DateTime?
+  resolvedAt         DateTime?
+  resolution         String? // RECOVERED | CUSTOMER_FIXED | CANCELLED | EXHAUSTED
+  recoveredAttemptId String?
+  recoveredCents     Int?
+
+  contract SubscriptionContract @relation(fields: [contractId], references: [id], onDelete: Cascade)
+
+  // INVARIANT (migration 0008, not expressible in Prisma DSL): at most ONE
+  // case per contract may be in an open state at a time, enforced by the
+  // Postgres partial unique index "DunningCase_one_open_case_per_contract"
+  // ON ("contractId") WHERE state IN (OPEN, RETRYING, AWAITING_CUSTOMER,
+  // AWAITING_3DS). ensureOpenCase treats the unique violation (P2002) as
+  // "lost the race" and reuses the winner's case.
+  @@index([state, nextRetryAt])
   @@index([contractId])
 }
 
-model Milestone {
+// ── Event log (single source for timeline, audit and Klaviyo outbox feed) ─────
+
+model SubscriberEvent {
   id         String   @id @default(cuid())
-  contractId String
-  // domain.ts MilestoneType: TREATMENT_STARTED | FIRST_MONTH | NINETY_DAYS | SIX_DELIVERIES | ONE_YEAR
-  type       String
-  achievedAt DateTime @default(now())
-  // domain.ts MilestoneRewardStatus: PENDING | GRANTED | NOTIFIED
-  rewardStatus String @default("PENDING")
-  rewardJson String?
+  shopId     String
+  contractId String?
+  customerId String?
+  email      String?
+  type       String // e.g. "contract.created", "cycle.skipped", "dunning.retry_scheduled"
+  source     String // SYSTEM | WEBHOOK | ADMIN | CUSTOMER_PORTAL | MAGIC_LINK | SCHEDULER | KLAVIYO
+  actor      String? // admin email, "customer", "system"
+  payload    Json?
+  createdAt  DateTime @default(now())
 
-  contract SubscriptionContract @relation(fields: [contractId], references: [id])
+  contract SubscriptionContract? @relation(fields: [contractId], references: [id], onDelete: SetNull)
 
-  @@unique([contractId, type])
+  @@index([contractId, createdAt])
+  @@index([shopId, type, createdAt])
+  @@index([email])
 }
 
-// ───────────────────────────── Offers & experiments ────────────────────
+// ── Magic links, OTP, portal sessions ─────────────────────────────────────────
 
-model WidgetConfig {
-  id            String   @id @default(cuid())
-  shop          String
-  // domain.ts WidgetType: TREATMENT_CHOICE | QUANTITY_CADENCE | ROUTINE_BUILDER | POST_ONE_TIME | CART_CONVERSION
-  widgetType    String
-  name          String
-  // JSON: targeting {productIds, markets, trafficSources, returningOnly, intentBands}
-  targetingJson String   @default("{}")
-  // JSON: widget-specific copy/settings overrides
-  settingsJson  String   @default("{}")
-  priority      Int      @default(0)
-  active        Boolean  @default(true)
-  experimentId  String?
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+model MagicLinkToken {
+  id         String    @id @default(cuid())
+  tokenHash  String    @unique // sha256 of the signed token — raw token never stored
+  action     String // SKIP_NEXT | DELAY_NEXT | ADD_TO_NEXT | UPDATE_CARD | RESUME | PAUSE | SWAP | CONFIRM_3DS | LOGIN
+  contractId String?
+  customerId String?
+  email      String?
+  payload    Json? // action parameters (variantId to add, weeks to delay, ...)
+  expiresAt  DateTime
+  maxUses    Int       @default(1)
+  useCount   Int       @default(0)
+  usedAt     DateTime?
+  createdVia String? // KLAVIYO_FLOW | DUNNING | ADMIN | PORTAL
+  createdAt  DateTime  @default(now())
 
-  @@index([shop, widgetType, active])
+  @@index([contractId])
+  @@index([expiresAt])
 }
 
-model Experiment {
-  id          String   @id @default(cuid())
-  shop        String
-  name        String
-  // JSON: variants [{key, weight, settingsJson}]
-  variantsJson String
-  // domain.ts ExperimentStatus: DRAFT | RUNNING | COMPLETED
-  status      String   @default("DRAFT")
-  startedAt   DateTime?
-  endedAt     DateTime?
-  createdAt   DateTime @default(now())
+model OtpCode {
+  id         String    @id @default(cuid())
+  email      String
+  codeHash   String
+  expiresAt  DateTime
+  attempts   Int       @default(0)
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
 
-  assignments ExperimentAssignment[]
+  @@index([email, createdAt])
 }
 
-model ExperimentAssignment {
-  id           String   @id @default(cuid())
-  experimentId String
-  // anonymous visitor token or shopify customer id
-  subjectKey   String
-  variantKey   String
-  assignedAt   DateTime @default(now())
+model PortalSession {
+  id         String   @id @default(cuid())
+  tokenHash  String   @unique
+  customerId String
+  email      String
+  shopId     String
+  // Admin preview session: full portal UI as the subscriber sees it, but every
+  // mutating action is intercepted — nothing executes, no Shopify calls.
+  isPreview  Boolean  @default(false)
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
 
-  experiment Experiment @relation(fields: [experimentId], references: [id])
-
-  @@unique([experimentId, subjectKey])
+  @@index([customerId])
 }
 
-// ───────────────────────────── Analytics event warehouse ───────────────
+// ── Gifts, offers, lifecycle incentives ───────────────────────────────────────
 
-model AnalyticsEvent {
+model GiftRule {
   id                String   @id @default(cuid())
-  shop              String
-  // domain.ts LifecycleEvent name
+  shopId            String
   name              String
-  contractId        String?
-  shopifyCustomerId String?
-  payloadJson       String   @default("{}")
-  // Replay protection: set only when the emitter passes an explicit
-  // dedupeKey — a redelivered webhook then cannot write a second row.
-  dedupeKey         String?  @unique
-  occurredAt        DateTime @default(now())
+  trigger           String // ORDER_INDEX | DAYS_SUBSCRIBED | SAVE_FLOW | WINBACK | MANUAL
+  orderIndex        Int? // e.g. 1 (first renewal surprise), 2, 6
+  daysSubscribed    Int? // e.g. 365 for 1-year milestone
+  variantId         String // the gift variant (zero-priced line)
+  variantTitle      String?
+  unitCostCents     Int      @default(0) // COGS — feeds LTGP math
+  announceInAdvance Boolean  @default(false) // "stay subscribed and get X" emails
+  active            Boolean  @default(true)
+  createdAt         DateTime @default(now())
 
-  @@index([shop, name, occurredAt])
+  grants GiftGrant[]
+
+  @@index([shopId, trigger])
+}
+
+enum GiftGrantStatus {
+  SCHEDULED
+  ADDED
+  SHIPPED
+  REMOVED
+  CANCELLED
+}
+
+model GiftGrant {
+  id         String          @id @default(cuid())
+  contractId String
+  ruleId     String?
+  cycleIndex Int // the billing cycle the gift ships with
+  variantId  String
+  status     GiftGrantStatus @default(SCHEDULED)
+  addedAt    DateTime?
+  removedAt  DateTime?
+  createdAt  DateTime        @default(now())
+
+  contract SubscriptionContract @relation(fields: [contractId], references: [id], onDelete: Cascade)
+  rule     GiftRule?            @relation(fields: [ruleId], references: [id], onDelete: SetNull)
+
+  @@index([contractId, cycleIndex])
+}
+
+// Temporary percentage discounts (save offers, win-back, retention) applied for
+// N cycles via billing-cycle contract edits — never discount codes.
+model DiscountGrant {
+  id              String    @id @default(cuid())
+  contractId      String
+  type            String // SAVE_OFFER | SAVE_OFFER_FINAL | WINBACK | RETENTION | MANUAL
+  percent         Int
+  cyclesTotal     Int
+  cyclesRemaining Int
+  grantedBy       String? // admin email / "cancel_flow" / "winback_engine"
+  reason          String?
+  createdAt       DateTime  @default(now())
+  exhaustedAt     DateTime?
+
+  contract SubscriptionContract @relation(fields: [contractId], references: [id], onDelete: Cascade)
+
   @@index([contractId])
 }
 
-// Outbox for Klaviyo (and any future destination): at-least-once with replay safety.
-model OutboundEvent {
-  id           String    @id @default(cuid())
-  shop         String
-  destination  String    @default("KLAVIYO")
-  eventName    String
-  // dedupe key so retries never double-send
-  dedupeKey    String    @unique
-  profileEmail String?
-  payloadJson  String
-  // domain.ts OutboxStatus: PENDING | SENT | FAILED | DEAD
-  status       String    @default("PENDING")
-  attempts     Int       @default(0)
-  lastError    String?
-  nextAttemptAt DateTime @default(now())
-  sentAt       DateTime?
-  createdAt    DateTime  @default(now())
+// ── Cancel flow ───────────────────────────────────────────────────────────────
+
+model CancelSession {
+  id            String    @id @default(cuid())
+  contractId    String
+  startedAt     DateTime  @default(now())
+  channel       String    @default("PORTAL") // PORTAL | ADMIN | MAGIC_LINK
+  reason        String? // TOO_MUCH_PRODUCT | TOO_EXPENSIVE | NOT_SEEING_RESULTS | ...
+  reasonDetail  String?
+  savesShown    Json? // ordered list of offers presented
+  saveAccepted  String? // which save was accepted (SKIP | FREQUENCY | PAUSE | DISCOUNT | SWAP | EDUCATION | FINAL_DISCOUNT)
+  outcome       String? // SAVED | CANCELLED | ABANDONED
+  completedAt   DateTime?
+  // 90-day retention tracking for saved customers
+  retainedAt90d Boolean?
+
+  contract SubscriptionContract @relation(fields: [contractId], references: [id], onDelete: Cascade)
+
+  @@index([contractId])
+  @@index([outcome, startedAt])
+}
+
+// ── Win-back ─────────────────────────────────────────────────────────────────
+
+model WinbackState {
+  id                 String    @id @default(cuid())
+  contractId         String    @unique
+  shopId             String
+  cancelledAt        DateTime
+  predictedEmptyDate DateTime // touches are timed to this, not to cancel date
+  stage              Int       @default(0) // 0=soft touch, 1=perk, 2=capped discount, 3=sunset
+  nextTouchAt        DateTime?
+  status             String    @default("ACTIVE") // ACTIVE | WON_BACK | SUNSET | OPTED_OUT
+  wonBackAt          DateTime?
+  createdAt          DateTime  @default(now())
+
+  @@index([status, nextTouchAt])
+}
+
+// ── Notifications ─────────────────────────────────────────────────────────────
+
+model NotificationLog {
+  id               String   @id @default(cuid())
+  shopId           String
+  contractId       String?
+  email            String?
+  phone            String?
+  channel          String // EMAIL | SMS | KLAVIYO_EVENT
+  template         String // e.g. "upcoming_order", "payment_failed_1"
+  status           String   @default("SENT") // SENT | FAILED | SUPPRESSED
+  klaviyoEventName String?
+  error            String?
+  payload          Json?
+  createdAt        DateTime @default(now())
+
+  @@index([contractId, createdAt])
+  @@index([shopId, template, createdAt])
+}
+
+// Outbox for Klaviyo events — guarantees delivery with retries; nothing is lost
+// if Klaviyo is briefly down.
+model KlaviyoOutbox {
+  id            String    @id @default(cuid())
+  shopId        String
+  eventName     String
+  email         String?
+  phone         String?
+  profileAttrs  Json?
+  properties    Json?
+  eventTime     DateTime  @default(now())
+  status        String    @default("PENDING") // PENDING | SENT | FAILED | DEAD
+  attempts      Int       @default(0)
+  nextAttemptAt DateTime  @default(now())
+  lastError     String?
+  sentAt        DateTime?
 
   @@index([status, nextAttemptAt])
 }
 
-model ForecastSnapshot {
-  id           String   @id @default(cuid())
-  shop         String
-  computedAt   DateTime @default(now())
-  horizonWeeks Int      @default(13)
-  // JSON: [{weekStart, sku, market, contractedUnits, probabilityAdjustedUnits,
-  //         expectedSkips, expectedPauses, expectedCancellations, expectedFailedPayments,
-  //         expectedAddOnUnits, revenueCents, marginCents, ciLowCents, ciHighCents}]
-  rowsJson     String
+// ── Webhook processing (idempotent consumption + failure visibility) ──────────
 
-  @@index([shop, computedAt])
-}
-
-// Learned model parameters (docs/LEARNING-DATA-V2.md §1). Append-only: each
-// recalibration writes version + 1; the newest version wins, and callers
-// treat a missing row as "use static defaults".
-model ModelState {
-  id          String   @id @default(cuid())
-  shop        String
-  // learning.server LearnedModel:
-  // CHURN_CALIBRATION | DUNNING_RECOVERY | FORECAST_PROPENSITY | DEPLETION_USAGE
-  model       String
-  version     Int
-  paramsJson  String   // learned parameters (shape per model, see learning.server)
-  metricsJson String   @default("{}") // quality metrics (brier, lift, n)
-  sampleSize  Int
-  computedAt  DateTime @default(now())
-
-  @@unique([shop, model, version])
-  @@index([shop, model])
-}
-
-// ───────────────────────────── Operational safeguards ──────────────────
-
-// Immutable, hash-chained audit log. Rows are append-only; prevHash links entries
-// per shop so tampering is detectable.
-model AuditLog {
-  id         String   @id @default(cuid())
-  shop       String
-  seq        Int
-  actorType  String // SYSTEM | STAFF | CUSTOMER | WEBHOOK
-  actorId    String?
-  action     String
-  subjectType String?
-  subjectId  String?
-  payloadJson String  @default("{}")
-  prevHash   String?
-  hash       String
-  createdAt  DateTime @default(now())
-
-  @@unique([shop, seq])
-  @@index([shop, subjectType, subjectId])
-}
-
-model IdempotencyKey {
-  id          String   @id @default(cuid())
-  key         String   @unique
-  scope       String
-  resultJson  String?
-  createdAt   DateTime @default(now())
-  expiresAt   DateTime
-}
-
-// Webhook replay protection: Shopify webhook ids we have already processed.
-model ProcessedWebhook {
-  id          String   @id @default(cuid())
-  webhookId   String   @unique
+model WebhookReceipt {
+  id          String    @id @default(cuid())
   topic       String
-  shop        String
-  processedAt DateTime @default(now())
+  shopDomain  String
+  webhookId   String    @unique // X-Shopify-Webhook-Id header — dedupe key
+  payloadHash String?
+  status      String    @default("PROCESSED") // PROCESSED | FAILED | SKIPPED_DUPLICATE
+  error       String?
+  receivedAt  DateTime  @default(now())
+  processedAt DateTime?
 
-  @@index([shop, topic])
+  @@index([topic, receivedAt])
+  @@index([status])
 }
 
-model MagicLinkToken {
-  id                String    @id @default(cuid())
-  shop              String
-  shopifyCustomerId String
-  email             String
-  tokenHash         String    @unique
-  expiresAt         DateTime
-  usedAt            DateTime?
-  createdAt         DateTime  @default(now())
+// ── Jobs, locks, monitoring ───────────────────────────────────────────────────
 
-  @@index([shop, shopifyCustomerId])
-  // requestMagicLink's one-live-link-per-address cooldown (and its
-  // enumeration-defence decoy twin) look up by (shop, email).
-  @@index([shop, email])
+model JobRun {
+  id         String    @id @default(cuid())
+  jobName    String // billing_run | dunning_run | gift_run | winback_run | rollup_run | klaviyo_flush | ...
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+  status     String    @default("RUNNING") // RUNNING | SUCCESS | FAILED
+  stats      Json?
+  error      String?
+
+  @@index([jobName, startedAt])
+}
+
+model JobLock {
+  name        String   @id
+  lockedUntil DateTime
+  owner       String
+}
+
+model Alert {
+  id         String    @id @default(cuid())
+  shopId     String
+  type       String // BILLING_RUN_FAILED | WEBHOOK_FAILURES | STUCK_CONTRACTS | CHURN_SPIKE | FAILURE_SPIKE | FAST_SHIPPING_SKIPS | STOCKOUT_RENEWALS
+  severity   String    @default("WARNING") // INFO | WARNING | CRITICAL
+  message    String
+  context    Json?
+  createdAt  DateTime  @default(now())
+  resolvedAt DateTime?
+  notifiedAt DateTime?
+
+  @@index([shopId, resolvedAt, createdAt])
+}
+
+// ── Price changes (propagate-with-notice vs grandfather is a setting) ─────────
+
+model PriceChangeBatch {
+  id                String    @id @default(cuid())
+  shopId            String
+  mode              String // PROPAGATE_WITH_NOTICE | GRANDFATHER
+  noticeDays        Int       @default(30)
+  createdBy         String?
+  createdAt         DateTime  @default(now())
+  noticeSentAt      DateTime?
+  effectiveAt       DateTime?
+  appliedAt         DateTime?
+  status            String    @default("DRAFT") // DRAFT | NOTICE_SENT | APPLIED | CANCELLED
+  items             Json // [{variantId, oldPriceCents, newPriceCents}]
+  contractsAffected Int       @default(0)
+}
+
+// ── Analytics ─────────────────────────────────────────────────────────────────
+
+model DailyRollup {
+  id                  String   @id @default(cuid())
+  shopId              String
+  date                DateTime // UTC midnight for the shop-tz day
+  activeSubscribers   Int      @default(0)
+  pausedSubscribers   Int      @default(0)
+  newSubscribers      Int      @default(0)
+  churnedVoluntary    Int      @default(0)
+  churnedInvoluntary  Int      @default(0)
+  mrrCents            Int      @default(0)
+  chargedCents        Int      @default(0)
+  discountCents       Int      @default(0)
+  giftCogsCents       Int      @default(0)
+  estGrossProfitCents Int      @default(0)
+  failedAttempts      Int      @default(0)
+  recoveredCents      Int      @default(0)
+  openDunningCases    Int      @default(0)
+  skips               Int      @default(0)
+  cancels             Int      @default(0)
+  savesOffered        Int      @default(0)
+  savesAccepted       Int      @default(0)
+  addonsAttached      Int      @default(0)
+  takeRateNum         Int      @default(0) // subscription checkouts
+  takeRateDen         Int      @default(0) // total checkouts of subscribable products
+  prepaidActive       Int      @default(0)
+  // Cost-model era (migration 0004): refunds recorded in the day window,
+  // estimated shipping/fulfillment + payment-fee load of the day's charges, and
+  // the share of billedCogs that came from the cogsFallbackPctOfPrice estimate
+  // (COGS coverage stat — 0 means all COGS was known from Shopify/overrides).
+  refundedCents       Int      @default(0)
+  shippingCostCents   Int      @default(0)
+  feesCents           Int      @default(0)
+  estimatedCogsCents  Int      @default(0)
+
+  @@unique([shopId, date])
+}
+
+// Cohort survival + LTGP: one row per (signup cohort month, months since signup)
+model CohortCell {
+  id                  String   @id @default(cuid())
+  shopId              String
+  cohortMonth         String // "2026-07"
+  monthOffset         Int // 0,1,2,... months since signup
+  cohortSize          Int      @default(0)
+  activeRemaining     Int      @default(0)
+  revenueCents        Int      @default(0)
+  discountCents       Int      @default(0)
+  cogsCents           Int      @default(0)
+  shippingCostCents   Int      @default(0)
+  feesCents           Int      @default(0)
+  grossProfitCents    Int      @default(0)
+  cumGrossProfitCents Int      @default(0)
+  computedAt          DateTime @default(now())
+  // Cost-model era (migration 0004): cents refunded against this cell's
+  // charges (revenueCents is already net of them), and the share of cogsCents
+  // that came from the cogsFallbackPctOfPrice estimate (COGS coverage stat).
+  refundedCents       Int      @default(0)
+  estimatedCogsCents  Int      @default(0)
+
+  @@unique([shopId, cohortMonth, monthOffset])
+}
+
+// ── Buy-box designer ─────────────────────────────────────────────────────────
+
+// Immutable revision history of the PDP buy-box design config. The latest row
+// with publishedAt set is the live design (mirrored to the shop metafield
+// cellexia.buybox_design as JSON for Liquid); rows without publishedAt are
+// drafts. Restoring an old design creates a new revision — history is
+// append-only, so every publish is reversible.
+model WidgetDesignRevision {
+  id          String    @id @default(cuid())
+  shopId      String
+  preset      String // classic | toggle | tiles | inline | value_stack | planner
+  config      Json // widgetDesignConfigSchema (app/lib/widget/presets.ts), version:1
+  createdBy   String? // admin user email / "system"
+  publishedAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([shopId, createdAt])
+}
+
+// ── Migration / import ────────────────────────────────────────────────────────
+
+model ImportBatch {
+  id         String    @id @default(cuid())
+  shopId     String
+  filename   String?
+  totalRows  Int       @default(0)
+  succeeded  Int       @default(0)
+  failed     Int       @default(0)
+  status     String    @default("PENDING") // PENDING | RUNNING | DONE | FAILED
+  createdAt  DateTime  @default(now())
+  finishedAt DateTime?
+  errors     Json?
 }

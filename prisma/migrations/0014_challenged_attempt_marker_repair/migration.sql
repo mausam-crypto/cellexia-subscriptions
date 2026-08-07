@@ -1,0 +1,49 @@
+-- 3DS challenge stamp vs. the failure engine's processed marker (stability
+-- pass).
+--
+-- NO SCHEMA CHANGE: one data repair on a single column, scoped to rows only
+-- the old challenge claims could have produced. No DROP, no RENAME, no type
+-- change, no ADD COLUMN.
+--
+-- Why:
+--
+-- BillingAttempt.declineCategory is onBillingAttemptFailed's written-LAST
+-- "processing complete" marker: a FAILED attempt with a non-null category has
+-- been all the way through the failure engine and is skipped on webhook
+-- redelivery (early-return guard + the atomic entry claim, both keyed on the
+-- column being null). The 3DS challenge claims overloaded that marker: both
+-- onBillingAttemptChallenged and the stale sweep's CHALLENGED branch stamped
+-- the ATTEMPT's declineCategory = 'AUTH_REQUIRED' at challenge time. When the
+-- challenged attempt's real FAILURE webhook later arrived (customer abandoned
+-- the challenge; bank declined after authentication; challenge expired), the
+-- handler marked the row FAILED and handed it to the engine — which saw
+-- FAILED + non-null category and returned: no soft-retry ladder for
+-- recoverable post-3DS declines, no consecutiveFailures increment, stale
+-- AUTH_REQUIRED on the case, and the settlement_redrive FAILED arm (filtered
+-- on declineCategory NULL) could never repair the row either. The cycle sat
+-- held at the sweep's b2 guard until cancelAfterFailedDays exhausted the
+-- case — auto-recovery revenue silently lost on every challenged renewal.
+--
+-- The code fix removes the attempt-level stamp from both challenge claims
+-- (the CASE's declineCategory and the attempt's mitEvidence fold keep the
+-- challenge state; the attempt column stays null until the failure engine has
+-- truly finished). This repair releases the rows the OLD code already
+-- stamped: attempts still sitting CHALLENGED with the challenge stamp get
+-- their marker cleared so the FAILURE webhook (or redelivery train) that
+-- eventually settles them runs the engine exactly once, like any other
+-- failure.
+--
+-- Scoped tightly on purpose: status CHALLENGED + category AUTH_REQUIRED is
+-- the exact and only signature the challenge claims wrote (the engine itself
+-- never leaves a row CHALLENGED when it stamps a category — its final write
+-- always accompanies status FAILED, or a FAILED status already set by the
+-- webhook handler). Rows already FAILED with category AUTH_REQUIRED are NOT
+-- touched: a legitimately engine-processed AUTH_REQUIRED failure is
+-- indistinguishable from one the old guard mis-skipped, and clearing a
+-- processed marker would re-run the engine on redelivery (double ladder
+-- entries). Those few mis-skipped historical rows resolve through the
+-- existing case timeouts; correctness going forward is what this buys.
+UPDATE "BillingAttempt"
+SET "declineCategory" = NULL
+WHERE "status" = 'CHALLENGED'
+  AND "declineCategory" = 'AUTH_REQUIRED';

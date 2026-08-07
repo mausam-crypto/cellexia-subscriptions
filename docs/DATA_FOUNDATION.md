@@ -1,0 +1,174 @@
+# Data foundation — origin-order revenue & acquisition capture
+
+v1.5.0 (migration `0006_origin_order_revenue_acquisition`). Two goals:
+
+1. **Close the renewals-only revenue gap.** The first (checkout) payment never
+   becomes a `BillingAttempt`, so before 0006 every cohort/LTGP/rollup revenue
+   figure structurally excluded it. The origin payment is now mirrored onto
+   the contract and included in analytics.
+2. **Collect as much acquisition/behavior data as possible, safely.** Source,
+   UTMs, geo, device class and first-order shape are captured at the moment
+   they exist (the origin order's webhook) into additive columns, so future
+   features (source-level LTGP, geo cohorts, device take-rate) have history
+   from day one instead of starting cold.
+
+**The additive rule (non-negotiable):** new ingest always lands in NEW
+additive columns or inside `acqRaw` — an existing field is never repurposed,
+renamed or re-typed. That is what makes this a foundation: every consumer
+written later can trust that a column has always meant the same thing.
+
+---
+
+## Part 1 — Origin-order money mirror (`SubscriptionContract`)
+
+| Field | Type | Source | Meaning |
+|---|---|---|---|
+| `originOrderTotalCents` | `Int?` | `getOrderSummary(originOrderId).totalCents` | The origin payment as charged (order current total at capture — for the normal same-day capture, exactly what was paid). Never rewritten after capture. `null` = not captured yet. |
+| `originOrderDiscountCents` | `Int?` | `…discountsCents` | Order-level discount total — money-true (no per-line estimation), reported alongside revenue like renewal `discountCents`. |
+| `originOrderShippingChargedCents` | `Int?` | `…shippingCents` | What the CUSTOMER paid for delivery on the first order. Revenue context (it is inside the total), never a cost. |
+| `originOrderRefundedCents` | `Int` (default 0) | `REFUNDS_CREATE` webhook | Σ refunds recorded against the origin order (matched by `contract.originOrderId` when no `BillingAttempt` claims the order). Netted in analytics; the total above is never rewritten. |
+| `originOrderProcessedAt` | `DateTime?` | order `processedAt` (fallback `createdAt`) | The payment instant — the day/month analytics book the origin payment on. |
+| `originOrderCurrencyCode` | `String?` | order currency (fallback contract currency) | Currency guard input: a non-shop-currency origin total is excluded from shop-currency aggregates, never summed at 1:1. |
+
+### Capture paths (all idempotent — only fill while `originOrderTotalCents` is null)
+
+1. **At mirror time**: `syncContractFromShopify` (create webhook / any sync)
+   fetches the order summary once for owned (`OURS`) contracts and persists
+   the fields. A failed fetch leaves them null.
+2. **Daily backfill**: job `origin_order_backfill` — OURS, non-demo contracts
+   with an `originOrderId` and a null total, oldest first, capped at 200 per
+   run (`ORIGIN_BACKFILL_CAP`), per-contract failures contained and retried
+   next run. Covers pre-0006 rows, failed fetches and contracts classified
+   OURS after creation. Ungated in SETUP (read-only analytics capture).
+
+### Analytics semantics
+
+- **Cohorts** (`runCohortComputation`): origin payment (total − refunded,
+  clamped) booked in the month it processed — normally month 0. Fees via the
+  shared cost model on the origin total; one shipment cost
+  (× deliveries-per-charge when prepaid); **COGS approximated from the
+  contract's CURRENT lines via `resolveLineCogs`** (origin lines ≈ current
+  lines — the same lines-as-they-exist-now approximation billed cycles already
+  accept; swaps between checkout and capture blur it slightly).
+- **Rollups** (`runDailyRollup`): origin payments enter `chargedCents` (and
+  discount/COGS/shipping/fees) on their processed day. The normal path
+  captures on the create webhook — same day, inside the trailing recompute
+  window. A LATE capture (backfill) whose processed day already left the
+  recompute/backfill window stays out of that closed rollup row — closed days
+  keep their snapshots — while the cohort triangle (full recompute from
+  source) always includes it. LTGP truth lives in cohorts; rollups are the
+  day-by-day operational ledger.
+- **Double-count guard**: an origin order that ALSO has a successful
+  `BillingAttempt` (should not exist, but nothing structurally prevents it)
+  counts ONCE — the attempt wins. `originPaymentCountsOnce`
+  (`app/lib/analytics/queries.server.ts`) is the single pure predicate both
+  surfaces share; refunds apply the same precedence (attempt match first,
+  origin match only otherwise).
+- **`lifetimeRevenueCents` keeps its renewals-only meaning** ("revenue billed
+  by this app", net of renewal refunds). The origin payment is deliberately
+  not added to it; cohort/LTGP/rollup aggregates read the origin columns
+  directly. Anything presenting `lifetimeRevenueCents` (subscriber cockpit)
+  shows billed-by-us revenue.
+- **Pre-capture refunds**: a refund issued before the money was captured is
+  partially reflected in the captured current total (item refunds reduce it),
+  which is the honest money-kept figure; money-only refunds predating capture
+  are the one case revenue can read slightly high — accepted and documented.
+
+---
+
+## Part 2 — Acquisition capture (`SubscriptionContract.acq*`)
+
+Captured for subscribable orders from the `ORDERS_CREATE` payload — a line
+carries a selling-plan marker OR a line's product is listed in an active
+`SellingPlanConfig.productIds` (the same `containsSubscribable` test the
+take-rate denominator uses, because REST order payloads do not always include
+the marker) — enriched with the Shopify customer record at contract creation.
+The webhooks race in either order, so the sanitized bundle is stashed as an
+`acquisition.captured` event (keyed by `payload.orderId`) and whichever side
+finds both halves persists it — idempotently, while `acqRaw` is still null.
+A stash for a subscribable one-time order is inert: the pickup only applies a
+bundle whose `orderId` matches the contract's `originOrderId`.
+
+Both online triggers can fire while the contract is not yet billable (e.g.
+mirrored `UNKNOWN`, reclassified `OURS` later), so the daily
+`origin_order_backfill` job re-runs the pickup for OURS, non-demo contracts
+with an `originOrderId` and `acqRaw` still null. That retry queue is
+drainable by construction: a contract still stash-less past the 48-hour
+webhook-race/redelivery horizon (`ACQ_PICKUP_GRACE_MS`) can never be filled
+by the pickup — its `ORDERS_CREATE` predates the stash feature (pre-0006) or
+its stash payload was redacted — and is stamped `acqPickupExhaustedAt`
+(migration 0010, additive) and excluded from future scans, so unfillable rows
+cannot monopolize the capped oldest-first window. Transient pickup errors are
+never stamped (retried next run), and the `ORDERS_CREATE` direct-persist path
+ignores the stamp, so a genuinely late order webhook still lands its bundle.
+
+| Field | Type | Source | Sanitization / meaning |
+|---|---|---|---|
+| `acqReferringSite` | `String?` | order `referring_site` | URL sanitizer (below). Where the buyer came from. |
+| `acqLandingSite` | `String?` | order `landing_site` | URL sanitizer. First page hit on the store. |
+| `acqSourceName` | `String?` | order `source_name` | Truncated 64. Shopify channel ("web", "shopify_draft_order", app ids…). |
+| `acqUtm` | `Json?` | utm params of landing (fallback referring) URL | `{source, medium, campaign, term, content}`, each PII-scrubbed + truncated; null when no UTM at all. Extracted BEFORE the URL sanitizer strips params, so no signal is lost. |
+| `acqCountryCode` | `String?` | shipping (fallback billing) address | Uppercased, ≤8 chars. |
+| `acqCity` | `String?` | shipping (fallback billing) address | Truncated 64. |
+| `acqProvinceCode` | `String?` | shipping (fallback billing) address | Uppercased, ≤16 chars. |
+| `acqDeviceType` | `String?` | `client_details.user_agent` | Reduced to `"mobile" \| "desktop" \| "tablet"` (else null). **The full UA string is never stored.** |
+| `acqTimeToPurchaseSeconds` | `Int?` | customer `createdAt` → origin order `processedAt` | Browse-to-buy latency, clamped ≥ 0. Needs the Shopify customer read; null when unavailable. |
+| `acqUnitsFirstOrder` | `Int?` | Σ line-item quantities | First-order basket size. |
+| `acqOrderValueBand` | `String?` | order total | Decile-friendly label (`"0_25"` … `"200_plus"`, major units, edges in `ORDER_VALUE_BAND_EDGES`). A presentation convenience — the raw total is kept in `acqRaw.orderTotalCents`, so bands can be recomputed with different edges without losing data. |
+| `acqRaw` | `Json?` | whole sanitized bundle | Everything above plus `orderId`, `orderTotalCents`, `orderCurrencyCode`, `orderProcessedAt`, `customerCreatedAt`, `customerNumberOfOrders` (and `importedFrom`/`importPassthrough` for CSV imports). **Future-mining surface**: new ingest may add keys here without a migration. |
+
+### Sanitization rules (pure module: `app/lib/acquisition/sanitize.ts`)
+
+Enforced in one exported, unit-testable place so no caller can forget them:
+
+- **Never the raw IP** (`client_details.browser_ip` is not even read),
+  **never the full user-agent string** (reduced to the device class, then
+  discarded).
+- **URLs**: keep host (absolute URLs) + path + `utm_*` query params ONLY —
+  every other query param is dropped (checkout tokens, session ids, gclid,
+  email-in-query…). Free-text parts are scrubbed of emails, phone-length
+  digit runs and token-shaped strings, then hard-capped (512 chars).
+- **Every field is length-capped** so a hostile payload cannot balloon a row.
+- Ownership: capture persists onto **OURS** contracts only (another app's
+  subscriber is not ours to profile; UNKNOWN fails safe).
+
+### GDPR (mandatory)
+
+`CUSTOMERS_REDACT` nulls **every** `acq*` data column and `acqRaw` on the
+customer's contracts and clears the payloads of their `acquisition.captured`
+stash events. It also **stamps** `acqPickupExhaustedAt` (the one non-data
+`acq*` column — a queue-control marker holding no acquisition information):
+the stash payloads are cleared, so the redacted `acqRaw`-null row must leave
+the backfill's pickup window rather than be re-scanned nightly forever.
+**Any new acq column must be added to the anonymizer in
+`app/lib/webhooks/handlers.server.ts` in the same change that adds it.**
+Origin-order *money* columns are retained (legitimate financial records, no
+personal data).
+
+### Where it surfaces today
+
+- **Subscriber cockpit** (`/app/subscribers/:id`): the "Acquisition" card —
+  first order, source, UTMs, location, device, account-to-first-order time,
+  first-order units.
+- **Klaviyo**: profile attributes `cellexia_acq_source` /
+  `cellexia_acq_country`, synced on every contract-scoped event when present.
+- **Import script** (`scripts/import-subscribers.ts`): optional `acq_*` CSV
+  columns pass through the same sanitizer into the same columns (geo falls
+  back to the delivery-address columns).
+
+### What it unlocks later (why we collect now)
+
+- **Source-level LTGP** — join `acqSourceName`/`acqUtm.source` against cohort
+  LTGP: which channel produces subscribers worth keeping, not just cheap ones.
+- **Geo cohorts** — retention/LTGP by `acqCountryCode`/`acqCity` (shipping
+  performance and product-market fit differ by region).
+- **Device take-rate** — buy-box conversion and survival by `acqDeviceType`,
+  feeding preset choice in the designer.
+- **Value-band survival** — do bigger first orders churn less?
+  `acqOrderValueBand` (and the raw total in `acqRaw`) make that a query, not
+  a project.
+- **Churn-risk features** — `acqTimeToPurchaseSeconds`, units and band are
+  natural inputs for the risk model once enough labeled history exists.
+
+None of these are computed yet; the rule is that when they are, they consume
+these columns read-only and any new signal lands additively.

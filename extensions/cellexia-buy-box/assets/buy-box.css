@@ -1,0 +1,1264 @@
+/* ─────────────────────────────────────────────────────────────────────────────
+   Cellexia Buy Box — PDP subscription widget.
+
+   Namespace: .cx-buybox (BEM) + .cx-buybox-embed (app-embed wrapper).
+   Mobile-first, no webfonts, no layout shift: the block is fully
+   server-rendered and JS only swaps strings. No element-id selectors here —
+   the host page may carry another vendor's "cx-*" ids.
+
+   v1.2.1 — TYPOGRAPHICALLY SELF-CONTAINED. The widget mounts inside the
+   host theme's markup (on cellexialabs.com: the ~394px .pdp__info buy
+   column), so every theme rule for h1/h2/h3, label, button, select,
+   fieldset, ul/li or p would otherwise leak in. It did: the heading rendered
+   in the theme's display face ("Gobold", uppercase, huge) and the badge
+   overflowed its card. Nothing below inherits typography except the
+   font-FAMILY, which is deliberately taken from the host (brand body face,
+   "argumentum") on the ROOT only.
+
+   ── Cascade contract (read before editing) ───────────────────────────────
+   1. Every rule is scoped so it carries AT LEAST TWO class selectors
+      (specificity 0,2,0). Host rules that reach into the widget are almost
+      always element (0,0,1) or single-class-plus-element (0,1,1) — e.g.
+      ".pdp__info h3" — so 0,2,0 wins without !important. The root itself is
+      written ".cx-buybox.cx-buybox" (same element, class repeated) purely to
+      reach that floor.
+   2. The element reset uses :where(...), which contributes ZERO
+      specificity — the reset is therefore exactly 0,2,0, and every
+      component rule further down the file (also ≥ 0,2,0) beats it on
+      source order. NEVER move a component rule above the reset, and never
+      drop the ".cx-buybox " prefix from one: it would fall to 0,1,0 and the
+      reset would win.
+   3. Merchant custom CSS is injected as "#cx-buybox-<uid> { … }" — an id
+      (1,0,0) — so it still overrides everything here, by design.
+
+   ── Units ────────────────────────────────────────────────────────────────
+   Type and spacing are in px, not rem: a host theme that sets
+   "html { font-size: 62.5% }" (a common Sass pattern) would otherwise
+   shrink the whole widget to 62.5%. Scaling stays available through
+   --cx-font-scale (style.fontScale, 0.85–1.15), which every type token is
+   multiplied by. em is used only inside pills, where "relative to my own
+   font-size" is exactly what is wanted.
+
+   ── Widths ───────────────────────────────────────────────────────────────
+   Every rule outside a media query is the mobile-first default and is
+   correct on its own at 320 / 375 / 394px — which is what the buy column
+   actually is; the media queries only ADD breathing room, so nothing
+   depends on them. Container queries are deliberately NOT used: they need
+   `container-type: inline-size`, whose size containment makes the widget
+   contribute zero width to a shrink-to-fit ancestor, and a widget that can
+   collapse to 0px in an unknown theme is a worse failure than slightly
+   roomy padding in a narrow column.
+
+   ── !important inventory (the only five; do not add a sixth lightly) ──────
+   a) .cx-buybox__sr / __sr-input position — visually-hidden inputs must stay
+      hidden even under a theme "input { position: relative }".
+   b) .cx-buybox [hidden] — attribute-driven visibility is toggled by
+      buy-box.js and must beat both theme [hidden] resets and our own
+      display rules (e.g. .cx-buybox__panel .cx-buybox__save, 0,3,0).
+   c) [data-cellexia-gated][hidden] — the launch gate. Must survive any theme
+      reset that re-displays [hidden] elements.
+   d) .cx-buybox-embed[hidden] — same, for the unmounted embed wrapper.
+   e) .cx-buybox--no-anim * — the behavior.animation kill switch must beat
+      every transition/animation declared here.
+
+   Theme override hooks (set on .cx-buybox or any ancestor). The app's
+   Buy box designer publishes these same properties via the block's inline
+   style:
+     --cx-accent        subscription accent (border, badge, radio) — also set
+                        inline from the block's "Accent color" setting
+     --cx-accent-soft   soft fill behind the subscription card (style.bgTint)
+     --cx-accent-text   text on accent surfaces: active tab, chips (style.accentText)
+     --cx-border        neutral card border color
+     --cx-border-width  card border width (layout.borderWidthPx)
+     --cx-bg            card background
+     --cx-text          main text color (style.text; defaults to inherit)
+     --cx-muted         secondary text color
+     --cx-badge-bg      badge background (style.badgeBg; defaults to accent)
+     --cx-badge-text    badge text color (style.badgeText)
+     --cx-radius        card corner radius (layout.radiusPx)
+     --cx-font-scale    typography multiplier (style.fontScale, 0.85–1.15)
+
+   Preset modifiers: .cx-buybox--classic (no extra rules — the base IS
+   classic), --toggle, --tiles, --inline, --value_stack, --planner,
+   --subscription_max.
+   ──────────────────────────────────────────────────────────────────────── */
+
+/* ── Root: design tokens + the widget's own typography ────────────────────
+   font-family is the ONLY typographic property inherited from the host
+   (brand body face). Everything else is stated here or on a component. */
+
+.cx-buybox.cx-buybox {
+  /* Brand fallbacks (v1.2.0, cellexialabs.com): near-black on white, grey
+     panel, hairline borders, square cards. Overridden by the published
+     design config through the root's inline style. */
+  --cx-accent: #1d1d1b;
+  --cx-accent-soft: #f4f4f4;
+  --cx-border: rgba(29, 29, 27, 0.12);
+  --cx-bg: #ffffff;
+  --cx-text: #1d1d1b;
+  --cx-muted: rgba(29, 29, 27, 0.55);
+  --cx-badge-text: #ffffff;
+  --cx-radius: 0px;
+
+  /* Internal type scale — not part of the public hook list above.
+     15px body / 13px microcopy / 19px price / 16px heading / 11–12px pills,
+     each multiplied by the config's font scale. */
+  --cx-fs: calc(15px * var(--cx-font-scale, 1));
+  --cx-fs-sm: calc(13px * var(--cx-font-scale, 1));
+  --cx-fs-lg: calc(19px * var(--cx-font-scale, 1));
+  --cx-fs-head: calc(16px * var(--cx-font-scale, 1));
+  --cx-fs-pill: calc(11px * var(--cx-font-scale, 1));
+  --cx-fs-chip: calc(12px * var(--cx-font-scale, 1));
+  /* Card padding, so presets and density stay in step. */
+  --cx-pad-x: 16px;
+  --cx-pad-y: 14px;
+
+  display: block;
+  box-sizing: border-box;
+  max-inline-size: 100%;
+  min-inline-size: 0;
+  margin: 16px 0;
+  color: var(--cx-text);
+  font-family: inherit;
+  font-size: var(--cx-fs);
+  font-style: normal;
+  font-weight: 300;
+  line-height: 1.45;
+  letter-spacing: normal;
+  text-align: start;
+  text-transform: none;
+  overflow-wrap: break-word;
+}
+
+/* ── Scoped reset ─────────────────────────────────────────────────────────
+   :where() keeps this at 0,2,0 so every component rule below wins on
+   source order. Values are "inherit", never literals: the root above is the
+   single source of truth, and the merchant's #id custom CSS can still
+   re-point the whole widget by setting a property once on the root.
+
+   `input` is intentionally NOT in the list. Author border/background on a
+   native checkbox can knock some engines off native theming, and the only
+   two inputs we render are already fully specified below: the sr-only
+   radios (.cx-buybox__sr-input) and the inline checkbox
+   (.cx-buybox__inline-box), both at 0,2,0. */
+
+.cx-buybox.cx-buybox,
+.cx-buybox.cx-buybox *,
+.cx-buybox.cx-buybox *::before,
+.cx-buybox.cx-buybox *::after {
+  box-sizing: border-box;
+}
+
+.cx-buybox.cx-buybox
+  :where(
+    h1,
+    h2,
+    h3,
+    h4,
+    h5,
+    h6,
+    p,
+    div,
+    span,
+    ul,
+    ol,
+    li,
+    label,
+    legend,
+    fieldset,
+    button,
+    select,
+    s,
+    small,
+    strong,
+    em,
+    svg
+  ) {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  box-shadow: none;
+  float: none;
+  color: inherit;
+  font-family: inherit;
+  font-size: inherit;
+  font-style: normal;
+  font-weight: inherit;
+  line-height: inherit;
+  letter-spacing: inherit;
+  text-align: inherit;
+  text-decoration: none;
+  text-indent: 0;
+  text-transform: none;
+  list-style: none;
+}
+
+/* (b) buy-box.js drives visibility with the [hidden] attribute; it has to
+   beat theme resets AND our own display rules, which is only reachable with
+   !important. */
+.cx-buybox [hidden] {
+  display: none !important;
+}
+
+/* The JSON island and the merchant's scoped <style> must never paint. */
+.cx-buybox.cx-buybox :where(script, style) {
+  display: none;
+}
+
+/* ── Heading + subheading ────────────────────────────────────────────────
+   Deliberately NOT display-sized: 16px/1.3, medium weight, sentence case —
+   a section label inside a buy column, not a page heading. */
+
+.cx-buybox .cx-buybox__heading {
+  margin: 0 0 12px;
+  font-size: var(--cx-fs-head);
+  font-weight: 500;
+  line-height: 1.3;
+  letter-spacing: 0.01em;
+  text-transform: none;
+}
+
+.cx-buybox .cx-buybox__subheading {
+  margin: -6px 0 12px;
+  font-size: var(--cx-fs-sm);
+  font-weight: 300;
+  line-height: 1.4;
+  color: var(--cx-muted);
+}
+
+/* ── Visually hidden but accessible (group label, select label, radios) ─── */
+
+.cx-buybox .cx-buybox__sr,
+.cx-buybox .cx-buybox__sr-input {
+  /* (a) a theme "input { position: relative }" would drag the clipped radio
+     back into the layout; nothing else can win that. */
+  position: absolute !important;
+  inline-size: 1px;
+  block-size: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+/* ── Option group ────────────────────────────────────────────────────────
+   padding-block-start reserves the 8px the badge pill lifts above the first
+   card's top edge (badge is 19px tall, offset -8px). */
+
+.cx-buybox .cx-buybox__group {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-block-start: 10px;
+}
+
+/* ── Option cards ─────────────────────────────────────────────────────── */
+
+.cx-buybox .cx-buybox__option {
+  position: relative;
+  min-inline-size: 0;
+  border: var(--cx-border-width, 1px) solid var(--cx-border);
+  border-radius: var(--cx-radius);
+  background: var(--cx-bg);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease,
+    background-color 0.15s ease;
+}
+
+/* Subscription card is always visually distinct: accent border + soft fill. */
+.cx-buybox .cx-buybox__option--sub {
+  border-color: var(--cx-accent);
+  background: var(--cx-accent-soft);
+}
+
+.cx-buybox .cx-buybox__option.is-selected {
+  box-shadow: 0 0 0 1px var(--cx-border) inset;
+}
+
+.cx-buybox .cx-buybox__option--sub.is-selected {
+  box-shadow: 0 0 0 1px var(--cx-accent) inset;
+}
+
+/* Focus ring — :focus-visible when :has() is supported, otherwise any focus. */
+.cx-buybox .cx-buybox__option:has(.cx-buybox__radio:focus-visible) {
+  outline: 2px solid var(--cx-accent);
+  outline-offset: 2px;
+}
+
+@supports not selector(:has(*)) {
+  .cx-buybox .cx-buybox__option:focus-within {
+    outline: 2px solid var(--cx-accent);
+    outline-offset: 2px;
+  }
+}
+
+/* Variant has no subscription allocation → hide the subscription card. */
+.cx-buybox--no-sub .cx-buybox__option--sub {
+  display: none;
+}
+
+/* ── Card label (whole surface clickable, ≥44px tap target) ────────────── */
+
+.cx-buybox .cx-buybox__card {
+  display: block;
+  min-block-size: 44px;
+  padding: var(--cx-pad-y) var(--cx-pad-x);
+  font-size: var(--cx-fs);
+  font-weight: 300;
+  line-height: 1.45;
+  letter-spacing: normal;
+  text-transform: none;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.cx-buybox .cx-buybox__card-body {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-inline-size: 0;
+}
+
+.cx-buybox .cx-buybox__card-main {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1 1 auto;
+  min-inline-size: 0;
+}
+
+/* ── Custom radio control ────────────────────────────────────────────── */
+
+.cx-buybox .cx-buybox__control {
+  display: block;
+  flex: 0 0 auto;
+  inline-size: 20px;
+  block-size: 20px;
+  margin-block-start: 2px;
+  border: 2px solid var(--cx-border);
+  border-radius: 50%;
+  position: relative;
+  transition: border-color 0.15s ease;
+}
+
+.cx-buybox .cx-buybox__control::after {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  border-radius: 50%;
+  background: var(--cx-accent);
+  opacity: 0;
+  transform: scale(0.5);
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+
+.cx-buybox .cx-buybox__radio:checked + .cx-buybox__card-body .cx-buybox__control {
+  border-color: var(--cx-accent);
+}
+
+.cx-buybox
+  .cx-buybox__radio:checked
+  + .cx-buybox__card-body
+  .cx-buybox__control::after {
+  opacity: 1;
+  transform: scale(1);
+}
+
+/* ── Card content ────────────────────────────────────────────────────── */
+
+.cx-buybox .cx-buybox__title-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-inline-size: 0;
+}
+
+.cx-buybox .cx-buybox__title {
+  font-size: var(--cx-fs);
+  font-weight: 500;
+  line-height: 1.35;
+  letter-spacing: normal;
+  text-transform: none;
+  min-inline-size: 0;
+}
+
+.cx-buybox .cx-buybox__save {
+  font-size: var(--cx-fs-sm);
+  font-weight: 500;
+  line-height: 1.35;
+  color: var(--cx-accent);
+  white-space: nowrap;
+}
+
+.cx-buybox .cx-buybox__price-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-inline-size: 0;
+}
+
+.cx-buybox .cx-buybox__price {
+  font-size: var(--cx-fs);
+  font-weight: 400;
+  line-height: 1.35;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.cx-buybox .cx-buybox__price--lg {
+  font-size: var(--cx-fs-lg);
+  font-weight: 400;
+  line-height: 1.2;
+}
+
+.cx-buybox .cx-price__compare {
+  font-size: 0.8em;
+  font-weight: 400;
+  color: var(--cx-muted);
+  text-decoration: line-through;
+  margin-inline-start: 0.35em;
+  white-space: nowrap;
+}
+
+.cx-buybox .cx-buybox__first-label,
+.cx-buybox .cx-buybox__then,
+.cx-buybox .cx-buybox__per-delivery {
+  font-size: var(--cx-fs-sm);
+  font-weight: 300;
+  line-height: 1.4;
+  color: var(--cx-muted);
+}
+
+/* ── Frequency selector ──────────────────────────────────────────────── */
+
+.cx-buybox .cx-buybox__freq {
+  padding: 0 var(--cx-pad-x) var(--cx-pad-y);
+}
+
+.cx-buybox .cx-buybox__freq-select {
+  display: block;
+  inline-size: 100%;
+  max-inline-size: 100%;
+  min-block-size: 44px;
+  padding: 8px 34px 8px 12px;
+  font-family: inherit;
+  font-size: var(--cx-fs);
+  font-weight: 300;
+  line-height: 1.4;
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--cx-text);
+  border: 1px solid var(--cx-border);
+  border-radius: max(0px, calc(var(--cx-radius) - 4px));
+  background-color: #ffffff;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5' fill='none' stroke='%23555555' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+}
+
+/* The popup list is a separate inheritance path — engines that honour
+   author styling on <option> would otherwise render the theme's uppercase
+   there even though the closed control is clean. Typography only: author
+   color/background on <option> is unreliable across platforms. */
+.cx-buybox.cx-buybox option {
+  font-family: inherit;
+  font-size: var(--cx-fs);
+  font-weight: 300;
+  letter-spacing: normal;
+  text-transform: none;
+}
+
+[dir="rtl"] .cx-buybox .cx-buybox__freq-select {
+  padding: 8px 12px 8px 34px;
+  background-position: left 12px center;
+}
+
+.cx-buybox .cx-buybox__freq-select:focus-visible {
+  outline: 2px solid var(--cx-accent);
+  outline-offset: 1px;
+}
+
+/* ── Badge pill ──────────────────────────────────────────────────────────
+   Absolutely positioned against .cx-buybox__option (the only positioned
+   ancestor), lifted 8px over the card's top edge — the group reserves that
+   space. It can NEVER exceed the card: it starts 12px in and is capped at
+   (card − 24px), so both edges keep a 12px inset; a badge longer than that
+   ellipsizes instead of spilling. Worst realistic case is a 320px viewport
+   → ~288px card → 264px of room, against ~112px for "MOST POPULAR" at
+   11px; 375px and 394px columns have more. display:inline-block computes to
+   block (it is absolutely positioned) so shrink-to-fit + max-inline-size +
+   text-overflow all behave. */
+
+.cx-buybox .cx-buybox__badge {
+  position: absolute;
+  inset-block-start: -8px;
+  inset-inline-start: 12px;
+  z-index: 1;
+  display: inline-block;
+  max-inline-size: calc(100% - 24px);
+  padding: 4px 10px;
+  font-size: var(--cx-fs-pill);
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--cx-badge-text);
+  background: var(--cx-badge-bg, var(--cx-accent));
+  border-radius: 999px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── Reassurance line ────────────────────────────────────────────────── */
+
+.cx-buybox .cx-buybox__reassurance {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0;
+  padding: 0 var(--cx-pad-x) var(--cx-pad-y);
+  font-size: var(--cx-fs-sm);
+  font-weight: 300;
+  line-height: 1.4;
+  color: var(--cx-muted);
+}
+
+/* Explicit box: a theme "svg { width: 100% }" would otherwise blow it up. */
+.cx-buybox .cx-buybox__check {
+  flex: 0 0 auto;
+  inline-size: 14px;
+  block-size: 14px;
+  margin-block-start: 2px;
+  color: var(--cx-accent);
+}
+
+/* ── Density (compact) ───────────────────────────────────────────────── */
+
+.cx-buybox.cx-buybox--compact {
+  --cx-fs: calc(14px * var(--cx-font-scale, 1));
+  --cx-fs-lg: calc(17px * var(--cx-font-scale, 1));
+  --cx-fs-head: calc(15px * var(--cx-font-scale, 1));
+  --cx-pad-x: 14px;
+  --cx-pad-y: 10px;
+}
+
+.cx-buybox--compact .cx-buybox__group {
+  gap: 8px;
+}
+
+/* ── Wider screens: a touch more breathing room ──────────────────────────
+   Padding only. The badge keeps its 12px inset at every width so the
+   overflow guard below stays a single, verifiable calculation. */
+
+@media (min-width: 750px) {
+  .cx-buybox:not(.cx-buybox--compact) {
+    --cx-pad-x: 20px;
+    --cx-pad-y: 16px;
+  }
+}
+
+/* ═══ Design presets ══════════════════════════════════════════════════════
+   Everything below only applies behind a .cx-buybox--{preset} modifier or a
+   preset-specific element class, so the classic rendering above is
+   untouched. All presets are driven by the same custom properties. */
+
+/* ── Shared: frequency chips (frequencyStyle "chips" + planner) ─────────── */
+
+.cx-buybox .cx-buybox__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding: 0 var(--cx-pad-x) var(--cx-pad-y);
+  border: 0;
+  min-inline-size: 0;
+}
+
+.cx-buybox .cx-buybox__chip {
+  display: inline-flex;
+  position: relative;
+  margin: 0;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.cx-buybox .cx-buybox__chip-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45em;
+  min-block-size: 40px;
+  padding: 6px 14px;
+  border: var(--cx-border-width, 1px) solid var(--cx-border);
+  border-radius: 999px;
+  background: var(--cx-bg);
+  font-size: var(--cx-fs-chip);
+  font-weight: 500;
+  line-height: 1.2;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.cx-buybox .cx-buybox__chip input:checked + .cx-buybox__chip-label {
+  border-color: var(--cx-accent);
+  background: var(--cx-accent-soft);
+  box-shadow: 0 0 0 1px var(--cx-accent) inset;
+}
+
+.cx-buybox .cx-buybox__chip:has(input:focus-visible) .cx-buybox__chip-label {
+  outline: 2px solid var(--cx-accent);
+  outline-offset: 2px;
+}
+
+@supports not selector(:has(*)) {
+  .cx-buybox .cx-buybox__chip:focus-within .cx-buybox__chip-label {
+    outline: 2px solid var(--cx-accent);
+    outline-offset: 2px;
+  }
+}
+
+.cx-buybox .cx-buybox__chip-tag {
+  display: inline-flex;
+  padding: 0.15em 0.5em;
+  font-size: 0.85em;
+  font-weight: 500;
+  line-height: 1.2;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--cx-badge-text);
+  background: var(--cx-badge-bg, var(--cx-accent));
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+/* Chips rendered outside a card (planner) sit flush with the wrapper. */
+.cx-buybox .cx-buybox__group--planner .cx-buybox__chips {
+  padding: 0 0 12px;
+}
+
+/* ── Shared: benefit list ────────────────────────────────────────────── */
+
+.cx-buybox .cx-buybox__benefits {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  list-style: none;
+  margin: 0;
+  padding: 4px var(--cx-pad-x) var(--cx-pad-y);
+  font-size: var(--cx-fs-sm);
+  font-weight: 300;
+  line-height: 1.4;
+}
+
+.cx-buybox .cx-buybox__benefit {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--cx-fs-sm);
+  font-weight: 300;
+  line-height: 1.4;
+}
+
+/* ── Shared: compare rows (tiles) ────────────────────────────────────── */
+
+.cx-buybox .cx-buybox__rows {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-block-start: 8px;
+  padding-block-start: 8px;
+  border-block-start: 1px dashed var(--cx-border);
+  font-size: var(--cx-fs-sm);
+  font-weight: 300;
+  line-height: 1.4;
+}
+
+.cx-buybox .cx-buybox__row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  min-inline-size: 0;
+}
+
+.cx-buybox .cx-buybox__row-label {
+  color: var(--cx-muted);
+}
+
+.cx-buybox .cx-buybox__row-value {
+  text-align: end;
+  font-variant-numeric: tabular-nums;
+}
+
+.cx-buybox .cx-buybox__row-value--accent {
+  color: var(--cx-accent);
+  font-weight: 500;
+}
+
+/* ── Toggle preset ───────────────────────────────────────────────────── */
+
+.cx-buybox .cx-buybox__tabs {
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  border: var(--cx-border-width, 1px) solid var(--cx-border);
+  border-radius: 999px;
+  background: var(--cx-bg);
+  min-inline-size: 0;
+}
+
+.cx-buybox .cx-buybox__tab {
+  flex: 1 1 0;
+  min-block-size: 44px;
+  min-inline-size: 0;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  font-size: var(--cx-fs-sm);
+  font-weight: 500;
+  line-height: 1.2;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  text-align: center;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.cx-buybox .cx-buybox__tab[aria-selected="true"] {
+  background: var(--cx-accent);
+  color: var(--cx-accent-text, #ffffff);
+}
+
+.cx-buybox .cx-buybox__tab:focus-visible {
+  outline: 2px solid var(--cx-accent);
+  outline-offset: 2px;
+}
+
+.cx-buybox .cx-buybox__panel {
+  /* vertical rhythm comes from the group's flex gap */
+  padding: var(--cx-pad-y) var(--cx-pad-x);
+  border: var(--cx-border-width, 1px) solid var(--cx-border);
+  border-radius: var(--cx-radius);
+  background: var(--cx-bg);
+  min-inline-size: 0;
+}
+
+.cx-buybox .cx-buybox__panel.cx-buybox__option--sub {
+  border-color: var(--cx-accent);
+  background: var(--cx-accent-soft);
+}
+
+.cx-buybox .cx-buybox__panel .cx-buybox__save {
+  display: block;
+  margin-block-end: 4px;
+}
+
+/* Panel children were designed for cards — the panel already pads them. */
+.cx-buybox .cx-buybox__panel .cx-buybox__freq,
+.cx-buybox .cx-buybox__panel .cx-buybox__reassurance,
+.cx-buybox .cx-buybox__panel .cx-buybox__benefits {
+  padding: 10px 0 0;
+}
+
+/* Panel reveal animation — opt-in (behavior.animation) and motion-safe. */
+@media (prefers-reduced-motion: no-preference) {
+  .cx-buybox--toggle:not(.cx-buybox--no-anim) .cx-buybox__panel:not([hidden]) {
+    animation: cx-panel-in 0.18s ease;
+  }
+}
+
+@keyframes cx-panel-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.cx-buybox--no-sub .cx-buybox__tabs {
+  display: none;
+}
+
+/* ── Tiles preset ────────────────────────────────────────────────────────
+   Stacked below 750px. The v1.2.0 breakpoint was 480px, which put two
+   ~190px tiles side by side in a phone-width column; 750px keeps them
+   stacked on every phone and small tablet. */
+
+.cx-buybox .cx-buybox__tiles {
+  display: grid;
+  grid-template-columns: 1fr;
+  align-items: stretch;
+}
+
+@media (min-width: 750px) {
+  .cx-buybox .cx-buybox__tiles {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+.cx-buybox .cx-buybox__tile {
+  display: flex;
+  flex-direction: column;
+  min-inline-size: 0;
+}
+
+/* The subscription tile is elevated: stronger shadow + badge. */
+.cx-buybox--tiles .cx-buybox__option--sub {
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.08);
+}
+
+.cx-buybox--tiles .cx-buybox__option--sub.is-selected {
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.08), 0 0 0 1px var(--cx-accent) inset;
+}
+
+.cx-buybox .cx-buybox__card--tile {
+  flex: 1 1 auto;
+}
+
+.cx-buybox .cx-buybox__card-body--stack {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* ── Inline preset ───────────────────────────────────────────────────── */
+
+.cx-buybox.cx-buybox--inline {
+  margin: 8px 0;
+}
+
+.cx-buybox .cx-buybox__inline-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-block-size: 44px;
+  padding: 6px 0;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* appearance is restated: themes that null out native checkboxes to draw
+   their own would otherwise leave this one invisible. */
+.cx-buybox .cx-buybox__inline-box {
+  flex: 0 0 auto;
+  inline-size: 18px;
+  block-size: 18px;
+  margin: 3px 0 0;
+  appearance: auto;
+  -webkit-appearance: checkbox;
+  accent-color: var(--cx-accent);
+  cursor: pointer;
+}
+
+.cx-buybox .cx-buybox__inline-box:focus-visible {
+  outline: 2px solid var(--cx-accent);
+  outline-offset: 2px;
+}
+
+.cx-buybox .cx-buybox__inline-label {
+  font-size: var(--cx-fs);
+  font-weight: 500;
+  line-height: 1.35;
+}
+
+.cx-buybox .cx-buybox__inline-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-inline-start: 28px;
+}
+
+.cx-buybox .cx-buybox__inline-detail .cx-buybox__freq,
+.cx-buybox .cx-buybox__inline-detail .cx-buybox__reassurance,
+.cx-buybox .cx-buybox__inline-detail .cx-buybox__chips {
+  padding: 6px 0 0;
+}
+
+/* Variant with no subscription allocation (buy-box.js toggles --no-sub): every
+   subscription-only fragment that lives OUTSIDE .cx-buybox__option--sub has to
+   be hidden here, or it survives as an orphan above a lone one-time card.
+   __planner-cadence is the showFrequency=false planner's standing "Delivery
+   every 8 weeks" line — a delivery promise for an offer that variant does not
+   have. (The other presets keep their frequency control inside the sub option,
+   and the planner always renders chips, never the __freq dropdown.) */
+.cx-buybox--no-sub .cx-buybox__inline-row,
+.cx-buybox--no-sub .cx-buybox__inline-detail,
+.cx-buybox--no-sub .cx-buybox__chips,
+.cx-buybox--no-sub .cx-buybox__planner-label,
+.cx-buybox--no-sub .cx-buybox__planner-cadence {
+  display: none;
+}
+
+/* ── Value stack preset ──────────────────────────────────────────────── */
+
+.cx-buybox .cx-buybox__stack-panel .cx-buybox__benefits {
+  padding-block-start: 0;
+}
+
+.cx-buybox .cx-buybox__stack-onetime {
+  display: block;
+  padding: 10px var(--cx-pad-x);
+  text-align: center;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.cx-buybox .cx-buybox__stack-onetime-link {
+  font-size: var(--cx-fs-sm);
+  font-weight: 300;
+  line-height: 1.4;
+  color: var(--cx-muted);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.cx-buybox .cx-buybox__stack-onetime.is-selected .cx-buybox__stack-onetime-link {
+  color: var(--cx-text);
+  font-weight: 500;
+}
+
+.cx-buybox .cx-buybox__stack-onetime:has(input:focus-visible) {
+  outline: 2px solid var(--cx-accent);
+  outline-offset: 2px;
+  border-radius: max(0px, calc(var(--cx-radius) - 4px));
+}
+
+@supports not selector(:has(*)) {
+  .cx-buybox .cx-buybox__stack-onetime:focus-within {
+    outline: 2px solid var(--cx-accent);
+    outline-offset: 2px;
+  }
+}
+
+/* ── Planner preset ──────────────────────────────────────────────────── */
+
+.cx-buybox .cx-buybox__planner-label {
+  margin: 0 0 8px;
+  font-size: var(--cx-fs-sm);
+  font-weight: 500;
+  line-height: 1.4;
+  text-transform: none;
+}
+
+/* Planner with the frequency selector removed (layout.showFrequency=false):
+   a single recommended-cadence line replaces the chips. */
+.cx-buybox .cx-buybox__planner-cadence {
+  margin: 0 0 8px;
+  font-size: var(--cx-fs-sm);
+  font-weight: 300;
+  line-height: 1.4;
+  color: var(--cx-muted);
+}
+
+.cx-buybox .cx-buybox__planner-options {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  /* room for the badge pill overlapping the subscription card's top edge */
+  padding-block-start: 10px;
+}
+
+.cx-buybox .cx-buybox__planner-onetime .cx-buybox__card--slim {
+  padding-block: 10px;
+}
+
+/* ── Subscription max preset ─────────────────────────────────────────────
+   The subscription card IS the buy box: one calm accent card, the
+   reassurance line kept prominent (it is the objection-killer), and the
+   one-time purchase demoted to a single muted underlined line sitting
+   apart below the card. Quiet is NOT hidden: the line is a real radio
+   (sr-input) with a >=44px tap target and the one-time price inside the
+   link before selection. Selecting it swaps the line for a minimal picked
+   state (small check + label + price) plus a quiet switch-back label;
+   is-selected on the wrap — toggled by the existing radio machinery in
+   buy-box.js — is the only switch. Everything is variable-driven (accent,
+   muted, radius, font scale), so the Cellexia defaults (near-black
+   #1D1D1B, radius 0) arrive through the same tokens as every preset.
+   Mobile-first: nothing here is nowrap except money, so a 320px column
+   wraps instead of overflowing. */
+
+.cx-buybox .cx-buybox__submax-card .cx-buybox__price-row {
+  padding-block-start: 2px;
+}
+
+/* Savings stay quiet in this preset: regular weight, no shouting. */
+.cx-buybox .cx-buybox__submax-card .cx-buybox__save--quiet {
+  font-weight: 400;
+}
+
+/* The reassurance line is load-bearing here — full text color, not muted. */
+.cx-buybox .cx-buybox__submax-card .cx-buybox__reassurance {
+  color: var(--cx-text);
+  font-weight: 400;
+}
+
+/* Generous whitespace above the demoted line (on top of the group gap),
+   so the one-time option sits apart from the card instead of reading as
+   part of it. */
+.cx-buybox .cx-buybox__submax-onetime {
+  margin-block-start: 10px;
+  text-align: start;
+}
+
+.cx-buybox .cx-buybox__submax-choice {
+  display: flex;
+  align-items: center;
+  min-block-size: 44px;
+  padding: 10px 2px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.cx-buybox .cx-buybox__submax-link {
+  font-size: var(--cx-fs-sm);
+  font-weight: 300;
+  line-height: 1.4;
+  color: var(--cx-muted);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* Minimal picked state — hidden until the wrap carries is-selected. */
+.cx-buybox .cx-buybox__submax-picked {
+  display: none;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: var(--cx-fs-sm);
+  font-weight: 500;
+  line-height: 1.4;
+  color: var(--cx-text);
+}
+
+.cx-buybox .cx-buybox__submax-picked .cx-buybox__check {
+  align-self: center;
+  margin-block-start: 0;
+}
+
+.cx-buybox .cx-buybox__submax-picked-price {
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Quiet switch-back link, same tap-target maths as the demoted line.
+   Hidden until one-time is selected (pointer convenience only: keyboards
+   and screen readers switch through the radio group itself). */
+.cx-buybox .cx-buybox__submax-switchback {
+  display: none;
+  align-items: center;
+  min-block-size: 44px;
+  padding: 10px 2px;
+  font-size: var(--cx-fs-sm);
+  font-weight: 300;
+  line-height: 1.4;
+  color: var(--cx-muted);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.cx-buybox .cx-buybox__submax-onetime.is-selected .cx-buybox__submax-link {
+  display: none;
+}
+
+.cx-buybox .cx-buybox__submax-onetime.is-selected .cx-buybox__submax-picked {
+  display: flex;
+}
+
+.cx-buybox
+  .cx-buybox__submax-onetime.is-selected
+  .cx-buybox__submax-switchback {
+  display: inline-flex;
+}
+
+/* subscription_max + variant with no subscription allocation (buy-box.js
+   toggles --no-sub and forces one_time): "Switch back to subscription" is a
+   promise this variant cannot honour — the subscription card is hidden and
+   there is no plan to switch back TO. Hide the affordance in BOTH states.
+   The extra .cx-buybox on the second selector lifts it to (0,5,0) so it
+   beats the (0,4,0) is-selected swap above regardless of source order; the
+   first selector covers the not-selected state (already hidden by the base
+   rule, pinned here so a refactor of that default cannot resurrect it). */
+.cx-buybox--no-sub .cx-buybox__submax-switchback,
+.cx-buybox.cx-buybox--no-sub
+  .cx-buybox__submax-onetime.is-selected
+  .cx-buybox__submax-switchback {
+  display: none;
+}
+
+/* Focus ring — same pattern as the value_stack demoted link. */
+.cx-buybox .cx-buybox__submax-onetime:has(input:focus-visible) {
+  outline: 2px solid var(--cx-accent);
+  outline-offset: 2px;
+  border-radius: max(0px, calc(var(--cx-radius) - 4px));
+}
+
+@supports not selector(:has(*)) {
+  .cx-buybox .cx-buybox__submax-onetime:focus-within {
+    outline: 2px solid var(--cx-accent);
+    outline-offset: 2px;
+  }
+}
+
+/* ── Density (compact) for preset elements ───────────────────────────── */
+
+.cx-buybox--compact .cx-buybox__chip-label {
+  min-block-size: 34px;
+  padding: 4px 11px;
+}
+
+.cx-buybox--compact .cx-buybox__tab {
+  min-block-size: 38px;
+}
+
+/* ── Animation kill switch (behavior.animation = false) ──────────────────
+   (e) must beat every transition/animation declared above. */
+
+.cx-buybox--no-anim *,
+.cx-buybox--no-anim *::before,
+.cx-buybox--no-anim *::after {
+  transition: none !important;
+  animation: none !important;
+}
+
+/* ── Reduced motion ──────────────────────────────────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  .cx-buybox .cx-buybox__option,
+  .cx-buybox .cx-buybox__control,
+  .cx-buybox .cx-buybox__control::after,
+  .cx-buybox .cx-buybox__tab,
+  .cx-buybox .cx-buybox__chip-label {
+    transition: none;
+  }
+}
+
+/* ── Launch gate & admin preview ─────────────────────────────────────── */
+
+/* (c) Setup mode: the block server-renders with [hidden][data-cellexia-gated] and
+   must stay invisible even when a theme's reset styles re-display [hidden]
+   elements. buy-box.js removes the attribute only after the signed preview
+   token validated server-side. */
+[data-cellexia-gated][hidden] {
+  display: none !important;
+}
+
+/* Slim ribbon shown only inside an admin preview session, so the admin can
+   tell the reveal worked (regular visitors never see the widget at all).
+   Its own block ABOVE the heading — never positioned over content — and it
+   shrink-wraps to its text without ever exceeding the widget. Hiding is
+   handled by the global .cx-buybox [hidden] rule. */
+.cx-buybox .cx-buybox__preview-ribbon {
+  display: block;
+  inline-size: fit-content;
+  max-inline-size: 100%;
+  margin: 0 0 12px;
+  padding: 4px 10px;
+  font-size: var(--cx-fs-pill);
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--cx-badge-text);
+  background: var(--cx-accent);
+  border-radius: 999px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── App-embed context (.cx-buybox-embed) ────────────────────────────── */
+
+/* The wrapper is server-rendered [hidden] at body end; buy-box-embed.js
+   moves it into the PDP buy column (on cellexialabs.com: before .pdp__grey,
+   in a ~394px column) and removes [hidden] from the WRAPPER only — the
+   inner .cx-buybox launch gate stays with buy-box.js. That reveal is
+   CONDITIONAL on the widget inside being showable: the rules below (block
+   display, 16px block margins, grid-column:1/-1) mean an unhidden EMPTY
+   wrapper is itself a visible change to the product page — an extra gap, or
+   a whole extra row in a grid buy column, above Add to cart — so while the
+   widget is launch-gated the wrapper keeps [hidden] and the PDP is exactly
+   what it was before the embed was enabled. The resets keep host section
+   styles out and make the wrapper immune to a flex or grid parent: it
+   stretches instead of being sized by its content, and min-inline-size:0
+   stops a long price from forcing an overflow. */
+.cx-buybox-embed.cx-buybox-embed {
+  display: block;
+  box-sizing: border-box;
+  inline-size: 100%;
+  max-inline-size: 100%;
+  min-inline-size: 0;
+  align-self: stretch;
+  grid-column: 1 / -1;
+  margin: 16px 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  float: none;
+  clear: both;
+  font: inherit;
+  color: inherit;
+  text-align: start;
+}
+
+.cx-buybox-embed.cx-buybox-embed *,
+.cx-buybox-embed.cx-buybox-embed *::before,
+.cx-buybox-embed.cx-buybox-embed *::after {
+  box-sizing: border-box;
+}
+
+/* (d) Unmounted (or dormant because the section block is present) →
+   invisible, even against theme resets that re-display [hidden] elements. */
+.cx-buybox-embed[hidden] {
+  display: none !important;
+}
+
+/* The wrapper owns the vertical rhythm in embed context. Last in the file:
+   it must also beat the preset margins above (e.g. --inline). */
+.cx-buybox-embed > .cx-buybox.cx-buybox {
+  margin: 0;
+}
+
+/* Admin-only diagnostic card, mounted at body end by buy-box-embed.js when
+   no placement anchor matched DURING A PREVIEW SESSION only (sessionStorage
+   preview token present) — a preview must never fail silently. Fixed
+   position: the card exists precisely because there is no in-page anchor. */
+.cx-buybox-diagnostic.cx-buybox-diagnostic {
+  position: fixed;
+  box-sizing: border-box;
+  inset-block-end: 16px;
+  inset-inline-start: 16px;
+  z-index: 2147483000;
+  max-inline-size: min(340px, calc(100vw - 32px));
+  padding: 12px 16px;
+  background: #1d1d1b;
+  color: #ffffff;
+  font: 400 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI",
+    "Helvetica Neue", Arial, sans-serif;
+  border-radius: 4px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.25);
+}

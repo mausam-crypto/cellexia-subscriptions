@@ -1,30 +1,36 @@
-FROM node:20-alpine
+FROM node:22-alpine
 
 RUN apk add --no-cache openssl
 
 EXPOSE 3000
 WORKDIR /app
 
+ENV NODE_ENV=production
+
 COPY package.json package-lock.json* ./
 
-# NODE_ENV is NOT set yet here — npm treats that env var as an implicit
-# --omit=dev regardless of the install flags used, and the build step below
-# (`remix vite:build`) needs @remix-run/dev and vite, both devDependencies.
-# It's set further down, right before CMD, so it only affects the running
-# app, not this install/build.
-RUN npm ci
+# This image *builds* the app (`npm run build` below) and the build chain —
+# @remix-run/dev (which provides the `remix` binary), vite, vite-tsconfig-paths
+# — lives in devDependencies. `ENV NODE_ENV=production` already makes npm omit
+# devDependencies, so `--include=dev` is mandatory here; without it the build
+# step dies with `sh: remix: not found`. The build-only packages are pruned
+# again further down, so the shipped image keeps the same runtime footprint.
+#
+# Do not add `npm remove <pkg>` between this line and the build: with
+# NODE_ENV=production `npm remove` re-reifies the tree with --omit=dev and
+# silently deletes every devDependency again (that is what the upstream
+# template's `npm remove @shopify/cli` line did — this project never depended
+# on @shopify/cli, so the line was a no-op booby trap and is gone).
+RUN npm ci --include=dev && npm cache clean --force
 
 COPY . .
 
-# Regenerate the Prisma Client against the Postgres schema at build time too
-# — not just at container boot via docker-start's setup:postgres. Belt and
-# suspenders: if a host ever serves a cached image/layer without re-running
-# CMD's generate step, the client baked into this image is still current
-# with prisma/postgres/schema.prisma's models.
-RUN npx prisma generate --schema prisma/postgres/schema.prisma
-
+RUN npx prisma generate
 RUN npm run build
 
-ENV NODE_ENV=production
+# Back down to runtime-only dependencies (@remix-run/serve, prisma,
+# @prisma/client, …). The Prisma client is regenerated on boot by
+# `npm run docker-start` → `npm run setup`, so pruning cannot leave it stale.
+RUN npm prune --omit=dev && npm cache clean --force
 
 CMD ["npm", "run", "docker-start"]

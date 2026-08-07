@@ -1,0 +1,157 @@
+{%- comment -%}
+  Cellexia Buy Box — PDP subscription widget (app block, target: section).
+
+  v1.2.0: this file is a THIN WRAPPER. The entire widget — config resolution
+  (shop.metafields.cellexia.buybox_design published by the app's "Buy box
+  designer"), all six presets (classic, toggle, tiles, inline, value_stack,
+  planner), launch gating, preview ribbon, JSON island — lives in
+  snippets/cx-buybox-core.liquid, shared with blocks/buy-box-embed.liquid
+  (the app embed for themes whose product section cannot take app blocks).
+  Rendering here is byte-identical to the pre-refactor v1.1.0 block.
+
+  Every contract is unchanged:
+    - design resolution: block setting "design_source" = "app" (default)
+      reads the metafield; no metafield / no preset => the classic preset
+      with v1.0.0 defaults (pixel-identical fallback). A preset key forces
+      that preset, ignoring the app config entirely (emergency override).
+    - group ownership (v1.2.4): the snippet renders the selling plan group
+      allow-listed by the shop metafield cellexia.plan_groups — ours — and
+      renders NOTHING otherwise: another app's group, no group of ours on
+      this product, or no allow-list published yet (sync the plan). There is
+      no name heuristic and no "first group" fallback; a group is rendered
+      because its id is allow-listed, or it is not rendered.
+    - selling-plan wiring: buy-box.js writes the chosen plan into the
+      product form's hidden `selling_plan` input;
+    - launch gating: [hidden][data-cellexia-gated] until cellexia.launch_status is
+      "live", revealed only by a validated ?cx_preview= token;
+    - variant-change price updates via the JSON island + data-cellexia-* hooks;
+    - design attribution via the hidden `properties[_cellexia_design]` line
+      property, consumed by the ORDERS_CREATE webhook.
+
+  HARD RULE — the render below must stay in MARKUP position. Shopify wraps
+  the output of every app-snippet render in "BEGIN/END app snippet" HTML
+  comments; here they are invisible comments between elements. Assigning or
+  capturing this render into a variable would pull those markers into a
+  string and print them on the page. Never capture a render. See the header
+  of snippets/cx-buybox-core.liquid.
+{%- endcomment -%}
+
+{%- render 'cx-buybox-core',
+  render_context: 'section',
+  product: product,
+  uid: block.id,
+  section_id: section.id,
+  shopify_attributes: block.shopify_attributes,
+  design_source: block.settings.design_source,
+  heading: block.settings.heading,
+  show_badge: block.settings.show_badge,
+  badge_text: block.settings.badge_text,
+  preselect_subscription: block.settings.preselect_subscription,
+  show_frequency_selector: block.settings.show_frequency_selector,
+  recommended_frequency_handle: block.settings.recommended_frequency_handle,
+  savings_format: block.settings.savings_format,
+  show_reassurance: block.settings.show_reassurance,
+  accent_color: block.settings.accent_color,
+  compact_mode: block.settings.compact_mode
+-%}
+
+{% schema %}
+{
+  "name": "Cellexia Buy Box",
+  "target": "section",
+  "templates": ["product"],
+  "stylesheet": "buy-box.css",
+  "javascript": "buy-box.js",
+  "settings": [
+    {
+      "type": "select",
+      "id": "design_source",
+      "label": "Design",
+      "options": [
+        { "value": "app", "label": "App design (Buy box designer)" },
+        { "value": "classic", "label": "Force preset: Classic cards" },
+        { "value": "toggle", "label": "Force preset: Toggle tabs" },
+        { "value": "tiles", "label": "Force preset: Comparison tiles" },
+        { "value": "inline", "label": "Force preset: Inline upgrade" },
+        { "value": "value_stack", "label": "Force preset: Value stack" },
+        { "value": "planner", "label": "Force preset: Routine planner" }
+      ],
+      "default": "app",
+      "info": "\"App design\" follows the design published from the Cellexia admin (Buy box designer). Forcing a preset is an emergency override: it ignores the published design and renders that preset with default settings."
+    },
+    {
+      "type": "text",
+      "id": "heading",
+      "label": "Heading",
+      "default": "Choose your ritual",
+      "info": "Shown above the purchase options. Leave empty to hide."
+    },
+    {
+      "type": "checkbox",
+      "id": "show_badge",
+      "label": "Show badge on subscription card",
+      "default": true
+    },
+    {
+      "type": "text",
+      "id": "badge_text",
+      "label": "Badge text",
+      "default": "Most popular",
+      "info": "Leave empty to use the translated \"Most popular\" label."
+    },
+    {
+      "type": "checkbox",
+      "id": "preselect_subscription",
+      "label": "Preselect subscription",
+      "default": true,
+      "info": "Preselecting lifts take-rate; A/B test against one-time preselected before committing."
+    },
+    {
+      "type": "checkbox",
+      "id": "show_frequency_selector",
+      "label": "Show frequency selector",
+      "default": true,
+      "info": "When hidden, the recommended frequency below is used."
+    },
+    {
+      "type": "text",
+      "id": "recommended_frequency_handle",
+      "label": "Recommended frequency",
+      "default": "8 weeks",
+      "info": "Matched against the selling plan names, e.g. \"8 weeks\". The matching plan is preselected; falls back to the first plan."
+    },
+    {
+      "type": "select",
+      "id": "savings_format",
+      "label": "Savings display",
+      "options": [
+        { "value": "percent", "label": "Percent (Save 20%)" },
+        { "value": "absolute", "label": "Amount (Save £9.80)" },
+        { "value": "both", "label": "Both (Save £9.80 (20%))" }
+      ],
+      "default": "percent"
+    },
+    {
+      "type": "checkbox",
+      "id": "show_reassurance",
+      "label": "Show reassurance line",
+      "default": true,
+      "info": "\"Skip, pause or cancel anytime.\" under the subscription card."
+    },
+    {
+      "type": "color",
+      "id": "accent_color",
+      "label": "Accent color",
+      "default": "#1d1d1b",
+      "info": "Used for the subscription card's border, badge, radio and check marks. This value is always written into the widget's inline style, so it overrides the stylesheet default — it must match the brand, not a sample palette. The app embed and the Buy box designer both default to the same near-black."
+    },
+    {
+      "type": "checkbox",
+      "id": "compact_mode",
+      "label": "Compact mode",
+      "default": false,
+      "info": "Tighter spacing for dense product pages."
+    }
+  ]
+}
+{% endschema %}

@@ -1,845 +1,590 @@
-/**
- * Executive dashboard [analytics/dashboard] — ANALYTICS-V2 §3.
- *
- * Insight strip first, then the Continuous Treatment KPI set grouped under
- * Growth / Revenue & profit / Retention / Payment recovery, the 13-week
- * forecast with its reliability chip, the survival curve and the voluntary
- * vs payment-related churn split.
- *
- * Honesty rules baked into this page:
- * - Point-in-time tiles never show a fake "Steady" badge. Where history is
- *   reconstructable (active plans, from createdAt/cancelledAt/pausedUntil)
- *   the badge uses the reconstruction; where it is not (money at historical
- *   prices, lifetime LTV), the badge is removed entirely.
- * - Forecast charts run over a DENSE week axis — zero weeks render as zero.
- * - Week labels are formatted from the ISO date string, never via local
- *   Date parsing (no timezone drift).
- * - 0/0 survival checkpoints are dropped, not rendered as 0%.
- */
 import type { LoaderFunctionArgs } from "@remix-run/node";
-import { json, redirect } from "@remix-run/node";
-import { useLoaderData, useSearchParams } from "@remix-run/react";
+import { json } from "@remix-run/node";
+import { useLoaderData } from "@remix-run/react";
 import {
-  Badge,
   Banner,
   BlockStack,
-  Box,
   Button,
   Card,
+  DataTable,
+  EmptyState,
   InlineGrid,
   InlineStack,
-  Layout,
+  Link as PolarisLink,
   Page,
-  Select,
   Text,
-  Tooltip,
 } from "@shopify/polaris";
-import type { BadgeProps, BoxProps } from "@shopify/polaris";
-import { useState } from "react";
-import type { ReactNode } from "react";
+import { toZonedTime, format as formatTz } from "date-fns-tz";
+
 import prisma from "~/db.server";
 import { authenticate } from "~/shopify.server";
-import { requireRole } from "~/services/core/rbac.server";
-import { isRoleAllowed } from "~/services/core/pure";
-import { addDays, isoDate } from "~/lib/dates";
-import { parseJson } from "~/types/domain";
+import { getPrimaryShop } from "~/lib/shop/install.server";
+import { getLaunchState } from "~/lib/launch/launch.server";
 import {
-  getExecutiveMetrics,
-  getSurvivalCurves,
-  safeRate,
-} from "~/services/analytics/metrics.server";
-import type { ExecutiveMetrics } from "~/services/analytics/metrics.server";
+  getDashboardStats,
+  getFailedPaymentsQueue,
+  getForecast,
+} from "~/lib/analytics/index.server";
+import { getInsights } from "~/lib/analytics/insights.server";
+import { formatMoney } from "~/lib/money";
 import {
-  computeReliabilityInputs,
-  forecastReliability,
-} from "~/services/analytics/forecast.server";
-import { getCostModel } from "~/services/analytics/costModel.server";
-import { bestConfigurations } from "~/services/analytics/cohorts.server";
-import {
-  aggregateForecastWeeks,
-  buildInsights,
-  extractForecastRows,
-  measurableSurvival,
-  reconstructActiveCount,
-} from "~/services/analytics/insights.server";
-import type { Insight } from "~/services/analytics/insights.server";
-import {
-  fmtDateLabel,
-  fmtDelta,
-  fmtMoney,
-  fmtNumber,
-  fmtPct,
-} from "~/components/charts/format";
-import type { DeltaFormat } from "~/components/charts/format";
-import { LineChart } from "~/components/charts/LineChart";
-import { BarChart } from "~/components/charts/BarChart";
-import { SurvivalChart } from "~/components/charts/SurvivalChart";
-import { Sparkline } from "~/components/charts/Sparkline";
+  AccuracyGradeChip,
+  BarPairChart,
+  DeltaStat,
+  InsightCards,
+  LineChart,
+  Sparkline,
+  compactMoney,
+  dateKeyLabel,
+  finite,
+} from "~/components/charts";
+import type { AccuracyGrade, DeltaStatDelta } from "~/components/charts";
 
-const RANGE_OPTIONS = [30, 90, 365] as const;
+const DAY_MS = 86_400_000;
+const MRR_TREND_DAYS = 90;
+const TOP_N = 5;
+/** Forecast teaser horizon: the next 4 projected weeks. */
+const TEASER_WEEKS = 4;
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
-  // RBAC (SAFEGUARDS.md §5): every admin loader enforces its own roles —
-  // parent loaders run in parallel and cannot gate children. The executive
-  // dashboard is OWNER/ADMIN/ANALYST; CS_AGENT is REDIRECTED to the
-  // subscriber console — this is the app's landing route ("/app"), and a
-  // thrown 403 here bubbles to app.tsx's ErrorBoundary, wiping the NavMenu
-  // and stranding CS_AGENT with no way into the pages their role allows.
-  const { role } = await requireRole(session);
-  if (role === "CS_AGENT") throw redirect("/app/subscribers");
-  // Explicit dashboard gate so future roles never silently gain access.
-  if (!isRoleAllowed(role, ["OWNER", "ADMIN", "ANALYST"])) {
-    throw new Response("Forbidden: your role does not permit this action", {
-      status: 403,
-      headers: { "Content-Type": "text/plain" },
-    });
+  await authenticate.admin(request);
+
+  const shop = await getPrimaryShop();
+  if (!shop) {
+    // Fresh install before the afterAuth hook has created the Shop row.
+    return json({ ready: false as const });
   }
-  const shop = session.shop;
 
-  const url = new URL(request.url);
-  const requested = Number(url.searchParams.get("range") ?? "90");
-  const rangeDays = (RANGE_OPTIONS as readonly number[]).includes(requested)
-    ? requested
-    : 90;
+  const now = new Date();
+  const tz = shop.ianaTimezone;
 
-  const to = new Date();
-  const from = addDays(to, -rangeDays);
-  const prevFrom = addDays(from, -rangeDays);
+  // DailyRollup.date keys are shop-timezone day LABELS (synthetic UTC
+  // midnights), so the trend cutoff is derived in label space from the shop-tz
+  // "today" — comparing labels against a raw UTC instant is off by up to a day
+  // for Europe/Zurich.
+  const todayKey = formatTz(toZonedTime(now, tz), "yyyy-MM-dd", { timeZone: tz });
+  const todayLabel = new Date(`${todayKey}T00:00:00.000Z`);
+  const trendCutoff = new Date(todayLabel.getTime() - (MRR_TREND_DAYS - 1) * DAY_MS);
+
+  const alertsFor = (severity: string) =>
+    prisma.alert.findMany({
+      where: { shopId: shop.id, resolvedAt: null, severity },
+      orderBy: { createdAt: "desc" },
+      take: TOP_N,
+    });
 
   const [
-    current,
-    previousRaw,
-    survivalCurves,
-    snapshot,
-    costModel,
-    reliabilityInputs,
-    bestConfigs,
-    contractRows,
+    launch,
+    stats,
+    failedQueue,
+    criticalAlerts,
+    warningAlerts,
+    infoAlerts,
+    forecast,
+    rollups,
+    insights,
   ] = await Promise.all([
-    getExecutiveMetrics(shop, { from, to }),
-    getExecutiveMetrics(shop, { from: prevFrom, to: from }),
-    getSurvivalCurves(shop),
-    prisma.forecastSnapshot.findFirst({
-      where: { shop },
-      orderBy: { computedAt: "desc" },
-    }),
-    getCostModel(shop),
-    computeReliabilityInputs(shop),
-    bestConfigurations(shop, 1),
-    prisma.subscriptionContract.findMany({
-      where: { shop },
+    getLaunchState(shop.id),
+    getDashboardStats(shop.id),
+    getFailedPaymentsQueue(shop.id),
+    // Severity-first triage: a days-old CRITICAL alert must never be buried
+    // under a pile of newer INFO notices.
+    alertsFor("CRITICAL"),
+    alertsFor("WARNING"),
+    alertsFor("INFO"),
+    getForecast(shop.id),
+    prisma.dailyRollup.findMany({
+      where: { shopId: shop.id, date: { gte: trendCutoff } },
+      orderBy: { date: "asc" },
       select: {
-        createdAt: true,
-        cancelledAt: true,
-        status: true,
-        pausedUntil: true,
+        date: true,
+        mrrCents: true,
+        activeSubscribers: true,
+        openDunningCases: true,
       },
     }),
+    getInsights(shop.id, now),
   ]);
 
-  const reliability = forecastReliability(reliabilityInputs);
+  const mrrTrend = rollups.map((r) => ({
+    label: dateKeyLabel(r.date.toISOString().slice(0, 10)),
+    value: r.mrrCents,
+  }));
 
-  // Honest point-in-time trend: reconstruct the subscriber base at each
-  // period boundary (the stored point-in-time metrics are computed from
-  // current DB state only, so comparing them to "previous" is comparing a
-  // value to itself).
-  const activeAtFrom = reconstructActiveCount(contractRows, from, to);
-  const activeAtTo = reconstructActiveCount(contractRows, to, to);
-
-  // The service divides the previous window's PRODUCT_ADDED count by
-  // TODAY's active base; rebase the previous rate on the base as of that
-  // window's end so a growing shop cannot manufacture a fake improvement.
-  const previous: ExecutiveMetrics = {
-    ...previousRaw,
-    productAdditionRate: safeRate(
-      previousRaw.counts.productsAdded,
-      Math.max(activeAtFrom, 1),
-    ),
+  // Reference rollup rows for week-over-week / 4-week deltas (nearest row at
+  // or before the target label day; null when history is too short).
+  const rowDaysAgo = (days: number) => {
+    const target = todayLabel.getTime() - days * DAY_MS;
+    for (let i = rollups.length - 1; i >= 0; i--) {
+      if (rollups[i].date.getTime() <= target) return rollups[i];
+    }
+    return null;
   };
+  const ref7 = rowDaysAgo(7);
+  const ref28 = rowDaysAgo(28);
 
-  const insights = buildInsights(current, previous, {
-    reliability,
-    costModel,
-    bestConfig: bestConfigs[0],
+  // nextRetryAt is a real instant — format its calendar day in the SHOP
+  // timezone, not the UTC day (a 00:30 Zurich retry is still "yesterday" UTC).
+  const shopDayLabel = new Intl.DateTimeFormat("en", {
+    day: "numeric",
+    month: "short",
+    timeZone: tz,
   });
 
-  const rows = extractForecastRows(
-    parseJson<unknown>(snapshot?.rowsJson ?? null, null),
-  );
-  const forecastWeeks = snapshot
-    ? aggregateForecastWeeks(
-        rows,
-        snapshot.computedAt,
-        snapshot.horizonWeeks,
-      ).map((w) => ({
-        ...w,
-        // Label from the ISO string itself — `new Date("2026-08-03")` is UTC
-        // midnight and renders as the previous day west of UTC.
-        label: fmtDateLabel(w.weekStart),
-      }))
-    : [];
+  const failedTop = failedQueue.slice(0, TOP_N).map((row) => ({
+    caseId: row.caseId,
+    contractId: row.contractId,
+    email: row.email,
+    name: [row.firstName, row.lastName].filter(Boolean).join(" ") || null,
+    amountCents: row.amountCents,
+    currencyCode: row.currencyCode ?? shop.currencyCode,
+    declineCode: row.declineCode,
+    declineCategory: row.declineCategory,
+    state: row.state,
+    daysOpen: Math.max(0, Math.floor((now.getTime() - row.openedAt.getTime()) / DAY_MS)),
+    nextRetryAt: row.nextRetryAt ? shopDayLabel.format(row.nextRetryAt) : null,
+  }));
 
-  const all = survivalCurves.find((c) => c.cohort === "all") ?? null;
+  const alerts = [...criticalAlerts, ...warningAlerts, ...infoAlerts]
+    .slice(0, TOP_N)
+    .map((a) => ({
+      id: a.id,
+      type: a.type,
+      severity: a.severity,
+      message: a.message,
+    }));
 
-  const costConfigured =
-    (current as ExecutiveMetrics & { costConfigured?: boolean })
-      .costConfigured ?? costModel.configured;
+  const weekCount = stats.newVsChurnedByWeek.weeks.length;
+  const thisWeekNew =
+    weekCount > 0 ? stats.newVsChurnedByWeek.newSubscribers[weekCount - 1] : 0;
+  const thisWeekChurned =
+    weekCount > 0 ? stats.newVsChurnedByWeek.churned[weekCount - 1] : 0;
+
+  // Forecast teaser: the projection TEASER_WEEKS out, plus the engine's
+  // accuracy grade so nobody trusts a week-1 forecast like a week-20 one.
+  const teaserIdx = Math.min(TEASER_WEEKS, forecast.projectedMrrCents.length) - 1;
+  const teaserMrrCents = teaserIdx >= 0 ? forecast.projectedMrrCents[teaserIdx] : null;
+  const forecastGrade: AccuracyGrade = forecast.accuracy.grade;
+
+  const teaserDeltaPct =
+    teaserMrrCents != null && stats.mrrCents > 0
+      ? Math.round(((teaserMrrCents - stats.mrrCents) / stats.mrrCents) * 1000) / 10
+      : null;
+
+  const lastRollupMrr = rollups.length > 0 ? rollups[rollups.length - 1].mrrCents : null;
+  const mrr4wDeltaCents =
+    lastRollupMrr != null && ref28 != null ? lastRollupMrr - ref28.mrrCents : null;
+  const mrr4wDeltaPct =
+    mrr4wDeltaCents != null && ref28 != null && ref28.mrrCents > 0
+      ? Math.round((mrr4wDeltaCents / ref28.mrrCents) * 1000) / 10
+      : null;
 
   return json({
-    rangeDays,
-    current,
-    previous,
-    insights,
-    reliability,
-    costConfigured,
-    activeAtFrom,
-    activeAtTo,
-    forecastWeeks,
-    // Formatted server-side from the UTC date string so SSR, hydration and
-    // the forecast tab all agree.
-    forecastComputedAtLabel: snapshot
-      ? fmtDateLabel(isoDate(snapshot.computedAt))
+    ready: true as const,
+    setupMode: launch.mode === "SETUP",
+    currencyCode: shop.currencyCode,
+    activeSubscribers: stats.activeSubscribers,
+    pausedCount: stats.pausedCount,
+    mrrCents: stats.mrrCents,
+    failedTotal: stats.failedQueueCount,
+    openAlertCount: stats.openAlerts,
+    recoveredThisMonthCents: stats.recoveredThisMonthCents,
+    thisWeekNew,
+    thisWeekChurned,
+    newVsChurned: {
+      labels: stats.newVsChurnedByWeek.weeks.map(dateKeyLabel),
+      newSubscribers: stats.newVsChurnedByWeek.newSubscribers,
+      churned: stats.newVsChurnedByWeek.churned,
+    },
+    weekAgo: ref7
+      ? {
+          mrrCents: ref7.mrrCents,
+          activeSubscribers: ref7.activeSubscribers,
+          openDunningCases: ref7.openDunningCases,
+        }
       : null,
-    // 0/0 checkpoints removed; null when nothing is measurable yet.
-    survival: measurableSurvival(all),
+    mrr4wDeltaCents,
+    mrr4wDeltaPct,
+    mrrTrend,
+    failedTop,
+    alerts,
+    insights,
+    forecastTeaser: {
+      teaserWeeks: TEASER_WEEKS,
+      projectedMrrCents: teaserMrrCents,
+      deltaPct: teaserDeltaPct,
+      grade: forecastGrade,
+      sparkMrr: forecast.projectedMrrCents,
+    },
   });
 };
 
-// ── Metric tiles ─────────────────────────────────────────────────────────
-
-type NumericMetricKey = {
-  [K in keyof ExecutiveMetrics]-?: ExecutiveMetrics[K] extends number ? K : never;
-}[keyof ExecutiveMetrics];
-
-type TileFormat = DeltaFormat;
-
-interface TileDef {
-  key: NumericMetricKey;
-  label: string;
-  format: TileFormat;
-  /** Business direction: is an increase good for the merchant? */
-  goodWhenUp: boolean;
-  /** Plain-language "How this is computed" shown in a tooltip. */
-  helpText: string;
-  /**
-   * How the period-over-period badge is produced:
-   * - "range": both periods are honestly range-scoped — compare directly.
-   * - "reconstructed": point-in-time metric whose history is reconstructed
-   *   from createdAt/cancelledAt/pausedUntil.
-   * - "none": point-in-time metric that CANNOT be reconstructed — no badge
-   *   at all rather than a fake "Steady".
-   */
-  delta: "range" | "reconstructed" | "none";
-  /** Hide the badge when either period's value is 0 (metric undefined). */
-  deltaGuard?: "bothNonZero";
+function alertTone(severity: string): "critical" | "warning" | "info" {
+  if (severity === "CRITICAL") return "critical";
+  if (severity === "WARNING") return "warning";
+  return "info";
 }
 
-interface TileSection {
-  title: string;
-  tiles: TileDef[];
+function humanizeCode(code: string): string {
+  const lower = code.toLowerCase().replace(/_/g, " ");
+  return lower.charAt(0).toUpperCase() + lower.slice(1);
 }
 
-const TILE_SECTIONS: TileSection[] = [
-  {
-    title: "Growth",
-    tiles: [
-      {
-        key: "activeSubscribers",
-        label: "Active treatment plans",
-        format: "count",
-        goodWhenUp: true,
-        delta: "reconstructed",
-        helpText:
-          "How this is computed: plans whose status is ACTIVE right now. The trend badge compares plans that existed and were not cancelled at the end of this period vs the end of the period before (past pause states cannot be reconstructed).",
-      },
-      {
-        key: "newSubscriptions",
-        label: "New plans started",
-        format: "count",
-        goodWhenUp: true,
-        delta: "range",
-        helpText:
-          "How this is computed: plans created during the selected period.",
-      },
-      {
-        key: "netGrowth",
-        label: "Net growth",
-        format: "count",
-        goodWhenUp: true,
-        delta: "range",
-        helpText:
-          "How this is computed: new plans started minus plans cancelled in the selected period.",
-      },
-      {
-        key: "widgetConversionRate",
-        label: "Widget conversion",
-        format: "rate",
-        goodWhenUp: true,
-        delta: "range",
-        helpText:
-          "How this is computed: widget conversions divided by widget impressions in the selected period.",
-      },
-      {
-        key: "attachRate",
-        label: "Plan attach rate",
-        format: "rate",
-        goodWhenUp: true,
-        delta: "range",
-        helpText:
-          "How this is computed: widget conversions that selected a subscription, divided by all widget conversions in the period.",
-      },
-      {
-        key: "oneTimeToSubscriptionRate",
-        label: "One-time to plan conversion",
-        format: "rate",
-        goodWhenUp: true,
-        delta: "range",
-        helpText:
-          "How this is computed: conversions of the post-purchase switch-to-a-plan widget divided by its impressions in the period.",
-      },
-    ],
-  },
-  {
-    title: "Revenue & profit",
-    tiles: [
-      {
-        key: "activeSubscriptionRevenueCents",
-        label: "Recurring revenue / cycle",
-        format: "cents",
-        goodWhenUp: true,
-        delta: "none",
-        helpText:
-          "How this is computed: the sum of every active plan's current line prices for one billing cycle. Snapshot of right now — historical prices are not stored, so no period comparison is shown.",
-      },
-      {
-        key: "recurringGrossProfitCents",
-        label: "Recurring gross profit / cycle",
-        format: "cents",
-        goodWhenUp: true,
-        delta: "none",
-        helpText:
-          "How this is computed: per-cycle recurring revenue minus product costs (COGS) from your cost model. Snapshot of right now, so no period comparison is shown.",
-      },
-      {
-        key: "contributionCents",
-        label: "Contribution / cycle",
-        format: "cents",
-        goodWhenUp: true,
-        delta: "none",
-        helpText:
-          "How this is computed: per-cycle revenue minus COGS, shipping, fulfilment and payment fees from your cost model. Snapshot of right now, so no period comparison is shown.",
-      },
-      {
-        key: "subscriberAovCents",
-        label: "Subscriber AOV",
-        format: "cents",
-        goodWhenUp: true,
-        delta: "range",
-        deltaGuard: "bothNonZero",
-        helpText:
-          "How this is computed: the average value of successful charges in the selected period. Before any billing history exists it falls back to the average per-cycle plan value; the comparison is hidden when either period had no charges.",
-      },
-      {
-        key: "grossMarginLtvCents",
-        label: "Gross-margin LTV (avg)",
-        format: "cents",
-        goodWhenUp: true,
-        delta: "none",
-        helpText:
-          "How this is computed: average lifetime revenue per billed plan multiplied by its gross-margin fraction. A lifetime figure has no honest previous-period value, so no comparison is shown.",
-      },
-      {
-        key: "paidOrdersPerSubscriber",
-        label: "Paid orders / subscriber",
-        format: "decimal",
-        goodWhenUp: true,
-        delta: "range",
-        helpText:
-          "How this is computed: successful charges up to each period's end divided by plans created up to that point.",
-      },
-    ],
-  },
-  {
-    title: "Retention",
-    tiles: [
-      {
-        key: "voluntaryChurnRate",
-        label: "Voluntary churn",
-        format: "rate",
-        goodWhenUp: false,
-        delta: "range",
-        helpText:
-          "How this is computed: completed customer cancellations in the period divided by the subscriber base at the period start. Down is good — a falling rate shows a green badge.",
-      },
-      {
-        key: "pauseRate",
-        label: "Pause rate",
-        format: "rate",
-        goodWhenUp: false,
-        delta: "range",
-        helpText:
-          "How this is computed: pauses started in the period divided by the subscriber base at the period start. Down is good.",
-      },
-      {
-        key: "reactivationRate",
-        label: "Reactivation rate",
-        format: "rate",
-        goodWhenUp: true,
-        delta: "range",
-        helpText:
-          "How this is computed: paused plans that resumed divided by pauses started in the period.",
-      },
-      {
-        key: "skipRate",
-        label: "Skip rate",
-        format: "rate",
-        goodWhenUp: false,
-        delta: "range",
-        helpText:
-          "How this is computed: skipped orders divided by skipped plus completed charges in the period. Down is good.",
-      },
-      {
-        key: "productAdditionRate",
-        label: "Product addition rate",
-        format: "rate",
-        goodWhenUp: true,
-        delta: "range",
-        helpText:
-          "How this is computed: products added to existing plans in the period divided by the active base at that period's end.",
-      },
-      {
-        key: "subscriptionToRoutineRate",
-        label: "Plan to routine rate",
-        format: "rate",
-        goodWhenUp: true,
-        delta: "none",
-        helpText:
-          "How this is computed: the share of active plans holding two or more distinct products. Snapshot of right now, so no period comparison is shown.",
-      },
-    ],
-  },
-  {
-    title: "Payment recovery",
-    tiles: [
-      {
-        key: "involuntaryChurnRate",
-        label: "Payment-related churn",
-        format: "rate",
-        goodWhenUp: false,
-        delta: "range",
-        helpText:
-          "How this is computed: plans lost to payment failure (dunning exhausted) in the period divided by the subscriber base at the period start. Down is good.",
-      },
-      {
-        key: "paymentRecoveryRate",
-        label: "Payment recovery rate",
-        format: "rate",
-        goodWhenUp: true,
-        delta: "range",
-        helpText:
-          "How this is computed: failed charges recovered by dunning retries divided by failed charges in the period.",
-      },
-    ],
-  },
-];
-
-const EMPTY_CHART_TEXT = "Data appears after your first rebills.";
-
-const INSIGHT_STYLES: Record<
-  Insight["tone"],
-  {
-    badgeTone: BadgeProps["tone"];
-    badgeLabel: string;
-    background: BoxProps["background"];
-  }
-> = {
-  positive: {
-    badgeTone: "success",
-    badgeLabel: "Win",
-    background: "bg-surface-success",
-  },
-  warning: {
-    badgeTone: "warning",
-    badgeLabel: "Watch",
-    background: "bg-surface-warning",
-  },
-  neutral: {
-    badgeTone: "info",
-    badgeLabel: "Note",
-    background: "bg-surface-info",
-  },
-};
-
-const RELIABILITY_TONES: Record<
-  "LOW" | "MODERATE" | "HIGH",
-  BadgeProps["tone"]
-> = {
-  LOW: "warning",
-  MODERATE: "attention",
-  HIGH: "success",
-};
-
-function formatMetric(
-  value: number,
-  format: TileFormat,
-  currencyCode: string,
-): string {
-  switch (format) {
-    case "cents":
-      return fmtMoney(value, currencyCode);
-    case "rate":
-      return fmtPct(value);
-    case "decimal":
-      return value.toFixed(2);
-    case "count":
-      return String(Math.round(value));
-  }
+/** WoW delta for a count metric where UP is good (subscribers). */
+function countDelta(current: number, previous: number | null): DeltaStatDelta | null {
+  if (previous == null) return null;
+  const diff = current - previous;
+  if (diff === 0) return { label: "no change WoW", direction: "flat", tone: "neutral" };
+  return {
+    label: `${diff > 0 ? "+" : ""}${diff.toLocaleString("en")} WoW`,
+    direction: diff > 0 ? "up" : "down",
+    tone: diff > 0 ? "positive" : "negative",
+  };
 }
 
-function DeltaBadge({
-  value,
-  previous,
-  format,
-  goodWhenUp,
-  currencyCode,
-}: {
-  value: number;
-  previous: number;
-  format: TileFormat;
-  goodWhenUp: boolean;
-  currencyCode: string;
-}) {
-  const delta = value - previous;
-  const negligible =
-    format === "rate" ? Math.abs(delta) < 0.0005 : Math.abs(delta) < 0.005;
-  if (!Number.isFinite(delta) || negligible) {
-    return <Badge>Steady</Badge>;
-  }
-  // Tone follows the BUSINESS direction: voluntary churn falling is green.
-  const good = (delta > 0) === goodWhenUp;
-  return (
-    <Badge tone={good ? "success" : "critical"}>
-      {fmtDelta(delta, format, currencyCode)}
-    </Badge>
-  );
-}
-
-// ── Page ─────────────────────────────────────────────────────────────────
-
-export default function ExecutiveDashboard() {
+export default function Dashboard() {
   const data = useLoaderData<typeof loader>();
-  const [, setSearchParams] = useSearchParams();
-  const [costsBannerDismissed, setCostsBannerDismissed] = useState(false);
 
-  const current = data.current as unknown as ExecutiveMetrics;
-  const previous = data.previous as unknown as ExecutiveMetrics;
-  const currencyCode = current.currencyCode;
-  const reliabilityGrade = data.reliability.grade as
-    | "LOW"
-    | "MODERATE"
-    | "HIGH";
-
-  const revenueSpark = data.forecastWeeks.map((w) => w.marginCents);
-
-  function tileBadge(tile: TileDef): ReactNode {
-    if (tile.delta === "none") return null;
-    if (tile.delta === "reconstructed") {
-      return (
-        <DeltaBadge
-          value={data.activeAtTo}
-          previous={data.activeAtFrom}
-          format="count"
-          goodWhenUp={tile.goodWhenUp}
-          currencyCode={currencyCode}
-        />
-      );
-    }
-    if (
-      tile.deltaGuard === "bothNonZero" &&
-      (current[tile.key] === 0 || previous[tile.key] === 0)
-    ) {
-      return null;
-    }
+  if (!data.ready) {
     return (
-      <DeltaBadge
-        value={current[tile.key]}
-        previous={previous[tile.key]}
-        format={tile.format}
-        goodWhenUp={tile.goodWhenUp}
-        currencyCode={currencyCode}
-      />
+      <Page title="Dashboard">
+        <Card>
+          <EmptyState
+            heading="Welcome to Cellexia Subscriptions"
+            action={{ content: "Set up subscription plans", url: "/app/plans" }}
+            image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
+          >
+            <p>
+              The app is finishing its first sync with your store. Start by
+              creating a subscription plan — the dashboard fills in as
+              subscribers arrive.
+            </p>
+          </EmptyState>
+        </Card>
+      </Page>
     );
   }
 
-  return (
-    <Page
-      title="Continuous Treatment overview"
-      subtitle={`Rates cover the last ${data.rangeDays} days, compared with the ${data.rangeDays} days before.`}
-    >
-      <Layout>
-        {data.insights.length > 0 ? (
-          <Layout.Section>
-            <InlineGrid columns={{ xs: 1, md: 2, lg: 3 }} gap="300">
-              {data.insights.map((insight, index) => {
-                const style =
-                  INSIGHT_STYLES[insight.tone as Insight["tone"]] ??
-                  INSIGHT_STYLES.neutral;
-                return (
-                  <Box
-                    key={`${index}-${insight.headline}`}
-                    background={style.background}
-                    padding="400"
-                    borderRadius="300"
-                  >
-                    <BlockStack gap="150">
-                      <InlineStack gap="200" blockAlign="center">
-                        <Badge tone={style.badgeTone}>{style.badgeLabel}</Badge>
-                        <Text as="h3" variant="headingSm">
-                          {insight.headline}
-                        </Text>
-                      </InlineStack>
-                      {insight.detail ? (
-                        <Text as="p" variant="bodySm" tone="subdued">
-                          {insight.detail}
-                        </Text>
-                      ) : null}
-                      {insight.linkTo ? (
-                        <Box>
-                          <Button url={insight.linkTo} variant="plain">
-                            Take a look
-                          </Button>
-                        </Box>
-                      ) : null}
-                    </BlockStack>
-                  </Box>
-                );
-              })}
-            </InlineGrid>
-          </Layout.Section>
-        ) : null}
+  const {
+    setupMode,
+    currencyCode,
+    activeSubscribers,
+    pausedCount,
+    mrrCents,
+    failedTotal,
+    openAlertCount,
+    recoveredThisMonthCents,
+    thisWeekNew,
+    thisWeekChurned,
+    newVsChurned,
+    weekAgo,
+    mrr4wDeltaCents,
+    mrr4wDeltaPct,
+    mrrTrend,
+    failedTop,
+    alerts,
+    insights,
+    forecastTeaser,
+  } = data;
 
-        {!data.costConfigured && !costsBannerDismissed ? (
-          <Layout.Section>
-            <Banner
-              tone="warning"
-              title="Profit metrics are estimates until you set your costs"
-              action={{
-                content: "Set up costs",
-                url: "/app/analytics?tab=costs",
+  const isFreshInstall =
+    activeSubscribers === 0 &&
+    pausedCount === 0 &&
+    mrrTrend.length === 0 &&
+    failedTotal === 0;
+
+  const setupBanner = setupMode ? (
+    <Banner
+      tone="info"
+      title="Setup mode — your live store is untouched"
+      action={{ content: "Preview & go live", url: "/app/preview" }}
+    >
+      <p>
+        Nothing is visible to store visitors, no renewals are charged and no
+        customer emails are sent. Preview the storefront widget and the
+        customer portal, then go live when everything looks right.
+      </p>
+    </Banner>
+  ) : null;
+
+  const alertBanners =
+    alerts.length > 0 ? (
+      <BlockStack gap="200">
+        {alerts.map((alert) => (
+          <Banner
+            key={alert.id}
+            tone={alertTone(alert.severity)}
+            title={humanizeCode(alert.type)}
+            action={{
+              content:
+                openAlertCount > alerts.length
+                  ? `View all alerts (${openAlertCount})`
+                  : "View alerts",
+              url: "/app/alerts",
+            }}
+          >
+            <p>{alert.message}</p>
+          </Banner>
+        ))}
+      </BlockStack>
+    ) : null;
+
+  if (isFreshInstall) {
+    return (
+      <Page title="Dashboard" subtitle="Subscription health at a glance">
+        <BlockStack gap="400">
+          {setupBanner}
+          {alertBanners}
+          <Card>
+            <EmptyState
+              heading="Set up your first subscription plan"
+              action={{ content: "Create a plan", url: "/app/plans" }}
+              secondaryAction={{
+                content: "Import existing subscribers",
+                url: "/app/import",
               }}
-              onDismiss={() => setCostsBannerDismissed(true)}
+              image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
             >
               <p>
-                Recurring gross profit, contribution and LTV currently use the
-                default margin. Add product costs, shipping, fulfilment and
-                payment fees to see true profit.
+                Create a Subscribe &amp; Save selling plan to start offering
+                subscriptions on your product pages. Once subscribers start
+                rolling in, this dashboard tracks MRR, new vs churned
+                subscribers, failed payments and a 12-week forecast.
               </p>
-            </Banner>
-          </Layout.Section>
-        ) : null}
+            </EmptyState>
+          </Card>
+        </BlockStack>
+      </Page>
+    );
+  }
 
-        <Layout.Section>
-          <InlineStack align="end">
-            <Select
-              label="Date range"
-              labelHidden
-              options={[
-                { label: "Last 30 days", value: "30" },
-                { label: "Last 90 days", value: "90" },
-                { label: "Last 365 days", value: "365" },
-              ]}
-              value={String(data.rangeDays)}
-              onChange={(value) => setSearchParams({ range: value })}
+  // ── Stat deltas ──
+  const mrrWowPct =
+    weekAgo && weekAgo.mrrCents > 0
+      ? Math.round(((mrrCents - weekAgo.mrrCents) / weekAgo.mrrCents) * 1000) / 10
+      : null;
+  const mrrDelta: DeltaStatDelta | null =
+    mrrWowPct == null
+      ? null
+      : mrrWowPct === 0
+        ? { label: "no change WoW", direction: "flat", tone: "neutral" }
+        : {
+            label: `${mrrWowPct > 0 ? "+" : ""}${mrrWowPct}% WoW`,
+            direction: mrrWowPct > 0 ? "up" : "down",
+            tone: mrrWowPct > 0 ? "positive" : "negative",
+          };
+
+  const net = thisWeekNew - thisWeekChurned;
+  // No badge when nothing happened — "+0 / −0 net growth" is noise.
+  const netDelta: DeltaStatDelta | null =
+    thisWeekNew === 0 && thisWeekChurned === 0
+      ? null
+      : {
+          label: net === 0 ? "flat" : `net ${net > 0 ? "+" : ""}${net}`,
+          direction: net > 0 ? "up" : net < 0 ? "down" : "flat",
+          tone: net > 0 ? "positive" : net < 0 ? "negative" : "neutral",
+        };
+
+  const failedDiff = weekAgo != null ? failedTotal - weekAgo.openDunningCases : null;
+  // Failed queue: DOWN is good.
+  const failedDelta: DeltaStatDelta | null =
+    failedDiff == null || failedDiff === 0
+      ? failedTotal === 0
+        ? { label: "all clear", direction: "flat", tone: "positive" }
+        : null
+      : {
+          label: `${failedDiff > 0 ? "+" : ""}${failedDiff} WoW`,
+          direction: failedDiff > 0 ? "up" : "down",
+          tone: failedDiff > 0 ? "negative" : "positive",
+        };
+
+  const failedRows = failedTop.map((row) => [
+    <PolarisLink key={row.caseId} url="/app/dunning" removeUnderline>
+      {row.email}
+    </PolarisLink>,
+    row.amountCents != null
+      ? formatMoney(row.amountCents, row.currencyCode)
+      : "—",
+    `${row.declineCode ?? humanizeCode(row.state)}${
+      row.declineCategory ? ` (${row.declineCategory})` : ""
+    }`,
+    row.daysOpen,
+    row.nextRetryAt ?? "—",
+  ]);
+
+  const mrr4wText =
+    mrr4wDeltaCents != null
+      ? `${mrr4wDeltaCents >= 0 ? "+" : "−"}${formatMoney(Math.abs(mrr4wDeltaCents), currencyCode)}${
+          mrr4wDeltaPct != null ? ` (${mrr4wDeltaPct >= 0 ? "+" : ""}${mrr4wDeltaPct}%)` : ""
+        } vs 4 weeks ago`
+      : null;
+
+  return (
+    <Page title="Dashboard" subtitle="Subscription health at a glance">
+      <BlockStack gap="500">
+        {setupBanner}
+        {alertBanners}
+
+        {insights.length > 0 && (
+          <BlockStack gap="300">
+            <Text as="h2" variant="headingMd">
+              This week
+            </Text>
+            <InsightCards insights={insights} />
+          </BlockStack>
+        )}
+
+        <InlineGrid columns={{ xs: 1, sm: 2, lg: 4 }} gap="400">
+          <DeltaStat
+            title="Active subscribers"
+            value={activeSubscribers.toLocaleString("en")}
+            delta={countDelta(activeSubscribers, weekAgo?.activeSubscribers ?? null)}
+            helpText={`${pausedCount.toLocaleString("en")} paused`}
+          />
+          <DeltaStat
+            title="MRR"
+            value={formatMoney(mrrCents, currencyCode)}
+            delta={mrrDelta}
+            helpText="Monthly recurring revenue, normalized across billing frequencies"
+          />
+          <DeltaStat
+            title="New vs churned"
+            value={`+${thisWeekNew} / −${thisWeekChurned}`}
+            delta={netDelta}
+            helpText="New subscribers vs cancellations, current week"
+          />
+          <DeltaStat
+            title="Failed payments queue"
+            value={failedTotal.toLocaleString("en")}
+            delta={failedDelta}
+            helpText={`${formatMoney(recoveredThisMonthCents, currencyCode)} recovered this month`}
+          />
+        </InlineGrid>
+
+        <Card>
+          <BlockStack gap="300">
+            <InlineStack align="space-between" blockAlign="center">
+              <Text as="h2" variant="headingMd">
+                MRR trend
+              </Text>
+              {mrr4wText && (
+                <Text
+                  as="span"
+                  variant="bodySm"
+                  tone={finite(mrr4wDeltaCents) >= 0 ? "success" : "critical"}
+                >
+                  {mrr4wText}
+                </Text>
+              )}
+            </InlineStack>
+            <Text as="p" variant="bodySm" tone="subdued">
+              Daily monthly-recurring-revenue snapshots, last 90 days.
+            </Text>
+            <LineChart
+              data={mrrTrend}
+              height={240}
+              area
+              showLastValue
+              formatValue={(v) => compactMoney(v, currencyCode)}
+              accessibilityLabel="MRR trend over the last 90 days"
             />
-          </InlineStack>
-        </Layout.Section>
+          </BlockStack>
+        </Card>
 
-        {TILE_SECTIONS.map((section) => (
-          <Layout.Section key={section.title}>
+        <InlineGrid columns={{ xs: 1, lg: 2 }} gap="400">
+          <Card>
             <BlockStack gap="300">
               <Text as="h2" variant="headingMd">
-                {section.title}
+                New vs churned subscribers
               </Text>
-              <InlineGrid columns={{ xs: 1, sm: 2, md: 3, lg: 4 }} gap="400">
-                {section.tiles.map((tile) => {
-                  const badge = tileBadge(tile);
-                  return (
-                    <Card key={tile.key}>
-                      <BlockStack gap="150">
-                        <Tooltip content={tile.helpText} width="wide">
-                          <Text as="p" variant="bodySm" tone="subdued">
-                            {tile.label}
-                          </Text>
-                        </Tooltip>
-                        <Text as="p" variant="headingLg">
-                          {formatMetric(
-                            current[tile.key],
-                            tile.format,
-                            currencyCode,
-                          )}
-                        </Text>
-                        {badge ? (
-                          <InlineStack gap="200">{badge}</InlineStack>
-                        ) : null}
-                      </BlockStack>
-                    </Card>
-                  );
-                })}
-              </InlineGrid>
+              <Text as="p" variant="bodySm" tone="subdued">
+                Weekly totals, last 12 weeks. Internal consolidation merges are
+                not counted as churn.
+              </Text>
+              <BarPairChart
+                labels={newVsChurned.labels}
+                seriesA={{ name: "New", values: newVsChurned.newSubscribers }}
+                seriesB={{ name: "Churned", values: newVsChurned.churned }}
+                height={220}
+                accessibilityLabel="New versus churned subscribers by week, last 12 weeks"
+              />
             </BlockStack>
-          </Layout.Section>
-        ))}
+          </Card>
 
-        <Layout.Section>
           <Card>
-            <BlockStack gap="400">
-              <InlineStack align="space-between" blockAlign="center" wrap>
+            <BlockStack gap="300">
+              <InlineStack align="space-between" blockAlign="center">
                 <InlineStack gap="200" blockAlign="center">
                   <Text as="h2" variant="headingMd">
-                    13-week outlook
+                    Next {forecastTeaser.teaserWeeks} weeks
                   </Text>
-                  <Tooltip
-                    width="wide"
-                    content={
-                      data.reliability.reasons.length > 0
-                        ? data.reliability.reasons.join(" ")
-                        : "Based on billing history depth, active base size, observed cancellations and cost coverage."
-                    }
-                  >
-                    <Badge tone={RELIABILITY_TONES[reliabilityGrade]}>
-                      {`Reliability: ${reliabilityGrade} (${data.reliability.expectedErrorBand})`}
-                    </Badge>
-                  </Tooltip>
+                  {forecastTeaser.grade && (
+                    <AccuracyGradeChip grade={forecastTeaser.grade} />
+                  )}
                 </InlineStack>
-                <InlineStack gap="200" blockAlign="center">
-                  {revenueSpark.length > 0 ? (
-                    <Sparkline
-                      values={revenueSpark}
-                      title="Expected margin trend over the next 13 weeks"
-                    />
-                  ) : null}
-                  <Text as="span" variant="bodySm" tone="subdued">
-                    {data.forecastComputedAtLabel
-                      ? `Snapshot ${data.forecastComputedAtLabel}`
-                      : ""}
-                  </Text>
-                </InlineStack>
-              </InlineStack>
-              {data.forecastWeeks.length === 0 ? (
-                <Banner tone="info" title="No forecast snapshot yet">
-                  <p>
-                    Run the forecast job (POST /jobs/forecast) to generate the
-                    13-week outlook by week, product and market.
-                  </p>
-                </Banner>
-              ) : (
-                <InlineGrid columns={{ xs: 1, md: 2 }} gap="400">
-                  <LineChart
-                    title="Expected revenue by week"
-                    description="Probability-adjusted recurring revenue for the next 13 weeks. Weeks in which nothing bills show as zero."
-                    labels={data.forecastWeeks.map((w) => w.label)}
-                    series={[
-                      {
-                        name: "Expected revenue",
-                        values: data.forecastWeeks.map((w) => w.revenueCents),
-                      },
-                      {
-                        name: "Expected margin",
-                        values: data.forecastWeeks.map((w) => w.marginCents),
-                      },
-                    ]}
-                    formatValue={(v) => fmtMoney(v, currencyCode)}
-                    emptyText={EMPTY_CHART_TEXT}
-                  />
-                  <BarChart
-                    title="Probability-adjusted units by week"
-                    description="Expected units to fulfil per week, including add-ons. Weeks with no fulfilment show as zero."
-                    labels={data.forecastWeeks.map((w) => w.label)}
-                    values={data.forecastWeeks.map((w) => w.units)}
-                    formatValue={fmtNumber}
-                    emptyText={EMPTY_CHART_TEXT}
-                  />
-                </InlineGrid>
-              )}
-            </BlockStack>
-          </Card>
-        </Layout.Section>
-
-        <Layout.Section>
-          <InlineGrid columns={{ xs: 1, md: 2 }} gap="400">
-            <Card>
-              <BlockStack gap="400">
-                <Text as="h2" variant="headingMd">
-                  Plan survival
-                </Text>
-                {data.survival ? (
-                  <SurvivalChart
-                    title="Share of treatment plans remaining"
-                    description="Remaining plans after each rebill and time checkpoint, split by exit type. Checkpoints no plan is old enough to reach are omitted."
-                    points={data.survival.points
-                      // null = no plan old enough to be observed there yet —
-                      // omitted per the chart description, never drawn as 0%.
-                      .filter((p) => p.remainingPercent !== null)
-                      .map((p) => ({
-                        label: p.label,
-                        remainingPercent: p.remainingPercent ?? 0,
-                        voluntaryExitPercent: p.voluntaryExitPercent ?? 0,
-                        paymentFailureExitPercent: p.paymentFailureExitPercent ?? 0,
-                      }))}
-                    emptyText={EMPTY_CHART_TEXT}
-                  />
-                ) : (
-                  <Text as="p" tone="subdued">
-                    Not enough data yet — {EMPTY_CHART_TEXT.toLowerCase()}
-                  </Text>
-                )}
-              </BlockStack>
-            </Card>
-            <Card>
-              <BlockStack gap="400">
-                <Text as="h2" variant="headingMd">
-                  Churn split
-                </Text>
-                <BarChart
-                  title="Voluntary vs payment-related churn"
-                  description="Churn rate in the selected range, split by cause."
-                  labels={["Voluntary", "Payment-related"]}
-                  values={[
-                    Math.round(current.voluntaryChurnRate * 1000) / 10,
-                    Math.round(current.involuntaryChurnRate * 1000) / 10,
-                  ]}
-                  formatValue={(v) => fmtPct(v / 100, 1)}
-                  height={180}
-                  emptyText={EMPTY_CHART_TEXT}
-                />
-                <Text as="p" variant="bodySm" tone="subdued">
-                  {current.counts.voluntaryCancellations} voluntary cancellations
-                  and {current.counts.involuntaryCancellations} payment-related
-                  losses in the selected range.
-                </Text>
-              </BlockStack>
-            </Card>
-          </InlineGrid>
-        </Layout.Section>
-
-        <Layout.Section>
-          <Card>
-            <BlockStack gap="300">
-              <Text as="h2" variant="headingMd">
-                Where to act next
-              </Text>
-              <InlineStack gap="300" wrap>
-                <Button url="/app/retention">At-risk subscribers</Button>
-                <Button url="/app/dunning">Payment recovery queue</Button>
-                <Button url="/app/analytics" variant="primary">
-                  Full analytics
+                <Button url="/app/analytics?tab=forecast" variant="plain">
+                  Open forecast
                 </Button>
               </InlineStack>
+              <BlockStack gap="150">
+                <Text as="h3" variant="headingSm" tone="subdued">
+                  Projected MRR in {forecastTeaser.teaserWeeks} weeks
+                </Text>
+                <InlineStack gap="200" blockAlign="center" wrap={false}>
+                  <Text as="p" variant="headingLg">
+                    {forecastTeaser.projectedMrrCents != null
+                      ? formatMoney(forecastTeaser.projectedMrrCents, currencyCode)
+                      : "—"}
+                  </Text>
+                  {forecastTeaser.deltaPct != null && (
+                    <Text
+                      as="span"
+                      variant="bodySm"
+                      tone={forecastTeaser.deltaPct >= 0 ? "success" : "critical"}
+                    >
+                      {forecastTeaser.deltaPct >= 0 ? "+" : ""}
+                      {forecastTeaser.deltaPct}% vs today
+                    </Text>
+                  )}
+                </InlineStack>
+                <Sparkline
+                  values={forecastTeaser.sparkMrr}
+                  accessibilityLabel="Projected MRR over the coming weeks"
+                />
+              </BlockStack>
+              <Text as="p" variant="bodySm" tone="subdued">
+                Projection from smoothed weekly MRR history. New-subscriber
+                inflow is not included, so treat this as a conservative floor.
+                The grade chip shows how much history backs it.
+              </Text>
             </BlockStack>
           </Card>
-        </Layout.Section>
-      </Layout>
+        </InlineGrid>
+
+        <Card>
+          <BlockStack gap="300">
+            <InlineStack align="space-between" blockAlign="center">
+              <Text as="h2" variant="headingMd">
+                Failed payments
+              </Text>
+              <Button url="/app/dunning" variant="plain">
+                {`View all (${failedTotal})`}
+              </Button>
+            </InlineStack>
+            {failedTop.length === 0 ? (
+              <Text as="p" variant="bodySm" tone="subdued">
+                No open dunning cases — every renewal charge is going through.
+              </Text>
+            ) : (
+              <DataTable
+                columnContentTypes={["text", "numeric", "text", "numeric", "text"]}
+                headings={["Subscriber", "Amount", "Decline", "Days open", "Next retry"]}
+                rows={failedRows}
+              />
+            )}
+          </BlockStack>
+        </Card>
+      </BlockStack>
     </Page>
   );
 }

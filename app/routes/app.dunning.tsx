@@ -1,691 +1,682 @@
-/**
- * [retention] Admin — payment recovery: dunning queue, recovery reporting
- * (grouped by episode step, not lifetime attempt number), retry-offset
- * editing (merchant > learned > static precedence), pre-dunning settings and
- * the decline-category strategy reference.
- */
 import { useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
-import { useFetcher, useLoaderData } from "@remix-run/react";
+import { useFetcher, useLoaderData, useNavigate, useSearchParams } from "@remix-run/react";
 import {
   Badge,
+  Banner,
   BlockStack,
+  Box,
   Button,
+  ButtonGroup,
   Card,
-  DataTable,
+  IndexTable,
+  InlineGrid,
   InlineStack,
-  Layout,
+  Modal,
   Page,
+  Tabs,
   Text,
-  TextField,
 } from "@shopify/polaris";
+import type { Prisma } from "@prisma/client";
 import prisma from "~/db.server";
 import { authenticate } from "~/shopify.server";
-import { appendAudit } from "~/services/audit.server";
-import { requireRole } from "~/services/core/rbac.server";
+import { getPrimaryShop } from "~/lib/shop/install.server";
+import { logEvent } from "~/lib/events/log.server";
+import { formatMoney } from "~/lib/money";
+import { buildMagicUrl } from "~/lib/magiclinks/builder.server";
 import {
-  MAX_RETRY_OFFSETS,
-  RETRY_OFFSET_MAX_DAYS,
-  RETRY_OFFSET_MIN_DAYS,
-  parseDunningOverrides,
-  strategyFor,
-} from "~/services/retention/dunning.server";
-import { getLearnedDunningOffsets } from "~/services/analytics/learning.server";
-import { DECLINE_CATEGORIES, parseJson } from "~/types/domain";
-import type { DunningStep } from "~/types/domain";
-
-// ─────────────────────────────── Loader ───────────────────────────────────
-
-interface HistoryEntry {
-  at: string;
-  type: string;
-  action?: string;
-  stepIndex?: number;
-}
-
-function formatWhen(d: Date | null): string {
-  if (!d) return "—";
-  return d.toISOString().slice(0, 16).replace("T", " ");
-}
-
-function stepLabel(cumulativeDays: number, action: string): string {
-  const label =
-    cumulativeDays > 0 && cumulativeDays < 1
-      ? `+${Math.round(cumulativeDays * 24)}h`
-      : `Day ${Number.isInteger(cumulativeDays) ? cumulativeDays : cumulativeDays.toFixed(1)}`;
-  return `${label} ${action}`;
-}
-
-/** Cumulative day offsets of the RETRY steps in a strategy. */
-function retryDays(steps: DunningStep[]): number[] {
-  let cumulative = 0;
-  const out: number[] = [];
-  for (const s of steps) {
-    cumulative += s.afterDays;
-    if (s.action === "RETRY") out.push(cumulative);
-  }
-  return out;
-}
+  OPEN_CASE_STATES,
+  categorizeDeclineCode,
+  transitionOpenCase,
+} from "~/lib/dunning/index.server";
+import { sendNotification } from "~/lib/notifications/index.server";
+import { cancelContract } from "~/lib/contracts/index.server";
+import { OURS_ONLY, isBillableOwnership } from "~/lib/ownership/ownership.server";
 
 /**
- * Episode step from a dunning retry's idempotency key
- * (`bill:<contractId>:<cycle>:<episode>-<idx>`), or null for attempts we did
- * not schedule (external/auto-billing retries).
+ * Admin — Dunning queue. Failed-payment cases by state, with human decline
+ * descriptions, ladder progress and per-case actions (retry now, resend the
+ * card-fix link, cancel the contract). Summary cards show open volume and
+ * 30-day recovery performance.
  */
-function episodeStepFromKey(idempotencyKey: string | null): number | null {
-  if (!idempotencyKey || !idempotencyKey.startsWith("bill:")) return null;
-  const suffix = idempotencyKey.split(":")[3];
-  if (!suffix) return null;
-  const idx = Number(suffix.split("-")[1]);
-  return Number.isInteger(idx) && idx >= 0 ? idx : null;
-}
+
+const TABS = [
+  { id: "retrying", content: "Retrying" },
+  { id: "awaiting", content: "Awaiting customer" },
+  { id: "threeds", content: "Awaiting 3DS" },
+  { id: "exhausted", content: "Exhausted" },
+  { id: "recovered", content: "Recovered (30d)" },
+] as const;
+
+type TabId = (typeof TABS)[number]["id"];
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// ── Loader ───────────────────────────────────────────────────────────────────
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
-  await requireRole(session, "OWNER", "ADMIN");
-  const shop = session.shop;
+  await authenticate.admin(request);
+  const shop = await getPrimaryShop();
+  if (!shop) {
+    throw new Response("App is not installed on any shop", { status: 503 });
+  }
 
-  // Queue: every dunning state for this shop, most urgent first.
-  const states = await prisma.dunningState.findMany({
-    where: { contract: { shop } },
-    include: { contract: true },
-    orderBy: { updatedAt: "desc" },
+  const url = new URL(request.url);
+  const tabParam = url.searchParams.get("tab") as TabId | null;
+  const tab: TabId = TABS.some((t) => t.id === tabParam) ? (tabParam as TabId) : "retrying";
+
+  const thirtyDaysAgo = new Date(Date.now() - 30 * DAY_MS);
+
+  let where: Prisma.DunningCaseWhereInput;
+  switch (tab) {
+    case "awaiting":
+      where = { state: "AWAITING_CUSTOMER" };
+      break;
+    case "threeds":
+      where = { state: "AWAITING_3DS" };
+      break;
+    case "exhausted":
+      where = { state: "EXHAUSTED" };
+      break;
+    case "recovered":
+      where = { state: "RECOVERED", resolvedAt: { gte: thirtyDaysAgo } };
+      break;
+    default:
+      where = { state: { in: ["OPEN", "RETRYING"] } };
+  }
+  // Standing rule: only our own, non-demo contracts. Legacy cases on foreign/
+  // demo contracts would otherwise sit in the queue forever — the sweep
+  // deliberately skips them, so "Retry now" on one would never fire.
+  where.contract = { shopId: shop.id, ...OURS_ONLY, isDemo: false };
+
+  const cases = await prisma.dunningCase.findMany({
+    where,
+    include: { contract: { include: { lines: true } } },
+    orderBy:
+      tab === "exhausted" || tab === "recovered"
+        ? { resolvedAt: "desc" }
+        : { openedAt: "asc" },
     take: 100,
   });
 
-  const queueRows = states.map((s) => {
-    const history = parseJson<HistoryEntry[]>(s.historyJson, []);
-    const tail = history
-      .slice(-3)
-      .map(
-        (h) =>
-          `${h.at.slice(0, 10)} ${h.type === "STEP" ? (h.action ?? "STEP") : h.type}`,
-      )
-      .join(" · ");
+  // Amounts: trigger attempt when it carries one, else line-sum estimate.
+  const attemptIds = cases
+    .map((k) => k.triggerAttemptId)
+    .filter((id): id is string => id != null);
+  const attempts = attemptIds.length
+    ? await prisma.billingAttempt.findMany({ where: { id: { in: attemptIds } } })
+    : [];
+  const attemptById = new Map(attempts.map((a) => [a.id, a]));
+
+  const rows = cases.map((k) => {
+    const contract = k.contract;
+    const attempt = k.triggerAttemptId
+      ? attemptById.get(k.triggerAttemptId)
+      : undefined;
+    const estimateCents =
+      contract.lines.reduce(
+        (sum, l) => sum + l.currentPriceCents * l.quantity,
+        0,
+      ) + contract.deliveryPriceCents;
+    const amountCents = attempt?.amountCents ?? (contract.lines.length ? estimateCents : null);
     return {
-      id: s.id,
-      email: s.contract.customerEmail ?? s.contract.shopifyCustomerId,
-      phase: s.phase,
-      category: s.declineCategory ?? "—",
-      retryCount: s.retryCount,
-      nextRetryAt: formatWhen(s.nextRetryAt),
-      lastFailureAt: formatWhen(s.lastFailureAt),
-      historyTail: tail || "—",
+      id: k.id,
+      contractId: contract.id,
+      customerName:
+        [contract.firstName, contract.lastName].filter(Boolean).join(" ") ||
+        contract.email,
+      email: contract.email,
+      amount:
+        amountCents != null
+          ? formatMoney(amountCents, attempt?.currencyCode ?? contract.currencyCode)
+          : "–",
+      declineCode: k.declineCode,
+      declineHuman: categorizeDeclineCode(k.declineCode).description,
+      state: k.state,
+      openedAt: k.openedAt.toISOString(),
+      resolvedAt: k.resolvedAt?.toISOString() ?? null,
+      ladderStep: k.ladderStep,
+      nextRetryAt: k.nextRetryAt?.toISOString() ?? null,
+      emailsSent: k.emailsSent,
+      smsSent: k.smsSent,
+      recovered:
+        k.recoveredCents != null
+          ? formatMoney(k.recoveredCents, contract.currencyCode)
+          : null,
     };
   });
 
-  // Recovery report. Three deliberate choices (each fixed a reporting bug):
-  //  - settled outcomes only — PENDING retries created moments ago must not
-  //    deflate every denominator until their webhook lands;
-  //  - grouped by EPISODE STEP (from the retry's idempotency key), never by
-  //    lifetime attemptNumber — a new subscriber's first dunning retry and a
-  //    2-year subscriber's first dunning retry belong in the same row;
-  //  - the category fallback is a dedicated lookup over exactly the involved
-  //    contracts, not whatever page of 100 states the queue happens to show.
-  const retryAttempts = await prisma.billingAttempt.findMany({
+  // Summary cards (same ownership/demo scoping as the queue).
+  const summaryContract = { shopId: shop.id, ...OURS_ONLY, isDemo: false };
+  const openCases = await prisma.dunningCase.count({
+    where: { state: { in: OPEN_CASE_STATES }, contract: summaryContract },
+  });
+  const recovered30 = await prisma.dunningCase.findMany({
     where: {
-      shop,
-      isRetry: true,
-      status: { in: ["SUCCESS", "FAILURE", "CHALLENGED"] },
+      state: "RECOVERED",
+      resolvedAt: { gte: thirtyDaysAgo },
+      contract: summaryContract,
     },
-    select: {
-      contractId: true,
-      status: true,
-      declineCategory: true,
-      idempotencyKey: true,
-    },
+    select: { recoveredCents: true },
   });
-  const pendingRetries = await prisma.billingAttempt.count({
-    where: { shop, isRetry: true, status: "PENDING" },
-  });
-  const fallbackStates = await prisma.dunningState.findMany({
+  const exhausted30 = await prisma.dunningCase.count({
     where: {
-      contractId: { in: [...new Set(retryAttempts.map((a) => a.contractId))] },
+      state: "EXHAUSTED",
+      resolvedAt: { gte: thirtyDaysAgo },
+      contract: summaryContract,
     },
-    select: { contractId: true, declineCategory: true },
   });
-  const stateCategoryByContract = new Map(
-    fallbackStates.map((s) => [s.contractId, s.declineCategory ?? "GENERIC_DECLINE"]),
+  // Cancelled-from-dunning cases are churn outcomes too — excluding them
+  // would flatter the recovery rate. SUPERSEDED closures (an old cycle's
+  // case replaced by a newer cycle's) are not outcomes and stay out.
+  const cancelled30 = await prisma.dunningCase.count({
+    where: {
+      state: "CANCELLED",
+      resolution: "CANCELLED",
+      resolvedAt: { gte: thirtyDaysAgo },
+      contract: summaryContract,
+    },
+  });
+  const recoveredCount = recovered30.length;
+  const resolvedTotal = recoveredCount + exhausted30 + cancelled30;
+  const recoveryRatePct =
+    resolvedTotal > 0 ? Math.round((recoveredCount / resolvedTotal) * 100) : null;
+  const recoveredRevenueCents = recovered30.reduce(
+    (sum, k) => sum + (k.recoveredCents ?? 0),
+    0,
   );
-
-  const byCategory = new Map<string, { attempts: number; recovered: number }>();
-  const byStep = new Map<string, { attempts: number; recovered: number }>();
-  for (const a of retryAttempts) {
-    const category =
-      a.declineCategory ??
-      stateCategoryByContract.get(a.contractId) ??
-      "UNKNOWN";
-    const cat = byCategory.get(category) ?? { attempts: 0, recovered: 0 };
-    cat.attempts++;
-    if (a.status === "SUCCESS") cat.recovered++;
-    byCategory.set(category, cat);
-
-    const stepIdx = episodeStepFromKey(a.idempotencyKey);
-    const stepKey = stepIdx == null ? "external" : `step ${stepIdx}`;
-    const step = byStep.get(stepKey) ?? { attempts: 0, recovered: 0 };
-    step.attempts++;
-    if (a.status === "SUCCESS") step.recovered++;
-    byStep.set(stepKey, step);
-  }
-
-  const recoveryByCategory = [...byCategory.entries()].map(([category, r]) => ({
-    category,
-    attempts: r.attempts,
-    recovered: r.recovered,
-    rate: r.attempts > 0 ? `${Math.round((r.recovered / r.attempts) * 100)}%` : "—",
-  }));
-  const recoveryByStep = [...byStep.entries()]
-    .sort((a, b) => {
-      // "step N" rows ascending, "external" last.
-      const na = a[0] === "external" ? Number.POSITIVE_INFINITY : Number(a[0].slice(5));
-      const nb = b[0] === "external" ? Number.POSITIVE_INFINITY : Number(b[0].slice(5));
-      return na - nb;
-    })
-    .map(([step, r]) => ({
-      step,
-      attempts: r.attempts,
-      recovered: r.recovered,
-      rate:
-        r.attempts > 0 ? `${Math.round((r.recovered / r.attempts) * 100)}%` : "—",
-    }));
-
-  // Settings: pre-dunning lead + merchant retry-offset overrides.
-  const settings = await prisma.shopSettings.findUnique({ where: { shop } });
-  const settingsObj = parseJson<Record<string, unknown>>(
-    settings?.settingsJson,
-    {},
-  );
-  const rawLead = Number(settingsObj.preDunningLeadDays);
-  const preDunningLeadDays =
-    Number.isFinite(rawLead) && rawLead > 0 ? rawLead : 10;
-  const overrides = parseDunningOverrides(settingsObj.dunningOverrides);
-
-  // Strategy reference (standard subscriber; high-value gets +1 grace step)
-  // plus the three offset layers per category for the editor.
-  const strategyRows = [] as Array<{
-    category: string;
-    retries: number;
-    sequence: string;
-  }>;
-  const offsetRows = [] as Array<{
-    category: string;
-    staticOffsets: string;
-    learnedOffsets: string;
-    override: string;
-    effective: "merchant" | "learned" | "static";
-    editable: boolean;
-  }>;
-  for (const category of DECLINE_CATEGORIES) {
-    const steps: DunningStep[] = strategyFor(category, false);
-    let cumulative = 0;
-    const sequence = steps
-      .map((s) => {
-        cumulative += s.afterDays;
-        return stepLabel(cumulative, s.action);
-      })
-      .join("  →  ");
-    const staticRetryDays = retryDays(steps);
-    strategyRows.push({
-      category,
-      retries: staticRetryDays.length,
-      sequence,
-    });
-
-    const learned = await getLearnedDunningOffsets(shop, category);
-    const merchant = overrides[category] ?? null;
-    offsetRows.push({
-      category,
-      staticOffsets: staticRetryDays.length > 0 ? staticRetryDays.join(", ") : "never retried",
-      learnedOffsets: learned && learned.length > 0 ? learned.join(", ") : "—",
-      override: merchant ? merchant.join(", ") : "",
-      effective: merchant ? "merchant" : learned && learned.length > 0 ? "learned" : "static",
-      editable: staticRetryDays.length > 0,
-    });
-  }
 
   return json({
-    queueRows,
-    recoveryByCategory,
-    recoveryByStep,
-    pendingRetries,
-    preDunningLeadDays,
-    strategyRows,
-    offsetRows,
-    offsetBounds: {
-      min: RETRY_OFFSET_MIN_DAYS,
-      max: RETRY_OFFSET_MAX_DAYS,
-      count: MAX_RETRY_OFFSETS,
+    tab,
+    rows,
+    tz: shop.ianaTimezone,
+    summary: {
+      openCases,
+      recoveryRatePct,
+      recoveredCount,
+      resolvedTotal,
+      recoveredRevenue: formatMoney(recoveredRevenueCents, shop.currencyCode),
     },
   });
 };
 
-// ─────────────────────────────── Action ───────────────────────────────────
+// ── Action ───────────────────────────────────────────────────────────────────
+
+interface ActionResponse {
+  ok: boolean;
+  intent: string;
+  message?: string;
+  error?: string;
+}
+
+function actorFromSession(session: {
+  shop: string;
+  onlineAccessInfo?: { associated_user?: { email?: string | null } } | null;
+}): string {
+  return session.onlineAccessInfo?.associated_user?.email ?? `admin@${session.shop}`;
+}
+
+function errMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { session } = await authenticate.admin(request);
-  await requireRole(session, "OWNER", "ADMIN");
-  const shop = session.shop;
-
-  const form = await request.formData();
-  const intent = String(form.get("intent") ?? "");
-
-  if (intent === "saveLeadDays") {
-    const leadDays = Number(form.get("leadDays"));
-    if (!Number.isFinite(leadDays) || leadDays < 1 || leadDays > 60) {
-      return json(
-        { ok: false, message: "Lead days must be between 1 and 60." },
-        400,
-      );
-    }
-
-    const settings = await prisma.shopSettings.findUnique({ where: { shop } });
-    const settingsObj = parseJson<Record<string, unknown>>(
-      settings?.settingsJson,
-      {},
-    );
-    settingsObj.preDunningLeadDays = leadDays;
-    await prisma.shopSettings.upsert({
-      where: { shop },
-      create: { shop, settingsJson: JSON.stringify(settingsObj) },
-      update: { settingsJson: JSON.stringify(settingsObj) },
-    });
-
-    await appendAudit({
-      shop,
-      actorType: "STAFF",
-      actorId: session.onlineAccessInfo?.associated_user?.email ?? "admin",
-      action: "PRE_DUNNING_SETTINGS_UPDATED",
-      subjectType: "ShopSettings",
-      subjectId: shop,
-      payload: { preDunningLeadDays: leadDays },
-    });
-
-    return json({ ok: true, message: "Pre-dunning lead time saved." });
+  const shop = await getPrimaryShop();
+  if (!shop) {
+    throw new Response("App is not installed on any shop", { status: 503 });
   }
+  const actor = actorFromSession(session);
+  const formData = await request.formData();
+  const intent = String(formData.get("intent") ?? "");
+  const caseId = String(formData.get("caseId") ?? "");
 
-  if (intent === "saveDunningOverrides") {
-    // Parse each category's comma-separated day list; strict validation —
-    // whole days 1..30, at most 4 retries; empty clears the override.
-    const overrides: Record<string, number[]> = {};
-    for (const category of DECLINE_CATEGORIES) {
-      const raw = String(form.get(`override_${category}`) ?? "").trim();
-      if (!raw) continue;
-      const parts = raw.split(",").map((p) => p.trim()).filter(Boolean);
-      const days = parts.map((p) => Number(p));
-      if (
-        parts.length === 0 ||
-        parts.length > MAX_RETRY_OFFSETS ||
-        days.some(
-          (d) =>
-            !Number.isInteger(d) ||
-            d < RETRY_OFFSET_MIN_DAYS ||
-            d > RETRY_OFFSET_MAX_DAYS,
-        )
-      ) {
-        return json(
-          {
-            ok: false,
-            message: `${category}: retry days must be ${MAX_RETRY_OFFSETS} or fewer whole numbers between ${RETRY_OFFSET_MIN_DAYS} and ${RETRY_OFFSET_MAX_DAYS} (e.g. "3, 5, 7").`,
-          },
-          400,
+  const kase = await prisma.dunningCase.findUnique({
+    where: { id: caseId },
+    include: { contract: { include: { lines: true } } },
+  });
+  if (!kase || kase.contract.shopId !== shop.id) {
+    return json<ActionResponse>({ ok: false, intent, error: "Dunning case not found" });
+  }
+  // Same gate as the loader: acting on a foreign/demo contract's case would
+  // retry another app's charge or email a fixture address.
+  if (!isBillableOwnership(kase.contract.ownership) || kase.contract.isDemo) {
+    return json<ActionResponse>({
+      ok: false,
+      intent,
+      error: "This contract is not managed by Cellexia Subscriptions",
+    });
+  }
+  const contract = kase.contract;
+
+  const adminLog = async (
+    description: string,
+    payload: Record<string, unknown> = {},
+  ) => {
+    await logEvent({
+      shopId: shop.id,
+      contractId: contract.id,
+      customerId: contract.customerId,
+      email: contract.email,
+      type: "admin.action",
+      source: "ADMIN",
+      actor,
+      payload: { description, dunningCaseId: kase.id, ...payload },
+    });
+  };
+
+  try {
+    switch (intent) {
+      case "retryNow": {
+        const now = new Date();
+        // Guarded + atomic (transitionOpenCase): only an OPEN-state case can
+        // be scheduled. The queue row may be minutes stale — if the recovery
+        // webhook already resolved this case, flipping it back to RETRYING
+        // would make the sweep re-bill the already-billed cycle and walk the
+        // paid customer toward exhaustion/cancellation.
+        const claimed = await transitionOpenCase(
+          kase.id,
+          contract.id,
+          "RETRYING",
+          now,
         );
+        if (!claimed) {
+          return json<ActionResponse>({
+            ok: false,
+            intent,
+            error: "This dunning case is already resolved — refresh the page",
+          });
+        }
+        await logEvent({
+          shopId: shop.id,
+          contractId: contract.id,
+          customerId: contract.customerId,
+          email: contract.email,
+          type: "dunning.retry_scheduled",
+          source: "ADMIN",
+          actor,
+          payload: {
+            dunningCaseId: kase.id,
+            trigger: "admin_retry_now",
+            immediate: true,
+            nextRetryAt: now.toISOString(),
+          },
+        });
+        await adminLog("Scheduled an immediate dunning retry from the queue", {
+          action: "dunning_retry_now",
+        });
+        return json<ActionResponse>({
+          ok: true,
+          intent,
+          message: "Retry scheduled — the next sweep fires it within a minute",
+        });
       }
-      overrides[category] = [...new Set(days)].sort((a, b) => a - b);
+
+      case "sendCardLink": {
+        // A resolved case is not re-mailable: the stale-page click after a
+        // webhook recovery would send "your payment failed" to a customer
+        // whose payment just succeeded.
+        if (!OPEN_CASE_STATES.includes(kase.state)) {
+          return json<ActionResponse>({
+            ok: false,
+            intent,
+            error: "This dunning case is already resolved — refresh the page",
+          });
+        }
+        const info = categorizeDeclineCode(kase.declineCode);
+        let ctaUrl: string | null = null;
+        try {
+          ctaUrl = await buildMagicUrl({
+            action: "UPDATE_CARD",
+            contractId: contract.id,
+            customerId: contract.customerId,
+            email: contract.email,
+            ttlSeconds: 14 * 24 * 3600,
+            maxUses: 5,
+            createdVia: "ADMIN",
+          });
+        } catch (err) {
+          console.error("[admin] update-card magic link failed", contract.id, err);
+        }
+        const estimateCents =
+          contract.lines.reduce(
+            (sum, l) => sum + l.currentPriceCents * l.quantity,
+            0,
+          ) + contract.deliveryPriceCents;
+        const result = await sendNotification({
+          shopId: shop.id,
+          contractId: contract.id,
+          template: "payment_failed_1",
+          vars: {
+            amount: contract.lines.length
+              ? formatMoney(estimateCents, contract.currencyCode, contract.locale)
+              : "",
+            card_last4: contract.cardLast4 ?? "",
+            decline_human: info.description,
+            resent_by_admin: true,
+            ...(ctaUrl ? { cta_url: ctaUrl } : {}),
+          },
+        });
+        if (result.status === "FAILED") {
+          return json<ActionResponse>({
+            ok: false,
+            intent,
+            error: "Notification could not be sent (see notification log)",
+          });
+        }
+        await prisma.dunningCase.update({
+          where: { id: kase.id },
+          data: { emailsSent: { increment: 1 }, lastNotifiedAt: new Date() },
+        });
+        await adminLog("Re-sent the fix-payment email with a fresh card-update link", {
+          action: "dunning_resend_card_link",
+          notificationStatus: result.status,
+        });
+        return json<ActionResponse>({
+          ok: true,
+          intent,
+          message: "Card-fix email sent again",
+        });
+      }
+
+      case "cancelContract": {
+        // Same stale-page guard: once the case is resolved (customer paid),
+        // "Cancel" here would cancel an ACTIVE, fully-paid contract with
+        // reason PAYMENT_FAILED and fire win-back at a paying customer.
+        if (!OPEN_CASE_STATES.includes(kase.state)) {
+          return json<ActionResponse>({
+            ok: false,
+            intent,
+            error: "This dunning case is already resolved — refresh the page",
+          });
+        }
+        await cancelContract(shop.domain, contract.id, "PAYMENT_FAILED", {
+          source: "ADMIN",
+          actor,
+          cancelSource: "ADMIN",
+        });
+        // Conditional close: if a recovery raced the cancel, the case is no
+        // longer open and there is nothing left to overwrite — the contract
+        // cancel above already happened under the admin's explicit click.
+        await transitionOpenCase(kase.id, contract.id, "CANCELLED");
+        await adminLog(
+          "Cancelled the contract from the dunning queue (reason PAYMENT_FAILED)",
+          { action: "dunning_cancel_contract" },
+        );
+        return json<ActionResponse>({
+          ok: true,
+          intent,
+          message: "Contract cancelled and case closed",
+        });
+      }
+
+      default:
+        return json<ActionResponse>({ ok: false, intent, error: `Unknown intent: ${intent}` });
     }
-
-    const settings = await prisma.shopSettings.findUnique({ where: { shop } });
-    const settingsObj = parseJson<Record<string, unknown>>(
-      settings?.settingsJson,
-      {},
-    );
-    if (Object.keys(overrides).length > 0) {
-      settingsObj.dunningOverrides = overrides;
-    } else {
-      delete settingsObj.dunningOverrides;
-    }
-    await prisma.shopSettings.upsert({
-      where: { shop },
-      create: { shop, settingsJson: JSON.stringify(settingsObj) },
-      update: { settingsJson: JSON.stringify(settingsObj) },
-    });
-
-    await appendAudit({
-      shop,
-      actorType: "STAFF",
-      actorId: session.onlineAccessInfo?.associated_user?.email ?? "admin",
-      action: "DUNNING_OVERRIDES_UPDATED",
-      subjectType: "ShopSettings",
-      subjectId: shop,
-      payload: { dunningOverrides: overrides },
-    });
-
-    return json({ ok: true, message: "Retry-day overrides saved." });
+  } catch (err) {
+    console.error("[admin] dunning action failed", intent, caseId, err);
+    return json<ActionResponse>({ ok: false, intent, error: errMessage(err) });
   }
-
-  return json({ ok: false, message: "Unknown action" }, 400);
 };
 
-// ─────────────────────────────── UI ───────────────────────────────────────
+// ── Component ────────────────────────────────────────────────────────────────
 
-function phaseTone(
-  phase: string,
-): "success" | "attention" | "warning" | "critical" | "info" | undefined {
-  switch (phase) {
-    case "RESOLVED":
+function formatDate(iso: string | null, tz?: string): string {
+  if (!iso) return "–";
+  return new Date(iso).toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    ...(tz ? { timeZone: tz } : {}),
+  });
+}
+
+/** Shop-timezone date + time — retry moments are times, not just days, and
+ * rendering them in the admin browser's timezone shifts the displayed day. */
+function formatDateTime(iso: string | null, tz: string): string {
+  if (!iso) return "–";
+  return new Date(iso).toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: tz,
+  });
+}
+
+function timeAgo(iso: string): string {
+  const mins = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 60) return `${days}d ago`;
+  return formatDate(iso);
+}
+
+function stateTone(
+  state: string,
+): "success" | "attention" | "critical" | "warning" | "info" | undefined {
+  switch (state) {
+    case "RECOVERED":
       return "success";
     case "RETRYING":
+    case "OPEN":
       return "attention";
-    case "GRACE":
-    case "FINAL_NOTICE":
+    case "AWAITING_CUSTOMER":
       return "warning";
+    case "AWAITING_3DS":
+      return "info";
     case "EXHAUSTED":
       return "critical";
-    case "PRE_DUNNING":
-      return "info";
     default:
       return undefined;
   }
 }
 
-function LeadDaysForm({ initial }: { initial: number }) {
-  const fetcher = useFetcher<typeof action>();
-  const [value, setValue] = useState(String(initial));
-  return (
-    <fetcher.Form method="post">
-      <BlockStack gap="300">
-        <input type="hidden" name="intent" value="saveLeadDays" />
-        <TextField
-          label="Lead time before next charge (days)"
-          name="leadDays"
-          type="number"
-          value={value}
-          onChange={setValue}
-          autoComplete="off"
-          min={1}
-          max={60}
-          helpText="Subscribers whose card expires before their next charge plus this lead time get a card-expiry notice and Shopify's secure payment-update email."
-        />
-        <InlineStack gap="200">
-          <Button submit variant="primary" loading={fetcher.state !== "idle"}>
-            Save
-          </Button>
-          {fetcher.data ? (
-            <Text
-              as="span"
-              tone={fetcher.data.ok ? "success" : "critical"}
-              variant="bodySm"
-            >
-              {fetcher.data.message}
-            </Text>
-          ) : null}
-        </InlineStack>
-      </BlockStack>
-    </fetcher.Form>
-  );
-}
-
-function OffsetsEditor({
-  rows,
-  bounds,
-}: {
-  rows: Array<{
-    category: string;
-    staticOffsets: string;
-    learnedOffsets: string;
-    override: string;
-    effective: "merchant" | "learned" | "static";
-    editable: boolean;
-  }>;
-  bounds: { min: number; max: number; count: number };
-}) {
-  const fetcher = useFetcher<typeof action>();
-  const [values, setValues] = useState<Record<string, string>>(
-    Object.fromEntries(rows.map((r) => [r.category, r.override])),
-  );
-  return (
-    <fetcher.Form method="post">
-      <BlockStack gap="300">
-        <input type="hidden" name="intent" value="saveDunningOverrides" />
-        <Text as="p" tone="subdued" variant="bodySm">
-          Retry days after the failure, comma-separated (e.g. "3, 5, 7"). Up to{" "}
-          {bounds.count} retries, each {bounds.min}–{bounds.max} days. Leave
-          blank to fall back to learned offsets, then the static strategy.
-          Categories that are never retried by design cannot be overridden.
-        </Text>
-        {rows.map((r) => (
-          <BlockStack key={r.category} gap="100">
-            <InlineStack gap="200" blockAlign="center">
-              <Text as="span" variant="bodyMd" fontWeight="semibold">
-                {r.category}
-              </Text>
-              <Badge
-                tone={
-                  r.effective === "merchant"
-                    ? "attention"
-                    : r.effective === "learned"
-                      ? "info"
-                      : undefined
-                }
-              >
-                {`using ${r.effective}`}
-              </Badge>
-            </InlineStack>
-            <InlineStack gap="400" blockAlign="center" wrap>
-              <Text as="span" tone="subdued" variant="bodySm">
-                static: {r.staticOffsets}
-              </Text>
-              <Text as="span" tone="subdued" variant="bodySm">
-                learned: {r.learnedOffsets}
-              </Text>
-            </InlineStack>
-            {r.editable ? (
-              <TextField
-                label={`${r.category} override`}
-                labelHidden
-                name={`override_${r.category}`}
-                value={values[r.category] ?? ""}
-                onChange={(v) =>
-                  setValues((prev) => ({ ...prev, [r.category]: v }))
-                }
-                autoComplete="off"
-                placeholder="e.g. 3, 5, 7"
-              />
-            ) : (
-              <input type="hidden" name={`override_${r.category}`} value="" />
-            )}
-          </BlockStack>
-        ))}
-        <InlineStack gap="200">
-          <Button submit variant="primary" loading={fetcher.state !== "idle"}>
-            Save overrides
-          </Button>
-          {fetcher.data ? (
-            <Text
-              as="span"
-              tone={fetcher.data.ok ? "success" : "critical"}
-              variant="bodySm"
-            >
-              {fetcher.data.message}
-            </Text>
-          ) : null}
-        </InlineStack>
-      </BlockStack>
-    </fetcher.Form>
-  );
-}
-
 export default function DunningPage() {
-  const {
-    queueRows,
-    recoveryByCategory,
-    recoveryByStep,
-    pendingRetries,
-    preDunningLeadDays,
-    strategyRows,
-    offsetRows,
-    offsetBounds,
-  } = useLoaderData<typeof loader>();
+  const data = useLoaderData<typeof loader>();
+  const navigate = useNavigate();
+  const [, setSearchParams] = useSearchParams();
+  const fetcher = useFetcher<typeof action>();
+  const [cancelCaseId, setCancelCaseId] = useState<string | null>(null);
 
-  const queueTableRows = queueRows.map((r) => [
-    r.email,
-    <Badge key={`${r.id}-phase`} tone={phaseTone(r.phase)}>
-      {r.phase}
-    </Badge>,
-    r.category,
-    r.retryCount,
-    r.nextRetryAt,
-    r.lastFailureAt,
-    r.historyTail,
-  ]);
+  const busy = fetcher.state !== "idle";
+  const selectedTabIndex = Math.max(
+    0,
+    TABS.findIndex((t) => t.id === data.tab),
+  );
+
+  const submit = (intent: string, caseId: string) => {
+    fetcher.submit({ intent, caseId }, { method: "post" });
+  };
+
+  const lastResult = fetcher.data;
 
   return (
-    <Page
-      title="Payment recovery"
-      subtitle="Decline-aware retries, recovery performance and pre-dunning"
-    >
-      <Layout>
-        <Layout.Section>
-          <Card>
-            <BlockStack gap="300">
-              <Text as="h2" variant="headingMd">
-                Recovery queue
-              </Text>
-              {queueTableRows.length > 0 ? (
-                <DataTable
-                  columnContentTypes={[
-                    "text",
-                    "text",
-                    "text",
-                    "numeric",
-                    "text",
-                    "text",
-                    "text",
-                  ]}
-                  headings={[
-                    "Customer",
-                    "Phase",
-                    "Category",
-                    "Retries",
-                    "Next action",
-                    "Last failure",
-                    "Recent history",
-                  ]}
-                  rows={queueTableRows}
-                />
-              ) : (
-                <Text as="p" tone="subdued">
-                  No payment issues in the queue.
-                </Text>
-              )}
-            </BlockStack>
-          </Card>
-        </Layout.Section>
+    <Page title="Dunning" subtitle="Failed payments and recovery" fullWidth>
+      <BlockStack gap="400">
+        {lastResult && !lastResult.ok && lastResult.error ? (
+          <Banner tone="critical" title="Action failed">
+            <p>{lastResult.error}</p>
+          </Banner>
+        ) : null}
+        {lastResult && lastResult.ok && lastResult.message ? (
+          <Banner tone="success">
+            <p>{lastResult.message}</p>
+          </Banner>
+        ) : null}
 
-        <Layout.Section variant="oneHalf">
+        <InlineGrid columns={{ xs: 1, sm: 3 }} gap="400">
           <Card>
-            <BlockStack gap="300">
-              <Text as="h2" variant="headingMd">
-                Recovery by decline category
+            <BlockStack gap="100">
+              <Text as="h3" variant="headingSm" tone="subdued">
+                Open cases
               </Text>
-              {recoveryByCategory.length > 0 ? (
-                <DataTable
-                  columnContentTypes={["text", "numeric", "numeric", "text"]}
-                  headings={["Category", "Retries", "Recovered", "Rate"]}
-                  rows={recoveryByCategory.map((r) => [
-                    r.category,
-                    r.attempts,
-                    r.recovered,
-                    r.rate,
-                  ])}
-                />
-              ) : (
-                <Text as="p" tone="subdued">
-                  No settled retry attempts recorded yet.
-                </Text>
-              )}
+              <Text as="p" variant="headingLg">
+                {String(data.summary.openCases)}
+              </Text>
             </BlockStack>
           </Card>
-        </Layout.Section>
+          <Card>
+            <BlockStack gap="100">
+              <Text as="h3" variant="headingSm" tone="subdued">
+                Recovery rate (30d)
+              </Text>
+              <Text as="p" variant="headingLg">
+                {data.summary.recoveryRatePct != null
+                  ? `${data.summary.recoveryRatePct}%`
+                  : "–"}
+              </Text>
+              <Text as="p" variant="bodySm" tone="subdued">
+                {`${data.summary.recoveredCount} of ${data.summary.resolvedTotal} resolved cases (incl. exhausted + cancelled)`}
+              </Text>
+            </BlockStack>
+          </Card>
+          <Card>
+            <BlockStack gap="100">
+              <Text as="h3" variant="headingSm" tone="subdued">
+                Recovered revenue (30d)
+              </Text>
+              <Text as="p" variant="headingLg">
+                {data.summary.recoveredRevenue}
+              </Text>
+            </BlockStack>
+          </Card>
+        </InlineGrid>
 
-        <Layout.Section variant="oneHalf">
-          <Card>
-            <BlockStack gap="300">
-              <Text as="h2" variant="headingMd">
-                Recovery by episode step
-              </Text>
-              <Text as="p" tone="subdued" variant="bodySm">
-                Settled outcomes only
-                {pendingRetries > 0
-                  ? ` — ${pendingRetries} retr${pendingRetries === 1 ? "y" : "ies"} in flight`
-                  : ""}
-                . "external" groups retries Shopify initiated outside the
-                dunning strategy.
-              </Text>
-              {recoveryByStep.length > 0 ? (
-                <DataTable
-                  columnContentTypes={["text", "numeric", "numeric", "text"]}
-                  headings={["Episode step", "Retries", "Recovered", "Rate"]}
-                  rows={recoveryByStep.map((r) => [
-                    r.step,
-                    r.attempts,
-                    r.recovered,
-                    r.rate,
-                  ])}
-                />
-              ) : (
-                <Text as="p" tone="subdued">
-                  No settled retry attempts recorded yet.
-                </Text>
-              )}
-            </BlockStack>
-          </Card>
-        </Layout.Section>
+        <Card padding="0">
+          <Tabs
+            tabs={TABS.map((t) => ({ id: t.id, content: t.content }))}
+            selected={selectedTabIndex}
+            onSelect={(index) => {
+              const next = new URLSearchParams();
+              const tab = TABS[index];
+              if (tab && tab.id !== "retrying") next.set("tab", tab.id);
+              setSearchParams(next, { replace: true });
+            }}
+          />
+          <IndexTable
+            resourceName={{ singular: "case", plural: "cases" }}
+            itemCount={data.rows.length}
+            selectable={false}
+            loading={busy}
+            headings={[
+              { title: "Customer" },
+              { title: "Amount" },
+              { title: "Decline" },
+              { title: "Opened" },
+              { title: "Step" },
+              { title: "Next retry" },
+              { title: "Emails / SMS" },
+              { title: "Actions" },
+            ]}
+          >
+            {data.rows.map((row, index) => (
+              <IndexTable.Row id={row.id} key={row.id} position={index}>
+                <IndexTable.Cell>
+                  <BlockStack gap="050">
+                    <Button
+                      variant="plain"
+                      onClick={() => navigate(`/app/subscribers/${row.contractId}`)}
+                    >
+                      {row.customerName}
+                    </Button>
+                    <Text as="span" variant="bodySm" tone="subdued">
+                      {row.email}
+                    </Text>
+                  </BlockStack>
+                </IndexTable.Cell>
+                <IndexTable.Cell>{row.amount}</IndexTable.Cell>
+                <IndexTable.Cell>
+                  <Box maxWidth="280px">
+                    <BlockStack gap="050">
+                      <InlineStack gap="100">
+                        <Badge tone={stateTone(row.state)}>{row.state}</Badge>
+                        {row.declineCode ? (
+                          <Text as="span" variant="bodySm" tone="subdued">
+                            {row.declineCode}
+                          </Text>
+                        ) : null}
+                      </InlineStack>
+                      <Text as="span" variant="bodySm" tone="subdued" truncate>
+                        {row.declineHuman}
+                      </Text>
+                    </BlockStack>
+                  </Box>
+                </IndexTable.Cell>
+                <IndexTable.Cell>{timeAgo(row.openedAt)}</IndexTable.Cell>
+                <IndexTable.Cell>{row.ladderStep}</IndexTable.Cell>
+                <IndexTable.Cell>
+                  {row.state === "RECOVERED" && row.recovered
+                    ? `Recovered ${row.recovered}`
+                    : formatDateTime(row.nextRetryAt, data.tz)}
+                </IndexTable.Cell>
+                <IndexTable.Cell>{`${row.emailsSent} / ${row.smsSent}`}</IndexTable.Cell>
+                <IndexTable.Cell>
+                  {row.state === "RECOVERED" || row.state === "EXHAUSTED" ? (
+                    <Text as="span" variant="bodySm" tone="subdued">
+                      {row.resolvedAt ? `Closed ${timeAgo(row.resolvedAt)}` : "Closed"}
+                    </Text>
+                  ) : (
+                    <ButtonGroup>
+                      <Button
+                        size="slim"
+                        disabled={busy}
+                        onClick={() => submit("retryNow", row.id)}
+                      >
+                        Retry now
+                      </Button>
+                      <Button
+                        size="slim"
+                        disabled={busy}
+                        onClick={() => submit("sendCardLink", row.id)}
+                      >
+                        Send card link
+                      </Button>
+                      <Button
+                        size="slim"
+                        tone="critical"
+                        disabled={busy}
+                        onClick={() => setCancelCaseId(row.id)}
+                      >
+                        Cancel contract
+                      </Button>
+                    </ButtonGroup>
+                  )}
+                </IndexTable.Cell>
+              </IndexTable.Row>
+            ))}
+          </IndexTable>
+        </Card>
+      </BlockStack>
 
-        <Layout.Section variant="oneHalf">
-          <Card>
-            <BlockStack gap="300">
-              <Text as="h2" variant="headingMd">
-                Retry-day overrides
-              </Text>
-              <OffsetsEditor rows={offsetRows} bounds={offsetBounds} />
-            </BlockStack>
-          </Card>
-        </Layout.Section>
-
-        <Layout.Section variant="oneHalf">
-          <Card>
-            <BlockStack gap="300">
-              <Text as="h2" variant="headingMd">
-                Pre-dunning
-              </Text>
-              <LeadDaysForm initial={preDunningLeadDays} />
-            </BlockStack>
-          </Card>
-        </Layout.Section>
-
-        <Layout.Section>
-          <Card>
-            <BlockStack gap="300">
-              <Text as="h2" variant="headingMd">
-                Strategy reference
-              </Text>
-              <Text as="p" tone="subdued">
-                Sequences differ per decline category. High-value subscribers
-                get one extra grace step before any pause or cancel. Lost or
-                stolen cards and permanent failures are never retried. Retry
-                timing follows merchant overrides first, then learned offsets,
-                then this static table.
-              </Text>
-              <DataTable
-                columnContentTypes={["text", "numeric", "text"]}
-                headings={["Category", "Retries", "Sequence"]}
-                rows={strategyRows.map((r) => [r.category, r.retries, r.sequence])}
-              />
-            </BlockStack>
-          </Card>
-        </Layout.Section>
-      </Layout>
+      <Modal
+        open={cancelCaseId != null}
+        onClose={() => setCancelCaseId(null)}
+        title="Cancel contract"
+        primaryAction={{
+          content: "Cancel contract",
+          destructive: true,
+          loading: busy,
+          onAction: () => {
+            if (cancelCaseId) submit("cancelContract", cancelCaseId);
+            setCancelCaseId(null);
+          },
+        }}
+        secondaryActions={[{ content: "Keep contract", onAction: () => setCancelCaseId(null) }]}
+      >
+        <Modal.Section>
+          <Text as="p">
+            Cancels the subscription contract (reason PAYMENT_FAILED) and
+            closes this dunning case. Win-back messaging will be scheduled
+            automatically.
+          </Text>
+        </Modal.Section>
+      </Modal>
     </Page>
   );
 }

@@ -1,0 +1,28 @@
+-- Cycle-scope for one-time add-on consumption (stability pass).
+--
+-- ADDITIVE ONLY: one nullable ADD COLUMN. No DROP, no RENAME, no type change,
+-- no data touched.
+--
+-- Why:
+--
+-- consumeCycleOnSuccess (the settlement-claim helper shared by the
+-- billing-success webhook and the stale-attempt sweep) used to clear one-time
+-- add-on mirror lines CONTRACT-scoped: every isOneTimeAddon row for the
+-- contract, whatever cycle it was staged onto. But an add-on can be staged
+-- for cycle N+1 while cycle N's charge is still in flight — runBillingSweep
+-- advances nextBillingDate optimistically when it creates the attempt, so a
+-- portal "Add one-time add-on" during that window (seconds normally, hours
+-- when the success webhook is lost and the stale sweep resolves the attempt)
+-- targets cycle N+1 on Shopify. When cycle N then settled, the contract-scoped
+-- clear deleted the N+1 mirror too: the Shopify N+1 billing-cycle edit
+-- survived (the customer still gets charged), the portal had nothing to
+-- remove, and — because deleting the row freed the permanently-unique
+-- addClaimKey — the customer could stage the same variant AGAIN and pay for
+-- it twice: exactly the double-charge shape migration 0009 exists to prevent.
+--
+-- The fix: addOneTimeAddon stamps the resolved Shopify cycle index on the
+-- mirror row at claim time, and consumeCycleOnSuccess deletes only rows whose
+-- addonCycleIndex equals the settling cycle. Nullable on purpose: legacy
+-- add-on rows (staged before this migration) keep the old cleared-on-any-
+-- settlement behavior, and non-add-on lines never set it.
+ALTER TABLE "ContractLine" ADD COLUMN "addonCycleIndex" INTEGER;

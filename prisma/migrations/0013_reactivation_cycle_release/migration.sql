@@ -1,0 +1,37 @@
+-- Win-back reactivation: release the failed cycle back to the scheduler
+-- (stability pass).
+--
+-- ADDITIVE ONLY: one nullable ADD COLUMN. No DROP, no RENAME, no type change,
+-- no data touched.
+--
+-- Why:
+--
+-- The billing sweep's cycle-history guard (scheduler step b2) may only ever
+-- open the FIRST attempt for a Shopify billing cycle: a cycle whose newest
+-- local attempt is FAILED / CHALLENGED / EXPIRED is held, deferring every
+-- further attempt to the dunning engine. That invariant is what keeps the
+-- 5-minute sweep from becoming an uncontrolled retry engine — but it assumed
+-- a dunning case would always be there to pick the cycle up. Win-back
+-- reactivation broke that assumption: a subscriber whose renewal for cycle N
+-- failed, who then cancelled (the dunning case auto-closes as CANCELLED, or
+-- was already EXHAUSTED) and later reactivated via the win-back magic link or
+-- the cancel-flow "Restart my subscription" button, came back ACTIVE with a
+-- next billing date typically INSIDE cycle N's still-unbilled window. Every
+-- sweep after that resolved cycle N, found the FAILED attempt, counted
+-- cycleHeld and returned; onPaymentMethodUpdated only reopens EXHAUSTED cases
+-- while the contract is FAILED (this one is ACTIVE), so NO code path ever
+-- created another attempt. The customer was told they resubscribed
+-- (winback.reactivated + contract.activated logged, discount granted, gift
+-- scheduled) but was never billed and never shipped — the only signal a
+-- generic STUCK_CONTRACTS warning with no open case to retry.
+--
+-- The fix: reactivateFromWinback stamps the contract's terminal attempts
+-- with "supersededAt" (only when no dunning case is open — an open case
+-- still owns its cycle), and the b2 guard skips superseded rows when reading
+-- the cycle's newest attempt. The history stays append-only — rows and
+-- outcomes are preserved, attempt numbering still counts superseded rows so
+-- idempotency keys stay unique — the stamped rows just stop counting as the
+-- cycle's live verdict, letting the sweep open the fresh first attempt the
+-- reactivation promised. Nullable on purpose: legacy rows (NULL) keep full
+-- guard-blocking power.
+ALTER TABLE "BillingAttempt" ADD COLUMN "supersededAt" TIMESTAMP(3);

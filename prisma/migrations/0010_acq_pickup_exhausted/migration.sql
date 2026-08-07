@@ -1,0 +1,32 @@
+-- Terminal marker for the acquisition stash pickup (stability pass).
+--
+-- ADDITIVE ONLY: one nullable ADD COLUMN. No DROP, no RENAME, no type change,
+-- no pre-existing data touched.
+--
+-- Why:
+--
+-- The daily origin_order_backfill's acquisition pass selects the OLDEST
+-- ORIGIN_BACKFILL_CAP (200) OURS non-demo contracts with an originOrderId and
+-- acqRaw still null, and re-runs the stash pickup for each. Unlike the money
+-- pass — which drains because getOrderSummary succeeds and fills
+-- originOrderTotalCents — the pickup wrote no "no stash exists, stop
+-- retrying" marker. Rows that can NEVER be filled (contracts whose
+-- ORDERS_CREATE fired before migration 0006 introduced the stash, and
+-- GDPR-redacted contracts whose stash payloads were cleared) therefore stayed
+-- in the oldest-first window forever; once >= 200 of them existed they
+-- permanently occupied the entire capped window and the queue starved — the
+-- exact class of contract the retry path was added for (mirrored UNKNOWN,
+-- reclassified OURS later, newest createdAt) could never enter it.
+--
+-- "acqPickupExhaustedAt" is the terminal marker: the backfill stamps it when
+-- no stash exists for a contract older than the webhook-race/redelivery
+-- horizon (ACQ_PICKUP_GRACE_MS, sync.server.ts), CUSTOMERS_REDACT stamps it
+-- when clearing the stash payloads, and the acqPending query excludes stamped
+-- rows — so every scanned row either applies or (eventually) leaves the
+-- window, and the queue drains at up to 200 rows per run. The ORDERS_CREATE
+-- direct-persist path deliberately ignores the marker: a genuinely late order
+-- webhook still lands its bundle, making a premature stamp self-healing.
+--
+-- Nullable, no backfill: every existing row is legitimately "not yet proven
+-- unfillable" — the next backfill runs prove (and stamp) the dead ones.
+ALTER TABLE "SubscriptionContract" ADD COLUMN "acqPickupExhaustedAt" TIMESTAMP(3);

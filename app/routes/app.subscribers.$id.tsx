@@ -1,1520 +1,1807 @@
-/**
- * [subscribers] — the customer-service console for one treatment plan.
- *
- * Full contract view (customer, lines, cadence, schedule, card, attribution,
- * scores, milestones, add-ons, depletion, dunning, cancellation history,
- * audit + event feed) plus every manual override from the core contract API,
- * each behind a confirm modal. Overrides run with STAFF actor audit and
- * idempotent form tokens so a double-click never fires twice.
- *
- * RBAC: OWNER / ADMIN / CS_AGENT (requireRole reads the staff email from the
- * authenticate.admin session).
- */
-import { useEffect, useState } from "react";
-import type { ReactNode } from "react";
-import type {
-  ActionFunctionArgs,
-  LoaderFunctionArgs,
-  SerializeFrom,
-} from "@remix-run/node";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
-import {
-  Form,
-  useActionData,
-  useLoaderData,
-  useNavigation,
-} from "@remix-run/react";
+import { useFetcher, useLoaderData } from "@remix-run/react";
 import {
   Badge,
   Banner,
   BlockStack,
+  Box,
   Button,
   ButtonGroup,
   Card,
-  Checkbox,
-  DataTable,
   Divider,
-  InlineGrid,
   InlineStack,
   Layout,
   Modal,
   Page,
+  Popover,
   Select,
   Text,
   TextField,
+  Thumbnail,
 } from "@shopify/polaris";
-import { useAppBridge } from "@shopify/app-bridge-react";
+import { z } from "zod";
 import prisma from "~/db.server";
 import { authenticate } from "~/shopify.server";
+import { getPrimaryShop } from "~/lib/shop/install.server";
+import { logEvent, contractTimeline } from "~/lib/events/log.server";
+import { getSetting } from "~/lib/settings/settings.server";
 import {
-  requireRole,
-  staffEmailFromSession,
-} from "~/services/core/rbac.server";
-import { appendAudit } from "~/services/audit.server";
-import { withIdempotency } from "~/services/idempotency.server";
+  applyDiscountPct,
+  centsFromDecimalString,
+  decimalStringFromCents,
+  formatMoney,
+} from "~/lib/money";
+import { shopDayStartUtc } from "~/lib/dates.server";
+import { buildMitEvidence } from "~/lib/billing/mit-evidence.server";
+import { buildMagicUrl } from "~/lib/magiclinks/builder.server";
 import {
-  gidTail,
-  ShopifyGraphqlError,
-  type AdminGraphql,
-} from "~/services/core/shopifyClient.server";
+  OPEN_CASE_STATES,
+  categorizeDeclineCode,
+  transitionOpenCase,
+} from "~/lib/dunning/index.server";
 import {
-  addLineToContract,
-  applyAccountCredit,
-  bringForward,
+  addLine,
+  addOneTimeAddon,
+  applyDiscountGrant,
   cancelContract,
-  delayByWeeks,
-  mergeContracts,
-  pauseUntil,
-  removeLineFromContract,
+  changeFrequency,
+  changeLineQuantity,
+  ongoingDiscountPctForProduct,
+  pauseContract,
+  removeLine,
   resumeContract,
-  sendPaymentUpdateEmail,
+  setLinePrice,
   setNextBillingDate,
-  skipNextShipment,
-  splitContract,
+  skipNextCycle,
   swapLineVariant,
-  switchCadence,
+  unskipNextCycle,
   updateDeliveryAddress,
-  updateLineQuantity,
-} from "~/services/core/contracts.server";
-import { formatMoney } from "~/lib/money";
+} from "~/lib/contracts/index.server";
 import {
-  CANCEL_REASONS,
-  PAUSE_OPTIONS_DAYS,
-  parseJson,
-} from "~/types/domain";
+  createBillingAttempt,
+  getBillingCycleByDate,
+  getPaymentMethodUpdateUrl,
+  listCustomerPaymentMethods,
+  refundOrderAmount,
+  searchProducts,
+  sendPaymentMethodUpdateEmail,
+} from "~/lib/graphql/index.server";
 import {
-  auditActionFor,
-  cadenceLabel,
-  churnBand,
-  churnBandTone,
-  DESTRUCTIVE_INTENTS,
-  dunningTone,
-  humanizeEnum,
-  parseConsoleAction,
-  qualityTone,
-  scoreOutOf100,
-  statusTone,
-  successMessage,
-  truncate,
-  type CsIntent,
-  type ParsedAction,
-} from "~/services/subscribers/actions";
+  OWNERSHIP_FOREIGN,
+  OWNERSHIP_OURS,
+  OWNERSHIP_UNKNOWN,
+  isBillableOwnership,
+  normalizeOwnership,
+} from "~/lib/ownership/shared";
 
-// ─────────────────────────────── Loader ───────────────────────────────────
+/**
+ * Admin — Subscriber support cockpit. Everything about one contract is
+ * visible and editable here: status, items, schedule, payment & dunning,
+ * address, discounts & gifts, refunds and the full compliance timeline.
+ *
+ * Every mutation goes through the contract/dunning service layer with
+ * source ADMIN + the session user as actor, and additionally logs an
+ * `admin.action` event with a human description — the full audit trail.
+ */
+
+const CANCEL_REASONS = [
+  "TOO_MUCH_PRODUCT",
+  "TOO_EXPENSIVE",
+  "NOT_SEEING_RESULTS",
+  "SHIPPING_ISSUES",
+  "PAYMENT_ISSUES",
+  "OTHER",
+] as const;
+
+const addressSchema = z
+  .object({
+    firstName: z.string().nullish(),
+    lastName: z.string().nullish(),
+    company: z.string().nullish(),
+    address1: z.string().nullish(),
+    address2: z.string().nullish(),
+    city: z.string().nullish(),
+    provinceCode: z.string().nullish(),
+    countryCode: z.string().nullish(),
+    zip: z.string().nullish(),
+    phone: z.string().nullish(),
+  })
+  .partial();
+
+// ── Loader ───────────────────────────────────────────────────────────────────
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
-  await requireRole(session, "OWNER", "ADMIN", "CS_AGENT");
-  const shop = session.shop;
+  const { admin } = await authenticate.admin(request);
+  const shop = await getPrimaryShop();
+  if (!shop) {
+    throw new Response("App is not installed on any shop", { status: 503 });
+  }
 
-  const id = params.id;
-  if (!id) throw new Response("Not found", { status: 404 });
-
-  const contract = await prisma.subscriptionContract.findFirst({
-    where: { id, shop },
+  const contract = await prisma.subscriptionContract.findUnique({
+    where: { id: params.id ?? "" },
     include: {
-      lines: { include: { depletion: true }, orderBy: { createdAt: "asc" } },
-      dunningState: true,
-      milestones: { orderBy: { achievedAt: "desc" } },
-      addOns: { orderBy: { createdAt: "desc" } },
-      billingAttempts: { orderBy: { occurredAt: "desc" }, take: 10 },
+      lines: { orderBy: { createdAt: "asc" } },
+      discountGrants: { orderBy: { createdAt: "desc" } },
+      giftGrants: { orderBy: { createdAt: "desc" }, take: 20 },
+      billingAttempts: { orderBy: { scheduledFor: "desc" }, take: 15 },
+      dunningCases: { orderBy: { openedAt: "desc" }, take: 5 },
     },
   });
-  if (!contract) throw new Response("Not found", { status: 404 });
-
-  const [qualitySnap, churnSnap, ltvSnap, cancellationSessions, auditRows, events, others] =
-    await Promise.all([
-      prisma.scoreSnapshot.findFirst({
-        where: { shop, contractId: contract.id, kind: "QUALITY" },
-        orderBy: { computedAt: "desc" },
-      }),
-      prisma.scoreSnapshot.findFirst({
-        where: { shop, contractId: contract.id, kind: "CHURN_RISK" },
-        orderBy: { computedAt: "desc" },
-      }),
-      prisma.scoreSnapshot.findFirst({
-        where: { shop, contractId: contract.id, kind: "LTV" },
-        orderBy: { computedAt: "desc" },
-      }),
-      prisma.cancellationSession.findMany({
-        where: { contractId: contract.id },
-        orderBy: { startedAt: "desc" },
-        take: 20,
-      }),
-      prisma.auditLog.findMany({
-        where: { shop, subjectId: contract.id },
-        orderBy: { seq: "desc" },
-        take: 50,
-      }),
-      prisma.analyticsEvent.findMany({
-        where: { contractId: contract.id },
-        orderBy: { occurredAt: "desc" },
-        take: 50,
-      }),
-      prisma.subscriptionContract.findMany({
-        where: {
-          shop,
-          shopifyCustomerId: contract.shopifyCustomerId,
-          id: { not: contract.id },
-          status: { in: ["ACTIVE", "PAUSED"] },
-        },
-        select: {
-          id: true,
-          status: true,
-          intervalWeeks: true,
-          shopifyContractId: true,
-          lines: { select: { title: true, quantity: true } },
-        },
-      }),
-    ]);
-
-  const now = new Date();
-  let cardExpiringSoon = false;
-  let cardExpired = false;
-  if (contract.cardExpiryYear !== null && contract.cardExpiryMonth !== null) {
-    // First instant after the expiry month.
-    const endOfMonth = new Date(Date.UTC(contract.cardExpiryYear, contract.cardExpiryMonth, 1));
-    cardExpired = endOfMonth.getTime() <= now.getTime();
-    cardExpiringSoon =
-      !cardExpired &&
-      endOfMonth.getTime() <= now.getTime() + 30 * 24 * 60 * 60 * 1000;
+  if (!contract || contract.shopId !== shop.id) {
+    throw new Response("Subscriber not found", { status: 404 });
   }
 
-  const rawAddress = parseJson<Record<string, unknown>>(contract.deliveryAddressJson, {});
-  const address: Record<string, string> = {};
-  for (const [k, v] of Object.entries(rawAddress)) {
-    if (typeof v === "string") address[k] = v;
-  }
-
-  const acquisition = parseJson<Record<string, unknown>>(contract.acquisitionJson, {});
-
-  // Committed Treatment Plan detection: match the lines' selling-plan ids
-  // against committed entries in SellingPlanConfig.plansJson (committed ===
-  // true or minDeliveries >= 2). Kept self-contained — CS console visibility
-  // only; the console itself is never gated by the commitment.
-  const lineSellingPlanIds = contract.lines
-    .map((l) => l.sellingPlanId)
-    .filter((v): v is string => typeof v === "string" && v.length > 0);
-  let committedMinDeliveries: number | null = null;
-  if (lineSellingPlanIds.length > 0) {
-    const planConfigs = await prisma.sellingPlanConfig.findMany({
-      where: { shop },
-      select: { plansJson: true },
+  // Best-effort Shopify read — the cockpit must load even when Shopify is slow.
+  let paymentMethods: Array<{
+    id: string;
+    label: string;
+    revoked: boolean;
+  }> | null = null;
+  try {
+    const methods = await listCustomerPaymentMethods(admin, contract.customerId);
+    paymentMethods = methods.map((m) => {
+      const inst = m.instrument;
+      const brand = inst?.brand ?? "Card";
+      const last4 = inst?.lastDigits ? ` ending ${inst.lastDigits}` : "";
+      const exp =
+        inst?.expiryMonth && inst?.expiryYear
+          ? `, exp ${String(inst.expiryMonth).padStart(2, "0")}/${inst.expiryYear}`
+          : "";
+      return {
+        id: m.id,
+        label: `${brand}${last4}${exp}${m.revoked ? " (revoked)" : ""}`,
+        revoked: m.revoked,
+      };
     });
-    const wanted = new Set(lineSellingPlanIds.map((id) => gidTail(id)));
-    for (const cfg of planConfigs) {
-      const plans = parseJson<
-        Array<{ shopifyPlanId?: string; minDeliveries?: number; committed?: boolean }>
-      >(cfg.plansJson, []);
-      for (const p of plans) {
-        const isCommitted =
-          p.committed === true ||
-          (typeof p.minDeliveries === "number" && p.minDeliveries >= 2);
-        if (!isCommitted || typeof p.shopifyPlanId !== "string") continue;
-        if (!wanted.has(gidTail(p.shopifyPlanId))) continue;
-        const min =
-          typeof p.minDeliveries === "number" && p.minDeliveries >= 2
-            ? Math.round(p.minDeliveries)
-            : 2;
-        committedMinDeliveries =
-          committedMinDeliveries === null
-            ? min
-            : Math.max(committedMinDeliveries, min);
-      }
-    }
+  } catch (err) {
+    console.error("[admin] payment methods read failed", contract.id, err);
   }
+
+  const pauseSettings = await getSetting(shop.id, "pause");
+
+  const configs = await prisma.sellingPlanConfig.findMany({
+    where: { shopId: shop.id, active: true },
+  });
+  const freqSet = new Set<number>([contract.intervalWeeks]);
+  for (const config of configs) {
+    const parsed = z.array(z.number().int()).safeParse(config.frequenciesWeeks);
+    if (parsed.success) parsed.data.forEach((w) => freqSet.add(w));
+  }
+  if (freqSet.size <= 1) [2, 4, 6, 8, 10, 12].forEach((w) => freqSet.add(w));
+  const frequencies = [...freqSet].sort((a, b) => a - b);
+
+  const events = await contractTimeline(contract.id, 200);
+
+  // The engine's vocabulary, not a local copy — what this loader shows as
+  // "the open case" must be exactly what the action's guarded transitions
+  // will accept.
+  const openCase =
+    contract.dunningCases.find((c) => OPEN_CASE_STATES.includes(c.state)) ??
+    null;
+
+  const addressParsed = addressSchema.safeParse(contract.deliveryAddress ?? {});
+  const address = addressParsed.success
+    ? addressParsed.data
+    : addressSchema.parse({});
+  const currency = contract.currencyCode;
 
   return json({
-    formToken: crypto.randomUUID(),
+    tz: shop.ianaTimezone,
+    pauseMaxMonths: pauseSettings.maxMonths,
+    frequencies,
     contract: {
       id: contract.id,
-      shopifyContractId: contract.shopifyContractId,
-      shopifyCustomerId: contract.shopifyCustomerId,
-      customerEmail: contract.customerEmail,
+      name:
+        [contract.firstName, contract.lastName].filter(Boolean).join(" ") ||
+        contract.email,
+      email: contract.email,
+      phone: contract.phone,
       status: contract.status,
-      currencyCode: contract.currencyCode,
-      intervalWeeks: contract.intervalWeeks,
-      nextBillingDate: contract.nextBillingDate,
-      nextDeliveryDate: contract.nextDeliveryDate,
-      treatmentStartedAt: contract.treatmentStartedAt,
-      pausedUntil: contract.pausedUntil,
-      cancelledAt: contract.cancelledAt,
-      cancelReason: contract.cancelReason,
-      successfulOrders: contract.successfulOrders,
-      failedAttempts: contract.failedAttempts,
-      totalRevenueCents: contract.totalRevenueCents,
-      cardBrand: contract.cardBrand,
-      cardLastDigits: contract.cardLastDigits,
-      cardExpiryMonth: contract.cardExpiryMonth,
-      cardExpiryYear: contract.cardExpiryYear,
-      cardExpiringSoon,
-      cardExpired,
-      autopilotEnabled: contract.autopilotEnabled,
-      qualityScore: contract.qualityScore,
+      // Which app manages this subscription. The support cockpit deliberately
+      // opens for non-OURS contracts (the merchant must be able to look at
+      // them), so it has to say loudly that nothing here applies to them.
+      ownership: normalizeOwnership(contract.ownership) ?? OWNERSHIP_UNKNOWN,
+      locale: contract.locale,
+      isPrepaid: contract.isPrepaid,
+      prepaidDeliveriesRemaining: contract.prepaidDeliveriesRemaining,
+      grandfathered: contract.grandfatheredPricing,
+      merged: contract.mergeGroupId != null,
       churnRiskScore: contract.churnRiskScore,
-      expectedLtvCents: contract.expectedLtvCents,
-      originOrderId: contract.originOrderId,
-      firstOrderAovCents: contract.firstOrderAovCents,
-      initialDiscountPercent: contract.initialDiscountPercent,
-      widgetVersion: contract.widgetVersion,
-      createdAt: contract.createdAt,
-      committedMinDeliveries,
-      address,
-      acquisitionEntries: Object.entries(acquisition).map(
-        ([k, v]) => [k, typeof v === "string" ? v : JSON.stringify(v)] as const,
-      ),
+      intervalWeeks: contract.intervalWeeks,
+      nextBillingDate: contract.nextBillingDate?.toISOString() ?? null,
+      pausedAt: contract.pausedAt?.toISOString() ?? null,
+      resumeAt: contract.resumeAt?.toISOString() ?? null,
+      cancelledAt: contract.cancelledAt?.toISOString() ?? null,
+      cancelReason: contract.cancelReason,
+      ordersCount: contract.ordersCount,
+      skipCount: contract.skipCount,
+      lifetimeRevenue: formatMoney(contract.lifetimeRevenueCents, currency),
+      currencyCode: currency,
+      paymentMethodId: contract.paymentMethodId,
+      backupPaymentMethodId: contract.backupPaymentMethodId,
+      cardBrand: contract.cardBrand,
+      cardLast4: contract.cardLast4,
+      cardExpiry:
+        contract.cardExpiryMonth && contract.cardExpiryYear
+          ? `${String(contract.cardExpiryMonth).padStart(2, "0")}/${contract.cardExpiryYear}`
+          : null,
+      createdAt: contract.createdAt.toISOString(),
     },
+    // Acquisition card (data foundation — docs/DATA_FOUNDATION.md). Captured
+    // from the origin order at contract creation / by the daily backfill;
+    // every field may be null on rows predating capture.
+    acquisition: {
+      captured: contract.acqRaw != null,
+      sourceName: contract.acqSourceName,
+      utm: (contract.acqUtm ?? null) as {
+        source?: string | null;
+        medium?: string | null;
+        campaign?: string | null;
+        term?: string | null;
+        content?: string | null;
+      } | null,
+      countryCode: contract.acqCountryCode,
+      city: contract.acqCity,
+      provinceCode: contract.acqProvinceCode,
+      deviceType: contract.acqDeviceType,
+      timeToPurchaseSeconds: contract.acqTimeToPurchaseSeconds,
+      unitsFirstOrder: contract.acqUnitsFirstOrder,
+      orderValueBand: contract.acqOrderValueBand,
+      referringSite: contract.acqReferringSite,
+      landingSite: contract.acqLandingSite,
+      originOrderName: contract.originOrderName,
+      originOrderTotal:
+        contract.originOrderTotalCents != null
+          ? formatMoney(
+              contract.originOrderTotalCents,
+              contract.originOrderCurrencyCode ?? currency,
+            )
+          : null,
+    },
+    address,
     lines: contract.lines.map((l) => ({
       id: l.id,
       title: l.title,
+      variantTitle: l.variantTitle,
+      sku: l.sku,
+      imageUrl: l.imageUrl,
       quantity: l.quantity,
-      currentPriceCents: l.currentPriceCents,
-      shopifyProductId: l.shopifyProductId,
-      shopifyVariantId: l.shopifyVariantId,
-      sellingPlanName: l.sellingPlanName,
-      depletion: l.depletion
-        ? {
-            predictedRunOutAt: l.depletion.predictedRunOutAt,
-            unitsOnHand: l.depletion.unitsOnHand,
-            estimatedDailyUsage: l.depletion.estimatedDailyUsage,
-            confidence: l.depletion.confidence,
-          }
-        : null,
+      price: formatMoney(l.currentPriceCents, currency),
+      priceCents: l.currentPriceCents,
+      isGift: l.isGift,
+      isOneTimeAddon: l.isOneTimeAddon,
     })),
-    addOns: contract.addOns.map((a) => ({
+    discountGrants: contract.discountGrants.map((g) => ({
+      id: g.id,
+      type: g.type,
+      percent: g.percent,
+      cyclesTotal: g.cyclesTotal,
+      cyclesRemaining: g.cyclesRemaining,
+      reason: g.reason,
+      grantedBy: g.grantedBy,
+      createdAt: g.createdAt.toISOString(),
+      active: g.cyclesRemaining > 0 && g.exhaustedAt == null,
+    })),
+    giftGrants: contract.giftGrants.map((g) => ({
+      id: g.id,
+      variantId: g.variantId,
+      cycleIndex: g.cycleIndex,
+      status: g.status,
+      createdAt: g.createdAt.toISOString(),
+    })),
+    attempts: contract.billingAttempts.map((a) => ({
       id: a.id,
-      title: a.title,
-      quantity: a.quantity,
-      priceCents: a.priceCents,
-      mode: a.mode,
-      remainingDeliveries: a.remainingDeliveries,
-      source: a.source,
-      createdAt: a.createdAt,
+      cycleIndex: a.cycleIndex,
+      attemptNumber: a.attemptNumber,
+      status: a.status,
+      scheduledFor: a.scheduledFor.toISOString(),
+      completedAt: a.completedAt?.toISOString() ?? null,
+      orderId: a.orderId,
+      orderName: a.orderName,
+      amount:
+        a.amountCents != null
+          ? formatMoney(a.amountCents, a.currencyCode ?? currency)
+          : null,
+      amountCents: a.amountCents,
+      errorCode: a.errorCode,
+      originatingAction: a.originatingAction,
     })),
-    milestones: contract.milestones.map((m) => ({
-      id: m.id,
-      type: m.type,
-      achievedAt: m.achievedAt,
-      rewardStatus: m.rewardStatus,
-    })),
-    dunning: contract.dunningState
+    dunningCase: openCase
       ? {
-          phase: contract.dunningState.phase,
-          declineCategory: contract.dunningState.declineCategory,
-          retryCount: contract.dunningState.retryCount,
-          nextRetryAt: contract.dunningState.nextRetryAt,
-          graceUntil: contract.dunningState.graceUntil,
-          lastFailureAt: contract.dunningState.lastFailureAt,
-          history: parseJson<
-            Array<{ at?: string; type?: string; stepIndex?: number; action?: string; template?: string }>
-          >(contract.dunningState.historyJson, []),
+          id: openCase.id,
+          state: openCase.state,
+          ladderStep: openCase.ladderStep,
+          nextRetryAt: openCase.nextRetryAt?.toISOString() ?? null,
+          openedAt: openCase.openedAt.toISOString(),
+          declineCode: openCase.declineCode,
+          declineHuman: categorizeDeclineCode(openCase.declineCode).description,
+          emailsSent: openCase.emailsSent,
+          smsSent: openCase.smsSent,
         }
       : null,
-    billingAttempts: contract.billingAttempts.map((b) => ({
-      id: b.id,
-      status: b.status,
-      errorCode: b.errorCode,
-      declineCategory: b.declineCategory,
-      amountCents: b.amountCents,
-      attemptNumber: b.attemptNumber,
-      isRetry: b.isRetry,
-      occurredAt: b.occurredAt,
-    })),
-    cancellationSessions: cancellationSessions.map((s) => ({
-      id: s.id,
-      startedAt: s.startedAt,
-      resolvedAt: s.resolvedAt,
-      reason: s.reason,
-      outcome: s.outcome,
-      savedByOffer: s.savedByOffer,
-      saveCostCents: s.saveCostCents,
-    })),
-    scores: {
-      quality: qualitySnap
-        ? {
-            value: qualitySnap.value,
-            computedAt: qualitySnap.computedAt,
-            factors: parseJson<Record<string, number>>(qualitySnap.factorsJson, {}),
-          }
-        : null,
-      churn: churnSnap
-        ? {
-            value: churnSnap.value,
-            computedAt: churnSnap.computedAt,
-            factors: parseJson<Record<string, number>>(churnSnap.factorsJson, {}),
-          }
-        : null,
-      ltv: ltvSnap
-        ? {
-            value: ltvSnap.value,
-            computedAt: ltvSnap.computedAt,
-            factors: parseJson<Record<string, number>>(ltvSnap.factorsJson, {}),
-          }
-        : null,
-    },
-    audit: auditRows.map((a) => ({
-      id: a.id,
-      seq: a.seq,
-      action: a.action,
-      actorType: a.actorType,
-      actorId: a.actorId,
-      createdAt: a.createdAt,
-      payloadPreview: truncate(a.payloadJson, 160),
-    })),
+    paymentMethods,
     events: events.map((e) => ({
       id: e.id,
-      name: e.name,
-      occurredAt: e.occurredAt,
-      payloadPreview: truncate(e.payloadJson, 160),
-    })),
-    otherContracts: others.map((c) => ({
-      id: c.id,
-      label: `#${gidTail(c.shopifyContractId)} — ${humanizeEnum(c.status)}, ${cadenceLabel(
-        c.intervalWeeks,
-      )}, ${c.lines.length} ${c.lines.length === 1 ? "product" : "products"}`,
+      type: e.type,
+      source: e.source,
+      actor: e.actor,
+      createdAt: e.createdAt.toISOString(),
+      payloadJson: JSON.stringify(e.payload ?? {}, null, 2),
     })),
   });
 };
 
-// ─────────────────────────────── Action ───────────────────────────────────
+// ── Action ───────────────────────────────────────────────────────────────────
 
-async function dispatchConsoleAction(
-  graphql: AdminGraphql,
-  shop: string,
-  contractId: string,
-  act: ParsedAction,
-  staffEmail: string,
-): Promise<void> {
-  switch (act.intent) {
-    case "CHANGE_QUANTITY":
-      await updateLineQuantity(graphql, shop, contractId, act.lineId, act.quantity);
-      return;
-    case "CHANGE_VARIANT":
-      await swapLineVariant(graphql, shop, contractId, act.lineId, act.variantGid);
-      return;
-    case "ADD_PRODUCT":
-      await addLineToContract(graphql, shop, contractId, {
-        variantGid: act.variantGid,
-        quantity: act.quantity,
-        ...(act.priceCents !== undefined ? { priceCents: act.priceCents } : {}),
-      });
-      return;
-    case "REMOVE_PRODUCT":
-      await removeLineFromContract(graphql, shop, contractId, act.lineId);
-      return;
-    case "CHANGE_BILLING_DATE":
-      await setNextBillingDate(graphql, shop, contractId, act.date);
-      return;
-    case "SKIP_SHIPMENT":
-      await skipNextShipment(graphql, shop, contractId);
-      return;
-    case "DELAY_WEEKS":
-      await delayByWeeks(graphql, shop, contractId, act.weeks);
-      return;
-    case "BRING_FORWARD":
-      await bringForward(graphql, shop, contractId, act.date);
-      return;
-    case "PAUSE_UNTIL":
-      await pauseUntil(graphql, shop, contractId, act.resumeDate);
-      return;
-    case "REACTIVATE":
-      await resumeContract(graphql, shop, contractId);
-      return;
-    case "SWITCH_CADENCE":
-      await switchCadence(graphql, shop, contractId, act.intervalWeeks);
-      return;
-    case "CHANGE_ADDRESS":
-      await updateDeliveryAddress(
-        graphql,
-        shop,
-        contractId,
-        act.address as unknown as Parameters<typeof updateDeliveryAddress>[3],
-      );
-      return;
-    case "UPDATE_PAYMENT_METHOD":
-      await sendPaymentUpdateEmail(graphql, shop, contractId);
-      return;
-    case "APPLY_CREDIT":
-      await applyAccountCredit(graphql, shop, contractId, act.amountCents);
-      return;
-    case "CANCEL":
-      await cancelContract(
-        graphql,
-        shop,
-        contractId,
-        act.reason,
-        { actorType: "STAFF", actorId: staffEmail } as unknown as Parameters<
-          typeof cancelContract
-        >[4],
-      );
-      return;
-    case "MERGE_CONTRACTS":
-      // "Merge into": this plan's products move into the selected target plan.
-      await mergeContracts(graphql, shop, act.targetContractId, [contractId]);
-      return;
-    case "SPLIT_SHIPMENT":
-      await splitContract(graphql, shop, contractId, act.lineIds);
-      return;
-  }
+interface ActionResponse {
+  ok: boolean;
+  intent: string;
+  message?: string;
+  error?: string;
+  loginUrl?: string;
+  updateUrl?: string;
+  results?: Array<{
+    id: string;
+    title: string;
+    status: string | null;
+    imageUrl: string | null;
+    ongoingPct: number | null;
+    variants: Array<{
+      id: string;
+      title: string;
+      sku: string | null;
+      price: string;
+      priceCents: number;
+      discounted: string | null;
+      available: boolean;
+    }>;
+  }>;
+}
+
+function actorFromSession(session: {
+  shop: string;
+  onlineAccessInfo?: { associated_user?: { email?: string | null } } | null;
+}): string {
+  return session.onlineAccessInfo?.associated_user?.email ?? `admin@${session.shop}`;
+}
+
+function errMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function str(formData: FormData, key: string): string {
+  const v = formData.get(key);
+  return typeof v === "string" ? v.trim() : "";
+}
+
+function int(formData: FormData, key: string, fallback = 0): number {
+  const n = parseInt(str(formData, key), 10);
+  return Number.isInteger(n) ? n : fallback;
+}
+
+/**
+ * Intents that neither charge, contact, nor modify anything — the only ones a
+ * contract this app does not own may reach. Everything else is refused for a
+ * FOREIGN or UNKNOWN contract by requireOwnedContract() below.
+ */
+const OWNERSHIP_EXEMPT_INTENTS = new Set(["searchProducts"]);
+
+/**
+ * The server-side ownership gate for this page.
+ *
+ * The cockpit deliberately OPENS for a contract another subscription app owns
+ * (the merchant must be able to look at what is on their store, and support
+ * questions arrive about those subscriptions too), and it says so in a banner.
+ * What it must never do is ACT on one. "Charge now" and "Retry now" call
+ * Shopify's billingAttemptCreate — on another app's contract that is the
+ * duplicate charge this whole ownership column exists to prevent, one click
+ * away, and no warning copy is a control. Pause / cancel / edit lines / change
+ * the date write straight to Shopify behind the owning app's back, and the
+ * customer-facing ones (card-update email, portal link) contact a subscriber
+ * who is not ours to contact.
+ *
+ * A warning banner enforced nothing: the buttons were live, and a POST to this
+ * route did not even need the UI. This is the enforcement, in the same place
+ * the contract is loaded, so it covers every intent by default — a new intent
+ * is refused unless it is explicitly listed as read-only above.
+ *
+ * The escape hatch is deliberate and one-way: claim the subscription on the
+ * Subscribers page (UNKNOWN → OURS, never FOREIGN → OURS). Positively
+ * identified as another app's means "cancel it there and re-import here" —
+ * two apps must never bill the same subscription.
+ */
+function ownershipRefusal(
+  intent: string,
+  ownership: string,
+): string | null {
+  if (OWNERSHIP_EXEMPT_INTENTS.has(intent)) return null;
+  if (isBillableOwnership(ownership)) return null;
+  return ownership === OWNERSHIP_FOREIGN
+    ? "This subscription is managed by another subscription app, so Cellexia will not act on it — charging, editing or emailing it here would collide with the app that owns it. Cancel it in that app and re-create it in Cellexia to take it over."
+    : "This subscription has not been attributed to Cellexia, so it is treated as not ours and no action is taken on it. If it is yours, claim it on the Subscribers page first (Subscribers → select → “Claim as Cellexia's”).";
 }
 
 export const action = async ({ request, params }: ActionFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
-  await requireRole(session, "OWNER", "ADMIN", "CS_AGENT");
-  const shop = session.shop;
-  const staffEmail = staffEmailFromSession(session) ?? `staff@${shop}`;
-
-  const contractId = params.id;
-  if (!contractId) throw new Response("Not found", { status: 404 });
-
-  const contract = await prisma.subscriptionContract.findFirst({
-    where: { id: contractId, shop },
-    select: { id: true, lines: { select: { id: true } } },
-  });
-  if (!contract) throw new Response("Not found", { status: 404 });
-
-  const form = await request.formData();
-  const parsed = parseConsoleAction(form, {
-    now: new Date(),
-    selfContractId: contractId,
-    totalLineCount: contract.lines.length,
-  });
-  if (!parsed.ok) {
-    return json(
-      { ok: false as const, error: parsed.error, ts: Date.now() },
-      { status: 400 },
-    );
+  const shop = await getPrimaryShop();
+  if (!shop) {
+    throw new Response("App is not installed on any shop", { status: 503 });
   }
-  const act = parsed.action;
+  const actor = actorFromSession(session);
+  const formData = await request.formData();
+  const intent = str(formData, "intent");
+  const opts = { source: "ADMIN" as const, actor };
 
-  const graphql = admin.graphql as unknown as AdminGraphql;
-  const tokenRaw = form.get("formToken");
-  const formToken =
-    typeof tokenRaw === "string" && tokenRaw !== "" ? tokenRaw : crypto.randomUUID();
-  const idempotencyKey = `cs:${contractId}:${act.intent}:${formToken}`;
+  const contract = await prisma.subscriptionContract.findUnique({
+    where: { id: params.id ?? "" },
+    include: { lines: true },
+  });
+  if (!contract || contract.shopId !== shop.id) {
+    return json<ActionResponse>({ ok: false, intent, error: "Subscriber not found" });
+  }
+  const refusal = ownershipRefusal(intent, contract.ownership);
+  if (refusal) {
+    console.warn(
+      "[admin] refused",
+      intent,
+      "on non-owned contract",
+      contract.id,
+      contract.ownership,
+    );
+    return json<ActionResponse>({ ok: false, intent, error: refusal });
+  }
+  const contractId = contract.id;
+
+  const adminLog = async (
+    description: string,
+    payload: Record<string, unknown> = {},
+  ) => {
+    await logEvent({
+      shopId: shop.id,
+      contractId,
+      customerId: contract.customerId,
+      email: contract.email,
+      type: "admin.action",
+      source: "ADMIN",
+      actor,
+      payload: { description, ...payload },
+    });
+  };
+
+  const ok = (message: string, extra: Partial<ActionResponse> = {}) =>
+    json<ActionResponse>({ ok: true, intent, message, ...extra });
 
   try {
-    const { replayed } = await withIdempotency(idempotencyKey, "cs-console", async () => {
-      await dispatchConsoleAction(graphql, shop, contractId, act, staffEmail);
-      return { intent: act.intent, at: new Date().toISOString() };
-    });
+    switch (intent) {
+      // ── Quick actions ───────────────────────────────────────────────────
+      case "pause": {
+        const months = Math.max(1, int(formData, "months", 1));
+        await pauseContract(shop.domain, contractId, months, opts);
+        await adminLog(`Paused subscription for ${months} month(s)`, {
+          action: "pause",
+          months,
+        });
+        return ok(`Paused for ${months} month(s)`);
+      }
+      case "resume": {
+        await resumeContract(shop.domain, contractId, opts);
+        await adminLog("Resumed subscription (next charge in ~3 days)", {
+          action: "resume",
+        });
+        return ok("Subscription resumed");
+      }
+      case "cancel": {
+        const reason = str(formData, "reason") || "OTHER";
+        await cancelContract(shop.domain, contractId, reason, {
+          ...opts,
+          cancelSource: "ADMIN",
+        });
+        await adminLog(`Cancelled subscription (reason: ${reason})`, {
+          action: "cancel",
+          reason,
+        });
+        return ok("Subscription cancelled");
+      }
+      case "chargeNow": {
+        if (!contract.nextBillingDate) {
+          return json<ActionResponse>({
+            ok: false,
+            intent,
+            error: "Contract has no next billing date to charge against",
+          });
+        }
+        const cycle = await getBillingCycleByDate(
+          admin,
+          contract.shopifyContractId,
+          contract.nextBillingDate,
+        );
+        if (!cycle) {
+          return json<ActionResponse>({
+            ok: false,
+            intent,
+            error: "Could not resolve the contract's current billing cycle on Shopify",
+          });
+        }
+        const now = new Date();
+        // Crash-safe reuse: a PENDING manual row without a Shopify attempt id
+        // keeps its idempotency key, so a re-fire can never double charge.
+        let row = await prisma.billingAttempt.findFirst({
+          where: {
+            contractId,
+            cycleIndex: cycle.cycleIndex,
+            status: "PENDING",
+            originatingAction: "ADMIN_MANUAL",
+            shopifyAttemptId: null,
+          },
+          orderBy: { attemptNumber: "desc" },
+        });
+        if (!row) {
+          const attempts = await prisma.billingAttempt.count({
+            where: { contractId, cycleIndex: cycle.cycleIndex },
+          });
+          row = await prisma.billingAttempt.create({
+            data: {
+              contractId,
+              idempotencyKey: `${contractId}:${cycle.cycleIndex}:manual-${attempts + 1}`,
+              cycleIndex: cycle.cycleIndex,
+              attemptNumber: attempts + 1,
+              status: "PENDING",
+              scheduledFor: now,
+              originatingAction: "ADMIN_MANUAL",
+              // Stored-credential/MIT compliance evidence — every attempt
+              // carries it, manual admin charges included.
+              mitEvidence: buildMitEvidence({
+                consentOrder: contract.originOrderId,
+                originatingAction: "ADMIN_MANUAL",
+                timestamp: now,
+                initiatedBy: actor,
+              }),
+            },
+          });
+        }
+        const created = await createBillingAttempt(
+          admin,
+          contract.shopifyContractId,
+          {
+            idempotencyKey: row.idempotencyKey,
+            originTime: now,
+            cycleIndex: cycle.cycleIndex,
+          },
+        );
+        await prisma.billingAttempt.update({
+          where: { id: row.id },
+          data: { shopifyAttemptId: created.attemptId, startedAt: now },
+        });
+        await logEvent({
+          shopId: shop.id,
+          contractId,
+          customerId: contract.customerId,
+          email: contract.email,
+          type: "billing.attempt_started",
+          source: "ADMIN",
+          actor,
+          payload: {
+            attemptId: row.id,
+            shopifyAttemptId: created.attemptId,
+            cycleIndex: cycle.cycleIndex,
+            attemptNumber: row.attemptNumber,
+            idempotencyKey: row.idempotencyKey,
+            originatingAction: "ADMIN_MANUAL",
+          },
+        });
+        await adminLog("Manually charged the current billing cycle", {
+          action: "charge_now",
+          cycleIndex: cycle.cycleIndex,
+          idempotencyKey: row.idempotencyKey,
+        });
+        return ok("Charge started — the result arrives via webhook shortly");
+      }
+      case "sendCardEmail": {
+        if (!contract.paymentMethodId) {
+          return json<ActionResponse>({
+            ok: false,
+            intent,
+            error: "No payment method on file for this contract",
+          });
+        }
+        await sendPaymentMethodUpdateEmail(admin, contract.paymentMethodId);
+        await adminLog("Sent Shopify's card-update email to the customer", {
+          action: "send_card_update_email",
+          paymentMethodId: contract.paymentMethodId,
+        });
+        return ok("Card-update email sent");
+      }
+      case "portalLink": {
+        const portal = await getSetting(shop.id, "portal");
+        const loginUrl = await buildMagicUrl({
+          action: "LOGIN",
+          contractId,
+          customerId: contract.customerId,
+          email: contract.email,
+          ttlSeconds: portal.magicLinkTtlDays * 24 * 3600,
+          maxUses: 3,
+          createdVia: "ADMIN",
+        });
+        await adminLog("Generated a portal login magic link for the customer", {
+          action: "portal_login_link",
+          ttlDays: portal.magicLinkTtlDays,
+        });
+        return ok("Login link created", { loginUrl });
+      }
 
-    if (!replayed) {
-      await appendAudit({
-        shop,
-        actorType: "STAFF",
-        actorId: staffEmail,
-        action: auditActionFor(act.intent),
-        subjectType: "SubscriptionContract",
-        subjectId: contractId,
-        payload: act as unknown as Record<string, unknown>,
-      });
+      // ── Items ───────────────────────────────────────────────────────────
+      case "setQuantity": {
+        const lineId = str(formData, "lineId");
+        const quantity = int(formData, "quantity");
+        await changeLineQuantity(shop.domain, contractId, lineId, quantity, opts);
+        await adminLog(`Changed line quantity to ${quantity}`, {
+          action: "set_quantity",
+          lineId,
+          quantity,
+        });
+        return ok("Quantity updated");
+      }
+      case "setLinePrice": {
+        const lineId = str(formData, "lineId");
+        const priceStr = str(formData, "price");
+        const priceCents = centsFromDecimalString(priceStr);
+        if (!priceStr || !Number.isInteger(priceCents) || priceCents < 0) {
+          return json<ActionResponse>({ ok: false, intent, error: "Invalid price" });
+        }
+        const line = contract.lines.find((l) => l.id === lineId);
+        await setLinePrice(shop.domain, contractId, lineId, priceCents, opts);
+        await adminLog(
+          `Set the unit price of "${line?.title ?? lineId}" to ${formatMoney(priceCents, contract.currencyCode)}`,
+          {
+            action: "set_line_price",
+            lineId,
+            oldPriceCents: line?.currentPriceCents ?? null,
+            newPriceCents: priceCents,
+          },
+        );
+        return ok("Line price updated");
+      }
+      case "swapLine": {
+        const lineId = str(formData, "lineId");
+        const variantId = str(formData, "variantId");
+        await swapLineVariant(shop.domain, contractId, lineId, variantId, opts);
+        await adminLog("Swapped a line to a different variant", {
+          action: "swap_line",
+          lineId,
+          newVariantId: variantId,
+        });
+        return ok("Product swapped");
+      }
+      case "removeLine": {
+        const lineId = str(formData, "lineId");
+        await removeLine(shop.domain, contractId, lineId, opts);
+        await adminLog("Removed a line from the subscription", {
+          action: "remove_line",
+          lineId,
+        });
+        return ok("Line removed");
+      }
+      case "addProduct": {
+        const variantId = str(formData, "variantId");
+        const quantity = Math.max(1, int(formData, "quantity", 1));
+        await addLine(
+          shop.domain,
+          contractId,
+          variantId,
+          quantity,
+          { addedVia: "ADMIN" },
+          opts,
+        );
+        await adminLog("Added a recurring product to the subscription", {
+          action: "add_product",
+          variantId,
+          quantity,
+        });
+        return ok("Product added");
+      }
+      case "addAddon": {
+        const variantId = str(formData, "variantId");
+        const quantity = Math.max(1, int(formData, "quantity", 1));
+        await addOneTimeAddon(
+          shop.domain,
+          contractId,
+          variantId,
+          quantity,
+          { addedVia: "ADMIN" },
+          opts,
+        );
+        await adminLog("Added a one-time add-on to the next order", {
+          action: "add_one_time_addon",
+          variantId,
+          quantity,
+        });
+        return ok("One-time add-on staged for the next order");
+      }
+
+      // ── Schedule ────────────────────────────────────────────────────────
+      case "skipNext": {
+        await skipNextCycle(shop.domain, contractId, opts);
+        await adminLog("Skipped the next billing cycle", { action: "skip_next" });
+        return ok("Next cycle skipped");
+      }
+      case "unskipNext": {
+        await unskipNextCycle(shop.domain, contractId, opts);
+        await adminLog("Un-skipped the upcoming billing cycle", {
+          action: "unskip_next",
+        });
+        return ok("Cycle restored");
+      }
+      case "setFrequency": {
+        const weeks = int(formData, "weeks");
+        await changeFrequency(shop.domain, contractId, weeks, opts);
+        await adminLog(`Changed delivery frequency to every ${weeks} weeks`, {
+          action: "set_frequency",
+          weeks,
+        });
+        return ok(`Frequency set to every ${weeks} weeks`);
+      }
+      case "setNextDate": {
+        const dateStr = str(formData, "date"); // YYYY-MM-DD
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+          return json<ActionResponse>({ ok: false, intent, error: "Invalid date" });
+        }
+        const target = shopDayStartUtc(
+          new Date(`${dateStr}T12:00:00Z`),
+          shop.ianaTimezone,
+        );
+        await setNextBillingDate(shop.domain, contractId, target, opts);
+        await adminLog(`Moved the next billing date to ${dateStr}`, {
+          action: "set_next_date",
+          date: dateStr,
+        });
+        return ok("Next billing date updated");
+      }
+
+      // ── Payment & dunning ───────────────────────────────────────────────
+      case "setBackup": {
+        const paymentMethodId = str(formData, "paymentMethodId") || null;
+        await prisma.subscriptionContract.update({
+          where: { id: contractId },
+          data: { backupPaymentMethodId: paymentMethodId },
+        });
+        await adminLog(
+          paymentMethodId
+            ? "Set a backup payment method for dunning fallback"
+            : "Cleared the backup payment method",
+          { action: "set_backup_payment", paymentMethodId },
+        );
+        return ok(paymentMethodId ? "Backup method set" : "Backup method cleared");
+      }
+      case "openUpdateUrl": {
+        const pmId = str(formData, "paymentMethodId") || contract.paymentMethodId;
+        if (!pmId) {
+          return json<ActionResponse>({
+            ok: false,
+            intent,
+            error: "No payment method on file",
+          });
+        }
+        const updateUrl = await getPaymentMethodUpdateUrl(admin, pmId);
+        await adminLog("Fetched the secure card-update URL", {
+          action: "open_card_update_url",
+          paymentMethodId: pmId,
+        });
+        return ok("Card-update URL ready", { updateUrl });
+      }
+      case "dunningRetryNow": {
+        const caseId = str(formData, "caseId");
+        const now = new Date();
+        // Guarded + atomic + scoped (transitionOpenCase): the caseId comes
+        // from the form, so it MUST be pinned to this contract — a bare POST
+        // could otherwise move any case in the database. And only an
+        // OPEN-state case may be scheduled: a stale cockpit's "Retry now"
+        // after a webhook recovery would re-bill the already-paid cycle.
+        const claimed = await transitionOpenCase(caseId, contractId, "RETRYING", now);
+        if (!claimed) {
+          return json<ActionResponse>({
+            ok: false,
+            intent,
+            error:
+              "Dunning case not found or already resolved — refresh the page",
+          });
+        }
+        await logEvent({
+          shopId: shop.id,
+          contractId,
+          customerId: contract.customerId,
+          email: contract.email,
+          type: "dunning.retry_scheduled",
+          source: "ADMIN",
+          actor,
+          payload: {
+            dunningCaseId: caseId,
+            trigger: "admin_retry_now",
+            immediate: true,
+            nextRetryAt: now.toISOString(),
+          },
+        });
+        await adminLog("Scheduled an immediate dunning retry", {
+          action: "dunning_retry_now",
+          dunningCaseId: caseId,
+        });
+        return ok("Retry scheduled — the next sweep fires it within a minute");
+      }
+      case "dunningResolve": {
+        const caseId = str(formData, "caseId");
+        const now = new Date();
+        // Scoped to THIS contract and guarded on an open state — otherwise a
+        // bare POST could resolve any case in the database while the
+        // consecutiveFailures reset below lands on this contract.
+        const claimed = await transitionOpenCase(caseId, contractId, "RECOVERED", now);
+        if (!claimed) {
+          return json<ActionResponse>({
+            ok: false,
+            intent,
+            error:
+              "Dunning case not found or already resolved — refresh the page",
+          });
+        }
+        await prisma.subscriptionContract.update({
+          where: { id: contractId },
+          data: { consecutiveFailures: 0 },
+        });
+        await logEvent({
+          shopId: shop.id,
+          contractId,
+          customerId: contract.customerId,
+          email: contract.email,
+          type: "dunning.recovered",
+          source: "ADMIN",
+          actor,
+          payload: { dunningCaseId: caseId, resolution: "RECOVERED", manual: true },
+        });
+        await adminLog("Manually marked the dunning case resolved", {
+          action: "dunning_mark_resolved",
+          dunningCaseId: caseId,
+        });
+        return ok("Dunning case marked resolved");
+      }
+      case "dunningCancelCase": {
+        const caseId = str(formData, "caseId");
+        // Same scope + open-state guard as the other dunning intents: a case
+        // the webhook already resolved keeps its real resolution.
+        const claimed = await transitionOpenCase(caseId, contractId, "CANCELLED");
+        if (!claimed) {
+          return json<ActionResponse>({
+            ok: false,
+            intent,
+            error:
+              "Dunning case not found or already resolved — refresh the page",
+          });
+        }
+        await adminLog("Moved the dunning case to cancelled (no more retries)", {
+          action: "dunning_cancel_case",
+          dunningCaseId: caseId,
+        });
+        return ok("Dunning case cancelled");
+      }
+
+      // ── Address ─────────────────────────────────────────────────────────
+      case "updateAddress": {
+        const address = {
+          firstName: str(formData, "firstName") || null,
+          lastName: str(formData, "lastName") || null,
+          company: str(formData, "company") || null,
+          address1: str(formData, "address1") || null,
+          address2: str(formData, "address2") || null,
+          city: str(formData, "city") || null,
+          provinceCode: str(formData, "provinceCode") || null,
+          countryCode: str(formData, "countryCode") || null,
+          zip: str(formData, "zip") || null,
+          phone: str(formData, "phone") || null,
+        };
+        await updateDeliveryAddress(shop.domain, contractId, address, opts);
+        await adminLog("Updated the delivery address", {
+          action: "update_address",
+          city: address.city,
+          zip: address.zip,
+          countryCode: address.countryCode,
+        });
+        return ok("Address updated");
+      }
+
+      // ── Discounts & gifts ───────────────────────────────────────────────
+      case "grantDiscount": {
+        const percent = int(formData, "percent");
+        const cycles = int(formData, "cycles");
+        const reason = str(formData, "reason") || null;
+        await applyDiscountGrant(
+          shop.domain,
+          contractId,
+          { type: "MANUAL", percent, cycles, grantedBy: actor, reason },
+          opts,
+        );
+        await adminLog(
+          `Granted a ${percent}% discount for ${cycles} cycle(s)`,
+          { action: "grant_discount", percent, cycles, reason },
+        );
+        return ok("Discount granted");
+      }
+      case "revokeGrant": {
+        const grantId = str(formData, "grantId");
+        const grant = await prisma.discountGrant.findFirst({
+          where: { id: grantId, contractId },
+        });
+        if (!grant) {
+          return json<ActionResponse>({ ok: false, intent, error: "Grant not found" });
+        }
+        await prisma.discountGrant.update({
+          where: { id: grant.id },
+          data: { cyclesRemaining: 0, exhaustedAt: new Date() },
+        });
+        await adminLog(
+          `Revoked a ${grant.percent}% discount grant (${grant.cyclesRemaining} cycle(s) were remaining)`,
+          {
+            action: "revoke_discount_grant",
+            grantId: grant.id,
+            percent: grant.percent,
+            cyclesRemaining: grant.cyclesRemaining,
+          },
+        );
+        return ok("Discount grant revoked");
+      }
+      case "addGift": {
+        const variantId = str(formData, "variantId");
+        const cycleIndex = int(formData, "cycleIndex", contract.ordersCount + 1);
+        if (!variantId) {
+          return json<ActionResponse>({ ok: false, intent, error: "Pick a gift variant" });
+        }
+        const gift = await prisma.giftGrant.create({
+          data: { contractId, variantId, cycleIndex, status: "SCHEDULED" },
+        });
+        await logEvent({
+          shopId: shop.id,
+          contractId,
+          customerId: contract.customerId,
+          email: contract.email,
+          type: "lifecycle.gift_scheduled",
+          source: "ADMIN",
+          actor,
+          payload: { giftGrantId: gift.id, variantId, cycleIndex, manual: true },
+        });
+        await adminLog(`Scheduled a manual gift for cycle ${cycleIndex}`, {
+          action: "add_manual_gift",
+          giftGrantId: gift.id,
+          variantId,
+          cycleIndex,
+        });
+        return ok(`Gift scheduled for cycle ${cycleIndex}`);
+      }
+
+      // ── Refunds ─────────────────────────────────────────────────────────
+      case "refund": {
+        const attemptId = str(formData, "attemptId");
+        const amountStr = str(formData, "amount");
+        const attempt = await prisma.billingAttempt.findFirst({
+          where: { id: attemptId, contractId },
+        });
+        if (!attempt || !attempt.orderId) {
+          return json<ActionResponse>({
+            ok: false,
+            intent,
+            error: "No refundable order on that attempt",
+          });
+        }
+        const amountCents = centsFromDecimalString(amountStr);
+        if (!Number.isInteger(amountCents) || amountCents <= 0) {
+          return json<ActionResponse>({ ok: false, intent, error: "Invalid amount" });
+        }
+        const currency = attempt.currencyCode ?? contract.currencyCode;
+        const result = await refundOrderAmount(
+          admin,
+          attempt.orderId,
+          amountCents,
+          currency,
+          `Cellexia admin refund by ${actor}`,
+        );
+        await adminLog(
+          `Refunded ${formatMoney(amountCents, currency)} on order ${attempt.orderName ?? attempt.orderId}`,
+          {
+            action: "refund",
+            attemptId,
+            orderId: attempt.orderId,
+            orderName: attempt.orderName,
+            amountCents,
+            currencyCode: currency,
+            refundId: result.refundId,
+          },
+        );
+        return ok(`Refunded ${formatMoney(amountCents, currency)}`);
+      }
+
+      // ── Product search (picker modal) ───────────────────────────────────
+      case "searchProducts": {
+        const q = str(formData, "q");
+        if (!q) return json<ActionResponse>({ ok: true, intent, results: [] });
+        const found = await searchProducts(admin, q, 10);
+        const results: NonNullable<ActionResponse["results"]> = [];
+        for (const product of found) {
+          const pct = await ongoingDiscountPctForProduct(shop.id, product.id);
+          results.push({
+            id: product.id,
+            title: product.title,
+            status: product.status,
+            imageUrl: product.featuredImageUrl,
+            ongoingPct: pct,
+            variants: product.variants.map((v) => ({
+              id: v.id,
+              title: v.title,
+              sku: v.sku,
+              price: formatMoney(v.priceCents, contract.currencyCode),
+              priceCents: v.priceCents,
+              discounted:
+                pct != null
+                  ? formatMoney(
+                      applyDiscountPct(v.priceCents, pct),
+                      contract.currencyCode,
+                    )
+                  : null,
+              available: v.availableForSale,
+            })),
+          });
+        }
+        return json<ActionResponse>({ ok: true, intent, results });
+      }
+
+      default:
+        return json<ActionResponse>({ ok: false, intent, error: `Unknown intent: ${intent}` });
     }
-
-    return json({
-      ok: true as const,
-      message: successMessage(act),
-      intent: act.intent,
-      ts: Date.now(),
-    });
-  } catch (e) {
-    const message =
-      e instanceof ShopifyGraphqlError && e.userErrors && e.userErrors.length > 0
-        ? e.userErrors.map((u) => u.message).join("; ")
-        : e instanceof Error
-          ? e.message
-          : "Something went wrong applying this change.";
-    return json({ ok: false as const, error: message, ts: Date.now() }, { status: 400 });
+  } catch (err) {
+    console.error("[admin] subscriber action failed", intent, contractId, err);
+    return json<ActionResponse>({ ok: false, intent, error: errMessage(err) });
   }
 };
 
-// ─────────────────────────────── UI ───────────────────────────────────────
+// ── Component ────────────────────────────────────────────────────────────────
 
-type LoaderData = SerializeFrom<typeof loader>;
+type PickerMode = "add" | "addon" | "swap" | "gift";
 
-interface ActiveAction {
-  intent: CsIntent;
-  lineId?: string;
-  lineTitle?: string;
-  defaultQuantity?: number;
-  openedAt: number;
-}
-
-function fmtDate(iso: string | null | undefined): string {
-  if (!iso) return "—";
-  return new Date(iso).toLocaleDateString("en-GB", {
-    day: "numeric",
-    month: "short",
-    year: "numeric",
-    timeZone: "UTC",
-  });
-}
-
-function fmtDateTime(iso: string | null | undefined): string {
-  if (!iso) return "—";
-  return new Date(iso).toLocaleString("en-GB", {
-    day: "numeric",
-    month: "short",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    timeZone: "UTC",
-  });
-}
-
-const MODAL_TITLES: Record<CsIntent, string> = {
-  CHANGE_QUANTITY: "Change quantity",
-  CHANGE_VARIANT: "Swap variant",
-  ADD_PRODUCT: "Add a product to this plan",
-  REMOVE_PRODUCT: "Remove product",
-  CHANGE_BILLING_DATE: "Set next billing date",
-  SKIP_SHIPMENT: "Skip the next delivery",
-  DELAY_WEEKS: "Delay the next delivery",
-  BRING_FORWARD: "Bring the next delivery forward",
-  PAUSE_UNTIL: "Pause this treatment plan",
-  REACTIVATE: "Resume this treatment plan",
-  SWITCH_CADENCE: "Change delivery cadence",
-  CHANGE_ADDRESS: "Update delivery address",
-  UPDATE_PAYMENT_METHOD: "Send payment update email",
-  APPLY_CREDIT: "Apply account credit",
-  CANCEL: "Cancel this treatment plan",
-  MERGE_CONTRACTS: "Merge into another plan",
-  SPLIT_SHIPMENT: "Split products into a new plan",
-};
-
-const SUBMIT_LABELS: Record<CsIntent, string> = {
-  CHANGE_QUANTITY: "Update quantity",
-  CHANGE_VARIANT: "Swap variant",
-  ADD_PRODUCT: "Add product",
-  REMOVE_PRODUCT: "Remove product",
-  CHANGE_BILLING_DATE: "Set date",
-  SKIP_SHIPMENT: "Skip delivery",
-  DELAY_WEEKS: "Delay delivery",
-  BRING_FORWARD: "Bring forward",
-  PAUSE_UNTIL: "Pause plan",
-  REACTIVATE: "Resume plan",
-  SWITCH_CADENCE: "Change cadence",
-  CHANGE_ADDRESS: "Update address",
-  UPDATE_PAYMENT_METHOD: "Send email",
-  APPLY_CREDIT: "Apply credit",
-  CANCEL: "Cancel plan",
-  MERGE_CONTRACTS: "Merge plans",
-  SPLIT_SHIPMENT: "Split plan",
-};
-
-function ActionModal(props: {
-  title: string;
-  intent: CsIntent;
-  formToken: string;
-  destructive: boolean;
-  submitLabel: string;
-  error?: string;
-  loading: boolean;
-  onClose: () => void;
-  children: ReactNode;
-}) {
-  const [confirmed, setConfirmed] = useState(false);
-  return (
-    <Modal open title={props.title} onClose={props.onClose}>
-      <Modal.Section>
-        <Form method="post">
-          <input type="hidden" name="intent" value={props.intent} />
-          <input type="hidden" name="formToken" value={props.formToken} />
-          {props.destructive ? (
-            <input type="hidden" name="confirm" value={confirmed ? "yes" : ""} />
-          ) : null}
-          <BlockStack gap="400">
-            {props.error ? (
-              <Banner tone="critical" title="The change could not be applied">
-                <p>{props.error}</p>
-              </Banner>
-            ) : null}
-            {props.children}
-            {props.destructive ? (
-              <Checkbox
-                label="I understand this change cannot be undone from the console"
-                checked={confirmed}
-                onChange={setConfirmed}
-              />
-            ) : null}
-            <InlineStack align="end" gap="200">
-              <Button onClick={props.onClose} disabled={props.loading}>
-                Back
-              </Button>
-              <Button
-                submit
-                variant="primary"
-                tone={props.destructive ? "critical" : undefined}
-                disabled={props.destructive && !confirmed}
-                loading={props.loading}
-              >
-                {props.submitLabel}
-              </Button>
-            </InlineStack>
-          </BlockStack>
-        </Form>
-      </Modal.Section>
-    </Modal>
-  );
-}
-
-// ── Per-intent field sets (mounted fresh each time a modal opens) ──────────
-
-function QuantityFields({ lineId, defaultQuantity }: { lineId: string; defaultQuantity: number }) {
-  const [value, setValue] = useState(String(defaultQuantity));
-  return (
-    <BlockStack gap="300">
-      <input type="hidden" name="lineId" value={lineId} />
-      <TextField
-        label="New quantity"
-        name="quantity"
-        type="number"
-        min={1}
-        value={value}
-        onChange={setValue}
-        autoComplete="off"
-        autoFocus
-      />
-    </BlockStack>
-  );
-}
-
-function VariantFields({ lineId }: { lineId: string }) {
-  const [value, setValue] = useState("");
-  return (
-    <BlockStack gap="300">
-      <input type="hidden" name="lineId" value={lineId} />
-      <TextField
-        label="New variant"
-        name="variantGid"
-        value={value}
-        onChange={setValue}
-        autoComplete="off"
-        autoFocus
-        placeholder="gid://shopify/ProductVariant/1234567890"
-        helpText="Paste a variant GID or a numeric variant ID. Pricing follows the plan's selling-plan rules."
-      />
-    </BlockStack>
-  );
-}
-
-function AddProductFields() {
-  const [variant, setVariant] = useState("");
-  const [qty, setQty] = useState("1");
-  const [price, setPrice] = useState("");
-  return (
-    <BlockStack gap="300">
-      <TextField
-        label="Variant"
-        name="variantGid"
-        value={variant}
-        onChange={setVariant}
-        autoComplete="off"
-        autoFocus
-        placeholder="gid://shopify/ProductVariant/1234567890"
-        helpText="Variant GID or numeric variant ID."
-      />
-      <InlineGrid columns={2} gap="300">
-        <TextField
-          label="Quantity"
-          name="quantity"
-          type="number"
-          min={1}
-          value={qty}
-          onChange={setQty}
-          autoComplete="off"
-        />
-        <TextField
-          label="Price override (optional)"
-          name="price"
-          type="number"
-          value={price}
-          onChange={setPrice}
-          autoComplete="off"
-          placeholder="49.00"
-          helpText="Leave empty to keep the standard plan price."
-        />
-      </InlineGrid>
-    </BlockStack>
-  );
-}
-
-function RemoveFields({ lineId, lineTitle }: { lineId: string; lineTitle: string }) {
-  return (
-    <BlockStack gap="300">
-      <input type="hidden" name="lineId" value={lineId} />
-      <Text as="p">
-        {`This removes “${lineTitle}” from every future delivery of this plan. Past orders are not affected.`}
-      </Text>
-    </BlockStack>
-  );
-}
-
-function DateFields({ label, helpText }: { label: string; helpText?: string }) {
-  const [value, setValue] = useState("");
-  return (
-    <TextField
-      label={label}
-      name="date"
-      type="date"
-      value={value}
-      onChange={setValue}
-      autoComplete="off"
-      autoFocus
-      helpText={helpText}
-    />
-  );
-}
-
-function DelayFields() {
-  const [weeks, setWeeks] = useState("1");
-  const options = [1, 2, 3, 4, 6, 8].map((w) => ({
-    label: w === 1 ? "1 week" : `${w} weeks`,
-    value: String(w),
-  }));
-  return (
-    <BlockStack gap="300">
-      <Select label="Delay by" name="weeks" options={options} value={weeks} onChange={setWeeks} />
-      <Text as="p" tone="subdued" variant="bodySm">
-        Billing and delivery both move. The customer keeps their plan benefits.
-      </Text>
-    </BlockStack>
-  );
-}
-
-function PauseFields() {
-  const [mode, setMode] = useState(String(PAUSE_OPTIONS_DAYS[0]));
-  const [date, setDate] = useState("");
-  const options = [
-    ...PAUSE_OPTIONS_DAYS.map((d) => ({ label: `${d} days`, value: String(d) })),
-    { label: "Until a specific date", value: "CUSTOM" },
-  ];
-  return (
-    <BlockStack gap="300">
-      <Select label="Pause for" options={options} value={mode} onChange={setMode} />
-      {mode === "CUSTOM" ? (
-        <TextField
-          label="Resume on"
-          name="resumeDate"
-          type="date"
-          value={date}
-          onChange={setDate}
-          autoComplete="off"
-        />
-      ) : (
-        <input type="hidden" name="pauseDays" value={mode} />
-      )}
-      <Text as="p" tone="subdued" variant="bodySm">
-        Deliveries and billing stop until the resume date. The customer can resume earlier
-        online at any time.
-      </Text>
-    </BlockStack>
-  );
-}
-
-function CadenceFields({ current }: { current: number }) {
-  const choices = [1, 2, 3, 4, 5, 6, 8, 10, 12];
-  const initial = choices.includes(current) ? String(current) : "4";
-  const [value, setValue] = useState(initial);
-  const options = choices.map((w) => ({ label: cadenceLabel(w), value: String(w) }));
-  return (
-    <BlockStack gap="300">
-      <Select
-        label="Delivery cadence"
-        name="intervalWeeks"
-        options={options}
-        value={value}
-        onChange={setValue}
-      />
-      <Text as="p" tone="subdued" variant="bodySm">
-        {`Currently ${cadenceLabel(current).toLowerCase()}. The change applies from the next billing cycle.`}
-      </Text>
-    </BlockStack>
-  );
-}
-
-const ADDRESS_FIELDS: Array<{ name: string; label: string }> = [
-  { name: "firstName", label: "First name" },
-  { name: "lastName", label: "Last name" },
-  { name: "address1", label: "Address line 1" },
-  { name: "address2", label: "Address line 2" },
-  { name: "zip", label: "Postcode / ZIP" },
-  { name: "city", label: "City" },
-  { name: "provinceCode", label: "Province / state code" },
-  { name: "countryCode", label: "Country code (2 letters)" },
-  { name: "phone", label: "Phone" },
-];
-
-function AddressFields({ address }: { address: Record<string, string> }) {
-  const [values, setValues] = useState<Record<string, string>>(() => {
-    const initial: Record<string, string> = {};
-    for (const f of ADDRESS_FIELDS) initial[f.name] = address[f.name] ?? "";
-    return initial;
-  });
-  const set = (name: string) => (v: string) => setValues((p) => ({ ...p, [name]: v }));
-  return (
-    <InlineGrid columns={2} gap="300">
-      {ADDRESS_FIELDS.map((f) => (
-        <TextField
-          key={f.name}
-          label={f.label}
-          name={f.name}
-          value={values[f.name] ?? ""}
-          onChange={set(f.name)}
-          autoComplete="off"
-        />
-      ))}
-    </InlineGrid>
-  );
-}
-
-function CreditFields({ currencyCode }: { currencyCode: string }) {
-  const [value, setValue] = useState("");
-  return (
-    <BlockStack gap="300">
-      <TextField
-        label={`Credit amount (${currencyCode})`}
-        name="amount"
-        type="number"
-        value={value}
-        onChange={setValue}
-        autoComplete="off"
-        autoFocus
-        placeholder="10.00"
-        helpText="Applied as a one-cycle discount to the customer's next order. Capped at 500.00 per action."
-      />
-    </BlockStack>
-  );
-}
-
-function CancelFields() {
-  const [reason, setReason] = useState<string>(CANCEL_REASONS[0]);
-  const options = CANCEL_REASONS.map((r) => ({ label: humanizeEnum(r), value: r }));
-  return (
-    <BlockStack gap="300">
-      <Banner tone="warning">
-        <p>
-          Consider a pause, a slower cadence or a smaller delivery first — most customers
-          leaving over volume or price stay when the plan adapts.
-        </p>
-      </Banner>
-      <Select
-        label="Cancellation reason"
-        name="reason"
-        options={options}
-        value={reason}
-        onChange={setReason}
-      />
-    </BlockStack>
-  );
-}
-
-function MergeFields({ options }: { options: Array<{ id: string; label: string }> }) {
-  const [target, setTarget] = useState(options[0]?.id ?? "");
-  return (
-    <BlockStack gap="300">
-      <Select
-        label="Merge into"
-        name="targetContractId"
-        options={options.map((o) => ({ label: o.label, value: o.id }))}
-        value={target}
-        onChange={setTarget}
-      />
-      <Text as="p" tone="subdued" variant="bodySm">
-        All products from this plan move into the selected plan: one combined delivery, one
-        charge. This plan is closed afterwards.
-      </Text>
-    </BlockStack>
-  );
-}
-
-function SplitFields({
-  lines,
-}: {
-  lines: Array<{ id: string; title: string; quantity: number }>;
-}) {
-  const [selected, setSelected] = useState<string[]>([]);
-  return (
-    <BlockStack gap="300">
-      <Text as="p">Choose the products to move into a new, separate plan:</Text>
-      {lines.map((l) => (
-        <Checkbox
-          key={l.id}
-          label={`${l.quantity}× ${l.title}`}
-          checked={selected.includes(l.id)}
-          onChange={(checked) =>
-            setSelected((prev) =>
-              checked ? [...prev, l.id] : prev.filter((x) => x !== l.id),
-            )
-          }
-        />
-      ))}
-      {selected.map((id) => (
-        <input key={id} type="hidden" name="lineIds" value={id} />
-      ))}
-      <Text as="p" tone="subdued" variant="bodySm">
-        The new plan keeps the same cadence and payment method, with its own schedule. At
-        least one product must stay in this plan.
-      </Text>
-    </BlockStack>
-  );
-}
-
-function ActionFields({ active, data }: { active: ActiveAction; data: LoaderData }) {
-  switch (active.intent) {
-    case "CHANGE_QUANTITY":
-      return (
-        <QuantityFields
-          lineId={active.lineId ?? ""}
-          defaultQuantity={active.defaultQuantity ?? 1}
-        />
-      );
-    case "CHANGE_VARIANT":
-      return <VariantFields lineId={active.lineId ?? ""} />;
-    case "ADD_PRODUCT":
-      return <AddProductFields />;
-    case "REMOVE_PRODUCT":
-      return (
-        <RemoveFields lineId={active.lineId ?? ""} lineTitle={active.lineTitle ?? "this product"} />
-      );
-    case "CHANGE_BILLING_DATE":
-      return (
-        <DateFields
-          label="Next billing date"
-          helpText={`Currently ${fmtDate(data.contract.nextBillingDate)}. Delivery follows billing.`}
-        />
-      );
-    case "SKIP_SHIPMENT":
-      return (
-        <Text as="p">
-          The next delivery and its charge move one full cycle later. Nothing is billed for
-          the skipped cycle.
-        </Text>
-      );
-    case "DELAY_WEEKS":
-      return <DelayFields />;
-    case "BRING_FORWARD":
-      return (
-        <DateFields
-          label="New billing date"
-          helpText={`Currently ${fmtDate(data.contract.nextBillingDate)}. Pick an earlier (future) date to bill and ship sooner.`}
-        />
-      );
-    case "PAUSE_UNTIL":
-      return <PauseFields />;
-    case "REACTIVATE":
-      return (
-        <Text as="p">
-          Billing and deliveries resume on the plan&apos;s regular cadence, starting from the
-          next available cycle.
-        </Text>
-      );
-    case "SWITCH_CADENCE":
-      return <CadenceFields current={data.contract.intervalWeeks} />;
-    case "CHANGE_ADDRESS":
-      return <AddressFields address={data.contract.address} />;
-    case "UPDATE_PAYMENT_METHOD":
-      return (
-        <Text as="p">
-          {`Shopify emails ${
-            data.contract.customerEmail ?? "the customer"
-          } a secure link to update their card. No card details ever pass through this console.`}
-        </Text>
-      );
-    case "APPLY_CREDIT":
-      return <CreditFields currencyCode={data.contract.currencyCode} />;
-    case "CANCEL":
-      return <CancelFields />;
-    case "MERGE_CONTRACTS":
-      return <MergeFields options={data.otherContracts} />;
-    case "SPLIT_SHIPMENT":
-      return (
-        <SplitFields
-          lines={data.lines.map((l) => ({ id: l.id, title: l.title, quantity: l.quantity }))}
-        />
-      );
+function statusTone(
+  status: string,
+): "success" | "attention" | "critical" | "info" | undefined {
+  switch (status) {
+    case "ACTIVE":
+      return "success";
+    case "PAUSED":
+      return "attention";
+    case "FAILED":
+      return "critical";
+    case "EXPIRED":
+      return "info";
     default:
-      return null;
+      return undefined;
   }
 }
 
-// ── Small display components ────────────────────────────────────────────────
-
-function InfoItem({ label, value }: { label: string; value: string }) {
-  return (
-    <BlockStack gap="100">
-      <Text as="p" variant="bodySm" tone="subdued">
-        {label}
-      </Text>
-      <Text as="p" variant="bodyMd">
-        {value}
-      </Text>
-    </BlockStack>
-  );
+function categoryTone(
+  category: string,
+): "success" | "attention" | "critical" | "info" | "warning" | "new" {
+  switch (category) {
+    case "dunning":
+      return "warning";
+    case "cancel":
+      return "critical";
+    case "billing":
+      return "success";
+    case "admin":
+      return "attention";
+    case "magic":
+    case "portal":
+      return "new";
+    default:
+      return "info";
+  }
 }
 
-function FactorList({ factors }: { factors: Record<string, number> }) {
-  const entries = Object.entries(factors)
-    .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
-    .slice(0, 6);
-  if (entries.length === 0) return null;
-  return (
-    <BlockStack gap="100">
-      {entries.map(([k, v]) => (
-        <InlineStack key={k} align="space-between">
-          <Text as="span" variant="bodySm" tone="subdued">
-            {k}
-          </Text>
-          <Text as="span" variant="bodySm">
-            {`${v >= 0 ? "+" : ""}${v.toFixed(2)}`}
-          </Text>
-        </InlineStack>
-      ))}
-    </BlockStack>
-  );
+function formatDate(iso: string | null): string {
+  if (!iso) return "–";
+  return new Date(iso).toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
 }
 
-// ─────────────────────────────── Page ─────────────────────────────────────
+function timeAgo(iso: string): string {
+  const mins = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 60) return `${days}d ago`;
+  return formatDate(iso);
+}
 
-export default function SubscriberConsole() {
+/** "browse-to-buy" latency for the Acquisition card: 90s → "2m", 2d → "2 days". */
+function humanizeSeconds(seconds: number): string {
+  if (seconds < 60) return "under a minute";
+  const mins = Math.round(seconds / 60);
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 48) return `${hours}h ${mins % 60}m`;
+  const days = Math.round(hours / 24);
+  return `${days} days`;
+}
+
+const EVENT_CATEGORIES = [
+  "all",
+  "contract",
+  "cycle",
+  "billing",
+  "dunning",
+  "cancel",
+  "winback",
+  "lifecycle",
+  "notification",
+  "portal",
+  "magic",
+  "admin",
+  "stockout",
+  "alert",
+] as const;
+
+export default function SubscriberDetailPage() {
   const data = useLoaderData<typeof loader>();
-  const actionData = useActionData<typeof action>();
-  const navigation = useNavigation();
-  const shopify = useAppBridge();
+  const fetcher = useFetcher<typeof action>();
+  const searchFetcher = useFetcher<typeof action>();
+  const linkFetcher = useFetcher<typeof action>();
+  const urlFetcher = useFetcher<typeof action>();
 
-  const [active, setActive] = useState<ActiveAction | null>(null);
-  const [dismissedErrorTs, setDismissedErrorTs] = useState(0);
-
-  const submitting = navigation.state === "submitting";
   const c = data.contract;
-  const cancelled = c.status === "CANCELLED";
+  const busy = fetcher.state !== "idle";
 
+  // Modals & local state
+  const [pauseOpen, setPauseOpen] = useState(false);
+  const [pauseMonths, setPauseMonths] = useState("1");
+  const [cancelOpen, setCancelOpen] = useState(false);
+  const [cancelReason, setCancelReason] = useState<string>(CANCEL_REASONS[0]);
+  const [chargeOpen, setChargeOpen] = useState(false);
+  const [linkOpen, setLinkOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const [priceEditLineId, setPriceEditLineId] = useState<string | null>(null);
+  const [priceEditValue, setPriceEditValue] = useState("");
+
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerMode, setPickerMode] = useState<PickerMode>("add");
+  const [pickerLineId, setPickerLineId] = useState<string | null>(null);
+  const [pickerQuery, setPickerQuery] = useState("");
+  const [giftCycle, setGiftCycle] = useState(String(c.ordersCount + 1));
+
+  const [nextDate, setNextDate] = useState(
+    c.nextBillingDate ? c.nextBillingDate.slice(0, 10) : "",
+  );
+  const [frequency, setFrequency] = useState(String(c.intervalWeeks));
+  const [backupMethod, setBackupMethod] = useState(c.backupPaymentMethodId ?? "");
+
+  const [grantOpen, setGrantOpen] = useState(false);
+  const [grantPercent, setGrantPercent] = useState("10");
+  const [grantCycles, setGrantCycles] = useState("2");
+  const [grantReason, setGrantReason] = useState("");
+
+  const [refundAttemptId, setRefundAttemptId] = useState<string | null>(null);
+  const [refundAmount, setRefundAmount] = useState("");
+
+  const [dunningCancelOpen, setDunningCancelOpen] = useState(false);
+
+  const [address, setAddress] = useState({
+    firstName: data.address.firstName ?? "",
+    lastName: data.address.lastName ?? "",
+    company: data.address.company ?? "",
+    address1: data.address.address1 ?? "",
+    address2: data.address.address2 ?? "",
+    city: data.address.city ?? "",
+    provinceCode: data.address.provinceCode ?? "",
+    countryCode: data.address.countryCode ?? "",
+    zip: data.address.zip ?? "",
+    phone: data.address.phone ?? "",
+  });
+
+  const [timelineCategory, setTimelineCategory] = useState<string>("all");
+  const [activePayloadId, setActivePayloadId] = useState<string | null>(null);
+
+  const openedUrlRef = useRef<string | null>(null);
   useEffect(() => {
-    if (actionData?.ok) {
-      setActive(null);
-      shopify.toast.show(actionData.message);
+    const url = urlFetcher.data?.updateUrl;
+    if (urlFetcher.state === "idle" && url && openedUrlRef.current !== url) {
+      openedUrlRef.current = url;
+      window.open(url, "_blank", "noopener");
     }
-  }, [actionData, shopify]);
+  }, [urlFetcher.state, urlFetcher.data]);
 
-  const actionErr = actionData && !actionData.ok ? actionData : null;
-  const modalError =
-    actionErr && active && actionErr.ts > active.openedAt ? actionErr.error : undefined;
-  const pageError =
-    actionErr && !active && actionErr.ts > dismissedErrorTs ? actionErr.error : undefined;
+  const submit = (intent: string, fields: Record<string, string> = {}) => {
+    fetcher.submit({ intent, ...fields }, { method: "post" });
+  };
 
-  const openAction = (a: Omit<ActiveAction, "openedAt">) =>
-    setActive({ ...a, openedAt: Date.now() });
+  const filteredEvents = useMemo(
+    () =>
+      timelineCategory === "all"
+        ? data.events
+        : data.events.filter((e) => e.type.startsWith(`${timelineCategory}.`)),
+    [data.events, timelineCategory],
+  );
 
-  const money = (cents: number) =>
-    formatMoney({ amountCents: cents, currencyCode: c.currencyCode });
+  const refundAttempt =
+    data.attempts.find((a) => a.id === refundAttemptId) ?? null;
 
-  const band = churnBand(c.churnRiskScore);
+  const pickVariant = (variantId: string) => {
+    if (pickerMode === "swap" && pickerLineId) {
+      submit("swapLine", { lineId: pickerLineId, variantId });
+    } else if (pickerMode === "addon") {
+      submit("addAddon", { variantId, quantity: "1" });
+    } else if (pickerMode === "gift") {
+      submit("addGift", { variantId, cycleIndex: giftCycle });
+    } else {
+      submit("addProduct", { variantId, quantity: "1" });
+    }
+    setPickerOpen(false);
+  };
 
-  const cardSummary =
-    c.cardLastDigits !== null
-      ? `${c.cardBrand ?? "Card"} •••• ${c.cardLastDigits}${
-          c.cardExpiryMonth !== null && c.cardExpiryYear !== null
-            ? ` — exp ${String(c.cardExpiryMonth).padStart(2, "0")}/${String(
-                c.cardExpiryYear,
-              ).slice(-2)}`
-            : ""
-        }`
-      : "No card on file";
+  const openPicker = (mode: PickerMode, lineId?: string) => {
+    setPickerMode(mode);
+    setPickerLineId(lineId ?? null);
+    setPickerQuery("");
+    setPickerOpen(true);
+  };
 
-  const addressSummary =
-    Object.keys(c.address).length > 0
-      ? [
-          [c.address.firstName, c.address.lastName].filter(Boolean).join(" "),
-          c.address.address1,
-          c.address.address2,
-          [c.address.zip, c.address.city].filter(Boolean).join(" "),
-          [c.address.provinceCode, c.address.countryCode].filter(Boolean).join(", "),
-        ]
-          .filter((part) => part && part !== "")
-          .join(" · ")
-      : "No delivery address on file";
+  const lastResult = fetcher.data;
 
   return (
     <Page
-      title={c.customerEmail ?? "Subscriber"}
-      subtitle={`Treatment plan #${gidTailClient(c.shopifyContractId)} · started ${fmtDate(
-        c.treatmentStartedAt ?? c.createdAt,
-      )}`}
-      titleMetadata={<Badge tone={statusTone(c.status)}>{humanizeEnum(c.status)}</Badge>}
+      title={c.name}
+      subtitle={`${c.email}${c.phone ? ` · ${c.phone}` : ""}`}
       backAction={{ content: "Subscribers", url: "/app/subscribers" }}
+      titleMetadata={
+        <InlineStack gap="200">
+          <Badge tone={statusTone(c.status)}>{c.status}</Badge>
+          {c.isPrepaid ? (
+            <Badge tone="info">{`Prepaid${c.prepaidDeliveriesRemaining != null ? ` (${c.prepaidDeliveriesRemaining} left)` : ""}`}</Badge>
+          ) : null}
+          {c.grandfathered ? <Badge tone="attention">Grandfathered</Badge> : null}
+          {c.merged ? <Badge tone="new">Merged box</Badge> : null}
+          {c.ownership === OWNERSHIP_FOREIGN ? (
+            <Badge tone="warning">Another app</Badge>
+          ) : null}
+          {c.ownership === OWNERSHIP_UNKNOWN ? (
+            <Badge tone="attention">Unattributed</Badge>
+          ) : null}
+          <Badge tone={(c.churnRiskScore ?? 0) >= 0.66 ? "critical" : (c.churnRiskScore ?? 0) >= 0.33 ? "warning" : "success"}>
+            {`Risk ${(c.churnRiskScore ?? 0).toFixed(2)}`}
+          </Badge>
+        </InlineStack>
+      }
     >
       <BlockStack gap="400">
-        {pageError && actionErr ? (
-          <Banner
-            tone="critical"
-            title="The change could not be applied"
-            onDismiss={() => setDismissedErrorTs(actionErr.ts)}
-          >
-            <p>{pageError}</p>
+        {lastResult && !lastResult.ok && lastResult.error ? (
+          <Banner tone="critical" title="Action failed">
+            <p>{lastResult.error}</p>
           </Banner>
         ) : null}
+        {lastResult && lastResult.ok && lastResult.message ? (
+          <Banner tone="success">
+            <p>{lastResult.message}</p>
+          </Banner>
+        ) : null}
+
+        {/* This subscription is not Cellexia's. The cockpit still opens — the
+            merchant must be able to look, and support questions arrive about
+            these subscriptions too — but every support action below is REFUSED
+            server-side (see ownershipRefusal in the action): charging, editing
+            or emailing another app's contract collides with the app that owns
+            it, and "Charge now" on it is precisely the duplicate charge the
+            ownership column exists to prevent. */}
+        {c.ownership !== OWNERSHIP_OURS ? (
+          <Banner
+            tone="warning"
+            title={
+              c.ownership === OWNERSHIP_FOREIGN
+                ? "This subscription is managed by another app"
+                : "This subscription could not be attributed to any app"
+            }
+          >
+            <BlockStack gap="200">
+              <p>
+                {c.ownership === OWNERSHIP_FOREIGN
+                  ? "It was created by another subscription app on this store. Cellexia will never bill it, email its customer, run dunning or win-back on it, or include it in analytics — and it does not appear in the Cellexia customer portal."
+                  : "None of its lines carry a selling plan, so Cellexia cannot prove it is ours. It is treated as not ours: never billed, never emailed, excluded from analytics and from the customer portal."}
+              </p>
+              <p>
+                {c.ownership === OWNERSHIP_FOREIGN
+                  ? "To move this customer to Cellexia, cancel the subscription in the other app first, then re-create it here — never leave both apps billing the same subscription."
+                  : "If it is in fact yours (e.g. imported after cancelling it in another app), claim it from the Subscribers list."}
+              </p>
+              <p>
+                {c.ownership === OWNERSHIP_FOREIGN
+                  ? "The support actions on this page are disabled for it: pausing, cancelling, editing items, changing the schedule, charging now and the customer emails all refuse, because they would act on a subscription another app is billing."
+                  : "The support actions on this page refuse until it is claimed — Cellexia does not charge, email or edit a subscription it cannot prove is its own."}
+              </p>
+            </BlockStack>
+          </Banner>
+        ) : null}
+
+        {/* Quick actions */}
+        <Card>
+          <InlineStack gap="200" wrap>
+            {c.status === "PAUSED" || c.status === "FAILED" ? (
+              <Button loading={busy} onClick={() => submit("resume")}>
+                Resume
+              </Button>
+            ) : (
+              <Button
+                disabled={c.status !== "ACTIVE"}
+                onClick={() => setPauseOpen(true)}
+              >
+                Pause
+              </Button>
+            )}
+            <Button
+              tone="critical"
+              disabled={c.status === "CANCELLED"}
+              onClick={() => setCancelOpen(true)}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="primary"
+              disabled={c.status === "CANCELLED"}
+              onClick={() => setChargeOpen(true)}
+            >
+              Charge now
+            </Button>
+            <Button loading={busy && fetcher.formData?.get("intent") === "sendCardEmail"} onClick={() => submit("sendCardEmail")}>
+              Send card-update email
+            </Button>
+            <Button
+              loading={linkFetcher.state !== "idle"}
+              onClick={() => {
+                setCopied(false);
+                setLinkOpen(true);
+                linkFetcher.submit({ intent: "portalLink" }, { method: "post" });
+              }}
+            >
+              Portal login link
+            </Button>
+          </InlineStack>
+        </Card>
 
         <Layout>
           <Layout.Section>
             <BlockStack gap="400">
-              {/* Plan overview */}
+              {/* Items */}
               <Card>
                 <BlockStack gap="300">
                   <InlineStack align="space-between" blockAlign="center">
                     <Text as="h2" variant="headingMd">
-                      Treatment plan
+                      Items
                     </Text>
-                    <InlineStack gap="200">
-                      {c.committedMinDeliveries !== null ? (
-                        <Badge tone="info">
-                          {`Committed · ${c.successfulOrders}/${c.committedMinDeliveries} deliveries`}
-                        </Badge>
-                      ) : null}
-                      {c.autopilotEnabled ? <Badge tone="info">Autopilot</Badge> : null}
-                      {c.pausedUntil ? (
-                        <Badge tone="attention">{`Paused until ${fmtDate(c.pausedUntil)}`}</Badge>
-                      ) : null}
-                    </InlineStack>
+                    <ButtonGroup>
+                      <Button onClick={() => openPicker("add")}>Add product</Button>
+                      <Button onClick={() => openPicker("addon")}>
+                        One-time add-on
+                      </Button>
+                    </ButtonGroup>
                   </InlineStack>
-                  <InlineGrid columns={{ xs: 1, sm: 2, md: 3 }} gap="300">
-                    <InfoItem label="Cadence" value={cadenceLabel(c.intervalWeeks)} />
-                    <InfoItem label="Next billing" value={fmtDate(c.nextBillingDate)} />
-                    <InfoItem label="Next delivery" value={fmtDate(c.nextDeliveryDate)} />
-                    <InfoItem label="Successful orders" value={String(c.successfulOrders)} />
-                    <InfoItem label="Failed attempts" value={String(c.failedAttempts)} />
-                    <InfoItem label="Lifetime revenue" value={money(c.totalRevenueCents)} />
-                  </InlineGrid>
                   <Divider />
-                  <InlineGrid columns={{ xs: 1, sm: 2 }} gap="300">
-                    <BlockStack gap="100">
-                      <Text as="p" variant="bodySm" tone="subdued">
-                        Payment method
-                      </Text>
-                      <InlineStack gap="200" blockAlign="center">
-                        <Text as="p" variant="bodyMd">
-                          {cardSummary}
-                        </Text>
-                        {c.cardExpired ? (
-                          <Badge tone="critical">Expired</Badge>
-                        ) : c.cardExpiringSoon ? (
-                          <Badge tone="warning">Expiring soon</Badge>
-                        ) : null}
-                      </InlineStack>
-                    </BlockStack>
-                    <InfoItem label="Delivery address" value={addressSummary} />
-                  </InlineGrid>
-                  {cancelled ? (
+                  {data.lines.length === 0 ? (
+                    <Text as="p" tone="subdued">
+                      No items on this subscription.
+                    </Text>
+                  ) : (
+                    data.lines.map((line) => (
+                      <Box key={line.id} paddingBlockEnd="200">
+                        <InlineStack gap="300" blockAlign="center" wrap={false}>
+                          <Thumbnail
+                            source={line.imageUrl ?? ""}
+                            alt={line.title}
+                            size="small"
+                          />
+                          <Box width="100%">
+                            <BlockStack gap="050">
+                              <InlineStack gap="200" blockAlign="center">
+                                <Text as="span" fontWeight="semibold">
+                                  {line.title}
+                                </Text>
+                                {line.isGift ? <Badge tone="new">Gift</Badge> : null}
+                                {line.isOneTimeAddon ? (
+                                  <Badge tone="info">One-time</Badge>
+                                ) : null}
+                              </InlineStack>
+                              <Text as="span" variant="bodySm" tone="subdued">
+                                {[line.variantTitle, line.sku]
+                                  .filter(Boolean)
+                                  .join(" · ") || " "}
+                              </Text>
+                            </BlockStack>
+                          </Box>
+                          <Popover
+                            active={priceEditLineId === line.id}
+                            onClose={() => setPriceEditLineId(null)}
+                            activator={
+                              <Button
+                                variant="plain"
+                                disabled={busy || line.isOneTimeAddon}
+                                accessibilityLabel={`Edit unit price for ${line.title}`}
+                                onClick={() => {
+                                  setPriceEditValue(
+                                    decimalStringFromCents(line.priceCents),
+                                  );
+                                  setPriceEditLineId(
+                                    priceEditLineId === line.id ? null : line.id,
+                                  );
+                                }}
+                              >
+                                {line.price}
+                              </Button>
+                            }
+                          >
+                            <Box padding="300" minWidth="240px">
+                              <BlockStack gap="200">
+                                <TextField
+                                  label={`Unit price (${c.currencyCode})`}
+                                  type="number"
+                                  value={priceEditValue}
+                                  onChange={setPriceEditValue}
+                                  min={0}
+                                  step={0.01}
+                                  autoComplete="off"
+                                  helpText="Overrides the recurring price for this line on all future cycles."
+                                />
+                                <InlineStack gap="200">
+                                  <Button
+                                    size="slim"
+                                    variant="primary"
+                                    disabled={busy || !priceEditValue}
+                                    onClick={() => {
+                                      submit("setLinePrice", {
+                                        lineId: line.id,
+                                        price: priceEditValue,
+                                      });
+                                      setPriceEditLineId(null);
+                                    }}
+                                  >
+                                    Save price
+                                  </Button>
+                                  <Button
+                                    size="slim"
+                                    onClick={() => setPriceEditLineId(null)}
+                                  >
+                                    Cancel
+                                  </Button>
+                                </InlineStack>
+                              </BlockStack>
+                            </Box>
+                          </Popover>
+                          <InlineStack gap="100" blockAlign="center" wrap={false}>
+                            <Button
+                              size="micro"
+                              disabled={busy || line.quantity <= 1 || line.isOneTimeAddon}
+                              onClick={() =>
+                                submit("setQuantity", {
+                                  lineId: line.id,
+                                  quantity: String(line.quantity - 1),
+                                })
+                              }
+                              accessibilityLabel="Decrease quantity"
+                            >
+                              −
+                            </Button>
+                            <Text as="span">{line.quantity}</Text>
+                            <Button
+                              size="micro"
+                              disabled={busy || line.isOneTimeAddon}
+                              onClick={() =>
+                                submit("setQuantity", {
+                                  lineId: line.id,
+                                  quantity: String(line.quantity + 1),
+                                })
+                              }
+                              accessibilityLabel="Increase quantity"
+                            >
+                              +
+                            </Button>
+                          </InlineStack>
+                          <ButtonGroup>
+                            <Button
+                              size="slim"
+                              disabled={busy || line.isOneTimeAddon}
+                              onClick={() => openPicker("swap", line.id)}
+                            >
+                              Swap
+                            </Button>
+                            <Button
+                              size="slim"
+                              tone="critical"
+                              disabled={busy}
+                              onClick={() =>
+                                submit("removeLine", { lineId: line.id })
+                              }
+                            >
+                              Remove
+                            </Button>
+                          </ButtonGroup>
+                        </InlineStack>
+                      </Box>
+                    ))
+                  )}
+                </BlockStack>
+              </Card>
+
+              {/* Schedule */}
+              <Card>
+                <BlockStack gap="300">
+                  <Text as="h2" variant="headingMd">
+                    Schedule
+                  </Text>
+                  <InlineStack gap="400" blockAlign="end" wrap>
+                    <TextField
+                      label="Next billing date"
+                      type="date"
+                      value={nextDate}
+                      onChange={setNextDate}
+                      autoComplete="off"
+                    />
+                    <Button
+                      disabled={busy || !nextDate}
+                      onClick={() => submit("setNextDate", { date: nextDate })}
+                    >
+                      Save date
+                    </Button>
+                    <Select
+                      label="Frequency"
+                      options={data.frequencies.map((w) => ({
+                        label: `Every ${w} weeks`,
+                        value: String(w),
+                      }))}
+                      value={frequency}
+                      onChange={setFrequency}
+                    />
+                    <Button
+                      disabled={busy || frequency === String(c.intervalWeeks)}
+                      onClick={() => submit("setFrequency", { weeks: frequency })}
+                    >
+                      Save frequency
+                    </Button>
+                  </InlineStack>
+                  <InlineStack gap="200">
+                    <Button disabled={busy || c.status !== "ACTIVE"} onClick={() => submit("skipNext")}>
+                      Skip next cycle
+                    </Button>
+                    <Button disabled={busy} onClick={() => submit("unskipNext")}>
+                      Un-skip
+                    </Button>
+                    <Text as="span" tone="subdued">
+                      {`Skipped ${c.skipCount} time(s) so far · ${c.ordersCount} orders billed · ${c.lifetimeRevenue} lifetime`}
+                    </Text>
+                  </InlineStack>
+                  {c.status === "PAUSED" && c.resumeAt ? (
                     <Banner tone="info">
-                      <p>
-                        {`Cancelled ${fmtDate(c.cancelledAt)}${
-                          c.cancelReason ? ` — ${humanizeEnum(c.cancelReason)}` : ""
-                        }.`}
-                      </p>
+                      <p>Paused — auto-resumes on {formatDate(c.resumeAt)}.</p>
                     </Banner>
                   ) : null}
                 </BlockStack>
               </Card>
 
-              {/* Products */}
+              {/* Discounts & gifts */}
               <Card>
                 <BlockStack gap="300">
                   <InlineStack align="space-between" blockAlign="center">
                     <Text as="h2" variant="headingMd">
-                      Products in this plan
+                      Discounts and gifts
                     </Text>
-                    <Button
-                      onClick={() => openAction({ intent: "ADD_PRODUCT" })}
-                      disabled={cancelled}
-                    >
-                      Add product
-                    </Button>
+                    <ButtonGroup>
+                      <Button onClick={() => setGrantOpen(true)}>Grant discount</Button>
+                      <Button onClick={() => openPicker("gift")}>Add gift</Button>
+                    </ButtonGroup>
                   </InlineStack>
-                  {data.lines.length === 0 ? (
+                  <Divider />
+                  {data.discountGrants.length === 0 ? (
                     <Text as="p" tone="subdued">
-                      No products on this plan.
+                      No discount grants.
                     </Text>
                   ) : (
-                    <DataTable
-                      columnContentTypes={["text", "numeric", "numeric", "text", "text"]}
-                      headings={["Product", "Qty", "Price", "Estimated run-out", "Actions"]}
-                      rows={data.lines.map((l) => [
-                        <BlockStack gap="100" key={`t-${l.id}`}>
-                          <Text as="span" variant="bodyMd" fontWeight="semibold">
-                            {l.title}
-                          </Text>
+                    data.discountGrants.map((g) => (
+                      <InlineStack
+                        key={g.id}
+                        align="space-between"
+                        blockAlign="center"
+                      >
+                        <InlineStack gap="200" blockAlign="center">
+                          <Badge tone={g.active ? "success" : undefined}>
+                            {`${g.percent}% · ${g.cyclesRemaining}/${g.cyclesTotal} cycles left`}
+                          </Badge>
                           <Text as="span" variant="bodySm" tone="subdued">
-                            {l.sellingPlanName ?? "No selling plan name"}
+                            {`${g.type}${g.reason ? ` · ${g.reason}` : ""}${g.grantedBy ? ` · by ${g.grantedBy}` : ""}`}
                           </Text>
-                        </BlockStack>,
-                        l.quantity,
-                        money(l.currentPriceCents),
-                        l.depletion?.predictedRunOutAt
-                          ? `${fmtDate(l.depletion.predictedRunOutAt)} (${Math.round(
-                              l.depletion.confidence * 100,
-                            )}% conf.)`
-                          : "—",
-                        <ButtonGroup key={`a-${l.id}`}>
-                          <Button
-                            size="slim"
-                            disabled={cancelled}
-                            onClick={() =>
-                              openAction({
-                                intent: "CHANGE_QUANTITY",
-                                lineId: l.id,
-                                lineTitle: l.title,
-                                defaultQuantity: l.quantity,
-                              })
-                            }
-                          >
-                            Quantity
-                          </Button>
-                          <Button
-                            size="slim"
-                            disabled={cancelled}
-                            onClick={() =>
-                              openAction({
-                                intent: "CHANGE_VARIANT",
-                                lineId: l.id,
-                                lineTitle: l.title,
-                              })
-                            }
-                          >
-                            Swap
-                          </Button>
+                        </InlineStack>
+                        {g.active ? (
                           <Button
                             size="slim"
                             tone="critical"
-                            disabled={cancelled}
-                            onClick={() =>
-                              openAction({
-                                intent: "REMOVE_PRODUCT",
-                                lineId: l.id,
-                                lineTitle: l.title,
-                              })
-                            }
+                            disabled={busy}
+                            onClick={() => submit("revokeGrant", { grantId: g.id })}
                           >
-                            Remove
+                            Revoke
                           </Button>
-                        </ButtonGroup>,
-                      ])}
-                    />
+                        ) : null}
+                      </InlineStack>
+                    ))
                   )}
-                </BlockStack>
-              </Card>
-
-              {/* Add-ons */}
-              {data.addOns.length > 0 ? (
-                <Card>
-                  <BlockStack gap="300">
-                    <Text as="h2" variant="headingMd">
-                      Add-ons
-                    </Text>
-                    <DataTable
-                      columnContentTypes={["text", "numeric", "numeric", "text", "text"]}
-                      headings={["Item", "Qty", "Price", "Mode", "Source"]}
-                      rows={data.addOns.map((a) => [
-                        a.title,
-                        a.quantity,
-                        money(a.priceCents),
-                        a.mode === "N_DELIVERIES" && a.remainingDeliveries !== null
-                          ? `${humanizeEnum(a.mode)} (${a.remainingDeliveries} left)`
-                          : humanizeEnum(a.mode),
-                        `${a.source} · ${fmtDate(a.createdAt)}`,
-                      ])}
-                    />
-                  </BlockStack>
-                </Card>
-              ) : null}
-
-              {/* Payment recovery */}
-              <Card>
-                <BlockStack gap="300">
-                  <InlineStack align="space-between" blockAlign="center">
-                    <Text as="h2" variant="headingMd">
-                      Payment recovery
-                    </Text>
-                    {data.dunning ? (
-                      <Badge tone={dunningTone(data.dunning.phase)}>
-                        {humanizeEnum(data.dunning.phase)}
-                      </Badge>
-                    ) : null}
-                  </InlineStack>
-                  {!data.dunning || data.dunning.phase === "NONE" ? (
-                    <Text as="p" tone="subdued">
-                      No payment recovery activity on this plan.
-                    </Text>
-                  ) : (
-                    <BlockStack gap="300">
-                      <InlineGrid columns={{ xs: 1, sm: 2, md: 4 }} gap="300">
-                        <InfoItem
-                          label="Decline category"
-                          value={
-                            data.dunning.declineCategory
-                              ? humanizeEnum(data.dunning.declineCategory)
-                              : "—"
-                          }
-                        />
-                        <InfoItem label="Retries" value={String(data.dunning.retryCount)} />
-                        <InfoItem label="Next retry" value={fmtDateTime(data.dunning.nextRetryAt)} />
-                        <InfoItem label="Grace until" value={fmtDate(data.dunning.graceUntil)} />
-                      </InlineGrid>
-                      {data.dunning.history.length > 0 ? (
-                        <BlockStack gap="200">
-                          <Text as="h3" variant="headingSm">
-                            Recovery timeline
-                          </Text>
-                          {data.dunning.history.map((h, i) => (
-                            <InlineStack key={i} gap="200" blockAlign="center" wrap={false}>
-                              <Text as="span" variant="bodySm" tone="subdued">
-                                {h.at ? fmtDateTime(h.at) : "—"}
-                              </Text>
-                              <Text as="span" variant="bodySm">
-                                {h.type && h.type !== "STEP"
-                                  ? humanizeEnum(h.type)
-                                  : [h.action, h.template].filter(Boolean).join(" · ") || "Step"}
-                              </Text>
-                            </InlineStack>
-                          ))}
-                        </BlockStack>
-                      ) : null}
-                    </BlockStack>
-                  )}
-                  {data.billingAttempts.length > 0 ? (
-                    <BlockStack gap="200">
+                  {data.giftGrants.length > 0 ? (
+                    <>
+                      <Divider />
                       <Text as="h3" variant="headingSm">
-                        Recent billing attempts
+                        Gifts
                       </Text>
-                      <DataTable
-                        columnContentTypes={["text", "text", "numeric", "text", "text"]}
-                        headings={["When", "Status", "Amount", "Error", "Attempt"]}
-                        rows={data.billingAttempts.map((b) => [
-                          fmtDateTime(b.occurredAt),
+                      {data.giftGrants.map((g) => (
+                        <InlineStack key={g.id} gap="200" blockAlign="center">
                           <Badge
-                            key={b.id}
                             tone={
-                              b.status === "SUCCESS"
+                              g.status === "ADDED" || g.status === "SHIPPED"
                                 ? "success"
-                                : b.status === "PENDING"
+                                : g.status === "SCHEDULED"
                                   ? "info"
-                                  : "critical"
+                                  : undefined
                             }
                           >
-                            {humanizeEnum(b.status)}
-                          </Badge>,
-                          b.amountCents !== null ? money(b.amountCents) : "—",
-                          b.errorCode ?? "—",
-                          `${b.attemptNumber}${b.isRetry ? " (retry)" : ""}`,
-                        ])}
-                      />
-                    </BlockStack>
+                            {g.status}
+                          </Badge>
+                          <Text as="span" variant="bodySm">
+                            {`Cycle ${g.cycleIndex} · ${g.variantId}`}
+                          </Text>
+                        </InlineStack>
+                      ))}
+                    </>
                   ) : null}
                 </BlockStack>
               </Card>
 
-              {/* Cancellation sessions */}
+              {/* Refunds */}
               <Card>
                 <BlockStack gap="300">
                   <Text as="h2" variant="headingMd">
-                    Cancellation history
+                    Recent charges and refunds
                   </Text>
-                  {data.cancellationSessions.length === 0 ? (
+                  <Divider />
+                  {data.attempts.length === 0 ? (
                     <Text as="p" tone="subdued">
-                      This customer has never started a cancellation.
+                      No billing attempts yet.
                     </Text>
                   ) : (
-                    <DataTable
-                      columnContentTypes={["text", "text", "text", "text", "numeric"]}
-                      headings={["Started", "Reason", "Outcome", "Saved by", "Save cost"]}
-                      rows={data.cancellationSessions.map((s) => [
-                        fmtDateTime(s.startedAt),
-                        s.reason ? humanizeEnum(s.reason) : "—",
-                        <Badge
-                          key={s.id}
-                          tone={
-                            s.outcome === "SAVED"
-                              ? "success"
-                              : s.outcome === "CANCELLED"
-                                ? "critical"
-                                : s.outcome === "IN_PROGRESS"
-                                  ? "attention"
-                                  : undefined
-                          }
+                    data.attempts.map((a) => (
+                      <InlineStack key={a.id} align="space-between" blockAlign="center">
+                        <InlineStack gap="200" blockAlign="center">
+                          <Badge
+                            tone={
+                              a.status === "SUCCESS"
+                                ? "success"
+                                : a.status === "FAILED"
+                                  ? "critical"
+                                  : a.status === "PENDING"
+                                    ? "attention"
+                                    : "info"
+                            }
+                          >
+                            {a.status}
+                          </Badge>
+                          <Text as="span" variant="bodySm">
+                            {`Cycle ${a.cycleIndex} · attempt ${a.attemptNumber} · ${formatDate(a.scheduledFor)}`}
+                            {a.orderName ? ` · ${a.orderName}` : ""}
+                            {a.amount ? ` · ${a.amount}` : ""}
+                            {a.errorCode ? ` · ${a.errorCode}` : ""}
+                          </Text>
+                        </InlineStack>
+                        {a.status === "SUCCESS" && a.orderId ? (
+                          <Button
+                            size="slim"
+                            onClick={() => {
+                              setRefundAttemptId(a.id);
+                              setRefundAmount(
+                                a.amountCents != null
+                                  ? decimalStringFromCents(a.amountCents)
+                                  : "",
+                              );
+                            }}
+                          >
+                            Refund
+                          </Button>
+                        ) : null}
+                      </InlineStack>
+                    ))
+                  )}
+                </BlockStack>
+              </Card>
+
+              {/* Timeline */}
+              <Card>
+                <BlockStack gap="300">
+                  <InlineStack align="space-between" blockAlign="center">
+                    <Text as="h2" variant="headingMd">
+                      Timeline
+                    </Text>
+                    <Box minWidth="200px">
+                      <Select
+                        label="Category"
+                        labelHidden
+                        options={EVENT_CATEGORIES.map((cat) => ({
+                          label: cat === "all" ? "All events" : cat,
+                          value: cat,
+                        }))}
+                        value={timelineCategory}
+                        onChange={setTimelineCategory}
+                      />
+                    </Box>
+                  </InlineStack>
+                  <Divider />
+                  {filteredEvents.length === 0 ? (
+                    <Text as="p" tone="subdued">
+                      No events in this category.
+                    </Text>
+                  ) : (
+                    filteredEvents.map((e) => {
+                      const category = e.type.split(".")[0] ?? "other";
+                      return (
+                        <InlineStack
+                          key={e.id}
+                          gap="200"
+                          blockAlign="center"
+                          wrap={false}
                         >
-                          {humanizeEnum(s.outcome)}
-                        </Badge>,
-                        s.savedByOffer ? humanizeEnum(s.savedByOffer) : "—",
-                        s.saveCostCents !== null ? money(s.saveCostCents) : "—",
-                      ])}
-                    />
-                  )}
-                </BlockStack>
-              </Card>
-
-              {/* Change history (audit) */}
-              <Card>
-                <BlockStack gap="300">
-                  <Text as="h2" variant="headingMd">
-                    Change history
-                  </Text>
-                  {data.audit.length === 0 ? (
-                    <Text as="p" tone="subdued">
-                      No recorded changes yet.
-                    </Text>
-                  ) : (
-                    <BlockStack gap="300">
-                      {data.audit.map((a) => (
-                        <BlockStack key={a.id} gap="100">
-                          <InlineStack gap="200" blockAlign="center">
-                            <Text as="span" variant="bodyMd" fontWeight="semibold">
-                              {a.action}
+                          <Box minWidth="96px">
+                            <Badge tone={categoryTone(category)}>{category}</Badge>
+                          </Box>
+                          <Box width="100%">
+                            <Text as="span" variant="bodySm">
+                              {e.type}
+                              {e.actor ? ` · ${e.actor}` : ""}
+                              {` · ${e.source}`}
                             </Text>
-                            <Badge size="small">{humanizeEnum(a.actorType)}</Badge>
+                          </Box>
+                          <Box minWidth="80px">
                             <Text as="span" variant="bodySm" tone="subdued">
-                              {`${a.actorId ?? "system"} · ${fmtDateTime(a.createdAt)} · #${a.seq}`}
+                              {timeAgo(e.createdAt)}
                             </Text>
-                          </InlineStack>
-                          {a.payloadPreview !== "{}" ? (
-                            <Text as="p" variant="bodySm" tone="subdued">
-                              {a.payloadPreview}
-                            </Text>
-                          ) : null}
-                        </BlockStack>
-                      ))}
-                    </BlockStack>
-                  )}
-                </BlockStack>
-              </Card>
-
-              {/* Event feed */}
-              <Card>
-                <BlockStack gap="300">
-                  <Text as="h2" variant="headingMd">
-                    Event feed
-                  </Text>
-                  {data.events.length === 0 ? (
-                    <Text as="p" tone="subdued">
-                      No lifecycle events recorded for this plan yet.
-                    </Text>
-                  ) : (
-                    <BlockStack gap="300">
-                      {data.events.map((e) => (
-                        <BlockStack key={e.id} gap="100">
-                          <InlineStack gap="200" blockAlign="center">
-                            <Text as="span" variant="bodyMd" fontWeight="semibold">
-                              {humanizeEnum(e.name)}
-                            </Text>
-                            <Text as="span" variant="bodySm" tone="subdued">
-                              {fmtDateTime(e.occurredAt)}
-                            </Text>
-                          </InlineStack>
-                          {e.payloadPreview !== "{}" ? (
-                            <Text as="p" variant="bodySm" tone="subdued">
-                              {e.payloadPreview}
-                            </Text>
-                          ) : null}
-                        </BlockStack>
-                      ))}
-                    </BlockStack>
+                          </Box>
+                          <Popover
+                            active={activePayloadId === e.id}
+                            onClose={() => setActivePayloadId(null)}
+                            activator={
+                              <Button
+                                size="micro"
+                                variant="plain"
+                                onClick={() =>
+                                  setActivePayloadId(
+                                    activePayloadId === e.id ? null : e.id,
+                                  )
+                                }
+                              >
+                                Payload
+                              </Button>
+                            }
+                          >
+                            <Box padding="300" maxWidth="420px">
+                              <pre
+                                style={{
+                                  margin: 0,
+                                  fontSize: 11,
+                                  whiteSpace: "pre-wrap",
+                                  wordBreak: "break-word",
+                                }}
+                              >
+                                {e.payloadJson}
+                              </pre>
+                            </Box>
+                          </Popover>
+                        </InlineStack>
+                      );
+                    })
                   )}
                 </BlockStack>
               </Card>
@@ -1523,284 +1810,306 @@ export default function SubscriberConsole() {
 
           <Layout.Section variant="oneThird">
             <BlockStack gap="400">
-              {/* Console actions */}
+              {/* Payment */}
               <Card>
                 <BlockStack gap="300">
                   <Text as="h2" variant="headingMd">
-                    Console actions
+                    Payment
                   </Text>
-
-                  <Text as="h3" variant="bodySm" tone="subdued">
-                    SCHEDULE
+                  <Text as="p">
+                    {c.cardBrand || c.cardLast4
+                      ? `${c.cardBrand ?? "Card"}${c.cardLast4 ? ` ending ${c.cardLast4}` : ""}${c.cardExpiry ? ` · exp ${c.cardExpiry}` : ""}`
+                      : "No card details on the mirror."}
                   </Text>
-                  <BlockStack gap="200">
-                    <Button
-                      fullWidth
-                      textAlign="left"
-                      disabled={cancelled}
-                      onClick={() => openAction({ intent: "CHANGE_BILLING_DATE" })}
-                    >
-                      Set next billing date
-                    </Button>
-                    <Button
-                      fullWidth
-                      textAlign="left"
-                      disabled={cancelled}
-                      onClick={() => openAction({ intent: "SKIP_SHIPMENT" })}
-                    >
-                      Skip next delivery
-                    </Button>
-                    <Button
-                      fullWidth
-                      textAlign="left"
-                      disabled={cancelled}
-                      onClick={() => openAction({ intent: "DELAY_WEEKS" })}
-                    >
-                      Delay by weeks
-                    </Button>
-                    <Button
-                      fullWidth
-                      textAlign="left"
-                      disabled={cancelled}
-                      onClick={() => openAction({ intent: "BRING_FORWARD" })}
-                    >
-                      Bring delivery forward
-                    </Button>
-                  </BlockStack>
-
-                  <Text as="h3" variant="bodySm" tone="subdued">
-                    PLAN
-                  </Text>
-                  <BlockStack gap="200">
-                    <Button
-                      fullWidth
-                      textAlign="left"
-                      disabled={cancelled}
-                      onClick={() => openAction({ intent: "SWITCH_CADENCE" })}
-                    >
-                      Change cadence
-                    </Button>
-                    <Button
-                      fullWidth
-                      textAlign="left"
-                      disabled={cancelled || c.status === "PAUSED"}
-                      onClick={() => openAction({ intent: "PAUSE_UNTIL" })}
-                    >
-                      Pause plan
-                    </Button>
-                    <Button
-                      fullWidth
-                      textAlign="left"
-                      disabled={c.status !== "PAUSED"}
-                      onClick={() => openAction({ intent: "REACTIVATE" })}
-                    >
-                      Resume plan
-                    </Button>
-                    <Button
-                      fullWidth
-                      textAlign="left"
-                      disabled={cancelled || data.lines.length < 2}
-                      onClick={() => openAction({ intent: "SPLIT_SHIPMENT" })}
-                    >
-                      Split into a new plan
-                    </Button>
-                    <Button
-                      fullWidth
-                      textAlign="left"
-                      disabled={cancelled || data.otherContracts.length === 0}
-                      onClick={() => openAction({ intent: "MERGE_CONTRACTS" })}
-                    >
-                      Merge into another plan
-                    </Button>
-                  </BlockStack>
-
-                  <Text as="h3" variant="bodySm" tone="subdued">
-                    PAYMENT & DELIVERY
-                  </Text>
-                  <BlockStack gap="200">
-                    <Button
-                      fullWidth
-                      textAlign="left"
-                      disabled={cancelled}
-                      onClick={() => openAction({ intent: "UPDATE_PAYMENT_METHOD" })}
-                    >
-                      Send payment update email
-                    </Button>
-                    <Button
-                      fullWidth
-                      textAlign="left"
-                      disabled={cancelled}
-                      onClick={() => openAction({ intent: "APPLY_CREDIT" })}
-                    >
-                      Apply account credit
-                    </Button>
-                    <Button
-                      fullWidth
-                      textAlign="left"
-                      disabled={cancelled}
-                      onClick={() => openAction({ intent: "CHANGE_ADDRESS" })}
-                    >
-                      Update delivery address
-                    </Button>
-                  </BlockStack>
-
-                  <Divider />
                   <Button
-                    fullWidth
-                    tone="critical"
-                    disabled={cancelled}
-                    onClick={() => openAction({ intent: "CANCEL" })}
+                    loading={urlFetcher.state !== "idle"}
+                    onClick={() =>
+                      urlFetcher.submit({ intent: "openUpdateUrl" }, { method: "post" })
+                    }
                   >
-                    Cancel treatment plan
+                    Open secure card-update page
                   </Button>
-                </BlockStack>
-              </Card>
+                  {data.paymentMethods ? (
+                    <>
+                      <Divider />
+                      <Select
+                        label="Backup payment method"
+                        options={[
+                          { label: "None", value: "" },
+                          ...data.paymentMethods
+                            .filter((m) => !m.revoked)
+                            .map((m) => ({ label: m.label, value: m.id })),
+                        ]}
+                        value={backupMethod}
+                        onChange={setBackupMethod}
+                        helpText="Tried automatically when a renewal fails on the primary card."
+                      />
+                      <Button
+                        disabled={busy || backupMethod === (c.backupPaymentMethodId ?? "")}
+                        onClick={() =>
+                          submit("setBackup", { paymentMethodId: backupMethod })
+                        }
+                      >
+                        Save backup method
+                      </Button>
+                    </>
+                  ) : (
+                    <Text as="p" tone="subdued">
+                      Payment methods could not be loaded from Shopify.
+                    </Text>
+                  )}
 
-              {/* Scores */}
-              <Card>
-                <BlockStack gap="300">
-                  <Text as="h2" variant="headingMd">
-                    Scores
-                  </Text>
-
-                  <BlockStack gap="200">
-                    <InlineStack align="space-between" blockAlign="center">
-                      <Text as="p" variant="bodyMd">
-                        Treatment quality
-                      </Text>
-                      {c.qualityScore !== null || data.scores.quality ? (
-                        <Badge tone={qualityTone(data.scores.quality?.value ?? c.qualityScore)}>
-                          {String(
-                            scoreOutOf100(data.scores.quality?.value ?? c.qualityScore ?? 0),
-                          )}
-                        </Badge>
-                      ) : (
-                        <Badge>Not scored</Badge>
-                      )}
-                    </InlineStack>
-                    {data.scores.quality ? (
-                      <FactorList factors={data.scores.quality.factors} />
-                    ) : null}
-                  </BlockStack>
-
-                  <Divider />
-
-                  <BlockStack gap="200">
-                    <InlineStack align="space-between" blockAlign="center">
-                      <Text as="p" variant="bodyMd">
-                        Churn risk
-                      </Text>
-                      {c.churnRiskScore !== null || data.scores.churn ? (
-                        <Badge tone={churnBandTone(band)}>
-                          {`${humanizeEnum(band)} · ${scoreOutOf100(
-                            data.scores.churn?.value ?? c.churnRiskScore ?? 0,
-                          )}`}
-                        </Badge>
-                      ) : (
-                        <Badge>Not scored</Badge>
-                      )}
-                    </InlineStack>
-                    {data.scores.churn ? <FactorList factors={data.scores.churn.factors} /> : null}
-                  </BlockStack>
-
-                  <Divider />
-
-                  <BlockStack gap="200">
-                    <InlineStack align="space-between" blockAlign="center">
-                      <Text as="p" variant="bodyMd">
-                        Expected LTV
-                      </Text>
-                      <Text as="p" variant="bodyMd" fontWeight="semibold">
-                        {c.expectedLtvCents !== null ? money(c.expectedLtvCents) : "—"}
-                      </Text>
-                    </InlineStack>
-                    {data.scores.ltv ? <FactorList factors={data.scores.ltv.factors} /> : null}
-                  </BlockStack>
-                </BlockStack>
-              </Card>
-
-              {/* Customer & acquisition */}
-              <Card>
-                <BlockStack gap="300">
-                  <Text as="h2" variant="headingMd">
-                    Customer & acquisition
-                  </Text>
-                  <InfoItem label="Email" value={c.customerEmail ?? "—"} />
-                  <InfoItem
-                    label="Shopify customer"
-                    value={gidTailClient(c.shopifyCustomerId)}
-                  />
-                  <InfoItem
-                    label="Origin order"
-                    value={c.originOrderId ? gidTailClient(c.originOrderId) : "—"}
-                  />
-                  <InlineGrid columns={2} gap="300">
-                    <InfoItem
-                      label="First order AOV"
-                      value={c.firstOrderAovCents !== null ? money(c.firstOrderAovCents) : "—"}
-                    />
-                    <InfoItem
-                      label="Initial discount"
-                      value={
-                        c.initialDiscountPercent !== null
-                          ? `${c.initialDiscountPercent}%`
-                          : "—"
-                      }
-                    />
-                  </InlineGrid>
-                  <InfoItem label="Widget version" value={c.widgetVersion ?? "—"} />
-                  {c.acquisitionEntries.length > 0 ? (
-                    <BlockStack gap="100">
-                      <Text as="p" variant="bodySm" tone="subdued">
-                        Attribution
-                      </Text>
-                      {c.acquisitionEntries.map(([k, v]) => (
-                        <InlineStack key={k} align="space-between">
-                          <Text as="span" variant="bodySm" tone="subdued">
-                            {k}
-                          </Text>
+                  {data.dunningCase ? (
+                    <>
+                      <Divider />
+                      <BlockStack gap="200">
+                        <InlineStack gap="200" blockAlign="center">
+                          <Badge tone="warning">{data.dunningCase.state}</Badge>
                           <Text as="span" variant="bodySm">
-                            {truncate(v, 40)}
+                            {`Ladder step ${data.dunningCase.ladderStep} · ${data.dunningCase.emailsSent} emails · ${data.dunningCase.smsSent} SMS`}
                           </Text>
                         </InlineStack>
-                      ))}
-                    </BlockStack>
+                        <Text as="p" variant="bodySm">
+                          {data.dunningCase.declineHuman}
+                        </Text>
+                        <Text as="p" variant="bodySm" tone="subdued">
+                          {`Opened ${timeAgo(data.dunningCase.openedAt)}${data.dunningCase.nextRetryAt ? ` · next retry ${formatDate(data.dunningCase.nextRetryAt)}` : ""}`}
+                        </Text>
+                        <ButtonGroup>
+                          <Button
+                            size="slim"
+                            disabled={busy}
+                            onClick={() =>
+                              submit("dunningRetryNow", {
+                                caseId: data.dunningCase!.id,
+                              })
+                            }
+                          >
+                            Retry now
+                          </Button>
+                          <Button
+                            size="slim"
+                            disabled={busy}
+                            onClick={() =>
+                              submit("dunningResolve", {
+                                caseId: data.dunningCase!.id,
+                              })
+                            }
+                          >
+                            Mark resolved
+                          </Button>
+                          <Button
+                            size="slim"
+                            tone="critical"
+                            disabled={busy}
+                            onClick={() => setDunningCancelOpen(true)}
+                          >
+                            Move to cancelled
+                          </Button>
+                        </ButtonGroup>
+                      </BlockStack>
+                    </>
                   ) : null}
                 </BlockStack>
               </Card>
 
-              {/* Milestones */}
+              {/* Acquisition (data foundation — docs/DATA_FOUNDATION.md) */}
               <Card>
                 <BlockStack gap="300">
                   <Text as="h2" variant="headingMd">
-                    Milestones
+                    Acquisition
                   </Text>
-                  {data.milestones.length === 0 ? (
+                  {!data.acquisition.captured &&
+                  data.acquisition.timeToPurchaseSeconds == null ? (
                     <Text as="p" tone="subdued">
-                      No milestones reached yet.
+                      No acquisition data captured for this subscription. It is
+                      collected automatically from the first (checkout) order
+                      of new subscriptions; older and imported contracts have
+                      none to collect.
                     </Text>
                   ) : (
-                    <BlockStack gap="200">
-                      {data.milestones.map((m) => (
-                        <InlineStack key={m.id} align="space-between" blockAlign="center">
-                          <Text as="span" variant="bodyMd">
-                            {humanizeEnum(m.type)}
-                          </Text>
-                          <InlineStack gap="200" blockAlign="center">
-                            <Badge
-                              tone={m.rewardStatus === "PENDING" ? "attention" : "success"}
-                              size="small"
-                            >
-                              {humanizeEnum(m.rewardStatus)}
-                            </Badge>
-                            <Text as="span" variant="bodySm" tone="subdued">
-                              {fmtDate(m.achievedAt)}
-                            </Text>
-                          </InlineStack>
-                        </InlineStack>
-                      ))}
+                    <BlockStack gap="150">
+                      {data.acquisition.originOrderName ||
+                      data.acquisition.originOrderTotal ? (
+                        <Text as="p" variant="bodySm">
+                          <Text as="span" fontWeight="semibold">
+                            First order:
+                          </Text>{" "}
+                          {[
+                            data.acquisition.originOrderName,
+                            data.acquisition.originOrderTotal,
+                          ]
+                            .filter(Boolean)
+                            .join(" · ")}
+                        </Text>
+                      ) : null}
+                      {data.acquisition.sourceName ? (
+                        <Text as="p" variant="bodySm">
+                          <Text as="span" fontWeight="semibold">
+                            Source:
+                          </Text>{" "}
+                          {data.acquisition.sourceName}
+                        </Text>
+                      ) : null}
+                      {data.acquisition.utm ? (
+                        <Text as="p" variant="bodySm">
+                          <Text as="span" fontWeight="semibold">
+                            UTM:
+                          </Text>{" "}
+                          {[
+                            data.acquisition.utm.source,
+                            data.acquisition.utm.medium,
+                            data.acquisition.utm.campaign,
+                          ]
+                            .filter(Boolean)
+                            .join(" / ") || "—"}
+                        </Text>
+                      ) : null}
+                      {data.acquisition.countryCode || data.acquisition.city ? (
+                        <Text as="p" variant="bodySm">
+                          <Text as="span" fontWeight="semibold">
+                            Location:
+                          </Text>{" "}
+                          {[
+                            data.acquisition.city,
+                            data.acquisition.provinceCode,
+                            data.acquisition.countryCode,
+                          ]
+                            .filter(Boolean)
+                            .join(", ")}
+                        </Text>
+                      ) : null}
+                      {data.acquisition.deviceType ? (
+                        <Text as="p" variant="bodySm">
+                          <Text as="span" fontWeight="semibold">
+                            Device:
+                          </Text>{" "}
+                          {data.acquisition.deviceType}
+                        </Text>
+                      ) : null}
+                      {data.acquisition.timeToPurchaseSeconds != null ? (
+                        <Text as="p" variant="bodySm">
+                          <Text as="span" fontWeight="semibold">
+                            Account to first order:
+                          </Text>{" "}
+                          {humanizeSeconds(
+                            data.acquisition.timeToPurchaseSeconds,
+                          )}
+                        </Text>
+                      ) : null}
+                      {data.acquisition.unitsFirstOrder != null ? (
+                        <Text as="p" variant="bodySm">
+                          <Text as="span" fontWeight="semibold">
+                            Units in first order:
+                          </Text>{" "}
+                          {data.acquisition.unitsFirstOrder}
+                        </Text>
+                      ) : null}
+                      {data.acquisition.landingSite ? (
+                        <Text as="p" variant="bodySm" tone="subdued" breakWord>
+                          Landed on {data.acquisition.landingSite}
+                          {data.acquisition.referringSite
+                            ? ` (from ${data.acquisition.referringSite})`
+                            : ""}
+                        </Text>
+                      ) : null}
                     </BlockStack>
                   )}
+                </BlockStack>
+              </Card>
+
+              {/* Address */}
+              <Card>
+                <BlockStack gap="300">
+                  <Text as="h2" variant="headingMd">
+                    Delivery address
+                  </Text>
+                  <InlineStack gap="200">
+                    <Box width="48%">
+                      <TextField
+                        label="First name"
+                        value={address.firstName}
+                        onChange={(v) => setAddress({ ...address, firstName: v })}
+                        autoComplete="off"
+                      />
+                    </Box>
+                    <Box width="48%">
+                      <TextField
+                        label="Last name"
+                        value={address.lastName}
+                        onChange={(v) => setAddress({ ...address, lastName: v })}
+                        autoComplete="off"
+                      />
+                    </Box>
+                  </InlineStack>
+                  <TextField
+                    label="Company"
+                    value={address.company}
+                    onChange={(v) => setAddress({ ...address, company: v })}
+                    autoComplete="off"
+                  />
+                  <TextField
+                    label="Address line 1"
+                    value={address.address1}
+                    onChange={(v) => setAddress({ ...address, address1: v })}
+                    autoComplete="off"
+                  />
+                  <TextField
+                    label="Address line 2"
+                    value={address.address2}
+                    onChange={(v) => setAddress({ ...address, address2: v })}
+                    autoComplete="off"
+                  />
+                  <InlineStack gap="200">
+                    <Box width="48%">
+                      <TextField
+                        label="City"
+                        value={address.city}
+                        onChange={(v) => setAddress({ ...address, city: v })}
+                        autoComplete="off"
+                      />
+                    </Box>
+                    <Box width="48%">
+                      <TextField
+                        label="Postcode"
+                        value={address.zip}
+                        onChange={(v) => setAddress({ ...address, zip: v })}
+                        autoComplete="off"
+                      />
+                    </Box>
+                  </InlineStack>
+                  <InlineStack gap="200">
+                    <Box width="48%">
+                      <TextField
+                        label="Province code"
+                        value={address.provinceCode}
+                        onChange={(v) => setAddress({ ...address, provinceCode: v })}
+                        autoComplete="off"
+                      />
+                    </Box>
+                    <Box width="48%">
+                      <TextField
+                        label="Country code"
+                        value={address.countryCode}
+                        onChange={(v) => setAddress({ ...address, countryCode: v })}
+                        autoComplete="off"
+                        placeholder="GB"
+                      />
+                    </Box>
+                  </InlineStack>
+                  <TextField
+                    label="Phone"
+                    value={address.phone}
+                    onChange={(v) => setAddress({ ...address, phone: v })}
+                    autoComplete="off"
+                  />
+                  <Button
+                    variant="primary"
+                    loading={busy && fetcher.formData?.get("intent") === "updateAddress"}
+                    onClick={() => submit("updateAddress", address)}
+                  >
+                    Save address
+                  </Button>
                 </BlockStack>
               </Card>
             </BlockStack>
@@ -1808,30 +2117,350 @@ export default function SubscriberConsole() {
         </Layout>
       </BlockStack>
 
-      {active ? (
-        <ActionModal
-          title={
-            active.lineTitle
-              ? `${MODAL_TITLES[active.intent]} — ${active.lineTitle}`
-              : MODAL_TITLES[active.intent]
-          }
-          intent={active.intent}
-          formToken={data.formToken}
-          destructive={DESTRUCTIVE_INTENTS.includes(active.intent)}
-          submitLabel={SUBMIT_LABELS[active.intent]}
-          error={modalError}
-          loading={submitting}
-          onClose={() => setActive(null)}
-        >
-          <ActionFields active={active} data={data} />
-        </ActionModal>
-      ) : null}
+      {/* ── Modals ─────────────────────────────────────────────────────────── */}
+
+      <Modal
+        open={pauseOpen}
+        onClose={() => setPauseOpen(false)}
+        title="Pause subscription"
+        primaryAction={{
+          content: "Pause",
+          loading: busy,
+          onAction: () => {
+            submit("pause", { months: pauseMonths });
+            setPauseOpen(false);
+          },
+        }}
+        secondaryActions={[{ content: "Cancel", onAction: () => setPauseOpen(false) }]}
+      >
+        <Modal.Section>
+          <Select
+            label="Pause for"
+            options={Array.from({ length: data.pauseMaxMonths }, (_, i) => ({
+              label: `${i + 1} month${i > 0 ? "s" : ""}`,
+              value: String(i + 1),
+            }))}
+            value={pauseMonths}
+            onChange={setPauseMonths}
+          />
+        </Modal.Section>
+      </Modal>
+
+      <Modal
+        open={cancelOpen}
+        onClose={() => setCancelOpen(false)}
+        title="Cancel subscription"
+        primaryAction={{
+          content: "Cancel subscription",
+          destructive: true,
+          loading: busy,
+          onAction: () => {
+            submit("cancel", { reason: cancelReason });
+            setCancelOpen(false);
+          },
+        }}
+        secondaryActions={[{ content: "Keep subscription", onAction: () => setCancelOpen(false) }]}
+      >
+        <Modal.Section>
+          <BlockStack gap="300">
+            <Text as="p">
+              This cancels the Shopify contract immediately. Win-back messaging
+              will be scheduled automatically.
+            </Text>
+            <Select
+              label="Cancellation reason"
+              options={CANCEL_REASONS.map((r) => ({ label: r, value: r }))}
+              value={cancelReason}
+              onChange={setCancelReason}
+            />
+          </BlockStack>
+        </Modal.Section>
+      </Modal>
+
+      <Modal
+        open={chargeOpen}
+        onClose={() => setChargeOpen(false)}
+        title="Charge now"
+        primaryAction={{
+          content: "Charge the card now",
+          destructive: true,
+          loading: busy,
+          onAction: () => {
+            submit("chargeNow");
+            setChargeOpen(false);
+          },
+        }}
+        secondaryActions={[{ content: "Cancel", onAction: () => setChargeOpen(false) }]}
+      >
+        <Modal.Section>
+          <Text as="p">
+            This immediately bills the current cycle against the card on file
+            (idempotent — a duplicate click can never double charge). The
+            outcome arrives via webhook and shows in the timeline.
+          </Text>
+        </Modal.Section>
+      </Modal>
+
+      <Modal
+        open={dunningCancelOpen}
+        onClose={() => setDunningCancelOpen(false)}
+        title="Cancel dunning case"
+        primaryAction={{
+          content: "Move case to cancelled",
+          destructive: true,
+          loading: busy,
+          onAction: () => {
+            if (data.dunningCase) {
+              submit("dunningCancelCase", { caseId: data.dunningCase.id });
+            }
+            setDunningCancelOpen(false);
+          },
+        }}
+        secondaryActions={[{ content: "Keep case open", onAction: () => setDunningCancelOpen(false) }]}
+      >
+        <Modal.Section>
+          <Text as="p">
+            Stops all further automatic retries and reminders for this failed
+            payment. The contract itself is not cancelled.
+          </Text>
+        </Modal.Section>
+      </Modal>
+
+      <Modal
+        open={linkOpen}
+        onClose={() => setLinkOpen(false)}
+        title="Portal login link"
+        secondaryActions={[{ content: "Close", onAction: () => setLinkOpen(false) }]}
+      >
+        <Modal.Section>
+          <BlockStack gap="300">
+            {linkFetcher.state !== "idle" ? (
+              <Text as="p" tone="subdued">
+                Generating link…
+              </Text>
+            ) : linkFetcher.data?.loginUrl ? (
+              <>
+                <TextField
+                  label="One-tap login link"
+                  value={linkFetcher.data.loginUrl}
+                  readOnly
+                  autoComplete="off"
+                  multiline={2}
+                />
+                <InlineStack gap="200">
+                  <Button
+                    onClick={() => {
+                      void navigator.clipboard.writeText(
+                        linkFetcher.data?.loginUrl ?? "",
+                      );
+                      setCopied(true);
+                    }}
+                  >
+                    {copied ? "Copied" : "Copy link"}
+                  </Button>
+                </InlineStack>
+                <Text as="p" tone="subdued" variant="bodySm">
+                  Signs the customer straight into their portal — share it only
+                  with the account owner.
+                </Text>
+              </>
+            ) : (
+              <Text as="p" tone="critical">
+                {linkFetcher.data?.error ?? "Link could not be generated."}
+              </Text>
+            )}
+          </BlockStack>
+        </Modal.Section>
+      </Modal>
+
+      <Modal
+        open={grantOpen}
+        onClose={() => setGrantOpen(false)}
+        title="Grant discount"
+        primaryAction={{
+          content: "Grant",
+          loading: busy,
+          onAction: () => {
+            submit("grantDiscount", {
+              percent: grantPercent,
+              cycles: grantCycles,
+              reason: grantReason,
+            });
+            setGrantOpen(false);
+          },
+        }}
+        secondaryActions={[{ content: "Cancel", onAction: () => setGrantOpen(false) }]}
+      >
+        <Modal.Section>
+          <BlockStack gap="300">
+            <TextField
+              label="Percent"
+              type="number"
+              value={grantPercent}
+              onChange={setGrantPercent}
+              suffix="%"
+              min={1}
+              max={90}
+              autoComplete="off"
+            />
+            <TextField
+              label="Cycles"
+              type="number"
+              value={grantCycles}
+              onChange={setGrantCycles}
+              min={1}
+              max={12}
+              autoComplete="off"
+            />
+            <TextField
+              label="Reason (internal)"
+              value={grantReason}
+              onChange={setGrantReason}
+              autoComplete="off"
+            />
+          </BlockStack>
+        </Modal.Section>
+      </Modal>
+
+      <Modal
+        open={refundAttempt != null}
+        onClose={() => setRefundAttemptId(null)}
+        title={`Refund ${refundAttempt?.orderName ?? "order"}`}
+        primaryAction={{
+          content: "Refund",
+          destructive: true,
+          loading: busy,
+          onAction: () => {
+            if (refundAttempt) {
+              submit("refund", {
+                attemptId: refundAttempt.id,
+                amount: refundAmount,
+              });
+            }
+            setRefundAttemptId(null);
+          },
+        }}
+        secondaryActions={[{ content: "Cancel", onAction: () => setRefundAttemptId(null) }]}
+      >
+        <Modal.Section>
+          <BlockStack gap="300">
+            <Text as="p">
+              Refunds against the original payment transaction(s). Charged
+              amount: {refundAttempt?.amount ?? "unknown"}.
+            </Text>
+            <TextField
+              label={`Amount (${c.currencyCode})`}
+              type="number"
+              value={refundAmount}
+              onChange={setRefundAmount}
+              autoComplete="off"
+            />
+          </BlockStack>
+        </Modal.Section>
+      </Modal>
+
+      <Modal
+        open={pickerOpen}
+        onClose={() => setPickerOpen(false)}
+        title={
+          pickerMode === "swap"
+            ? "Swap to a different product"
+            : pickerMode === "addon"
+              ? "Add a one-time add-on to the next order"
+              : pickerMode === "gift"
+                ? "Add a manual gift"
+                : "Add a product"
+        }
+        secondaryActions={[{ content: "Close", onAction: () => setPickerOpen(false) }]}
+      >
+        <Modal.Section>
+          <BlockStack gap="300">
+            {pickerMode === "gift" ? (
+              <TextField
+                label="Ship with billing cycle"
+                type="number"
+                value={giftCycle}
+                onChange={setGiftCycle}
+                autoComplete="off"
+                helpText={`Next cycle is approximately ${c.ordersCount + 1}.`}
+              />
+            ) : null}
+            <InlineStack gap="200" blockAlign="end">
+              <Box width="70%">
+                <TextField
+                  label="Search products"
+                  value={pickerQuery}
+                  onChange={setPickerQuery}
+                  autoComplete="off"
+                  placeholder="Search by title"
+                />
+              </Box>
+              <Button
+                loading={searchFetcher.state !== "idle"}
+                onClick={() =>
+                  searchFetcher.submit(
+                    { intent: "searchProducts", q: pickerQuery },
+                    { method: "post" },
+                  )
+                }
+              >
+                Search
+              </Button>
+            </InlineStack>
+            {(searchFetcher.data?.results ?? []).map((product) => (
+              <Box key={product.id} paddingBlockStart="200">
+                <BlockStack gap="200">
+                  <InlineStack gap="200" blockAlign="center">
+                    <Thumbnail
+                      source={product.imageUrl ?? ""}
+                      alt={product.title}
+                      size="small"
+                    />
+                    <BlockStack gap="050">
+                      <Text as="span" fontWeight="semibold">
+                        {product.title}
+                      </Text>
+                      {product.ongoingPct != null && pickerMode !== "gift" ? (
+                        <Text as="span" variant="bodySm" tone="subdued">
+                          {`Ongoing subscription discount: ${product.ongoingPct}%`}
+                        </Text>
+                      ) : null}
+                    </BlockStack>
+                  </InlineStack>
+                  {product.variants.map((v) => (
+                    <InlineStack key={v.id} align="space-between" blockAlign="center">
+                      <Text as="span" variant="bodySm">
+                        {v.title || "Default"}
+                        {v.sku ? ` · ${v.sku}` : ""}
+                        {" · "}
+                        {pickerMode === "gift"
+                          ? "free gift"
+                          : v.discounted
+                            ? `${v.discounted} (was ${v.price})`
+                            : v.price}
+                        {!v.available ? " · out of stock" : ""}
+                      </Text>
+                      <Button
+                        size="slim"
+                        disabled={busy}
+                        onClick={() => pickVariant(v.id)}
+                      >
+                        Select
+                      </Button>
+                    </InlineStack>
+                  ))}
+                  <Divider />
+                </BlockStack>
+              </Box>
+            ))}
+            {searchFetcher.data && (searchFetcher.data.results ?? []).length === 0 ? (
+              <Text as="p" tone="subdued">
+                No products found.
+              </Text>
+            ) : null}
+          </BlockStack>
+        </Modal.Section>
+      </Modal>
     </Page>
   );
-}
-
-/** Client-safe GID tail (mirror of core's gidTail, kept local to the view). */
-function gidTailClient(gid: string): string {
-  const idx = gid.lastIndexOf("/");
-  return idx === -1 ? gid : gid.slice(idx + 1);
 }

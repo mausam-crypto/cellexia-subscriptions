@@ -1,10 +1,16 @@
 import { PassThrough } from "stream";
 import { renderToPipeableStream } from "react-dom/server";
 import { RemixServer } from "@remix-run/react";
-import { createReadableStreamFromReadable } from "@remix-run/node";
-import type { EntryContext } from "@remix-run/node";
+import {
+  createReadableStreamFromReadable,
+  type EntryContext,
+} from "@remix-run/node";
 import { isbot } from "isbot";
 import { addDocumentResponseHeaders } from "./shopify.server";
+import { startInternalScheduler } from "./lib/jobs/bootstrap.server";
+
+// Kick off the internal job scheduler (no-op when SCHEDULER_MODE=external).
+startInternalScheduler();
 
 export const streamTimeout = 5000;
 

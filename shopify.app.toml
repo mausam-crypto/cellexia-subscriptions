@@ -1,26 +1,41 @@
-# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+# Cellexia Subscriptions — Shopify app configuration
+#
+# IMPORTANT (developer): after creating the app in the Partner Dashboard, run
+#   npm run config:link
+# to link this file to your app, which fills in client_id. Then `npm run deploy`.
+#
+# See docs/INSTALL.md for the full installation runbook, including how to
+# request access to the protected Subscriptions APIs and protected customer data.
 
+client_id = "REPLACE_WITH_YOUR_CLIENT_ID"
 name = "Cellexia Subscriptions"
-handle = "cellexia-continuous-treatment"
-client_id = "82fdbdf7947dce298a06cb43afb6a678"
-application_url = "https://cellexia-subscriptions.onrender.com"
+handle = "cellexia-subscriptions"
+application_url = "https://REPLACE_WITH_YOUR_APP_HOST"
 embedded = true
 
 [build]
 automatically_update_urls_on_dev = true
+include_config_on_deploy = true
 
 [access_scopes]
-scopes = "read_customers,write_customers,read_orders,read_products,write_products,read_purchase_options,write_purchase_options,read_own_subscription_contracts,write_own_subscription_contracts,read_customer_payment_methods"
+# Subscriptions require protected API access — request in Partner Dashboard:
+# App setup → API access → "Access Subscriptions APIs" + "Protected customer data access".
+# write_orders: required by refundCreate (admin cycle refunds in the subscriber
+# cockpit) and orderCancel. write_order_edits: required by the order-edit
+# mutations (orderEditBegin/AddVariant/AddLineItemDiscount/Commit) that attach
+# the first-order gift to the origin order — without it every gift silently
+# defers to cycle 1. Keep in sync with SCOPES in .env / docs/INSTALL.md.
+scopes = "read_customers,write_customers,read_orders,write_orders,write_order_edits,read_products,write_products,read_purchase_options,write_purchase_options,read_own_subscription_contracts,write_own_subscription_contracts,read_customer_payment_methods,write_customer_payment_methods,read_locales,read_markets,read_inventory,read_fulfillments,read_discounts"
 
 [auth]
 redirect_urls = [
-  "https://cellexia-subscriptions.onrender.com/auth/callback",
-  "https://cellexia-subscriptions.onrender.com/auth/shopify/callback",
-  "https://cellexia-subscriptions.onrender.com/api/auth/callback"
+  "https://REPLACE_WITH_YOUR_APP_HOST/auth/callback",
+  "https://REPLACE_WITH_YOUR_APP_HOST/auth/shopify/callback",
+  "https://REPLACE_WITH_YOUR_APP_HOST/api/auth/callback"
 ]
 
 [webhooks]
-api_version = "2025-10"
+api_version = "2025-01"
 
   [[webhooks.subscriptions]]
   topics = [
@@ -31,14 +46,23 @@ api_version = "2025-10"
     "subscription_billing_attempts/success",
     "subscription_billing_attempts/failure",
     "subscription_billing_attempts/challenged",
+    "subscription_billing_cycle_edits/create",
+    "subscription_billing_cycle_edits/update",
+    "subscription_billing_cycle_edits/delete",
     "customer_payment_methods/create",
     "customer_payment_methods/update",
     "customer_payment_methods/revoke",
     "orders/create",
-    "products/update"
+    "orders/fulfilled",
+    "refunds/create"
   ]
   uri = "/webhooks"
 
+  # Mandatory GDPR/privacy webhooks. These are NOT regular webhook topics:
+  # Shopify CLI 3.x requires them under `compliance_topics` (declaring them in
+  # `topics` fails `shopify app deploy` config validation). Handlers are the
+  # CUSTOMERS_DATA_REQUEST / CUSTOMERS_REDACT / SHOP_REDACT entries in
+  # app/lib/webhooks/handlers.server.ts — unchanged.
   [[webhooks.subscriptions]]
   compliance_topics = [
     "customers/data_request",
@@ -47,15 +71,12 @@ api_version = "2025-10"
   ]
   uri = "/webhooks"
 
-# Storefront widgets and the customer portal talk to the app through the app proxy:
-#   https://<shop-domain>/apps/cellexia-subscriptions/...  ->  <application_url>/proxy/...
-# NOTE: "cellexia" alone is already owned by the AOV & LTV Booster app's proxy
-# on this store — reusing it here would collide with that app's /apps/cellexia/*
-# traffic. Keep this subpath unique across every app installed on the store.
 [app_proxy]
-url = "https://cellexia-subscriptions.onrender.com/proxy"
+# The customer portal is served on the shop's own domain at:
+#   https://<your-store-domain>/apps/cellexia/...
+url = "https://REPLACE_WITH_YOUR_APP_HOST/proxy"
+subpath = "cellexia"
 prefix = "apps"
-subpath = "cellexia-subscriptions"
 
 [pos]
 embedded = false

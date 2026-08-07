@@ -1,0 +1,37 @@
+-- Terminal marker for the origin-order MONEY backfill (stability pass).
+--
+-- ADDITIVE ONLY: one nullable ADD COLUMN. No DROP, no RENAME, no type change,
+-- no pre-existing data touched.
+--
+-- Why:
+--
+-- The daily origin_order_backfill's MONEY pass selects the OLDEST
+-- ORIGIN_BACKFILL_CAP (200) OURS non-demo contracts with an originOrderId and
+-- originOrderTotalCents still null, and fetches each origin order via
+-- getOrderSummary. Migration 0010 gave the ACQUISITION pass a terminal marker
+-- (acqPickupExhaustedAt) on the premise that "the money pass drains because
+-- getOrderSummary succeeds" — but that premise is false for whole classes of
+-- orders: without the read_all_orders scope (absent from shopify.app.toml;
+-- it needs Shopify approval) the Admin API returns `order: null` for EVERY
+-- order older than 60 days, and it returns null forever for deleted and
+-- GDPR-erased orders. Those rows failed every night, never left the window,
+-- and once >= 200 existed they permanently occupied the entire capped
+-- oldest-first window — starving the exact rows the job exists for (a new
+-- contract whose capture-at-sync fetch transiently failed, an UNKNOWN
+-- contract reclassified OURS while its order was still fetchable).
+--
+-- "originCaptureExhaustedAt" is the money pass's terminal marker: the
+-- backfill stamps it when getOrderSummary reports the order does not exist /
+-- is not accessible (OrderNotFoundError — a conclusive API answer, never a
+-- transport error) for a contract mirrored longer ago than
+-- ORIGIN_CAPTURE_GRACE_MS (sync.server.ts), and the pending query excludes
+-- stamped rows — so every scanned row either captures or (eventually) leaves
+-- the window and the queue drains at up to 200 rows per run. The
+-- capture-at-sync path deliberately ignores the marker: a later successful
+-- fetch (order becomes accessible after read_all_orders approval, webhook
+-- redelivery, manual re-sync) still lands the money through its atomic
+-- originOrderTotalCents-null claim, making a premature stamp self-healing.
+--
+-- Nullable, no backfill: every existing row is legitimately "not yet proven
+-- unfetchable" — the next backfill runs prove (and stamp) the dead ones.
+ALTER TABLE "SubscriptionContract" ADD COLUMN "originCaptureExhaustedAt" TIMESTAMP(3);
