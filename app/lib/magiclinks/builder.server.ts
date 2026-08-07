@@ -3,6 +3,7 @@ import {
   createMagicToken,
   type CreateMagicLinkInput,
 } from "~/lib/crypto/tokens.server";
+import { PORTAL_PROXY_BASE } from "~/lib/portal/proxy-path";
 
 /**
  * Magic link URL builders. Every URL is a signed, expiring, single-action token.
@@ -32,7 +33,7 @@ export async function buildPortalUrl(
   const host = shop?.primaryDomain ?? shop?.domain;
   if (!host) throw new Error("No shop domain available for portal URL");
   const clean = path.startsWith("/") ? path : `/${path}`;
-  return `https://${host}/apps/cellexia-subscriptions${clean}`;
+  return `https://${host}${PORTAL_PROXY_BASE}${clean}`;
 }
 
 const DEFAULT_TTL_DAYS = 14;

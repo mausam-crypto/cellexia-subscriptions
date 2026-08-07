@@ -1,0 +1,47 @@
+{%- comment -%} cx-preset-value_stack — benefit-rich subscription panel with one-time demoted to a text link. Direct-render partial dispatched by cx-buybox-core: prints ONLY values the core precomputed and passed as render args, computes nothing, renders nothing further. Rules, args, string-space contract, history: README "Core snippet internals". {%- endcomment -%}
+<div class="cx-buybox__group cx-buybox__group--stack" role="radiogroup" aria-labelledby="cx-buybox-label-{{ uid }}">
+<div
+class="cx-buybox__option cx-buybox__option--sub cx-buybox__stack-panel{% if cx_sub_checked %} is-selected{% endif %}"
+data-cellexia-option-wrap="subscription"
+>
+{%- if cx_show_badge and cx_badge != blank -%}
+<span class="cx-buybox__badge">{{ cx_badge }}</span>
+{%- endif -%}
+<label class="cx-buybox__card">
+<input
+type="radio"
+class="cx-buybox__radio cx-buybox__sr-input"
+name="cx-purchase-{{ uid }}"
+value="subscription"
+data-cellexia-option="subscription"
+{% if cx_sub_checked %}checked aria-checked="true"{% else %}aria-checked="false"{% endif %}
+>
+<span class="cx-buybox__card-body cx-buybox__card-body--stack">
+<span class="cx-buybox__card-main">
+<span class="cx-buybox__title-row">
+<span class="cx-buybox__title"{% if cx_sub_label_raw contains '{' %} data-cellexia-tpl="{{ cx_sub_label_raw | escape }}"{% endif %}>{{ cx_sub_label }}</span>
+{%- if cx_show_savings -%}
+<span class="cx-buybox__save" data-cellexia-save{% if cx_save_tpl_raw != blank %} data-cellexia-tpl="{{ cx_save_tpl_raw | escape }}"{% endif %} {% if cx_save == blank %}hidden{% endif %}>{{ cx_save }}</span>
+{%- endif -%}
+</span>
+{{ cx_price_block }}
+</span>
+</span>
+</label>
+{{ cx_benefits_html }}
+{{ cx_freq_control }}
+</div>
+{%- unless product.requires_selling_plan -%}
+<label class="cx-buybox__stack-onetime{% unless cx_sub_checked %} is-selected{% endunless %}" data-cellexia-option-wrap="one_time">
+<input
+type="radio"
+class="cx-buybox__radio cx-buybox__sr-input"
+name="cx-purchase-{{ uid }}"
+value="one_time"
+data-cellexia-option="one_time"
+{% unless cx_sub_checked %}checked aria-checked="true"{% else %}aria-checked="false"{% endunless %}
+>
+<span class="cx-buybox__stack-onetime-link"{% if cx_onetime_link_raw contains '{' %} data-cellexia-tpl="{{ cx_onetime_link_raw | escape }}"{% endif %}>{{ cx_onetime_link }}</span>
+</label>
+{%- endunless -%}
+</div>

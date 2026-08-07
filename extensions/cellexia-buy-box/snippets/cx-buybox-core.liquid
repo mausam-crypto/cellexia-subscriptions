@@ -1,1632 +1,1082 @@
-{%- comment -%}
-  cx-buybox-core — the ENTIRE buy-box widget (config resolution, including
-  the per-market preset lookup + all seven design presets + JSON island +
-  noscript fallback), shared verbatim by:
-
-    blocks/buy-box.liquid        the product-page app block (target: section)
-    blocks/buy-box-embed.liquid  the app embed (target: body) for themes whose
-                                 product section cannot take app blocks
-
-  Both wrappers are thin: they pass their settings (or, for the embed, the
-  section block's defaults) into this snippet, which renders the identical
-  widget markup either way.
-
-  NOTE FOR EDITORS: this comment deliberately contains NO Liquid tag or
-  output delimiters — a half-written tag inside a comment can break the whole
-  storefront page. Write tag names in prose (render / capture / assign), never
-  as real tags.
-
-  FULL RULES AND RATIONALE ARE IN README.md — read "Theme app extension
-  Liquid rules" and "Running alongside another subscription app" there
-  before editing this file. The two safety-critical rules, in short:
-
-  RULE 1 — never capture (or stringify) the output of a render. Shopify
-  wraps every extension-snippet render in HTML comments
-  ("<!-- BEGIN/END app snippet -->"), invisible in markup position but
-  printed as visible text once captured into a variable and escaped. So: a
-  snippet may ONLY emit final markup, never act as a function — this file
-  has ZERO render tags, every helper inlined. The two block files' single
-  `render 'cx-buybox-core'` each is the only render in this extension.
-
-  RULE 2 — `t` returns ALREADY-ESCAPED HTML; never escape it again
-  ("Subscribe &amp; Save" double-escaped becomes the literal "&amp;amp;").
-  Full RAW/SAFE contract: README.md (RAW = unescaped, "_raw" suffix, feeds
-  data-cellexia-* attrs + the JSON island; SAFE = HTML-escaped, printed
-  as-is; money counts as SAFE, never escaped — money_format may
-  legitimately contain entities).
-
-  Params: render_context ('section'|'embed'), product, uid (block.id — input
-  names/aria/scoped custom-css selector), section_id ('section' context
-  only; omitted in the embed so buy-box.js falls back to a document-wide
-  product-form lookup), shopify_attributes (theme editor),
-  design_source ('app' or a forced preset key), heading (''=hidden),
-  show_badge, badge_text (''=translated default), preselect_subscription,
-  show_frequency_selector (config layout.showFrequency wins either way when
-  published), recommended_frequency_handle (e.g. '8 weeks'), savings_format
-  ('percent'|'absolute'|'both'), show_reassurance, accent_color (hex
-  fallback when no published config), compact_mode. No group-selection
-  param: the group resolves from the shop metafield allow-list only — see
-  the ownership block below.
-
-  GROUP OWNERSHIP (v1.2.4): renders OUR group or NOTHING, never a
-  competitor's — see the ownership block below and README §
-  "Running alongside another subscription app".
-
-  Frequency selector removal (v1.2.0, layout.showFrequency=false): no
-  dropdown/chips in ANY preset (planner degrades to one cadence line); cart
-  still gets the default plan. See README § "Removing the frequency
-  selector".
-{%- endcomment -%}
-
+{%- comment -%} cx-buybox-core — the ENTIRE buy-box widget, rendered verbatim by both thin block wrappers. MINIFIED ON PURPOSE (total-Liquid deploy budget): full exposition of THE LIQUID RULES (RULE 1 never capture, assign or echo a render; RULE 2 t returns already-escaped HTML, RAW/SAFE string spaces), params, group ownership and history live in README "Core snippet internals". Editor note: comments here carry NO Liquid delimiters and no pipe characters (harness fidelity lint). {%- endcomment -%}
 {%- if product != blank and product.selling_plan_groups.size > 0 -%}
-
-  {%- liquid
-    # ══ OWNERSHIP — WHICH SELLING PLAN GROUP IS OURS ══════════════════════
-    #
-    # THE ONE RULE: render OUR group, or render NOTHING. Never a foreign one,
-    # never a guess. Full history (the Joy Subscriptions incident this block
-    # exists to prevent) and rationale are in README.md § "Running alongside
-    # another subscription app" — read that before touching this block.
-    #
-    # The allow-list is the shop metafield cellexia.plan_groups (type json),
-    # rewritten by the app on every plan sync (and again on go-live) and
-    # defensively read here:
-    #   {"v":1,"groupIds":["123","456"],"planIds":["789"]}
-    # It may be absent (fresh install), blank, or hand-edited into any shape,
-    # so nothing below assumes more than "maybe there is a list of ids".
-    #
-    # Ids are compared as STRINGS, one entry at a time, by EXACT equality.
-    # Liquid hands out numeric ids and the metafield holds strings, so both
-    # sides are normalised with an empty append. A substring test against a
-    # joined list would let group 12 match an allow-listed 123 — which is how
-    # a competitor's group gets rendered by accident.
-    #
-    # NO ALLOW-LIST, NO WIDGET. There is deliberately no other way to resolve
-    # a group — no name-matching fallback of any kind. Guessing from a name
-    # has no safe version (see README): it is what caused the incident.
-    #
-    # TWO FACTORS, NOT ONE, AND BOTH ARE MANDATORY: the group id must be
-    # allow-listed AND the group must actually contain one of the allow-listed
-    # PLAN ids. Either list empty unlocks NOTHING, on any product — planIds is
-    # a REQUIREMENT, not a veto (see README for why matching on groupIds alone
-    # is a real, previously-exploited hole, proven in
-    # tests/liquid/two-apps.test.ts).
-    assign cx_allow = shop.metafields.cellexia.plan_groups.value
-    assign cx_allow_ids = cx_allow.groupIds
-    assign cx_allow_count = cx_allow_ids | size
-    assign cx_allow_plan_ids = cx_allow.planIds
-    assign cx_allow_plan_count = cx_allow_plan_ids | size
-    assign cx_group = false
-    assign cx_group_found = false
-
-    if cx_allow_count > 0 and cx_allow_plan_count > 0
-      for cx_g in product.selling_plan_groups
-        assign cx_g_id = cx_g.id | append: ''
-        assign cx_id_match = false
-        for cx_allowed in cx_allow_ids
-          assign cx_allowed_id = cx_allowed | append: ''
-          if cx_allowed_id == cx_g_id
-            assign cx_id_match = true
-            break
-          endif
-        endfor
-
-        if cx_id_match
-          # Second factor: scans the group's OWN plans, not the product's.
-          # No `else`: cx_plan_match defaults false, so a broken guarantee
-          # above fails closed, never open.
-          assign cx_plan_match = false
-          for cx_p in cx_g.selling_plans
-            assign cx_p_id = cx_p.id | append: ''
-            for cx_allowed_plan in cx_allow_plan_ids
-              assign cx_allowed_plan_id = cx_allowed_plan | append: ''
-              if cx_allowed_plan_id == cx_p_id
-                assign cx_plan_match = true
-                break
-              endif
-            endfor
-            if cx_plan_match
-              break
-            endif
-          endfor
-
-          # Failing the second factor skips this group, not the scan — a
-          # later group on the product may still be genuinely ours.
-          if cx_plan_match
-            assign cx_group = cx_g
-            assign cx_group_found = true
-            break
-          endif
-        endif
-      endfor
-    endif
-  -%}
-
-  {%- if cx_group_found -%}
-
-  {%- comment -%} Markup below keeps its original indentation on purpose —
-    whitespace-sensitive (byte-stable snapshot); never re-indent it.
-  {%- endcomment -%}
-
-  {%- liquid
-    # ── Launch gate: hidden until the app has gone live ────────────────────
-    # Fallback covers a legacy raw-string access. Missing metafield => not
-    # live (fail closed).
-    assign cx_launch_status = shop.metafields.cellexia.launch_status.value | default: shop.metafields.cellexia.launch_status
-    assign cx_live = false
-    if cx_launch_status == 'live'
-      assign cx_live = true
-    endif
-
-    # ── Design config (published by the app's Buy box designer) ────────────
-    assign cx_cfg = shop.metafields.cellexia.buybox_design.value
-    assign cx_source = design_source | default: 'app'
-    assign cx_preset = 'classic'
-    assign cx_use_cfg = false
-    assign cx_known_presets = 'classic toggle tiles inline value_stack planner subscription_max' | split: ' '
-    if cx_source != blank and cx_source != 'app'
-      assign cx_preset = cx_source
-    elsif cx_cfg and cx_cfg.preset
-      assign cx_preset = cx_cfg.preset
-      assign cx_use_cfg = true
-      # ── Per-market preset (config.markets, v1.6.0): README §
-      # "Per-market design selection". Nil-safe; exact match on market
-      # handle; unknown preset falls back to BASE. Forced design_source wins.
-      assign cx_market_handle = ''
-      if localization.market.handle != blank
-        assign cx_market_handle = localization.market.handle | append: ''
-      endif
-      if cx_market_handle != blank and cx_cfg.markets
-        assign cx_market_entry = cx_cfg.markets[cx_market_handle]
-        if cx_market_entry and cx_market_entry.preset != blank
-          assign cx_market_preset = cx_market_entry.preset | append: ''
-          if cx_known_presets contains cx_market_preset
-            assign cx_preset = cx_market_preset
-          endif
-        endif
-      endif
-    endif
-    unless cx_known_presets contains cx_preset
-      assign cx_preset = 'classic'
-    endunless
-
-    # ── The selling plan group — resolved by the ownership block above;
-    # reaching here means cx_group is OURS.
-    assign cx_multi_plan = false
-    if cx_group.selling_plans.size > 1
-      assign cx_multi_plan = true
-    endif
-
-    # ── Pick the preselected plan (recommended frequency, else first) ──────
-    assign cx_selected_plan = cx_group.selling_plans | first
-    assign cx_rec = recommended_frequency_handle | strip | downcase
-    if cx_rec != blank
-      assign cx_rec_found = false
-      for p in cx_group.selling_plans
-        unless cx_rec_found
-          assign p_hay = p.name | downcase
-          for opt in p.options
-            assign opt_val = opt.value | downcase
-            assign p_hay = p_hay | append: ' ' | append: opt_val
-          endfor
-          if p_hay contains cx_rec
-            assign cx_selected_plan = p
-            assign cx_rec_found = true
-          endif
-        endunless
-      endfor
-    endif
-    # The recommended plan keeps its tag (planner) even if the allocation
-    # fallback below moves the initial selection to another plan.
-    assign cx_rec_plan_id = cx_selected_plan.id
-
-    # ── Current variant (honours ?variant= deep links) ─────────────────────
-    assign cx_variant = product.selected_or_first_available_variant
-    if cx_variant == blank
-      assign cx_variant = product.variants | first
-    endif
-
-    # ── Allocation for current variant + selected plan (with fallback) ─────
-    assign cx_alloc = false
-    for a in cx_variant.selling_plan_allocations
-      if a.selling_plan.id == cx_selected_plan.id
-        assign cx_alloc = a
-        break
-      endif
-    endfor
-    unless cx_alloc
-      for a in cx_variant.selling_plan_allocations
-        if a.selling_plan_group_id == cx_group.id
-          assign cx_alloc = a
-          assign cx_selected_plan = a.selling_plan
-          break
-        endif
-      endfor
-    endunless
-
-    # ── Initial prices ─────────────────────────────────────────────────────
-    if cx_alloc
-      assign cx_first = cx_alloc.price
-      assign cx_adj_count = cx_alloc.price_adjustments | size
-      if cx_adj_count > 1
-        assign cx_last_adj = cx_alloc.price_adjustments | last
-        assign cx_ongoing = cx_last_adj.price
-      else
-        assign cx_ongoing = cx_alloc.price
-      endif
-      # nil per_delivery_price (not 0) falls back to the charge price,
-      # matching buy-box.js. NOTE: no pipe chars in comments — the fidelity
-      # lint reads every "pipe word" as a filter.
-      assign cx_pd_cents = cx_alloc.per_delivery_price
-      if cx_pd_cents == blank
-        assign cx_pd_cents = cx_first
-      endif
-    else
-      assign cx_first = cx_variant.price
-      assign cx_ongoing = cx_variant.price
-      assign cx_pd_cents = cx_variant.price
-    endif
-
-    # ── Layout knobs (defaults = the v1.0.0 rendering / block settings) ────
-    assign cx_order = 'sub_first'
-    assign cx_density_compact = compact_mode
-    assign cx_freq_style = 'dropdown'
-    assign cx_show_badge = show_badge
-    assign cx_show_savings = true
-    assign cx_show_pd = true
-    assign cx_show_compare = false
-    assign cx_show_reassurance = show_reassurance
-    assign cx_show_benefits = false
-    assign cx_benefit_count = 4
-    assign cx_show_freq = show_frequency_selector
-    # subscription_max defaults (v1.6.0): badge + freq selector OFF by
-    # design. Config below reads both keys in BOTH directions, so an
-    # explicit true still re-enables.
-    if cx_preset == 'subscription_max'
-      assign cx_show_badge = false
-      assign cx_show_freq = false
-    endif
-    if cx_use_cfg and cx_cfg.layout
-      assign cx_l = cx_cfg.layout
-      if cx_l.order == 'one_time_first'
-        assign cx_order = 'one_time_first'
-      endif
-      if cx_l.density == 'compact'
-        assign cx_density_compact = true
-      elsif cx_l.density == 'comfortable'
-        assign cx_density_compact = false
-      endif
-      if cx_l.frequencyStyle == 'chips'
-        assign cx_freq_style = 'chips'
-      endif
-      # v1.2.0 layout.showFrequency (README § "Removing the frequency
-      # selector"). Read defensively: a missing key means "show" (v1.1.0).
-      if cx_l.showFrequency == false
-        assign cx_show_freq = false
-      elsif cx_l.showFrequency == true
-        assign cx_show_freq = true
-      endif
-      if cx_l.showBadge == false
-        assign cx_show_badge = false
-      elsif cx_l.showBadge == true
-        assign cx_show_badge = true
-      endif
-      if cx_l.showSavings == false
-        assign cx_show_savings = false
-      endif
-      if cx_l.showPerDelivery == false
-        assign cx_show_pd = false
-      endif
-      if cx_l.showCompareAt == true
-        assign cx_show_compare = true
-      endif
-      if cx_l.showReassurance == false
-        assign cx_show_reassurance = false
-      elsif cx_l.showReassurance == true
-        assign cx_show_reassurance = true
-      endif
-      if cx_l.showBenefits == true
-        assign cx_show_benefits = true
-      endif
-      if cx_l.benefitCount != blank
-        assign cx_benefit_count = cx_l.benefitCount
-      endif
-    endif
-    # value_stack IS the benefit panel — its archetype always renders the list.
-    if cx_preset == 'value_stack'
-      assign cx_show_benefits = true
-      if cx_benefit_count < 1
-        assign cx_benefit_count = 4
-      endif
-    endif
-
-    # Frequency control renders only when switched on AND the group has
-    # more than one cadence (single-plan groups never show a selector).
-    assign cx_freq_ui = false
-    if cx_show_freq and cx_multi_plan
-      assign cx_freq_ui = true
-    endif
-    # The planner sells the cadence, so it always uses chips and tags the
-    # recommended plan; every other preset follows layout.frequencyStyle.
-    assign cx_ctl_style = cx_freq_style
-    assign cx_ctl_recommended = false
-    if cx_preset == 'planner'
-      assign cx_ctl_style = 'chips'
-      assign cx_ctl_recommended = true
-    endif
-
-    # ── Behavior knobs ─────────────────────────────────────────────────────
-    assign cx_sub_checked = preselect_subscription
-    assign cx_anim = true
-    if cx_use_cfg and cx_cfg.behavior
-      if cx_cfg.behavior.preselect == 'subscription'
-        assign cx_sub_checked = true
-      elsif cx_cfg.behavior.preselect == 'one_time'
-        assign cx_sub_checked = false
-      endif
-      if cx_cfg.behavior.animation == false
-        assign cx_anim = false
-      endif
-    endif
-    if product.requires_selling_plan
-      assign cx_sub_checked = true
-    endif
-
-    # ── Style knobs → CSS custom properties (inline style) ─────────────────
-    # "" = inherit v1.0.0 default. Accent mirrors --cx-accent/accent_color/
-    # DEFAULT_DESIGN_CONFIG.style.accent, ALWAYS inline (wins over stylesheet).
-    assign cx_accent = accent_color | default: '#1d1d1b'
-    assign cx_accent_soft = ''
-    assign cx_style_extra = ''
-    assign cx_custom_css = ''
-    if cx_use_cfg
-      if cx_cfg.style.accent != blank
-        assign cx_accent = cx_cfg.style.accent
-      endif
-      # NOT appended to cx_style_extra: --cx-accent-soft has ONE fixed slot
-      # (avoids a duplicate a theme/CDN could reorder wrong).
-      if cx_cfg.style.bgTint != blank
-        assign cx_accent_soft = cx_cfg.style.bgTint
-      endif
-      if cx_cfg.style.text != blank
-        assign cx_style_extra = cx_style_extra | append: ' --cx-text: ' | append: cx_cfg.style.text | append: ';'
-      endif
-      if cx_cfg.style.badgeBg != blank
-        assign cx_style_extra = cx_style_extra | append: ' --cx-badge-bg: ' | append: cx_cfg.style.badgeBg | append: ';'
-      endif
-      if cx_cfg.style.badgeText != blank
-        assign cx_style_extra = cx_style_extra | append: ' --cx-badge-text: ' | append: cx_cfg.style.badgeText | append: ';'
-      endif
-      if cx_cfg.style.accentText != blank
-        assign cx_style_extra = cx_style_extra | append: ' --cx-accent-text: ' | append: cx_cfg.style.accentText | append: ';'
-      endif
-      if cx_cfg.style.fontScale and cx_cfg.style.fontScale != 1
-        assign cx_style_extra = cx_style_extra | append: ' --cx-font-scale: ' | append: cx_cfg.style.fontScale | append: ';'
-      endif
-      if cx_cfg.layout.radiusPx != blank and cx_cfg.layout.radiusPx != 12
-        assign cx_style_extra = cx_style_extra | append: ' --cx-radius: ' | append: cx_cfg.layout.radiusPx | append: 'px;'
-      endif
-      if cx_cfg.layout.borderWidthPx != blank and cx_cfg.layout.borderWidthPx != 1
-        assign cx_style_extra = cx_style_extra | append: ' --cx-border-width: ' | append: cx_cfg.layout.borderWidthPx | append: 'px;'
-      endif
-      # Server-sanitized before publish (sanitizeCustomCss); this is an
-      # idempotent belt against a hand-edited metafield (5000-char cap mirrored).
-      if cx_cfg.style.customCss != blank
-        assign cx_custom_css = cx_cfg.style.customCss | slice: 0, 5000 | replace: '<', '' | replace: '>', '' | replace: 'javascript:', '' | replace: '@import', ''
-        # BRACE CONTAINMENT (load-bearing): an unmatched '}' would close the
-        # wrapper rule early and leak CSS storefront-wide. Track depth
-        # across segments split on '}', drop the css if depth goes negative.
-        assign cx_css_probe = cx_custom_css | append: 'x'
-        assign cx_css_segments = cx_css_probe | split: '}'
-        assign cx_css_depth = 0
-        for cx_css_segment in cx_css_segments
-          unless forloop.last
-            assign cx_css_opens = cx_css_segment | append: 'x' | split: '{' | size
-            assign cx_css_depth = cx_css_depth | plus: cx_css_opens | minus: 2
-            if cx_css_depth < 0
-              assign cx_custom_css = ''
-              break
-            endif
-          endunless
-        endfor
-      endif
-    endif
-    # The soft fill resolves to exactly one value: the merchant's bgTint when
-    # set, otherwise the accent at 7% alpha (the v1.0.0 rendering).
-    if cx_accent_soft == blank
-      assign cx_accent_soft = cx_accent | color_modify: 'alpha', 0.07
-    endif
-    # strip_html+escape: values are zod-validated; filters just guard a
-    # hand-edited metafield. color_modify returns UNCHANGED when invalid,
-    # so cx_accent_soft needs escaping too.
-    assign cx_accent_soft = cx_accent_soft | strip_html | escape
-    assign cx_style_extra = cx_style_extra | strip_html | escape
-
-    # ══ SAFE → RAW: locale defaults ═══════════════════════════════════════
-    # `| t` is HTML-ESCAPED (RULE 2); un-escaped here ONCE for RAW merges/
-    # attrs — '&amp;' LAST (else "&amp;lt;" decodes twice). Strings printed
-    # directly below skip this pipeline — already SAFE.
-    assign cx_lc_subscribe_raw = 'subscribe_save' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
-    assign cx_lc_subscribe_pct_raw = 'subscribe_save_percent' | t: percent: '{percent}' | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
-    assign cx_lc_one_time_raw = 'one_time' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
-    assign cx_lc_one_time_short_raw = 'one_time_short' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
-    assign cx_lc_most_popular_raw = 'most_popular' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
-    assign cx_lc_reassurance_raw = 'reassurance' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
-    assign cx_lc_freq_label_raw = 'frequency_label' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
-    assign cx_lc_delivery_every_raw = 'delivery_every' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
-    assign cx_lc_weeks_raw = 'weeks' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
-    assign cx_lc_first_order_raw = 'first_order' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
-    assign cx_lc_buy_once_raw = 'or_buy_once' | t: amount: '{amount}' | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
-    assign cx_lc_buy_once_quiet_raw = 'or_buy_once_quiet' | t: amount: '{amount}' | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
-    assign cx_lc_b1 = 'benefit_first_order' | t
-    assign cx_lc_b2 = 'benefit_ongoing' | t
-    assign cx_lc_b3 = 'benefit_milestone_gift' | t
-    assign cx_lc_b4 = 'benefit_flexibility' | t
-    assign cx_lc_benefits_joined = cx_lc_b1 | append: '||' | append: cx_lc_b2 | append: '||' | append: cx_lc_b3 | append: '||' | append: cx_lc_b4
-    assign cx_lc_benefits_raw = cx_lc_benefits_joined | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
-    # SAFE locale strings that are printed as-is (never merged, never escaped).
-    assign cx_lc_per_delivery = 'per_delivery' | t
-    assign cx_recommended_label = 'recommended_tag' | t
-
-    # ── Frequency label for the SELECTED plan (cx-freq-label) — extracts
-    # week count from options/name when it mentions weeks; else raw name.
-    assign cx_fl_weeks = 0
-    for cx_fl_opt in cx_selected_plan.options
-      assign cx_fl_val = cx_fl_opt.value | downcase
-      if cx_fl_val contains 'week'
-        assign cx_fl_cand = cx_fl_val | split: ' ' | first | plus: 0
-        if cx_fl_cand > 0
-          assign cx_fl_weeks = cx_fl_cand
-          break
-        endif
-      endif
-    endfor
-    if cx_fl_weeks == 0
-      assign cx_fl_name = cx_selected_plan.name | downcase
-      if cx_fl_name contains 'week'
-        assign cx_fl_tokens = cx_fl_name | split: ' '
-        for cx_fl_tok in cx_fl_tokens
-          assign cx_fl_cand = cx_fl_tok | plus: 0
-          if cx_fl_cand > 0
-            assign cx_fl_weeks = cx_fl_cand
-            break
-          endif
-        endfor
-      endif
-    endif
-    if cx_fl_weeks > 1
-      assign cx_freq_raw = cx_fl_weeks | append: ' ' | append: cx_lc_weeks_raw
-      assign cx_freq_full_raw = cx_lc_delivery_every_raw | append: ' ' | append: cx_freq_raw
-    else
-      assign cx_freq_raw = cx_selected_plan.name
-      assign cx_freq_full_raw = cx_selected_plan.name
-    endif
-    assign cx_freq = cx_freq_raw | escape
-    assign cx_freq_full = cx_freq_full_raw | escape
-
-    # ── {percent}/{amount}/{frequency}: already SAFE, injected AFTER the
-    # template's single `| escape`.
-    assign cx_save_cents = cx_variant.price | minus: cx_first
-    assign cx_save_pct = 0
-    if cx_save_cents > 0 and cx_variant.price > 0
-      assign cx_save_pct = cx_save_cents | times: 100.0 | divided_by: cx_variant.price | round
-    endif
-    assign cx_pct = ''
-    if cx_save_pct > 0
-      assign cx_pct = cx_save_pct | append: '%'
-    endif
-    assign cx_amount = cx_variant.price | money | strip_html
-
-    # ── "then {price} every {frequency}" (SAFE) — `t` gets the LOCALE
-    # SENTENCE ONLY; already-SAFE values substitute after.
-    assign cx_then = ''
-    if cx_ongoing != cx_first
-      assign cx_ongoing_fmt = cx_ongoing | money | strip_html
-      assign cx_then = 'then_price' | t: price: '{price}', frequency: '{frequency}'
-      assign cx_then = cx_then | replace: '{price}', cx_ongoing_fmt | replace: '{frequency}', cx_freq | strip
-    endif
-
-    # ── "Save X" (cx-save-label; SAFE) — renders only on a positive saving;
-    # a rounding below 1% degrades to the absolute amount, never "Save 0%".
-    assign cx_savings_format = savings_format | default: 'percent'
-    assign cx_save = ''
-    if cx_alloc and cx_save_cents > 0 and cx_variant.price > 0
-      assign cx_save_fmt = cx_savings_format
-      if cx_save_pct < 1
-        assign cx_save_fmt = 'absolute'
-      endif
-      assign cx_save_abs = cx_save_cents | money | strip_html
-      if cx_save_fmt == 'absolute'
-        assign cx_save_amt = cx_save_abs
-      elsif cx_save_fmt == 'both'
-        assign cx_save_amt = cx_save_abs | append: ' (' | append: cx_save_pct | append: '%)'
-      else
-        assign cx_save_amt = cx_save_pct | append: '%'
-      endif
-      # Placeholder in, SAFE money/percent substituted after — never through
-      # the t filter, which would escape the money entities a second time.
-      assign cx_save = 'save_amount' | t: amount: '{amount}'
-      assign cx_save = cx_save | replace: '{amount}', cx_save_amt | strip
-    endif
-
-    # ── "{price} per delivery" (SAFE) — prepaid only, when per-delivery
-    # price DIFFERS from the charge. Guard nested: nil means "unknown", not "0".
-    assign cx_pd = ''
-    if cx_alloc
-      assign cx_pd_alloc = cx_alloc.per_delivery_price
-      if cx_pd_alloc != blank and cx_pd_alloc != cx_alloc.price
-        assign cx_pd_money = cx_pd_alloc | money | strip_html
-        assign cx_pd = cx_pd_money | append: ' ' | append: cx_lc_per_delivery
-      endif
-    endif
-
-    # ── Theme add-to-cart price sync (v1.2.2) — README § same name ─────────
-    # SAFE money swapped into the theme's button text (never innerHTML).
-    # NEVER escape again; double quote entity-encoded. Re-synced from the
-    # JSON island's "oneTime"/"first" keys.
-    assign cx_money_onetime = cx_amount | replace: '"', '&quot;'
-    assign cx_money_sub = ''
-    if cx_alloc
-      assign cx_money_sub = cx_first | money | strip_html | replace: '"', '&quot;'
-    endif
-    # Feature flag + optional selector (themeSync config). Missing key means
-    # ON (pre-v1.2.2 configs); no-op on themes whose button shows no price.
-    assign cx_price_sync = true
-    assign cx_price_selector_raw = ''
-    if cx_use_cfg and cx_cfg.themeSync
-      if cx_cfg.themeSync.syncAddToCartPrice == false
-        assign cx_price_sync = false
-      endif
-      # Server-sanitized before publish (sanitizePlacementSelector); the
-      # replaces are an idempotent belt against a hand-edited metafield.
-      assign cx_price_selector_raw = cx_cfg.themeSync.priceSelector | default: '' | replace: '<', '' | replace: '>', '' | replace: '"', '' | replace: "'", '' | strip
-    endif
-
-    # ══ Config text lookup tables (locale → en → default) ═════════════════
-    assign cx_t_loc = false
-    assign cx_t_en = false
-    if cx_use_cfg and cx_cfg.text
-      assign cx_t_loc = cx_cfg.text[request.locale.iso_code]
-      assign cx_t_en = cx_cfg.text['en']
-    endif
-
-    # ══ Text resolution, key by key. RAW: config.text[locale] → .en →
-    # default; blank/whitespace overrides count ABSENT. Then ONE step:
-    # `| escape` + placeholder injection + whitespace collapse.
-
-    # heading — default is the theme-editor block setting (already RAW).
-    assign cx_heading_raw = ''
-    if cx_t_loc
-      assign cx_heading_raw = cx_t_loc.heading | default: '' | strip
-    endif
-    if cx_heading_raw == blank and cx_t_en
-      assign cx_heading_raw = cx_t_en.heading | default: '' | strip
-    endif
-    if cx_heading_raw == blank and cx_preset != 'subscription_max'
-      # subscription_max skips the block-setting fallback on purpose: its
-      # heading DEFAULTS to empty (no "choose your option" framing).
-      assign cx_heading_raw = heading | default: ''
-    endif
-    assign cx_heading = cx_heading_raw | escape | replace: '{percent}', cx_pct | replace: '{amount}', cx_amount | replace: '{frequency}', cx_freq | replace: '  ', ' ' | strip
-
-    # subheading — config-only (no locale default).
-    assign cx_subheading_raw = ''
-    if cx_t_loc
-      assign cx_subheading_raw = cx_t_loc.subheading | default: '' | strip
-    endif
-    if cx_subheading_raw == blank and cx_t_en
-      assign cx_subheading_raw = cx_t_en.subheading | default: '' | strip
-    endif
-    assign cx_subheading = cx_subheading_raw | escape | replace: '{percent}', cx_pct | replace: '{amount}', cx_amount | replace: '{frequency}', cx_freq | replace: '  ', ' ' | strip
-
-    # badge — config → block setting → translated "Most popular".
-    assign cx_badge_raw = ''
-    if cx_t_loc
-      assign cx_badge_raw = cx_t_loc.badge | default: '' | strip
-    endif
-    if cx_badge_raw == blank and cx_t_en
-      assign cx_badge_raw = cx_t_en.badge | default: '' | strip
-    endif
-    if cx_badge_raw == blank
-      assign cx_badge_raw = badge_text | default: '' | strip
-    endif
-    if cx_badge_raw == blank
-      assign cx_badge_raw = cx_lc_most_popular_raw
-    endif
-    assign cx_badge = cx_badge_raw | escape
-
-    # subscribeLabel — the toggle/inline default embeds {percent}.
-    if cx_preset == 'toggle' or cx_preset == 'inline'
-      assign cx_sub_label_default_raw = cx_lc_subscribe_pct_raw
-    else
-      assign cx_sub_label_default_raw = cx_lc_subscribe_raw
-    endif
-    assign cx_sub_label_raw = ''
-    if cx_t_loc
-      assign cx_sub_label_raw = cx_t_loc.subscribeLabel | default: '' | strip
-    endif
-    if cx_sub_label_raw == blank and cx_t_en
-      assign cx_sub_label_raw = cx_t_en.subscribeLabel | default: '' | strip
-    endif
-    if cx_sub_label_raw == blank
-      assign cx_sub_label_raw = cx_sub_label_default_raw
-    endif
-    assign cx_sub_label = cx_sub_label_raw | escape | replace: '{percent}', cx_pct | replace: '{amount}', cx_amount | replace: '{frequency}', cx_freq | replace: '  ', ' ' | strip
-
-    # oneTimeLabel — full label, plus the short variant used by the toggle
-    # tabs (one override key, two locale defaults — v1.1.0 behaviour).
-    assign cx_onetime_override_raw = ''
-    if cx_t_loc
-      assign cx_onetime_override_raw = cx_t_loc.oneTimeLabel | default: '' | strip
-    endif
-    if cx_onetime_override_raw == blank and cx_t_en
-      assign cx_onetime_override_raw = cx_t_en.oneTimeLabel | default: '' | strip
-    endif
-    assign cx_onetime_label_raw = cx_onetime_override_raw
-    if cx_onetime_label_raw == blank
-      assign cx_onetime_label_raw = cx_lc_one_time_raw
-    endif
-    assign cx_onetime_short_raw = cx_onetime_override_raw
-    if cx_onetime_short_raw == blank
-      assign cx_onetime_short_raw = cx_lc_one_time_short_raw
-    endif
-    assign cx_onetime_label = cx_onetime_label_raw | escape
-    assign cx_onetime_label_short = cx_onetime_short_raw | escape
-
-    # savingsTemplate — config-only; when set it REPLACES the built-in
-    # "Save X" copy (but only while there is a real saving to claim).
-    assign cx_save_tpl_raw = ''
-    if cx_t_loc
-      assign cx_save_tpl_raw = cx_t_loc.savingsTemplate | default: '' | strip
-    endif
-    if cx_save_tpl_raw == blank and cx_t_en
-      assign cx_save_tpl_raw = cx_t_en.savingsTemplate | default: '' | strip
-    endif
-    if cx_save != blank and cx_save_tpl_raw != blank
-      assign cx_save = cx_save_tpl_raw | escape | replace: '{percent}', cx_pct | replace: '{amount}', cx_amount | replace: '{frequency}', cx_freq | replace: '  ', ' ' | strip
-    endif
-
-    # reassurance
-    assign cx_reassurance_raw = ''
-    if cx_t_loc
-      assign cx_reassurance_raw = cx_t_loc.reassurance | default: '' | strip
-    endif
-    if cx_reassurance_raw == blank and cx_t_en
-      assign cx_reassurance_raw = cx_t_en.reassurance | default: '' | strip
-    endif
-    if cx_reassurance_raw == blank
-      assign cx_reassurance_raw = cx_lc_reassurance_raw
-    endif
-    assign cx_reassurance = cx_reassurance_raw | escape | replace: '{percent}', cx_pct | replace: '{amount}', cx_amount | replace: '{frequency}', cx_freq | replace: '  ', ' ' | strip
-
-    # frequencyLabel — the planner asks a question, the others label a select.
-    if cx_preset == 'planner'
-      assign cx_freq_label_default_raw = cx_lc_freq_label_raw
-    else
-      assign cx_freq_label_default_raw = cx_lc_delivery_every_raw
-    endif
-    assign cx_freq_label_raw = ''
-    if cx_t_loc
-      assign cx_freq_label_raw = cx_t_loc.frequencyLabel | default: '' | strip
-    endif
-    if cx_freq_label_raw == blank and cx_t_en
-      assign cx_freq_label_raw = cx_t_en.frequencyLabel | default: '' | strip
-    endif
-    if cx_freq_label_raw == blank
-      assign cx_freq_label_raw = cx_freq_label_default_raw
-    endif
-    assign cx_freq_label = cx_freq_label_raw | escape
-
-    # firstOrderLine
-    assign cx_first_line_raw = ''
-    if cx_t_loc
-      assign cx_first_line_raw = cx_t_loc.firstOrderLine | default: '' | strip
-    endif
-    if cx_first_line_raw == blank and cx_t_en
-      assign cx_first_line_raw = cx_t_en.firstOrderLine | default: '' | strip
-    endif
-    if cx_first_line_raw == blank
-      assign cx_first_line_raw = cx_lc_first_order_raw
-    endif
-    assign cx_first_line = cx_first_line_raw | escape | replace: '{percent}', cx_pct | replace: '{amount}', cx_amount | replace: '{frequency}', cx_freq | replace: '  ', ' ' | strip
-
-    # oneTimeLinkLabel — value_stack's link + subscription_max's quiet line.
-    # Default embeds {amount}: price shows BEFORE selection (compliance
-    # guardrail, "quiet" ≠ "hidden").
-    if cx_preset == 'subscription_max'
-      assign cx_onetime_link_default_raw = cx_lc_buy_once_quiet_raw
-    else
-      assign cx_onetime_link_default_raw = cx_lc_buy_once_raw
-    endif
-    assign cx_onetime_link_raw = ''
-    if cx_t_loc
-      assign cx_onetime_link_raw = cx_t_loc.oneTimeLinkLabel | default: '' | strip
-    endif
-    if cx_onetime_link_raw == blank and cx_t_en
-      assign cx_onetime_link_raw = cx_t_en.oneTimeLinkLabel | default: '' | strip
-    endif
-    if cx_onetime_link_raw == blank
-      assign cx_onetime_link_raw = cx_onetime_link_default_raw
-    endif
-    assign cx_onetime_link = cx_onetime_link_raw | escape | replace: '{percent}', cx_pct | replace: '{amount}', cx_amount | replace: '{frequency}', cx_freq | replace: '  ', ' ' | strip
-
-    # benefits — config array (RAW) → the four un-escaped locale defaults.
-    assign cx_benefits_arr = false
-    if cx_show_benefits
-      if cx_t_loc and cx_t_loc.benefits.size > 0
-        assign cx_benefits_arr = cx_t_loc.benefits
-      elsif cx_t_en and cx_t_en.benefits.size > 0
-        assign cx_benefits_arr = cx_t_en.benefits
-      else
-        assign cx_benefits_arr = cx_lc_benefits_raw | split: '||'
-      endif
-    endif
-  -%}
-
-  {%- comment -%} Shared markup fragments — PURE MARKUP (RULE 1), captured
-    and printed unescaped as-is. {%- endcomment -%}
-
-  {%- comment -%} Frequency control — dropdown or chips (was cx-freq-control) {%- endcomment -%}
-  {%- assign cx_freq_control = '' -%}
-  {%- if cx_freq_ui -%}
-    {%- capture cx_freq_control -%}
-      {%- if cx_ctl_style == 'chips' -%}
-        <fieldset class="cx-buybox__chips">
-          <legend class="cx-buybox__sr">{{ cx_freq_label }}</legend>
-          {%- for p in cx_group.selling_plans -%}
-            {%- liquid
-              # cx-freq-label (inlined) — see the selected-plan copy above.
-              assign cx_fl_weeks = 0
-              for cx_fl_opt in p.options
-                assign cx_fl_val = cx_fl_opt.value | downcase
-                if cx_fl_val contains 'week'
-                  assign cx_fl_cand = cx_fl_val | split: ' ' | first | plus: 0
-                  if cx_fl_cand > 0
-                    assign cx_fl_weeks = cx_fl_cand
-                    break
-                  endif
-                endif
-              endfor
-              if cx_fl_weeks == 0
-                assign cx_fl_name = p.name | downcase
-                if cx_fl_name contains 'week'
-                  assign cx_fl_tokens = cx_fl_name | split: ' '
-                  for cx_fl_tok in cx_fl_tokens
-                    assign cx_fl_cand = cx_fl_tok | plus: 0
-                    if cx_fl_cand > 0
-                      assign cx_fl_weeks = cx_fl_cand
-                      break
-                    endif
-                  endfor
-                endif
-              endif
-              if cx_fl_weeks > 1
-                assign cx_chip_raw = cx_fl_weeks | append: ' ' | append: cx_lc_weeks_raw
-              else
-                assign cx_chip_raw = p.name
-              endif
-              assign cx_chip_label = cx_chip_raw | escape
-            -%}
-            <label class="cx-buybox__chip">
-              <input
-                type="radio"
-                class="cx-buybox__sr-input"
-                name="cx-freq-{{ uid }}"
-                value="{{ p.id }}"
-                data-cellexia-freq-chip
-                {% if p.id == cx_selected_plan.id %}checked{% endif %}
-              >
-              <span class="cx-buybox__chip-label">
-                {{- cx_chip_label -}}
-                {%- if cx_ctl_recommended and p.id == cx_rec_plan_id and cx_recommended_label != blank -%}
-                  <span class="cx-buybox__chip-tag">{{ cx_recommended_label }}</span>
-                {%- endif -%}
-              </span>
-            </label>
-          {%- endfor -%}
-        </fieldset>
-      {%- else -%}
-        <div class="cx-buybox__freq">
-          <label class="cx-buybox__sr" for="cx-freq-{{ uid }}">{{ cx_freq_label }}</label>
-          <select id="cx-freq-{{ uid }}" class="cx-buybox__freq-select" data-cellexia-freq>
-            {%- for p in cx_group.selling_plans -%}
-              {%- liquid
-                # cx-freq-label (inlined), 'select' variant: full sentence.
-                assign cx_fl_weeks = 0
-                for cx_fl_opt in p.options
-                  assign cx_fl_val = cx_fl_opt.value | downcase
-                  if cx_fl_val contains 'week'
-                    assign cx_fl_cand = cx_fl_val | split: ' ' | first | plus: 0
-                    if cx_fl_cand > 0
-                      assign cx_fl_weeks = cx_fl_cand
-                      break
-                    endif
-                  endif
-                endfor
-                if cx_fl_weeks == 0
-                  assign cx_fl_name = p.name | downcase
-                  if cx_fl_name contains 'week'
-                    assign cx_fl_tokens = cx_fl_name | split: ' '
-                    for cx_fl_tok in cx_fl_tokens
-                      assign cx_fl_cand = cx_fl_tok | plus: 0
-                      if cx_fl_cand > 0
-                        assign cx_fl_weeks = cx_fl_cand
-                        break
-                      endif
-                    endfor
-                  endif
-                endif
-                if cx_fl_weeks > 1
-                  assign cx_opt_raw = cx_fl_weeks | append: ' ' | append: cx_lc_weeks_raw
-                  assign cx_opt_raw = cx_lc_delivery_every_raw | append: ' ' | append: cx_opt_raw
-                else
-                  assign cx_opt_raw = p.name
-                endif
-                assign cx_opt_label = cx_opt_raw | escape
-              -%}
-              <option value="{{ p.id }}" {% if p.id == cx_selected_plan.id %}selected{% endif %}>
-                {{- cx_opt_label -}}
-              </option>
-            {%- endfor -%}
-          </select>
-        </div>
-      {%- endif -%}
-    {%- endcapture -%}
-  {%- endif -%}
-
-  {%- comment -%} Benefit list (was cx-benefit-list) {%- endcomment -%}
-  {%- assign cx_benefits_html = '' -%}
-  {%- if cx_benefits_arr and cx_benefit_count > 0 -%}
-    {%- capture cx_benefits_html -%}
-      <ul class="cx-buybox__benefits" role="list">
-        {%- for b in cx_benefits_arr limit: cx_benefit_count -%}
-          {%- assign cx_b_raw = b | strip -%}
-          {%- if cx_b_raw != blank -%}
-            <li class="cx-buybox__benefit">
-              <svg class="cx-buybox__check" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
-                <path d="M6.5 11.3 3.4 8.2l1-1 2.1 2 5-5.1 1 1z" fill="currentColor"/>
-              </svg>
-              {{ cx_b_raw | escape }}
-            </li>
-          {%- endif -%}
-        {%- endfor -%}
-      </ul>
-    {%- endcapture -%}
-  {%- endif -%}
-
-  {%- comment -%} Reassurance line (was cx-reassurance) {%- endcomment -%}
-  {%- assign cx_reassurance_html = '' -%}
-  {%- if cx_reassurance != blank -%}
-    {%- capture cx_reassurance_html -%}
-      <p class="cx-buybox__reassurance">
-        <svg class="cx-buybox__check" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
-          <path d="M6.5 11.3 3.4 8.2l1-1 2.1 2 5-5.1 1 1z" fill="currentColor"/>
-        </svg>
-        {{- cx_reassurance -}}
-      </p>
-    {%- endcapture -%}
-  {%- endif -%}
-
-  {%- comment -%} Subscription price cluster: first-order price (+ optional
-    compare-at), "First order" microcopy, "then …" line, per-delivery line.
-  {%- endcomment -%}
-  {%- capture cx_price_block -%}
-    <span class="cx-buybox__price-row">
-      <span class="cx-buybox__price cx-buybox__price--lg" data-cellexia-sub-price{% if cx_show_compare %} data-cellexia-compare{% endif %}>
-        <span class="cx-price">{{ cx_first | money }}</span>
-        {%- if cx_show_compare and cx_variant.price > cx_first %} <s class="cx-price__compare">{{ cx_variant.price | money }}</s>{% endif -%}
-      </span>
-      <span class="cx-buybox__first-label" data-cellexia-first-label{% if cx_first_line_raw contains '{' %} data-cellexia-tpl="{{ cx_first_line_raw | escape }}"{% endif %} {% if cx_then == blank %}hidden{% endif %}>{{ cx_first_line }}</span>
-    </span>
-    <span class="cx-buybox__then" data-cellexia-then {% if cx_then == blank %}hidden{% endif %}>{{ cx_then }}</span>
-    {%- if cx_show_pd -%}
-      <span class="cx-buybox__per-delivery" data-cellexia-per-delivery {% if cx_pd == blank %}hidden{% endif %}>{{ cx_pd }}</span>
-    {%- endif -%}
-  {%- endcapture -%}
-  {%- capture cx_price_block_nopd -%}
-    <span class="cx-buybox__price-row">
-      <span class="cx-buybox__price cx-buybox__price--lg" data-cellexia-sub-price{% if cx_show_compare %} data-cellexia-compare{% endif %}>
-        <span class="cx-price">{{ cx_first | money }}</span>
-        {%- if cx_show_compare and cx_variant.price > cx_first %} <s class="cx-price__compare">{{ cx_variant.price | money }}</s>{% endif -%}
-      </span>
-      <span class="cx-buybox__first-label" data-cellexia-first-label{% if cx_first_line_raw contains '{' %} data-cellexia-tpl="{{ cx_first_line_raw | escape }}"{% endif %} {% if cx_then == blank %}hidden{% endif %}>{{ cx_first_line }}</span>
-    </span>
-    <span class="cx-buybox__then" data-cellexia-then {% if cx_then == blank %}hidden{% endif %}>{{ cx_then }}</span>
-  {%- endcapture -%}
-
-  {%- comment -%}
-    THE WIDGET ROOT. data-cellexia-money-*/-price-* drive the theme price
-    sync; -money-sub is empty with no allocation.
-
-    WHITESPACE CONTROL (load-bearing): a false conditional attribute must
-    leave no blank line. Fix: a left-trimming tag opener (percent-brace with
-    a hyphen) eats the preceding newline+indent, re-supplies it INSIDE the
-    body ahead of the attribute, so the newline travels WITH the attribute
-    and nothing emits when false. Never trim the trailing side or hoist the
-    newline out.
-  {%- endcomment -%}
-  <div
-    id="cx-buybox-{{ uid }}"
-    class="cx-buybox cx-buybox--{{ cx_preset }}{% if cx_density_compact %} cx-buybox--compact{% endif %}{% unless cx_anim %} cx-buybox--no-anim{% endunless %}{% unless cx_alloc %} cx-buybox--no-sub{% endunless %}"
-    data-cellexia-buybox
-    data-cellexia-preset="{{ cx_preset }}"
-    data-block-id="{{ uid }}"
-    data-cellexia-money-onetime="{{ cx_money_onetime }}"
-    data-cellexia-money-sub="{{ cx_money_sub }}"
-    data-cellexia-price-sync="{% if cx_price_sync %}true{% else %}false{% endif %}"
-    data-cellexia-price-selector="{{ cx_price_selector_raw | escape }}"
-    {%- if render_context == 'section' %}
-    data-section-id="{{ section_id }}"{% endif %}
-    {%- unless cx_live %}
-    hidden data-cellexia-gated="true"{% endunless %}
-    style="--cx-accent: {{ cx_accent | escape }}; --cx-accent-soft: {{ cx_accent_soft }};{{ cx_style_extra }}"
-    {{ shopify_attributes }}
-  >
-    {%- if cx_custom_css != blank -%}
-      {%- comment -%} Merchant custom CSS, scoped via CSS nesting under the
-        wrapper id — real only because the sanitizer + brace belt above
-        both hold. {%- endcomment -%}
-      <style>#cx-buybox-{{ uid }} { {{ cx_custom_css }} }</style>
-    {%- endif -%}
-
-    {%- unless cx_live -%}
-      {%- comment -%} Shown only after buy-box.js validates a signed preview token. {%- endcomment -%}
-      <p class="cx-buybox__preview-ribbon" data-cellexia-preview-ribbon hidden>{{ 'preview_mode' | t }}</p>
-    {%- endunless -%}
-
-    {%- if cx_heading != blank -%}
-      <h3 class="cx-buybox__heading">{{ cx_heading }}</h3>
-    {%- endif -%}
-    {%- if cx_subheading != blank -%}
-      <p class="cx-buybox__subheading">{{ cx_subheading }}</p>
-    {%- endif -%}
-
-    <span class="cx-buybox__sr" id="cx-buybox-label-{{ uid }}">{{ 'purchase_options' | t }}</span>
-
-    {%- case cx_preset -%}
-
-      {%- when 'toggle' -%}
-        {%- comment -%} ══ TOGGLE — segmented pill tabs + detail panel ══ {%- endcomment -%}
-        <div class="cx-buybox__group cx-buybox__group--toggle">
-          {%- unless product.requires_selling_plan -%}
-            {%- capture cx_tab_sub -%}
-              <button
-                type="button"
-                class="cx-buybox__tab{% if cx_sub_checked %} is-selected{% endif %}"
-                role="tab"
-                id="cx-tab-sub-{{ uid }}"
-                aria-controls="cx-panel-sub-{{ uid }}"
-                aria-selected="{% if cx_sub_checked %}true{% else %}false{% endif %}"
-                {% unless cx_sub_checked %}tabindex="-1"{% endunless %}
-                data-cellexia-tab="subscription"
-              ><span class="cx-buybox__tab-label"{% if cx_sub_label_raw contains '{' %} data-cellexia-tpl="{{ cx_sub_label_raw | escape }}"{% endif %}>{{ cx_sub_label }}</span></button>
-            {%- endcapture -%}
-            {%- capture cx_tab_one -%}
-              <button
-                type="button"
-                class="cx-buybox__tab{% unless cx_sub_checked %} is-selected{% endunless %}"
-                role="tab"
-                id="cx-tab-one-{{ uid }}"
-                aria-controls="cx-panel-one-{{ uid }}"
-                aria-selected="{% unless cx_sub_checked %}true{% else %}false{% endunless %}"
-                {% if cx_sub_checked %}tabindex="-1"{% endif %}
-                data-cellexia-tab="one_time"
-              ><span class="cx-buybox__tab-label">{{ cx_onetime_label_short }}</span></button>
-            {%- endcapture -%}
-            <div class="cx-buybox__tabs" role="tablist" aria-label="{{ 'purchase_options' | t }}">
-              {%- if cx_order == 'one_time_first' -%}{{ cx_tab_one }}{{ cx_tab_sub }}{%- else -%}{{ cx_tab_sub }}{{ cx_tab_one }}{%- endif -%}
-            </div>
-          {%- endunless -%}
-
-          <div
-            class="cx-buybox__panel cx-buybox__option--sub"
-            role="tabpanel"
-            id="cx-panel-sub-{{ uid }}"
-            aria-labelledby="cx-tab-sub-{{ uid }}"
-            data-cellexia-panel="subscription"
-            {% unless cx_sub_checked %}hidden{% endunless %}
-          >
-            {%- if cx_show_savings -%}
-              <span class="cx-buybox__save" data-cellexia-save{% if cx_save_tpl_raw != blank %} data-cellexia-tpl="{{ cx_save_tpl_raw | escape }}"{% endif %} {% if cx_save == blank %}hidden{% endif %}>{{ cx_save }}</span>
-            {%- endif -%}
-            {{ cx_price_block }}
-            {{ cx_freq_control }}
-            {{ cx_benefits_html }}
-            {%- if cx_show_reassurance -%}{{ cx_reassurance_html }}{%- endif -%}
-          </div>
-
-          {%- unless product.requires_selling_plan -%}
-            <div
-              class="cx-buybox__panel"
-              role="tabpanel"
-              id="cx-panel-one-{{ uid }}"
-              aria-labelledby="cx-tab-one-{{ uid }}"
-              data-cellexia-panel="one_time"
-              {% if cx_sub_checked %}hidden{% endif %}
-            >
-              <span class="cx-buybox__title-row">
-                <span class="cx-buybox__title">{{ cx_onetime_label }}</span>
-                <span class="cx-buybox__price" data-cellexia-onetime-price>
-                  <span class="cx-price">{{ cx_variant.price | money }}</span>
-                </span>
-              </span>
-            </div>
-          {%- endunless -%}
-        </div>
-
-      {%- when 'tiles' -%}
-        {%- comment -%} ══ TILES — side-by-side comparison, subscription elevated ══ {%- endcomment -%}
-        {%- capture cx_tile_sub -%}
-          <div
-            class="cx-buybox__option cx-buybox__tile cx-buybox__option--sub{% if cx_sub_checked %} is-selected{% endif %}"
-            data-cellexia-option-wrap="subscription"
-          >
-            {%- if cx_show_badge and cx_badge != blank -%}
-              <span class="cx-buybox__badge">{{ cx_badge }}</span>
-            {%- endif -%}
-            <label class="cx-buybox__card cx-buybox__card--tile">
-              <input
-                type="radio"
-                class="cx-buybox__radio cx-buybox__sr-input"
-                name="cx-purchase-{{ uid }}"
-                value="subscription"
-                data-cellexia-option="subscription"
-                {% if cx_sub_checked %}checked aria-checked="true"{% else %}aria-checked="false"{% endif %}
-              >
-              <span class="cx-buybox__card-body cx-buybox__card-body--stack">
-                <span class="cx-buybox__card-main">
-                  <span class="cx-buybox__title"{% if cx_sub_label_raw contains '{' %} data-cellexia-tpl="{{ cx_sub_label_raw | escape }}"{% endif %}>{{ cx_sub_label }}</span>
-                  {{ cx_price_block_nopd }}
-                  <span class="cx-buybox__rows">
-                    <span class="cx-buybox__row">
-                      <span class="cx-buybox__row-label">{{ 'per_delivery' | t }}</span>
-                      <span class="cx-buybox__row-value" data-cellexia-pd-price><span class="cx-price">{{ cx_pd_cents | money }}</span></span>
-                    </span>
-                    {%- if cx_show_savings -%}
-                      <span class="cx-buybox__row" data-cellexia-save-row {% if cx_save == blank %}hidden{% endif %}>
-                        <span class="cx-buybox__row-label">{{ 'tile_savings' | t }}</span>
-                        <span class="cx-buybox__row-value cx-buybox__row-value--accent" data-cellexia-save{% if cx_save_tpl_raw != blank %} data-cellexia-tpl="{{ cx_save_tpl_raw | escape }}"{% endif %}>{{ cx_save }}</span>
-                      </span>
-                    {%- endif -%}
-                    <span class="cx-buybox__row">
-                      <span class="cx-buybox__row-label">{{ 'tile_flexibility' | t }}</span>
-                      <span class="cx-buybox__row-value">{{ 'benefit_flexibility' | t }}</span>
-                    </span>
-                  </span>
-                </span>
-              </span>
-            </label>
-            {{ cx_freq_control }}
-            {{ cx_benefits_html }}
-            {%- if cx_show_reassurance -%}{{ cx_reassurance_html }}{%- endif -%}
-          </div>
-        {%- endcapture -%}
-        {%- capture cx_tile_one -%}
-          {%- unless product.requires_selling_plan -%}
-            <div
-              class="cx-buybox__option cx-buybox__tile{% unless cx_sub_checked %} is-selected{% endunless %}"
-              data-cellexia-option-wrap="one_time"
-            >
-              <label class="cx-buybox__card cx-buybox__card--tile">
-                <input
-                  type="radio"
-                  class="cx-buybox__radio cx-buybox__sr-input"
-                  name="cx-purchase-{{ uid }}"
-                  value="one_time"
-                  data-cellexia-option="one_time"
-                  {% unless cx_sub_checked %}checked aria-checked="true"{% else %}aria-checked="false"{% endunless %}
-                >
-                <span class="cx-buybox__card-body cx-buybox__card-body--stack">
-                  <span class="cx-buybox__card-main">
-                    <span class="cx-buybox__title">{{ cx_onetime_label }}</span>
-                    <span class="cx-buybox__price-row">
-                      <span class="cx-buybox__price cx-buybox__price--lg" data-cellexia-onetime-price>
-                        <span class="cx-price">{{ cx_variant.price | money }}</span>
-                      </span>
-                    </span>
-                  </span>
-                </span>
-              </label>
-            </div>
-          {%- endunless -%}
-        {%- endcapture -%}
-        <div class="cx-buybox__group cx-buybox__tiles" role="radiogroup" aria-labelledby="cx-buybox-label-{{ uid }}">
-          {%- if cx_order == 'one_time_first' -%}{{ cx_tile_one }}{{ cx_tile_sub }}{%- else -%}{{ cx_tile_sub }}{{ cx_tile_one }}{%- endif -%}
-        </div>
-
-      {%- when 'inline' -%}
-        {%- comment -%} ══ INLINE — one checkbox row, near-zero visual weight ══ {%- endcomment -%}
-        <div class="cx-buybox__group cx-buybox__group--inline">
-          <label class="cx-buybox__inline-row{% if cx_sub_checked %} is-selected{% endif %}" data-cellexia-option-wrap="subscription">
-            <input
-              type="checkbox"
-              class="cx-buybox__inline-box"
-              data-cellexia-inline
-              {% if cx_sub_checked %}checked{% endif %}
-              {% if product.requires_selling_plan %}disabled{% endif %}
-              aria-describedby="cx-inline-detail-{{ uid }}"
-            >
-            <span class="cx-buybox__inline-label"{% if cx_sub_label_raw contains '{' %} data-cellexia-tpl="{{ cx_sub_label_raw | escape }}"{% endif %}>{{ cx_sub_label }}</span>
-          </label>
-          <div class="cx-buybox__inline-detail" id="cx-inline-detail-{{ uid }}" data-cellexia-panel="subscription" {% unless cx_sub_checked %}hidden{% endunless %}>
-            <span class="cx-buybox__price-row">
-              <span class="cx-buybox__price" data-cellexia-sub-price{% if cx_show_compare %} data-cellexia-compare{% endif %}>
-                <span class="cx-price">{{ cx_first | money }}</span>
-                {%- if cx_show_compare and cx_variant.price > cx_first %} <s class="cx-price__compare">{{ cx_variant.price | money }}</s>{% endif -%}
-              </span>
-              <span class="cx-buybox__first-label" data-cellexia-first-label{% if cx_first_line_raw contains '{' %} data-cellexia-tpl="{{ cx_first_line_raw | escape }}"{% endif %} {% if cx_then == blank %}hidden{% endif %}>{{ cx_first_line }}</span>
-            </span>
-            <span class="cx-buybox__then" data-cellexia-then {% if cx_then == blank %}hidden{% endif %}>{{ cx_then }}</span>
-            {%- if cx_show_pd -%}
-              <span class="cx-buybox__per-delivery" data-cellexia-per-delivery {% if cx_pd == blank %}hidden{% endif %}>{{ cx_pd }}</span>
-            {%- endif -%}
-            {{ cx_freq_control }}
-            {%- if cx_show_reassurance -%}{{ cx_reassurance_html }}{%- endif -%}
-          </div>
-        </div>
-
-      {%- when 'value_stack' -%}
-        {%- comment -%} ══ VALUE STACK — benefit panel, one-time demoted to a link ══ {%- endcomment -%}
-        <div class="cx-buybox__group cx-buybox__group--stack" role="radiogroup" aria-labelledby="cx-buybox-label-{{ uid }}">
-          <div
-            class="cx-buybox__option cx-buybox__option--sub cx-buybox__stack-panel{% if cx_sub_checked %} is-selected{% endif %}"
-            data-cellexia-option-wrap="subscription"
-          >
-            {%- if cx_show_badge and cx_badge != blank -%}
-              <span class="cx-buybox__badge">{{ cx_badge }}</span>
-            {%- endif -%}
-            <label class="cx-buybox__card">
-              <input
-                type="radio"
-                class="cx-buybox__radio cx-buybox__sr-input"
-                name="cx-purchase-{{ uid }}"
-                value="subscription"
-                data-cellexia-option="subscription"
-                {% if cx_sub_checked %}checked aria-checked="true"{% else %}aria-checked="false"{% endif %}
-              >
-              <span class="cx-buybox__card-body cx-buybox__card-body--stack">
-                <span class="cx-buybox__card-main">
-                  <span class="cx-buybox__title-row">
-                    <span class="cx-buybox__title"{% if cx_sub_label_raw contains '{' %} data-cellexia-tpl="{{ cx_sub_label_raw | escape }}"{% endif %}>{{ cx_sub_label }}</span>
-                    {%- if cx_show_savings -%}
-                      <span class="cx-buybox__save" data-cellexia-save{% if cx_save_tpl_raw != blank %} data-cellexia-tpl="{{ cx_save_tpl_raw | escape }}"{% endif %} {% if cx_save == blank %}hidden{% endif %}>{{ cx_save }}</span>
-                    {%- endif -%}
-                  </span>
-                  {{ cx_price_block }}
-                </span>
-              </span>
-            </label>
-            {{ cx_benefits_html }}
-            {{ cx_freq_control }}
-          </div>
-          {%- unless product.requires_selling_plan -%}
-            <label class="cx-buybox__stack-onetime{% unless cx_sub_checked %} is-selected{% endunless %}" data-cellexia-option-wrap="one_time">
-              <input
-                type="radio"
-                class="cx-buybox__radio cx-buybox__sr-input"
-                name="cx-purchase-{{ uid }}"
-                value="one_time"
-                data-cellexia-option="one_time"
-                {% unless cx_sub_checked %}checked aria-checked="true"{% else %}aria-checked="false"{% endunless %}
-              >
-              <span class="cx-buybox__stack-onetime-link"{% if cx_onetime_link_raw contains '{' %} data-cellexia-tpl="{{ cx_onetime_link_raw | escape }}"{% endif %}>{{ cx_onetime_link }}</span>
-            </label>
-          {%- endunless -%}
-        </div>
-
-      {%- when 'planner' -%}
-        {%- comment -%} ══ PLANNER — frequency-forward chips, per-delivery framing ══ {%- endcomment -%}
-        <div class="cx-buybox__group cx-buybox__group--planner">
-          {%- if cx_multi_plan -%}
-            {%- if cx_show_freq -%}
-              <p class="cx-buybox__planner-label">{{ cx_freq_label }}</p>
-              {{ cx_freq_control }}
-            {%- else -%}
-              {%- comment -%} layout.showFrequency=false degrades to one
-                recommended-cadence line — README § "Removing the
-                frequency selector". {%- endcomment -%}
-              <p class="cx-buybox__planner-cadence">{{ cx_freq_full }}</p>
-            {%- endif -%}
-          {%- endif -%}
-          {%- capture cx_planner_sub -%}
-            <div
-              class="cx-buybox__option cx-buybox__option--sub{% if cx_sub_checked %} is-selected{% endif %}"
-              data-cellexia-option-wrap="subscription"
-            >
-              {%- if cx_show_badge and cx_badge != blank -%}
-                <span class="cx-buybox__badge">{{ cx_badge }}</span>
-              {%- endif -%}
-              <label class="cx-buybox__card">
-                <input
-                  type="radio"
-                  class="cx-buybox__radio cx-buybox__sr-input"
-                  name="cx-purchase-{{ uid }}"
-                  value="subscription"
-                  data-cellexia-option="subscription"
-                  {% if cx_sub_checked %}checked aria-checked="true"{% else %}aria-checked="false"{% endif %}
-                >
-                <span class="cx-buybox__card-body">
-                  <span class="cx-buybox__control" aria-hidden="true"></span>
-                  <span class="cx-buybox__card-main">
-                    <span class="cx-buybox__title-row">
-                      <span class="cx-buybox__title"{% if cx_sub_label_raw contains '{' %} data-cellexia-tpl="{{ cx_sub_label_raw | escape }}"{% endif %}>{{ cx_sub_label }}</span>
-                      {%- if cx_show_savings -%}
-                        <span class="cx-buybox__save" data-cellexia-save{% if cx_save_tpl_raw != blank %} data-cellexia-tpl="{{ cx_save_tpl_raw | escape }}"{% endif %} {% if cx_save == blank %}hidden{% endif %}>{{ cx_save }}</span>
-                      {%- endif -%}
-                    </span>
-                    <span class="cx-buybox__price-row">
-                      <span class="cx-buybox__price cx-buybox__price--lg" data-cellexia-pd-price>
-                        <span class="cx-price">{{ cx_pd_cents | money }}</span>
-                      </span>
-                      <span class="cx-buybox__first-label">{{ 'per_delivery' | t }}</span>
-                    </span>
-                    <span class="cx-buybox__then" data-cellexia-then {% if cx_then == blank %}hidden{% endif %}>{{ cx_then }}</span>
-                  </span>
-                </span>
-              </label>
-              {{ cx_benefits_html }}
-              {%- if cx_show_reassurance -%}{{ cx_reassurance_html }}{%- endif -%}
-            </div>
-          {%- endcapture -%}
-          {%- capture cx_planner_one -%}
-            {%- unless product.requires_selling_plan -%}
-              <div
-                class="cx-buybox__option cx-buybox__planner-onetime{% unless cx_sub_checked %} is-selected{% endunless %}"
-                data-cellexia-option-wrap="one_time"
-              >
-                <label class="cx-buybox__card cx-buybox__card--slim">
-                  <input
-                    type="radio"
-                    class="cx-buybox__radio cx-buybox__sr-input"
-                    name="cx-purchase-{{ uid }}"
-                    value="one_time"
-                    data-cellexia-option="one_time"
-                    {% unless cx_sub_checked %}checked aria-checked="true"{% else %}aria-checked="false"{% endunless %}
-                  >
-                  <span class="cx-buybox__card-body">
-                    <span class="cx-buybox__control" aria-hidden="true"></span>
-                    <span class="cx-buybox__card-main">
-                      <span class="cx-buybox__title-row">
-                        <span class="cx-buybox__title">{{ cx_onetime_label }}</span>
-                        <span class="cx-buybox__price" data-cellexia-onetime-price>
-                          <span class="cx-price">{{ cx_variant.price | money }}</span>
-                        </span>
-                      </span>
-                    </span>
-                  </span>
-                </label>
-              </div>
-            {%- endunless -%}
-          {%- endcapture -%}
-          <div class="cx-buybox__planner-options" role="radiogroup" aria-labelledby="cx-buybox-label-{{ uid }}">
-            {%- if cx_order == 'one_time_first' -%}{{ cx_planner_one }}{{ cx_planner_sub }}{%- else -%}{{ cx_planner_sub }}{{ cx_planner_one }}{%- endif -%}
-          </div>
-        </div>
-
-      {%- when 'subscription_max' -%}
-        {%- comment -%}
-          SUBSCRIPTION MAX: sub card IS the buy box. Quiet is NOT hidden —
-          one-time stays a real radio, price shown BEFORE selection
-          (compliance guardrail, README § "subscription_max: the compliance
-          guardrails are load-bearing"). Ignores layout.order.
-        {%- endcomment -%}
-        <div class="cx-buybox__group cx-buybox__group--submax" role="radiogroup" aria-labelledby="cx-buybox-label-{{ uid }}">
-          <div
-            class="cx-buybox__option cx-buybox__option--sub cx-buybox__submax-card{% if cx_sub_checked %} is-selected{% endif %}"
-            data-cellexia-option-wrap="subscription"
-          >
-            {%- if cx_show_badge and cx_badge != blank -%}
-              <span class="cx-buybox__badge">{{ cx_badge }}</span>
-            {%- endif -%}
-            <label class="cx-buybox__card">
-              <input
-                type="radio"
-                class="cx-buybox__radio cx-buybox__sr-input"
-                name="cx-purchase-{{ uid }}"
-                value="subscription"
-                id="cx-submax-sub-{{ uid }}"
-                data-cellexia-option="subscription"
-                {% if cx_sub_checked %}checked aria-checked="true"{% else %}aria-checked="false"{% endif %}
-              >
-              <span class="cx-buybox__card-body cx-buybox__card-body--stack">
-                <span class="cx-buybox__card-main">
-                  <span class="cx-buybox__title-row">
-                    <span class="cx-buybox__title"{% if cx_sub_label_raw contains '{' %} data-cellexia-tpl="{{ cx_sub_label_raw | escape }}"{% endif %}>{{ cx_sub_label }}</span>
-                    {%- if cx_show_savings -%}
-                      <span class="cx-buybox__save cx-buybox__save--quiet" data-cellexia-save{% if cx_save_tpl_raw != blank %} data-cellexia-tpl="{{ cx_save_tpl_raw | escape }}"{% endif %} {% if cx_save == blank %}hidden{% endif %}>{{ cx_save }}</span>
-                    {%- endif -%}
-                  </span>
-                  {{ cx_price_block }}
-                </span>
-              </span>
-            </label>
-            {{ cx_freq_control }}
-            {%- if cx_show_reassurance -%}{{ cx_reassurance_html }}{%- endif -%}
-            {{ cx_benefits_html }}
-          </div>
-          {%- unless product.requires_selling_plan -%}
-            <div class="cx-buybox__submax-onetime{% unless cx_sub_checked %} is-selected{% endunless %}" data-cellexia-option-wrap="one_time">
-              <label class="cx-buybox__submax-choice">
-                <input
-                  type="radio"
-                  class="cx-buybox__radio cx-buybox__sr-input"
-                  name="cx-purchase-{{ uid }}"
-                  value="one_time"
-                  data-cellexia-option="one_time"
-                  {% unless cx_sub_checked %}checked aria-checked="true"{% else %}aria-checked="false"{% endunless %}
-                >
-                <span class="cx-buybox__submax-link"{% if cx_onetime_link_raw contains '{' %} data-cellexia-tpl="{{ cx_onetime_link_raw | escape }}"{% endif %}>{{ cx_onetime_link }}</span>
-                <span class="cx-buybox__submax-picked">
-                  <svg class="cx-buybox__check" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
-                    <path d="M6.5 11.3 3.4 8.2l1-1 2.1 2 5-5.1 1 1z" fill="currentColor"/>
-                  </svg>
-                  <span class="cx-buybox__submax-picked-label">{{ cx_onetime_label }}</span>
-                  <span class="cx-buybox__submax-picked-sep" aria-hidden="true">—</span>
-                  <span class="cx-buybox__submax-picked-price" data-cellexia-onetime-price><span class="cx-price">{{ cx_variant.price | money }}</span></span>
-                </span>
-              </label>
-              <label class="cx-buybox__submax-switchback" for="cx-submax-sub-{{ uid }}" aria-hidden="true">{{ 'switch_back' | t }}</label>
-            </div>
-          {%- endunless -%}
-        </div>
-
-      {%- else -%}
-        {%- comment -%} CLASSIC — v1.0.0 stacked cards; with no saved
-          config the resolved variables collapse to the old values.
-        {%- endcomment -%}
-        {%- capture cx_card_sub -%}
-      <div
-        class="cx-buybox__option cx-buybox__option--sub{% if cx_sub_checked %} is-selected{% endif %}"
-        data-cellexia-option-wrap="subscription"
-      >
-        {%- if cx_show_badge and cx_badge != blank -%}
-          <span class="cx-buybox__badge">{{ cx_badge }}</span>
-        {%- endif -%}
-
-        <label class="cx-buybox__card">
-          <input
-            type="radio"
-            class="cx-buybox__radio cx-buybox__sr-input"
-            name="cx-purchase-{{ uid }}"
-            value="subscription"
-            data-cellexia-option="subscription"
-            {% if cx_sub_checked %}checked aria-checked="true"{% else %}aria-checked="false"{% endif %}
-          >
-          <span class="cx-buybox__card-body">
-            <span class="cx-buybox__control" aria-hidden="true"></span>
-            <span class="cx-buybox__card-main">
-              <span class="cx-buybox__title-row">
-                <span class="cx-buybox__title"{% if cx_sub_label_raw contains '{' %} data-cellexia-tpl="{{ cx_sub_label_raw | escape }}"{% endif %}>{{ cx_sub_label }}</span>
-                {%- if cx_show_savings -%}
-                <span class="cx-buybox__save" data-cellexia-save{% if cx_save_tpl_raw != blank %} data-cellexia-tpl="{{ cx_save_tpl_raw | escape }}"{% endif %} {% if cx_save == blank %}hidden{% endif %}>{{ cx_save }}</span>
-                {%- endif -%}
-              </span>
-              {{ cx_price_block }}
-            </span>
-          </span>
-        </label>
-
-        {{ cx_freq_control }}
-
-        {%- if cx_show_reassurance -%}{{ cx_reassurance_html }}{%- endif -%}
-
-        {{ cx_benefits_html }}
-      </div>
-        {%- endcapture -%}
-        {%- capture cx_card_one -%}
-      {%- unless product.requires_selling_plan -%}
-        <div
-          class="cx-buybox__option cx-buybox__option--onetime{% unless cx_sub_checked %} is-selected{% endunless %}"
-          data-cellexia-option-wrap="one_time"
-        >
-          <label class="cx-buybox__card">
-            <input
-              type="radio"
-              class="cx-buybox__radio cx-buybox__sr-input"
-              name="cx-purchase-{{ uid }}"
-              value="one_time"
-              data-cellexia-option="one_time"
-              {% unless cx_sub_checked %}checked aria-checked="true"{% else %}aria-checked="false"{% endunless %}
-            >
-            <span class="cx-buybox__card-body">
-              <span class="cx-buybox__control" aria-hidden="true"></span>
-              <span class="cx-buybox__card-main">
-                <span class="cx-buybox__title-row">
-                  <span class="cx-buybox__title">{{ cx_onetime_label }}</span>
-                  <span class="cx-buybox__price" data-cellexia-onetime-price>
-                    <span class="cx-price">{{ cx_variant.price | money }}</span>
-                  </span>
-                </span>
-              </span>
-            </span>
-          </label>
-        </div>
-      {%- endunless -%}
-        {%- endcapture -%}
-        <div class="cx-buybox__group" role="radiogroup" aria-labelledby="cx-buybox-label-{{ uid }}">
-          {%- if cx_order == 'one_time_first' -%}{{ cx_card_one }}{{ cx_card_sub }}{%- else -%}{{ cx_card_sub }}{{ cx_card_one }}{%- endif -%}
-        </div>
-
-    {%- endcase -%}
-
-    {%- comment -%} Hidden selling-plan MIRROR — NAMELESS on purpose. NEVER
-      GIVE IT name="selling_plan": buy-box-embed.js can move this into a
-      form that already has buy-box.js's own selling_plan field, and
-      Shopify keeps the LAST duplicate — not this one — so "One-time" could
-      still submit a subscription. That name belongs only to
-      data-cellexia-plan-input. {%- endcomment -%}
-    <input
-      type="hidden"
-      hidden
-      value="{% if cx_sub_checked %}{{ cx_selected_plan.id }}{% endif %}"
-      data-cellexia-selling-plan
-    >
-
-    {%- comment -%}
-      JSON island: RAW localized price strings per variant x plan, swapped
-      by buy-box.js via textContent (never formats money). "oneTime"/"first"
-      double as the theme price-sync pair.
-
-      Money decoded SAFE→RAW here too (<script> never decodes entities):
-      money-format entities + standard un-escape set, &amp; LAST. Composed
-      strings (then/save/perDelivery) go through the locale-defaults chain
-      above, THEN get RAW plan label + money substituted in.
-    {%- endcomment -%}
-    <script type="application/json" data-cellexia-data>
-      {
-        "initialVariant": "{{ cx_variant.id }}",
-        "initialPlan": "{{ cx_selected_plan.id }}",
-        "preselect": {% if cx_sub_checked %}true{% else %}false{% endif %},
-        "requiresSellingPlan": {% if product.requires_selling_plan %}true{% else %}false{% endif %},
-        "variants": {
-          {%- for v in product.variants -%}
-            {%- comment -%}
-              MONEY SAFE → RAW again (island boundary) — same money chain as
-              the comment above the variants map (&amp; last); this is the
-              per-variant one-time price.
-            {%- endcomment -%}
-            {%- assign v_onetime_raw = v.price | money | strip_html | replace: '&nbsp;', ' ' | replace: '&pound;', '£' | replace: '&euro;', '€' | replace: '&yen;', '¥' | replace: '&cent;', '¢' | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&' -%}
-            "{{ v.id }}": {
-              "available": {% if v.available %}true{% else %}false{% endif %},
-              "oneTime": {{ v_onetime_raw | json }},
-              "plans": {
-                {%- assign cx_plan_i = 0 -%}
-                {%- for a in v.selling_plan_allocations -%}
-                  {%- if a.selling_plan_group_id == cx_group.id -%}
-                    {%- liquid
-                      # cx-freq-label (inlined) for this allocation's plan.
-                      assign a_weeks = 0
-                      for a_opt in a.selling_plan.options
-                        assign a_opt_val = a_opt.value | downcase
-                        if a_opt_val contains 'week'
-                          assign a_cand = a_opt_val | split: ' ' | first | plus: 0
-                          if a_cand > 0
-                            assign a_weeks = a_cand
-                            break
-                          endif
-                        endif
-                      endfor
-                      if a_weeks == 0
-                        assign a_plan_name = a.selling_plan.name | downcase
-                        if a_plan_name contains 'week'
-                          assign a_tokens = a_plan_name | split: ' '
-                          for a_tok in a_tokens
-                            assign a_cand = a_tok | plus: 0
-                            if a_cand > 0
-                              assign a_weeks = a_cand
-                              break
-                            endif
-                          endfor
-                        endif
-                      endif
-                      if a_weeks > 1
-                        assign a_freq_raw = a_weeks | append: ' ' | append: cx_lc_weeks_raw
-                      else
-                        assign a_freq_raw = a.selling_plan.name
-                      endif
-
-                      # "then {price} every {frequency}", RAW throughout (see
-                      # money chain above); money decoded to RAW before
-                      # substitution, same order as the initial render above.
-                      assign a_adj_count = a.price_adjustments | size
-                      if a_adj_count > 1
-                        assign a_last_adj = a.price_adjustments | last
-                        assign a_ongoing = a_last_adj.price
-                      else
-                        assign a_ongoing = a.price
-                      endif
-                      assign a_then_raw = ''
-                      if a_ongoing != a.price
-                        assign a_ongoing_fmt = a_ongoing | money | strip_html | replace: '&nbsp;', ' ' | replace: '&pound;', '£' | replace: '&euro;', '€' | replace: '&yen;', '¥' | replace: '&cent;', '¢' | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
-                        assign a_then = 'then_price' | t: price: '{price}', frequency: '{frequency}'
-                        assign a_then_raw = a_then | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
-                        assign a_then_raw = a_then_raw | replace: '{price}', a_ongoing_fmt | replace: '{frequency}', a_freq_raw | strip
-                      endif
-
-                      # "Save X" (cx-save-label inlined), RAW — same chain.
-                      assign a_save_cents = v.price | minus: a.price
-                      assign a_pct = 0
-                      if a_save_cents > 0 and v.price > 0
-                        assign a_pct = a_save_cents | times: 100.0 | divided_by: v.price | round
-                      endif
-                      assign a_pct_str = ''
-                      if a_pct > 0
-                        assign a_pct_str = a_pct | append: '%'
-                      endif
-                      assign a_save_raw = ''
-                      if a_save_cents > 0 and v.price > 0
-                        assign a_save_fmt = cx_savings_format
-                        if a_pct < 1
-                          assign a_save_fmt = 'absolute'
-                        endif
-                        assign a_save_abs = a_save_cents | money | strip_html | replace: '&nbsp;', ' ' | replace: '&pound;', '£' | replace: '&euro;', '€' | replace: '&yen;', '¥' | replace: '&cent;', '¢' | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
-                        if a_save_fmt == 'absolute'
-                          assign a_save_amt = a_save_abs
-                        elsif a_save_fmt == 'both'
-                          assign a_save_amt = a_save_abs | append: ' (' | append: a_pct | append: '%)'
-                        else
-                          assign a_save_amt = a_pct | append: '%'
-                        endif
-                        assign a_save = 'save_amount' | t: amount: '{amount}'
-                        assign a_save_raw = a_save | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
-                        assign a_save_raw = a_save_raw | replace: '{amount}', a_save_amt | strip
-                      endif
-
-                      # "{price} per delivery": label to RAW first, THEN RAW
-                      # money prepended (order matters, see chain above).
-                      # a_pd_cents mirrors the JS fallback.
-                      assign a_pd_cents = a.per_delivery_price
-                      if a_pd_cents == blank
-                        assign a_pd_cents = a.price
-                      endif
-                      assign a_pd_money_raw = a_pd_cents | money | strip_html | replace: '&nbsp;', ' ' | replace: '&pound;', '£' | replace: '&euro;', '€' | replace: '&yen;', '¥' | replace: '&cent;', '¢' | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
-                      assign a_pd_raw = ''
-                      if a.per_delivery_price != blank and a.per_delivery_price != a.price
-                        assign a_pd_label_raw = cx_lc_per_delivery | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
-                        assign a_pd_raw = a_pd_money_raw | append: ' ' | append: a_pd_label_raw | strip
-                      endif
-
-                      # "first" (+ "oneTime" above): the price-sync pair, RAW.
-                      assign a_first_raw = a.price | money | strip_html | replace: '&nbsp;', ' ' | replace: '&pound;', '£' | replace: '&euro;', '€' | replace: '&yen;', '¥' | replace: '&cent;', '¢' | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
-                    -%}
-                    {%- if cx_plan_i > 0 -%},{%- endif -%}
-                    {%- assign cx_plan_i = cx_plan_i | plus: 1 -%}
-                    "{{ a.selling_plan.id }}": {
-                      "first": {{ a_first_raw | json }},
-                      "then": {{ a_then_raw | json }},
-                      "save": {{ a_save_raw | json }},
-                      "perDelivery": {{ a_pd_raw | json }},
-                      "pd": {{ a_pd_money_raw | json }},
-                      "freq": {{ a_freq_raw | json }},
-                      "savePct": {{ a_pct_str | json }}
-                    }
-                  {%- endif -%}
-                {%- endfor -%}
-              }
-            }{%- unless forloop.last -%},{%- endunless -%}
-          {%- endfor -%}
-        }
-      }
-    </script>
-
-    <noscript>
-      {%- comment -%}
-        Without JS the widget cannot write selling_plan into the product form;
-        showing it would promise a subscription the cart would not contain.
-      {%- endcomment -%}
-      <style>
-        #cx-buybox-{{ uid }} .cx-buybox__group,
-        #cx-buybox-{{ uid }} .cx-buybox__heading,
-        #cx-buybox-{{ uid }} .cx-buybox__subheading { display: none; }
-      </style>
-    </noscript>
-  </div>
-
-  {%- else -%}{%- comment -%}
-    NO OWNED GROUP: renders NOTHING, same as no selling plans. Inert
-    <template> below lets buy-box.js show an admin-only diagnostic behind a
-    validated preview session only — README.md § "The admin-only diagnostic".
-  {%- endcomment -%}<template class="cx-buybox-nogroup" data-cellexia-no-owned-group hidden style="display:none!important"></template>
-  {%- endif -%}
-
+{%- liquid
+# OWNERSHIP: render OUR allow-listed group or render NOTHING — TWO factors, group id AND a plan id, exact string equality; no allow-list means no widget. Full essay: README "Core snippet internals"; proof: tests/liquid/two-apps.test.ts.
+assign cx_allow = shop.metafields.cellexia.plan_groups.value
+assign cx_allow_ids = cx_allow.groupIds
+assign cx_allow_count = cx_allow_ids | size
+assign cx_allow_plan_ids = cx_allow.planIds
+assign cx_allow_plan_count = cx_allow_plan_ids | size
+assign cx_group = false
+assign cx_group_found = false
+if cx_allow_count > 0 and cx_allow_plan_count > 0
+for cx_g in product.selling_plan_groups
+assign cx_g_id = cx_g.id | append: ''
+assign cx_id_match = false
+for cx_allowed in cx_allow_ids
+assign cx_allowed_id = cx_allowed | append: ''
+if cx_allowed_id == cx_g_id
+assign cx_id_match = true
+break
+endif
+endfor
+if cx_id_match
+# Second factor, scanned on the GROUP's own plans; defaults false, no path renders with it defaulted true.
+assign cx_plan_match = false
+for cx_p in cx_g.selling_plans
+assign cx_p_id = cx_p.id | append: ''
+for cx_allowed_plan in cx_allow_plan_ids
+assign cx_allowed_plan_id = cx_allowed_plan | append: ''
+if cx_allowed_plan_id == cx_p_id
+assign cx_plan_match = true
+break
+endif
+endfor
+if cx_plan_match
+break
+endif
+endfor
+# A group failing the second factor is skipped, not fatal: a later group may be genuinely ours.
+if cx_plan_match
+assign cx_group = cx_g
+assign cx_group_found = true
+break
+endif
+endif
+endfor
+endif
+-%}
+{%- if cx_group_found -%}
+{%- comment -%} From here to the matching else branch: the widget itself (the render snapshot pins the output). {%- endcomment -%}
+{%- liquid
+# Launch gate: hidden until live; missing metafield fails closed.
+assign cx_launch_status = shop.metafields.cellexia.launch_status.value | default: shop.metafields.cellexia.launch_status
+assign cx_live = false
+if cx_launch_status == 'live'
+assign cx_live = true
+endif
+# Design config (published by the app's Buy box designer)
+assign cx_cfg = shop.metafields.cellexia.buybox_design.value
+assign cx_source = design_source | default: 'app'
+assign cx_preset = 'classic'
+assign cx_use_cfg = false
+assign cx_known_presets = 'classic toggle tiles inline value_stack planner subscription_max' | split: ' '
+if cx_source != blank and cx_source != 'app'
+assign cx_preset = cx_source
+elsif cx_cfg and cx_cfg.preset
+assign cx_preset = cx_cfg.preset
+assign cx_use_cfg = true
+# Per-market preset (config.markets, v1.6.0) keyed by market HANDLE; nil-safe, exact key, unknown preset falls back to the base preset.
+assign cx_market_handle = ''
+if localization.market.handle != blank
+assign cx_market_handle = localization.market.handle | append: ''
+endif
+if cx_market_handle != blank and cx_cfg.markets
+assign cx_market_entry = cx_cfg.markets[cx_market_handle]
+if cx_market_entry and cx_market_entry.preset != blank
+assign cx_market_preset = cx_market_entry.preset | append: ''
+if cx_known_presets contains cx_market_preset
+assign cx_preset = cx_market_preset
+endif
+endif
+endif
+endif
+unless cx_known_presets contains cx_preset
+assign cx_preset = 'classic'
+endunless
+# The selling plan group — resolved above; reaching here means cx_group is OURS.
+assign cx_multi_plan = false
+if cx_group.selling_plans.size > 1
+assign cx_multi_plan = true
+endif
+# Preselected plan: recommended frequency, else first
+assign cx_selected_plan = cx_group.selling_plans | first
+assign cx_rec = recommended_frequency_handle | strip | downcase
+if cx_rec != blank
+assign cx_rec_found = false
+for p in cx_group.selling_plans
+unless cx_rec_found
+assign p_hay = p.name | downcase
+for opt in p.options
+assign opt_val = opt.value | downcase
+assign p_hay = p_hay | append: ' ' | append: opt_val
+endfor
+if p_hay contains cx_rec
+assign cx_selected_plan = p
+assign cx_rec_found = true
+endif
+endunless
+endfor
+endif
+# The recommended plan keeps its planner tag even if the allocation fallback moves the initial selection.
+assign cx_rec_plan_id = cx_selected_plan.id
+# Current variant (honours ?variant= deep links)
+assign cx_variant = product.selected_or_first_available_variant
+if cx_variant == blank
+assign cx_variant = product.variants | first
+endif
+# Allocation for current variant + selected plan (with fallback)
+assign cx_alloc = false
+for a in cx_variant.selling_plan_allocations
+if a.selling_plan.id == cx_selected_plan.id
+assign cx_alloc = a
+break
+endif
+endfor
+unless cx_alloc
+for a in cx_variant.selling_plan_allocations
+if a.selling_plan_group_id == cx_group.id
+assign cx_alloc = a
+assign cx_selected_plan = a.selling_plan
+break
+endif
+endfor
+endunless
+# Initial prices
+if cx_alloc
+assign cx_first = cx_alloc.price
+assign cx_adj_count = cx_alloc.price_adjustments | size
+if cx_adj_count > 1
+assign cx_last_adj = cx_alloc.price_adjustments | last
+assign cx_ongoing = cx_last_adj.price
+else
+assign cx_ongoing = cx_alloc.price
+endif
+# nil per_delivery_price falls back to the charge price like buy-box.js; blank test, not gt-zero (a free product has a real 0).
+assign cx_pd_cents = cx_alloc.per_delivery_price
+if cx_pd_cents == blank
+assign cx_pd_cents = cx_first
+endif
+else
+assign cx_first = cx_variant.price
+assign cx_ongoing = cx_variant.price
+assign cx_pd_cents = cx_variant.price
+endif
+# Layout knobs (defaults = the v1.0.0 rendering / block settings)
+assign cx_order = 'sub_first'
+assign cx_density_compact = compact_mode
+assign cx_freq_style = 'dropdown'
+assign cx_show_badge = show_badge
+assign cx_show_savings = true
+assign cx_show_pd = true
+assign cx_show_compare = false
+assign cx_show_reassurance = show_reassurance
+assign cx_show_benefits = false
+assign cx_benefit_count = 4
+assign cx_show_freq = show_frequency_selector
+# subscription_max defaults (v1.6.0): quiet — badge and frequency selector OFF unless the config re-enables them.
+if cx_preset == 'subscription_max'
+assign cx_show_badge = false
+assign cx_show_freq = false
+endif
+if cx_use_cfg and cx_cfg.layout
+assign cx_l = cx_cfg.layout
+if cx_l.order == 'one_time_first'
+assign cx_order = 'one_time_first'
+endif
+if cx_l.density == 'compact'
+assign cx_density_compact = true
+elsif cx_l.density == 'comfortable'
+assign cx_density_compact = false
+endif
+if cx_l.frequencyStyle == 'chips'
+assign cx_freq_style = 'chips'
+endif
+# v1.2.0 frequency removal; a missing showFrequency key must mean "show" (pre-v1.2.0 configs).
+if cx_l.showFrequency == false
+assign cx_show_freq = false
+elsif cx_l.showFrequency == true
+assign cx_show_freq = true
+endif
+if cx_l.showBadge == false
+assign cx_show_badge = false
+elsif cx_l.showBadge == true
+assign cx_show_badge = true
+endif
+if cx_l.showSavings == false
+assign cx_show_savings = false
+endif
+if cx_l.showPerDelivery == false
+assign cx_show_pd = false
+endif
+if cx_l.showCompareAt == true
+assign cx_show_compare = true
+endif
+if cx_l.showReassurance == false
+assign cx_show_reassurance = false
+elsif cx_l.showReassurance == true
+assign cx_show_reassurance = true
+endif
+if cx_l.showBenefits == true
+assign cx_show_benefits = true
+endif
+if cx_l.benefitCount != blank
+assign cx_benefit_count = cx_l.benefitCount
+endif
+endif
+# value_stack IS the benefit panel — its archetype always renders the list.
+if cx_preset == 'value_stack'
+assign cx_show_benefits = true
+if cx_benefit_count < 1
+assign cx_benefit_count = 4
+endif
+endif
+# Frequency control renders only when ON and the group is multi-plan.
+assign cx_freq_ui = false
+if cx_show_freq and cx_multi_plan
+assign cx_freq_ui = true
+endif
+# The planner always uses chips and tags the recommended plan; other presets follow layout.frequencyStyle.
+assign cx_ctl_style = cx_freq_style
+assign cx_ctl_recommended = false
+if cx_preset == 'planner'
+assign cx_ctl_style = 'chips'
+assign cx_ctl_recommended = true
+endif
+# Behavior knobs
+assign cx_sub_checked = preselect_subscription
+assign cx_anim = true
+if cx_use_cfg and cx_cfg.behavior
+if cx_cfg.behavior.preselect == 'subscription'
+assign cx_sub_checked = true
+elsif cx_cfg.behavior.preselect == 'one_time'
+assign cx_sub_checked = false
+endif
+if cx_cfg.behavior.animation == false
+assign cx_anim = false
+endif
+endif
+if product.requires_selling_plan
+assign cx_sub_checked = true
+endif
+# Style knobs to CSS custom properties; the accent is ALWAYS emitted inline (brand near-black default) and wins over the stylesheet.
+assign cx_accent = accent_color | default: '#1d1d1b'
+assign cx_accent_soft = ''
+assign cx_style_extra = ''
+assign cx_custom_css = ''
+if cx_use_cfg
+if cx_cfg.style.accent != blank
+assign cx_accent = cx_cfg.style.accent
+endif
+# NOT appended to cx_style_extra: --cx-accent-soft has ONE fixed slot below, never carried twice.
+if cx_cfg.style.bgTint != blank
+assign cx_accent_soft = cx_cfg.style.bgTint
+endif
+if cx_cfg.style.text != blank
+assign cx_style_extra = cx_style_extra | append: ' --cx-text: ' | append: cx_cfg.style.text | append: ';'
+endif
+if cx_cfg.style.badgeBg != blank
+assign cx_style_extra = cx_style_extra | append: ' --cx-badge-bg: ' | append: cx_cfg.style.badgeBg | append: ';'
+endif
+if cx_cfg.style.badgeText != blank
+assign cx_style_extra = cx_style_extra | append: ' --cx-badge-text: ' | append: cx_cfg.style.badgeText | append: ';'
+endif
+if cx_cfg.style.accentText != blank
+assign cx_style_extra = cx_style_extra | append: ' --cx-accent-text: ' | append: cx_cfg.style.accentText | append: ';'
+endif
+if cx_cfg.style.fontScale and cx_cfg.style.fontScale != 1
+assign cx_style_extra = cx_style_extra | append: ' --cx-font-scale: ' | append: cx_cfg.style.fontScale | append: ';'
+endif
+if cx_cfg.layout.radiusPx != blank and cx_cfg.layout.radiusPx != 12
+assign cx_style_extra = cx_style_extra | append: ' --cx-radius: ' | append: cx_cfg.layout.radiusPx | append: 'px;'
+endif
+if cx_cfg.layout.borderWidthPx != blank and cx_cfg.layout.borderWidthPx != 1
+assign cx_style_extra = cx_style_extra | append: ' --cx-border-width: ' | append: cx_cfg.layout.borderWidthPx | append: 'px;'
+endif
+# Server-sanitized (sanitizeCustomCss); replaces + brace walk are an idempotent belt against hand-edited metafields, slice bounds the walk.
+if cx_cfg.style.customCss != blank
+assign cx_custom_css = cx_cfg.style.customCss | slice: 0, 5000 | replace: '<', '' | replace: '>', '' | replace: 'javascript:', '' | replace: '@import', ''
+# BRACE CONTAINMENT: negative depth drops the css whole; the 'x' sentinel stops split collapsing trailing separators.
+assign cx_css_probe = cx_custom_css | append: 'x'
+assign cx_css_segments = cx_css_probe | split: '}'
+assign cx_css_depth = 0
+for cx_css_segment in cx_css_segments
+unless forloop.last
+assign cx_css_opens = cx_css_segment | append: 'x' | split: '{' | size
+assign cx_css_depth = cx_css_depth | plus: cx_css_opens | minus: 2
+if cx_css_depth < 0
+assign cx_custom_css = ''
+break
+endif
+endunless
+endfor
+endif
+endif
+# Soft fill: merchant bgTint when set, else accent at 7% alpha.
+if cx_accent_soft == blank
+assign cx_accent_soft = cx_accent | color_modify: 'alpha', 0.07
+endif
+# strip_html + escape: attribute-injection hardening only (zod-validated tokens pass unchanged); color_modify returns invalid colours UNCHANGED so the soft value needs it too.
+assign cx_accent_soft = cx_accent_soft | strip_html | escape
+assign cx_style_extra = cx_style_extra | strip_html | escape
+# SAFE to RAW locale defaults: un-escaped here ONCE, amp replaced LAST; strings printed directly stay SAFE.
+assign cx_lc_subscribe_raw = 'subscribe_save' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign cx_lc_subscribe_pct_raw = 'subscribe_save_percent' | t: percent: '{percent}' | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign cx_lc_one_time_raw = 'one_time' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign cx_lc_one_time_short_raw = 'one_time_short' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign cx_lc_most_popular_raw = 'most_popular' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign cx_lc_reassurance_raw = 'reassurance' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign cx_lc_freq_label_raw = 'frequency_label' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign cx_lc_delivery_every_raw = 'delivery_every' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign cx_lc_weeks_raw = 'weeks' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign cx_lc_first_order_raw = 'first_order' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign cx_lc_buy_once_raw = 'or_buy_once' | t: amount: '{amount}' | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign cx_lc_buy_once_quiet_raw = 'or_buy_once_quiet' | t: amount: '{amount}' | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign cx_lc_b1 = 'benefit_first_order' | t
+assign cx_lc_b2 = 'benefit_ongoing' | t
+assign cx_lc_b3 = 'benefit_milestone_gift' | t
+assign cx_lc_b4 = 'benefit_flexibility' | t
+assign cx_lc_benefits_joined = cx_lc_b1 | append: '||' | append: cx_lc_b2 | append: '||' | append: cx_lc_b3 | append: '||' | append: cx_lc_b4
+assign cx_lc_benefits_raw = cx_lc_benefits_joined | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+# SAFE locale strings printed as-is.
+assign cx_lc_per_delivery = 'per_delivery' | t
+assign cx_recommended_label = 'recommended_tag' | t
+# Frequency label for the SELECTED plan (was cx-freq-label): week count from options, else name; month plans and week-count 1 keep the raw plan name. RAW in, RAW out.
+assign cx_fl_weeks = 0
+for cx_fl_opt in cx_selected_plan.options
+assign cx_fl_val = cx_fl_opt.value | downcase
+if cx_fl_val contains 'week'
+assign cx_fl_cand = cx_fl_val | split: ' ' | first | plus: 0
+if cx_fl_cand > 0
+assign cx_fl_weeks = cx_fl_cand
+break
+endif
+endif
+endfor
+if cx_fl_weeks == 0
+assign cx_fl_name = cx_selected_plan.name | downcase
+if cx_fl_name contains 'week'
+assign cx_fl_tokens = cx_fl_name | split: ' '
+for cx_fl_tok in cx_fl_tokens
+assign cx_fl_cand = cx_fl_tok | plus: 0
+if cx_fl_cand > 0
+assign cx_fl_weeks = cx_fl_cand
+break
+endif
+endfor
+endif
+endif
+if cx_fl_weeks > 1
+assign cx_freq_raw = cx_fl_weeks | append: ' ' | append: cx_lc_weeks_raw
+assign cx_freq_full_raw = cx_lc_delivery_every_raw | append: ' ' | append: cx_freq_raw
+else
+assign cx_freq_raw = cx_selected_plan.name
+assign cx_freq_full_raw = cx_selected_plan.name
+endif
+assign cx_freq = cx_freq_raw | escape
+assign cx_freq_full = cx_freq_full_raw | escape
+# Template values for the percent, amount and frequency placeholders — all three inject into SAFE strings AFTER the single escape.
+assign cx_save_cents = cx_variant.price | minus: cx_first
+assign cx_save_pct = 0
+if cx_save_cents > 0 and cx_variant.price > 0
+assign cx_save_pct = cx_save_cents | times: 100.0 | divided_by: cx_variant.price | round
+endif
+assign cx_pct = ''
+if cx_save_pct > 0
+assign cx_pct = cx_save_pct | append: '%'
+endif
+assign cx_amount = cx_variant.price | money | strip_html
+# "then price every frequency" (SAFE, contains money): t gets the locale sentence only, inert placeholders substituted afterwards.
+assign cx_then = ''
+if cx_ongoing != cx_first
+assign cx_ongoing_fmt = cx_ongoing | money | strip_html
+assign cx_then = 'then_price' | t: price: '{price}', frequency: '{frequency}'
+assign cx_then = cx_then | replace: '{price}', cx_ongoing_fmt | replace: '{frequency}', cx_freq | strip
+endif
+# "Save X" for the current allocation (SAFE); a percentage rounding below 1% degrades to the absolute amount.
+assign cx_savings_format = savings_format | default: 'percent'
+assign cx_save = ''
+if cx_alloc and cx_save_cents > 0 and cx_variant.price > 0
+assign cx_save_fmt = cx_savings_format
+if cx_save_pct < 1
+assign cx_save_fmt = 'absolute'
+endif
+assign cx_save_abs = cx_save_cents | money | strip_html
+if cx_save_fmt == 'absolute'
+assign cx_save_amt = cx_save_abs
+elsif cx_save_fmt == 'both'
+assign cx_save_amt = cx_save_abs | append: ' (' | append: cx_save_pct | append: '%)'
+else
+assign cx_save_amt = cx_save_pct | append: '%'
+endif
+# Placeholder in, SAFE money substituted after — never through t (double escape).
+assign cx_save = 'save_amount' | t: amount: '{amount}'
+assign cx_save = cx_save | replace: '{amount}', cx_save_amt | strip
+endif
+# "price per delivery" (SAFE): only when the allocation STATES a per-delivery price that DIFFERS from the charge; nested blank guard (nil is unknown, not 0).
+assign cx_pd = ''
+if cx_alloc
+assign cx_pd_alloc = cx_alloc.per_delivery_price
+if cx_pd_alloc != blank and cx_pd_alloc != cx_alloc.price
+assign cx_pd_money = cx_pd_alloc | money | strip_html
+assign cx_pd = cx_pd_money | append: ' ' | append: cx_lc_per_delivery
+endif
+endif
+# Theme add-to-cart price sync (v1.2.2): both attrs SAFE money, NEVER escaped, only the double quote entity-encoded (README "Core snippet internals").
+assign cx_money_onetime = cx_amount | replace: '"', '&quot;'
+assign cx_money_sub = ''
+if cx_alloc
+assign cx_money_sub = cx_first | money | strip_html | replace: '"', '&quot;'
+endif
+# Feature flag + optional selector (config themeSync); a missing key means ON.
+assign cx_price_sync = true
+assign cx_price_selector_raw = ''
+if cx_use_cfg and cx_cfg.themeSync
+if cx_cfg.themeSync.syncAddToCartPrice == false
+assign cx_price_sync = false
+endif
+# Server-sanitized (sanitizePlacementSelector); replaces are an idempotent belt.
+assign cx_price_selector_raw = cx_cfg.themeSync.priceSelector | default: '' | replace: '<', '' | replace: '>', '' | replace: '"', '' | replace: "'", '' | strip
+endif
+# Config text lookup tables (locale, then en, then default)
+assign cx_t_loc = false
+assign cx_t_en = false
+if cx_use_cfg and cx_cfg.text
+assign cx_t_loc = cx_cfg.text[request.locale.iso_code]
+assign cx_t_en = cx_cfg.text['en']
+endif
+# Text resolution, key by key, in RAW space: config.text locale, then en, then default (blank overrides count as ABSENT); then ONE step of escape + SAFE-placeholder injection + whitespace collapse.
+# heading — default is the theme-editor block setting (already RAW).
+assign cx_heading_raw = ''
+if cx_t_loc
+assign cx_heading_raw = cx_t_loc.heading | default: '' | strip
+endif
+if cx_heading_raw == blank and cx_t_en
+assign cx_heading_raw = cx_t_en.heading | default: '' | strip
+endif
+if cx_heading_raw == blank and cx_preset != 'subscription_max'
+# subscription_max skips the block-setting fallback: its heading defaults to empty (config override still wins).
+assign cx_heading_raw = heading | default: ''
+endif
+assign cx_heading = cx_heading_raw | escape | replace: '{percent}', cx_pct | replace: '{amount}', cx_amount | replace: '{frequency}', cx_freq | replace: '  ', ' ' | strip
+# subheading — config-only (no locale default).
+assign cx_subheading_raw = ''
+if cx_t_loc
+assign cx_subheading_raw = cx_t_loc.subheading | default: '' | strip
+endif
+if cx_subheading_raw == blank and cx_t_en
+assign cx_subheading_raw = cx_t_en.subheading | default: '' | strip
+endif
+assign cx_subheading = cx_subheading_raw | escape | replace: '{percent}', cx_pct | replace: '{amount}', cx_amount | replace: '{frequency}', cx_freq | replace: '  ', ' ' | strip
+# badge — config → block setting → translated "Most popular".
+assign cx_badge_raw = ''
+if cx_t_loc
+assign cx_badge_raw = cx_t_loc.badge | default: '' | strip
+endif
+if cx_badge_raw == blank and cx_t_en
+assign cx_badge_raw = cx_t_en.badge | default: '' | strip
+endif
+if cx_badge_raw == blank
+assign cx_badge_raw = badge_text | default: '' | strip
+endif
+if cx_badge_raw == blank
+assign cx_badge_raw = cx_lc_most_popular_raw
+endif
+assign cx_badge = cx_badge_raw | escape
+# subscribeLabel — the toggle/inline default embeds {percent}.
+if cx_preset == 'toggle' or cx_preset == 'inline'
+assign cx_sub_label_default_raw = cx_lc_subscribe_pct_raw
+else
+assign cx_sub_label_default_raw = cx_lc_subscribe_raw
+endif
+assign cx_sub_label_raw = ''
+if cx_t_loc
+assign cx_sub_label_raw = cx_t_loc.subscribeLabel | default: '' | strip
+endif
+if cx_sub_label_raw == blank and cx_t_en
+assign cx_sub_label_raw = cx_t_en.subscribeLabel | default: '' | strip
+endif
+if cx_sub_label_raw == blank
+assign cx_sub_label_raw = cx_sub_label_default_raw
+endif
+assign cx_sub_label = cx_sub_label_raw | escape | replace: '{percent}', cx_pct | replace: '{amount}', cx_amount | replace: '{frequency}', cx_freq | replace: '  ', ' ' | strip
+# oneTimeLabel — full label plus the short toggle-tab variant (one override key, two locale defaults).
+assign cx_onetime_override_raw = ''
+if cx_t_loc
+assign cx_onetime_override_raw = cx_t_loc.oneTimeLabel | default: '' | strip
+endif
+if cx_onetime_override_raw == blank and cx_t_en
+assign cx_onetime_override_raw = cx_t_en.oneTimeLabel | default: '' | strip
+endif
+assign cx_onetime_label_raw = cx_onetime_override_raw
+if cx_onetime_label_raw == blank
+assign cx_onetime_label_raw = cx_lc_one_time_raw
+endif
+assign cx_onetime_short_raw = cx_onetime_override_raw
+if cx_onetime_short_raw == blank
+assign cx_onetime_short_raw = cx_lc_one_time_short_raw
+endif
+assign cx_onetime_label = cx_onetime_label_raw | escape
+assign cx_onetime_label_short = cx_onetime_short_raw | escape
+# savingsTemplate — config-only; REPLACES the built-in copy while there is a real saving to claim.
+assign cx_save_tpl_raw = ''
+if cx_t_loc
+assign cx_save_tpl_raw = cx_t_loc.savingsTemplate | default: '' | strip
+endif
+if cx_save_tpl_raw == blank and cx_t_en
+assign cx_save_tpl_raw = cx_t_en.savingsTemplate | default: '' | strip
+endif
+if cx_save != blank and cx_save_tpl_raw != blank
+assign cx_save = cx_save_tpl_raw | escape | replace: '{percent}', cx_pct | replace: '{amount}', cx_amount | replace: '{frequency}', cx_freq | replace: '  ', ' ' | strip
+endif
+# reassurance
+assign cx_reassurance_raw = ''
+if cx_t_loc
+assign cx_reassurance_raw = cx_t_loc.reassurance | default: '' | strip
+endif
+if cx_reassurance_raw == blank and cx_t_en
+assign cx_reassurance_raw = cx_t_en.reassurance | default: '' | strip
+endif
+if cx_reassurance_raw == blank
+assign cx_reassurance_raw = cx_lc_reassurance_raw
+endif
+assign cx_reassurance = cx_reassurance_raw | escape | replace: '{percent}', cx_pct | replace: '{amount}', cx_amount | replace: '{frequency}', cx_freq | replace: '  ', ' ' | strip
+# frequencyLabel — the planner asks a question, the others label a select.
+if cx_preset == 'planner'
+assign cx_freq_label_default_raw = cx_lc_freq_label_raw
+else
+assign cx_freq_label_default_raw = cx_lc_delivery_every_raw
+endif
+assign cx_freq_label_raw = ''
+if cx_t_loc
+assign cx_freq_label_raw = cx_t_loc.frequencyLabel | default: '' | strip
+endif
+if cx_freq_label_raw == blank and cx_t_en
+assign cx_freq_label_raw = cx_t_en.frequencyLabel | default: '' | strip
+endif
+if cx_freq_label_raw == blank
+assign cx_freq_label_raw = cx_freq_label_default_raw
+endif
+assign cx_freq_label = cx_freq_label_raw | escape
+# firstOrderLine
+assign cx_first_line_raw = ''
+if cx_t_loc
+assign cx_first_line_raw = cx_t_loc.firstOrderLine | default: '' | strip
+endif
+if cx_first_line_raw == blank and cx_t_en
+assign cx_first_line_raw = cx_t_en.firstOrderLine | default: '' | strip
+endif
+if cx_first_line_raw == blank
+assign cx_first_line_raw = cx_lc_first_order_raw
+endif
+assign cx_first_line = cx_first_line_raw | escape | replace: '{percent}', cx_pct | replace: '{amount}', cx_amount | replace: '{frequency}', cx_freq | replace: '  ', ' ' | strip
+# oneTimeLinkLabel — value_stack escape hatch and subscription_max quiet line; the default embeds the amount so the one-time price is visible BEFORE selection (compliance guardrail).
+if cx_preset == 'subscription_max'
+assign cx_onetime_link_default_raw = cx_lc_buy_once_quiet_raw
+else
+assign cx_onetime_link_default_raw = cx_lc_buy_once_raw
+endif
+assign cx_onetime_link_raw = ''
+if cx_t_loc
+assign cx_onetime_link_raw = cx_t_loc.oneTimeLinkLabel | default: '' | strip
+endif
+if cx_onetime_link_raw == blank and cx_t_en
+assign cx_onetime_link_raw = cx_t_en.oneTimeLinkLabel | default: '' | strip
+endif
+if cx_onetime_link_raw == blank
+assign cx_onetime_link_raw = cx_onetime_link_default_raw
+endif
+assign cx_onetime_link = cx_onetime_link_raw | escape | replace: '{percent}', cx_pct | replace: '{amount}', cx_amount | replace: '{frequency}', cx_freq | replace: '  ', ' ' | strip
+# benefits — config array (RAW) → the four un-escaped locale defaults.
+assign cx_benefits_arr = false
+if cx_show_benefits
+if cx_t_loc and cx_t_loc.benefits.size > 0
+assign cx_benefits_arr = cx_t_loc.benefits
+elsif cx_t_en and cx_t_en.benefits.size > 0
+assign cx_benefits_arr = cx_t_en.benefits
+else
+assign cx_benefits_arr = cx_lc_benefits_raw | split: '||'
+endif
+endif
+-%}
+{%- comment -%} Shared markup fragments — captures of PURE MARKUP, no render tag anywhere (RULE 1). {%- endcomment -%}
+{%- comment -%} Frequency control — dropdown or chips (was cx-freq-control) {%- endcomment -%}
+{%- assign cx_freq_control = '' -%}
+{%- if cx_freq_ui -%}
+{%- capture cx_freq_control -%}
+{%- if cx_ctl_style == 'chips' -%}
+<fieldset class="cx-buybox__chips">
+<legend class="cx-buybox__sr">{{ cx_freq_label }}</legend>
+{%- for p in cx_group.selling_plans -%}
+{%- liquid
+# cx-freq-label (inlined) — see the selected-plan copy above.
+assign cx_fl_weeks = 0
+for cx_fl_opt in p.options
+assign cx_fl_val = cx_fl_opt.value | downcase
+if cx_fl_val contains 'week'
+assign cx_fl_cand = cx_fl_val | split: ' ' | first | plus: 0
+if cx_fl_cand > 0
+assign cx_fl_weeks = cx_fl_cand
+break
+endif
+endif
+endfor
+if cx_fl_weeks == 0
+assign cx_fl_name = p.name | downcase
+if cx_fl_name contains 'week'
+assign cx_fl_tokens = cx_fl_name | split: ' '
+for cx_fl_tok in cx_fl_tokens
+assign cx_fl_cand = cx_fl_tok | plus: 0
+if cx_fl_cand > 0
+assign cx_fl_weeks = cx_fl_cand
+break
+endif
+endfor
+endif
+endif
+if cx_fl_weeks > 1
+assign cx_chip_raw = cx_fl_weeks | append: ' ' | append: cx_lc_weeks_raw
+else
+assign cx_chip_raw = p.name
+endif
+assign cx_chip_label = cx_chip_raw | escape
+-%}
+<label class="cx-buybox__chip">
+<input
+type="radio"
+class="cx-buybox__sr-input"
+name="cx-freq-{{ uid }}"
+value="{{ p.id }}"
+data-cellexia-freq-chip
+{% if p.id == cx_selected_plan.id %}checked{% endif %}
+>
+<span class="cx-buybox__chip-label">
+{{- cx_chip_label -}}
+{%- if cx_ctl_recommended and p.id == cx_rec_plan_id and cx_recommended_label != blank -%}
+<span class="cx-buybox__chip-tag">{{ cx_recommended_label }}</span>
+{%- endif -%}
+</span>
+</label>
+{%- endfor -%}
+</fieldset>
+{%- else -%}
+<div class="cx-buybox__freq">
+<label class="cx-buybox__sr" for="cx-freq-{{ uid }}">{{ cx_freq_label }}</label>
+<select id="cx-freq-{{ uid }}" class="cx-buybox__freq-select" data-cellexia-freq>
+{%- for p in cx_group.selling_plans -%}
+{%- liquid
+# cx-freq-label (inlined), 'select' variant: full sentence.
+assign cx_fl_weeks = 0
+for cx_fl_opt in p.options
+assign cx_fl_val = cx_fl_opt.value | downcase
+if cx_fl_val contains 'week'
+assign cx_fl_cand = cx_fl_val | split: ' ' | first | plus: 0
+if cx_fl_cand > 0
+assign cx_fl_weeks = cx_fl_cand
+break
+endif
+endif
+endfor
+if cx_fl_weeks == 0
+assign cx_fl_name = p.name | downcase
+if cx_fl_name contains 'week'
+assign cx_fl_tokens = cx_fl_name | split: ' '
+for cx_fl_tok in cx_fl_tokens
+assign cx_fl_cand = cx_fl_tok | plus: 0
+if cx_fl_cand > 0
+assign cx_fl_weeks = cx_fl_cand
+break
+endif
+endfor
+endif
+endif
+if cx_fl_weeks > 1
+assign cx_opt_raw = cx_fl_weeks | append: ' ' | append: cx_lc_weeks_raw
+assign cx_opt_raw = cx_lc_delivery_every_raw | append: ' ' | append: cx_opt_raw
+else
+assign cx_opt_raw = p.name
+endif
+assign cx_opt_label = cx_opt_raw | escape
+-%}
+<option value="{{ p.id }}" {% if p.id == cx_selected_plan.id %}selected{% endif %}>
+{{- cx_opt_label -}}
+</option>
+{%- endfor -%}
+</select>
+</div>
+{%- endif -%}
+{%- endcapture -%}
+{%- endif -%}
+{%- comment -%} Benefit list (was cx-benefit-list) {%- endcomment -%}
+{%- assign cx_benefits_html = '' -%}
+{%- if cx_benefits_arr and cx_benefit_count > 0 -%}
+{%- capture cx_benefits_html -%}
+<ul class="cx-buybox__benefits" role="list">
+{%- for b in cx_benefits_arr limit: cx_benefit_count -%}
+{%- assign cx_b_raw = b | strip -%}
+{%- if cx_b_raw != blank -%}
+<li class="cx-buybox__benefit">
+<svg class="cx-buybox__check" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
+<path d="M6.5 11.3 3.4 8.2l1-1 2.1 2 5-5.1 1 1z" fill="currentColor"/>
+</svg>
+{{ cx_b_raw | escape }}
+</li>
+{%- endif -%}
+{%- endfor -%}
+</ul>
+{%- endcapture -%}
+{%- endif -%}
+{%- comment -%} Reassurance line (was cx-reassurance) {%- endcomment -%}
+{%- assign cx_reassurance_html = '' -%}
+{%- if cx_reassurance != blank -%}
+{%- capture cx_reassurance_html -%}
+<p class="cx-buybox__reassurance">
+<svg class="cx-buybox__check" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
+<path d="M6.5 11.3 3.4 8.2l1-1 2.1 2 5-5.1 1 1z" fill="currentColor"/>
+</svg>
+{{- cx_reassurance -}}
+</p>
+{%- endcapture -%}
+{%- endif -%}
+{%- comment -%} Subscription price cluster, with and without the per-delivery row; hooks match buy-box.js. {%- endcomment -%}
+{%- capture cx_price_block -%}
+<span class="cx-buybox__price-row">
+<span class="cx-buybox__price cx-buybox__price--lg" data-cellexia-sub-price{% if cx_show_compare %} data-cellexia-compare{% endif %}>
+<span class="cx-price">{{ cx_first | money }}</span>
+{%- if cx_show_compare and cx_variant.price > cx_first %} <s class="cx-price__compare">{{ cx_variant.price | money }}</s>{% endif -%}
+</span>
+<span class="cx-buybox__first-label" data-cellexia-first-label{% if cx_first_line_raw contains '{' %} data-cellexia-tpl="{{ cx_first_line_raw | escape }}"{% endif %} {% if cx_then == blank %}hidden{% endif %}>{{ cx_first_line }}</span>
+</span>
+<span class="cx-buybox__then" data-cellexia-then {% if cx_then == blank %}hidden{% endif %}>{{ cx_then }}</span>
+{%- if cx_show_pd -%}
+<span class="cx-buybox__per-delivery" data-cellexia-per-delivery {% if cx_pd == blank %}hidden{% endif %}>{{ cx_pd }}</span>
+{%- endif -%}
+{%- endcapture -%}
+{%- capture cx_price_block_nopd -%}
+<span class="cx-buybox__price-row">
+<span class="cx-buybox__price cx-buybox__price--lg" data-cellexia-sub-price{% if cx_show_compare %} data-cellexia-compare{% endif %}>
+<span class="cx-price">{{ cx_first | money }}</span>
+{%- if cx_show_compare and cx_variant.price > cx_first %} <s class="cx-price__compare">{{ cx_variant.price | money }}</s>{% endif -%}
+</span>
+<span class="cx-buybox__first-label" data-cellexia-first-label{% if cx_first_line_raw contains '{' %} data-cellexia-tpl="{{ cx_first_line_raw | escape }}"{% endif %} {% if cx_then == blank %}hidden{% endif %}>{{ cx_first_line }}</span>
+</span>
+<span class="cx-buybox__then" data-cellexia-then {% if cx_then == blank %}hidden{% endif %}>{{ cx_then }}</span>
+{%- endcapture -%}
+{%- comment -%} THE WIDGET ROOT. WHITESPACE CONTROL: each conditional attribute opens with a LEFT-trimming delimiter and carries its newline INSIDE its own body; never trim the trailing side, never hoist the leading newline out (README "Core snippet internals"). {%- endcomment -%}
+<div
+id="cx-buybox-{{ uid }}"
+class="cx-buybox cx-buybox--{{ cx_preset }}{% if cx_density_compact %} cx-buybox--compact{% endif %}{% unless cx_anim %} cx-buybox--no-anim{% endunless %}{% unless cx_alloc %} cx-buybox--no-sub{% endunless %}"
+data-cellexia-buybox
+data-cellexia-preset="{{ cx_preset }}"
+data-block-id="{{ uid }}"
+data-cellexia-money-onetime="{{ cx_money_onetime }}"
+data-cellexia-money-sub="{{ cx_money_sub }}"
+data-cellexia-price-sync="{% if cx_price_sync %}true{% else %}false{% endif %}"
+data-cellexia-price-selector="{{ cx_price_selector_raw | escape }}"
+{%- if render_context == 'section' %}
+data-section-id="{{ section_id }}"{% endif %}
+{%- unless cx_live %}
+hidden data-cellexia-gated="true"{% endunless %}
+style="--cx-accent: {{ cx_accent | escape }}; --cx-accent-soft: {{ cx_accent_soft }};{{ cx_style_extra }}"
+{{ shopify_attributes }}
+>
+{%- if cx_custom_css != blank -%}
+{%- comment -%} Merchant custom CSS, sanitized server-side, scoped under the wrapper id (brace containment above). {%- endcomment -%}
+<style>#cx-buybox-{{ uid }} { {{ cx_custom_css }} }</style>
+{%- endif -%}
+{%- unless cx_live -%}
+{%- comment -%} Shown only after buy-box.js validates a signed preview token. {%- endcomment -%}
+<p class="cx-buybox__preview-ribbon" data-cellexia-preview-ribbon hidden>{{ 'preview_mode' | t }}</p>
+{%- endunless -%}
+{%- if cx_heading != blank -%}
+<h3 class="cx-buybox__heading">{{ cx_heading }}</h3>
+{%- endif -%}
+{%- if cx_subheading != blank -%}
+<p class="cx-buybox__subheading">{{ cx_subheading }}</p>
+{%- endif -%}
+<span class="cx-buybox__sr" id="cx-buybox-label-{{ uid }}">{{ 'purchase_options' | t }}</span>
+{%- comment -%} Preset dispatch: each preset is a DIRECT partial render in markup position; every printed value is precomputed above and passed explicitly (render isolates scope). {%- endcomment -%}
+{%- case cx_preset -%}
+{%- when 'toggle' -%}
+{%- render 'cx-preset-toggle',
+uid: uid,
+product: product,
+cx_variant: cx_variant,
+cx_order: cx_order,
+cx_sub_checked: cx_sub_checked,
+cx_sub_label: cx_sub_label,
+cx_sub_label_raw: cx_sub_label_raw,
+cx_onetime_label: cx_onetime_label,
+cx_onetime_label_short: cx_onetime_label_short,
+cx_show_savings: cx_show_savings,
+cx_save: cx_save,
+cx_save_tpl_raw: cx_save_tpl_raw,
+cx_show_reassurance: cx_show_reassurance,
+cx_price_block: cx_price_block,
+cx_freq_control: cx_freq_control,
+cx_benefits_html: cx_benefits_html,
+cx_reassurance_html: cx_reassurance_html
+-%}
+{%- when 'tiles' -%}
+{%- render 'cx-preset-tiles',
+uid: uid,
+product: product,
+cx_variant: cx_variant,
+cx_order: cx_order,
+cx_sub_checked: cx_sub_checked,
+cx_show_badge: cx_show_badge,
+cx_badge: cx_badge,
+cx_sub_label: cx_sub_label,
+cx_sub_label_raw: cx_sub_label_raw,
+cx_onetime_label: cx_onetime_label,
+cx_show_savings: cx_show_savings,
+cx_save: cx_save,
+cx_save_tpl_raw: cx_save_tpl_raw,
+cx_show_reassurance: cx_show_reassurance,
+cx_pd_cents: cx_pd_cents,
+cx_price_block_nopd: cx_price_block_nopd,
+cx_freq_control: cx_freq_control,
+cx_benefits_html: cx_benefits_html,
+cx_reassurance_html: cx_reassurance_html
+-%}
+{%- when 'inline' -%}
+{%- render 'cx-preset-inline',
+uid: uid,
+product: product,
+cx_variant: cx_variant,
+cx_sub_checked: cx_sub_checked,
+cx_sub_label: cx_sub_label,
+cx_sub_label_raw: cx_sub_label_raw,
+cx_show_compare: cx_show_compare,
+cx_first: cx_first,
+cx_first_line: cx_first_line,
+cx_first_line_raw: cx_first_line_raw,
+cx_then: cx_then,
+cx_show_pd: cx_show_pd,
+cx_pd: cx_pd,
+cx_show_reassurance: cx_show_reassurance,
+cx_freq_control: cx_freq_control,
+cx_reassurance_html: cx_reassurance_html
+-%}
+{%- when 'value_stack' -%}
+{%- render 'cx-preset-value_stack',
+uid: uid,
+product: product,
+cx_sub_checked: cx_sub_checked,
+cx_show_badge: cx_show_badge,
+cx_badge: cx_badge,
+cx_sub_label: cx_sub_label,
+cx_sub_label_raw: cx_sub_label_raw,
+cx_show_savings: cx_show_savings,
+cx_save: cx_save,
+cx_save_tpl_raw: cx_save_tpl_raw,
+cx_onetime_link: cx_onetime_link,
+cx_onetime_link_raw: cx_onetime_link_raw,
+cx_price_block: cx_price_block,
+cx_freq_control: cx_freq_control,
+cx_benefits_html: cx_benefits_html
+-%}
+{%- when 'planner' -%}
+{%- render 'cx-preset-planner',
+uid: uid,
+product: product,
+cx_variant: cx_variant,
+cx_order: cx_order,
+cx_multi_plan: cx_multi_plan,
+cx_show_freq: cx_show_freq,
+cx_freq_label: cx_freq_label,
+cx_freq_full: cx_freq_full,
+cx_sub_checked: cx_sub_checked,
+cx_show_badge: cx_show_badge,
+cx_badge: cx_badge,
+cx_sub_label: cx_sub_label,
+cx_sub_label_raw: cx_sub_label_raw,
+cx_onetime_label: cx_onetime_label,
+cx_show_savings: cx_show_savings,
+cx_save: cx_save,
+cx_save_tpl_raw: cx_save_tpl_raw,
+cx_pd_cents: cx_pd_cents,
+cx_then: cx_then,
+cx_show_reassurance: cx_show_reassurance,
+cx_freq_control: cx_freq_control,
+cx_benefits_html: cx_benefits_html,
+cx_reassurance_html: cx_reassurance_html
+-%}
+{%- when 'subscription_max' -%}
+{%- render 'cx-preset-subscription_max',
+uid: uid,
+product: product,
+cx_variant: cx_variant,
+cx_sub_checked: cx_sub_checked,
+cx_show_badge: cx_show_badge,
+cx_badge: cx_badge,
+cx_sub_label: cx_sub_label,
+cx_sub_label_raw: cx_sub_label_raw,
+cx_onetime_label: cx_onetime_label,
+cx_onetime_link: cx_onetime_link,
+cx_onetime_link_raw: cx_onetime_link_raw,
+cx_show_savings: cx_show_savings,
+cx_save: cx_save,
+cx_save_tpl_raw: cx_save_tpl_raw,
+cx_show_reassurance: cx_show_reassurance,
+cx_price_block: cx_price_block,
+cx_freq_control: cx_freq_control,
+cx_benefits_html: cx_benefits_html,
+cx_reassurance_html: cx_reassurance_html
+-%}
+{%- else -%}
+{%- render 'cx-preset-classic',
+uid: uid,
+product: product,
+cx_variant: cx_variant,
+cx_order: cx_order,
+cx_sub_checked: cx_sub_checked,
+cx_show_badge: cx_show_badge,
+cx_badge: cx_badge,
+cx_sub_label: cx_sub_label,
+cx_sub_label_raw: cx_sub_label_raw,
+cx_onetime_label: cx_onetime_label,
+cx_show_savings: cx_show_savings,
+cx_save: cx_save,
+cx_save_tpl_raw: cx_save_tpl_raw,
+cx_show_reassurance: cx_show_reassurance,
+cx_price_block: cx_price_block,
+cx_freq_control: cx_freq_control,
+cx_benefits_html: cx_benefits_html,
+cx_reassurance_html: cx_reassurance_html
+-%}
+{%- endcase -%}
+{%- comment -%} Hidden selling-plan MIRROR — deliberately NAMELESS; the selling_plan name belongs only to the data-cellexia-plan-input field (README "Core snippet internals"). {%- endcomment -%}
+<input
+type="hidden"
+hidden
+value="{% if cx_sub_checked %}{{ cx_selected_plan.id }}{% endif %}"
+data-cellexia-selling-plan
+>
+{%- comment -%} JSON island: localized price strings per variant x plan, ALL RAW (script is raw-text, JS writes textContent); money decoded to RAW exactly once at this boundary (README "Core snippet internals"). {%- endcomment -%}
+<script type="application/json" data-cellexia-data>
+{
+"initialVariant": "{{ cx_variant.id }}",
+"initialPlan": "{{ cx_selected_plan.id }}",
+"preselect": {% if cx_sub_checked %}true{% else %}false{% endif %},
+"requiresSellingPlan": {% if product.requires_selling_plan %}true{% else %}false{% endif %},
+"variants": {
+{%- for v in product.variants -%}
+{%- comment -%} MONEY SAFE to RAW (island boundary): decoded HERE exactly once — money-format entities plus the standard un-escape set, amp LAST. {%- endcomment -%}
+{%- assign v_onetime_raw = v.price | money | strip_html | replace: '&nbsp;', ' ' | replace: '&pound;', '£' | replace: '&euro;', '€' | replace: '&yen;', '¥' | replace: '&cent;', '¢' | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&' -%}
+"{{ v.id }}": {
+"available": {% if v.available %}true{% else %}false{% endif %},
+"oneTime": {{ v_onetime_raw | json }},
+"plans": {
+{%- assign cx_plan_i = 0 -%}
+{%- for a in v.selling_plan_allocations -%}
+{%- if a.selling_plan_group_id == cx_group.id -%}
+{%- liquid
+# cx-freq-label (inlined) for this allocation's plan.
+assign a_weeks = 0
+for a_opt in a.selling_plan.options
+assign a_opt_val = a_opt.value | downcase
+if a_opt_val contains 'week'
+assign a_cand = a_opt_val | split: ' ' | first | plus: 0
+if a_cand > 0
+assign a_weeks = a_cand
+break
+endif
+endif
+endfor
+if a_weeks == 0
+assign a_plan_name = a.selling_plan.name | downcase
+if a_plan_name contains 'week'
+assign a_tokens = a_plan_name | split: ' '
+for a_tok in a_tokens
+assign a_cand = a_tok | plus: 0
+if a_cand > 0
+assign a_weeks = a_cand
+break
+endif
+endfor
+endif
+endif
+if a_weeks > 1
+assign a_freq_raw = a_weeks | append: ' ' | append: cx_lc_weeks_raw
+else
+assign a_freq_raw = a.selling_plan.name
+endif
+# "then price every frequency" — locale sentence un-escaped ONCE to RAW, then RAW label and money substituted in.
+assign a_adj_count = a.price_adjustments | size
+if a_adj_count > 1
+assign a_last_adj = a.price_adjustments | last
+assign a_ongoing = a_last_adj.price
+else
+assign a_ongoing = a.price
+endif
+assign a_then_raw = ''
+if a_ongoing != a.price
+assign a_ongoing_fmt = a_ongoing | money | strip_html | replace: '&nbsp;', ' ' | replace: '&pound;', '£' | replace: '&euro;', '€' | replace: '&yen;', '¥' | replace: '&cent;', '¢' | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign a_then = 'then_price' | t: price: '{price}', frequency: '{frequency}'
+assign a_then_raw = a_then | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign a_then_raw = a_then_raw | replace: '{price}', a_ongoing_fmt | replace: '{frequency}', a_freq_raw | strip
+endif
+# "Save X" — locale sentence un-escaped to RAW, then the RAW amount substituted in.
+assign a_save_cents = v.price | minus: a.price
+assign a_pct = 0
+if a_save_cents > 0 and v.price > 0
+assign a_pct = a_save_cents | times: 100.0 | divided_by: v.price | round
+endif
+assign a_pct_str = ''
+if a_pct > 0
+assign a_pct_str = a_pct | append: '%'
+endif
+assign a_save_raw = ''
+if a_save_cents > 0 and v.price > 0
+assign a_save_fmt = cx_savings_format
+if a_pct < 1
+assign a_save_fmt = 'absolute'
+endif
+assign a_save_abs = a_save_cents | money | strip_html | replace: '&nbsp;', ' ' | replace: '&pound;', '£' | replace: '&euro;', '€' | replace: '&yen;', '¥' | replace: '&cent;', '¢' | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+if a_save_fmt == 'absolute'
+assign a_save_amt = a_save_abs
+elsif a_save_fmt == 'both'
+assign a_save_amt = a_save_abs | append: ' (' | append: a_pct | append: '%)'
+else
+assign a_save_amt = a_pct | append: '%'
+endif
+assign a_save = 'save_amount' | t: amount: '{amount}'
+assign a_save_raw = a_save | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign a_save_raw = a_save_raw | replace: '{amount}', a_save_amt | strip
+endif
+# "price per delivery" — label un-escaped to RAW on its own, THEN the RAW money prepended; a_pd_cents mirrors the JS fallback.
+assign a_pd_cents = a.per_delivery_price
+if a_pd_cents == blank
+assign a_pd_cents = a.price
+endif
+assign a_pd_money_raw = a_pd_cents | money | strip_html | replace: '&nbsp;', ' ' | replace: '&pound;', '£' | replace: '&euro;', '€' | replace: '&yen;', '¥' | replace: '&cent;', '¢' | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign a_pd_raw = ''
+if a.per_delivery_price != blank and a.per_delivery_price != a.price
+assign a_pd_label_raw = cx_lc_per_delivery | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign a_pd_raw = a_pd_money_raw | append: ' ' | append: a_pd_label_raw | strip
+endif
+# "first" and "oneTime" are the theme price-sync comparison pair — RAW via the same money chain.
+assign a_first_raw = a.price | money | strip_html | replace: '&nbsp;', ' ' | replace: '&pound;', '£' | replace: '&euro;', '€' | replace: '&yen;', '¥' | replace: '&cent;', '¢' | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+-%}
+{%- if cx_plan_i > 0 -%},{%- endif -%}
+{%- assign cx_plan_i = cx_plan_i | plus: 1 -%}
+"{{ a.selling_plan.id }}": {
+"first": {{ a_first_raw | json }},
+"then": {{ a_then_raw | json }},
+"save": {{ a_save_raw | json }},
+"perDelivery": {{ a_pd_raw | json }},
+"pd": {{ a_pd_money_raw | json }},
+"freq": {{ a_freq_raw | json }},
+"savePct": {{ a_pct_str | json }}
+}
+{%- endif -%}
+{%- endfor -%}
+}
+}{%- unless forloop.last -%},{%- endunless -%}
+{%- endfor -%}
+}
+}
+</script>
+<noscript>
+{%- comment -%} Without JS the widget cannot write selling_plan into the form; showing it would promise a subscription the cart would not contain. {%- endcomment -%}
+<style>
+#cx-buybox-{{ uid }} .cx-buybox__group,
+#cx-buybox-{{ uid }} .cx-buybox__heading,
+#cx-buybox-{{ uid }} .cx-buybox__subheading { display: none; }
+</style>
+</noscript>
+</div>
+{%- else -%}{%- comment -%} NO OWNED GROUP: render NOTHING but this invisible admin-diagnostic marker (three hiding layers; carries none of the widget hooks) — README "Core snippet internals". {%- endcomment -%}<template class="cx-buybox-nogroup" data-cellexia-no-owned-group hidden style="display:none!important"></template>
+{%- endif -%}
 {%- endif -%}

@@ -40,10 +40,13 @@ import {
   goLive,
   launchFlagDiverged,
   markChecklist,
+  probeProxyIdentity,
   readLaunchMetafield,
   revertToSetup,
   syncLaunchMetafield,
+  type ProxyIdentityProbe,
 } from "~/lib/launch/launch.server";
+import { PORTAL_PROXY_BASE } from "~/lib/portal/proxy-path";
 import { createDemoContract } from "~/lib/portal/demo.server";
 import { buildMagicUrl } from "~/lib/magiclinks/builder.server";
 import { isKlaviyoConfigured } from "~/lib/klaviyo/client.server";
@@ -270,6 +273,15 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const url = new URL(request.url);
   const query = (url.searchParams.get("q") ?? "").trim();
 
+  // Proxy-identity probe ("Portal proxy answers as Cellexia"): a real fetch
+  // against the live store domain, so it is kicked off FIRST and awaited last
+  // to overlap the DB/Shopify reads below. Skipped for subscriber-search
+  // fetcher requests (?q=) like every other non-search read on this page.
+  // probeProxyIdentity never throws and times out quickly — the page render
+  // is never blocked by a dead storefront.
+  const proxyIdentityPromise: Promise<ProxyIdentityProbe> | null =
+    query.length >= SEARCH_MIN_CHARS ? null : probeProxyIdentity(shop.id);
+
   const now = new Date();
   const [launch, syncedConfigs, recentJobRun, overdue, demoContract, matches] =
     await Promise.all([
@@ -388,10 +400,13 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     status: m.status,
   }));
 
+  const proxyIdentity = proxyIdentityPromise ? await proxyIdentityPromise : null;
+
   return json({
     storeDomain: shop.primaryDomain ?? shop.domain,
     launch,
     storefrontFlag,
+    proxyIdentity,
     checklist: {
       plansSynced: syncedConfigs.length > 0,
       schedulerHealthy: recentJobRun != null,
@@ -896,6 +911,7 @@ export default function PreviewPage() {
   const { launch, checklist, overdueCount, overdueSample, products } = data;
   const isLive = launch.mode === "LIVE";
   const storefrontFlag = data.storefrontFlag;
+  const proxyIdentity = data.proxyIdentity;
   const otherApps: OtherAppsView = data.otherApps ?? EMPTY_OTHER_APPS;
   const otherAppsPresent = hasOtherApps(otherApps);
 
@@ -1114,6 +1130,35 @@ export default function PreviewPage() {
                     : "No job has run in the last 10 minutes — check the internal tick or your external cron hitting /api/jobs/run."
                 }
               />
+              {/* Proxy-identity guard: the store-domain portal path must be
+                  answered by THIS app. The store's other app ("AOV & LTV
+                  Booster") owns /apps/cellexia, so this row is what catches a
+                  deployed collision or an undeployed [app_proxy] config. A
+                  network failure is a warning, never a failed row. */}
+              {proxyIdentity == null ? null : proxyIdentity.status ===
+                "UNREACHABLE" ? (
+                <ChecklistWarningRow title="Portal proxy could not be checked">
+                  <Text as="p" variant="bodySm" tone="subdued">
+                    {`Could not reach ${proxyIdentity.url}${
+                      proxyIdentity.detail ? ` (${proxyIdentity.detail})` : ""
+                    } — likely a network hiccup between the app host and the store. Reload this page to re-check; this warning does not block go-live.`}
+                  </Text>
+                </ChecklistWarningRow>
+              ) : (
+                <ChecklistRow
+                  done={proxyIdentity.status === "OK"}
+                  title="Portal proxy answers as Cellexia"
+                  detail={
+                    proxyIdentity.status === "OK"
+                      ? `${proxyIdentity.url} answered as this app — the store-domain portal path is Cellexia's.`
+                      : `Something else answered at ${proxyIdentity.url}${
+                          proxyIdentity.detail
+                            ? ` (${proxyIdentity.detail})`
+                            : ""
+                        } — another app may be occupying this proxy path — the app proxy config may not be deployed, or a colliding app owns it; run npm run deploy and check the other app's proxy settings.`
+                  }
+                />
+              )}
               {/* Non-blocking warning: another subscription app is running on
                   this store. Going live does not touch it, and moving its
                   subscribers over is a separate, manual step. */}
@@ -1552,7 +1597,7 @@ export default function PreviewPage() {
                 • The subscription widget becomes visible on your product pages
               </Text>
               <Text as="p" variant="bodySm">
-                • The customer portal opens at /apps/cellexia-subscriptions
+                {`• The customer portal opens at ${PORTAL_PROXY_BASE}`}
               </Text>
               <Text as="p" variant="bodySm">
                 • Renewal billing, reminders, dunning and win-back start running

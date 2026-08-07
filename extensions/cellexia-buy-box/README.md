@@ -20,12 +20,16 @@ It ships in **two install shapes sharing one implementation**
 ```
 blocks/buy-box.liquid            app block (target: section) — thin wrapper over cx-buybox-core
 blocks/buy-box-embed.liquid      app embed (target: body) — self-mounting wrapper over cx-buybox-core
-snippets/cx-buybox-core.liquid   THE widget, self-contained: group ownership (which selling plan
-                                 group is OURS — see "Running alongside another subscription app"),
-                                 config resolution, text resolution, templating, frequency/save
-                                 labels, price blocks, all seven presets, JSON island. The ONLY
-                                 snippet in this extension — see the Liquid rules below for why it
-                                 is deliberately one big file.
+snippets/cx-buybox-core.liquid   THE widget's brain: group ownership (which selling plan group is
+                                 OURS — see "Running alongside another subscription app"), config
+                                 resolution, text resolution, templating, frequency/save labels,
+                                 price blocks, preset dispatch, JSON island. ALL string/value
+                                 computation happens here — the presets only print.
+snippets/cx-preset-*.liquid      the seven design presets (classic, toggle, tiles, inline,
+                                 value_stack, planner, subscription_max), one partial each,
+                                 rendered DIRECTLY (markup position) from the core's case
+                                 statement. Pure markup: they compute nothing, resolve no text
+                                 and render no further snippet — see the Liquid rules below.
 assets/buy-box.css               mobile-first styles (BEM namespaces cx-buybox / cx-buybox-embed)
 assets/buy-box.js                widget behaviour: vanilla JS, deferred, no dependencies
 assets/buy-box-embed.js          embed-only: self-mounting + fetch/XHR cart-request patching
@@ -43,19 +47,32 @@ snippet in `<!-- BEGIN app snippet: x -->` … `<!-- END app snippet -->`.
 Those markers are invisible when they land in markup position, but the
 moment a render is captured into a variable they become part of the
 **string** — and a later `| escape` prints them as visible page text
-(`<!-- BEGIN app snippet: cx-design-text -->CHOOSE YOUR RITUAL…`).
+(`<!-- BEGIN app snippet: cx-design-text -->CHOOSE YOUR RITUAL…`). That is
+exactly what corrupted the v1.2.x storefront render.
 
-- A snippet may only emit final markup. **A snippet is never a function.**
-- `snippets/cx-buybox-core.liquid` therefore contains **zero `render`
-  tags**: every former helper snippet is inlined as `{% liquid %}` /
-  `{% assign %}` blocks, or as a `{% capture %}` of pure markup (capturing
-  markup that contains no render is fine — that is how the preset ordering
-  knobs work).
-- The only renders in the extension are the single
-  `{% render 'cx-buybox-core' %}` in each of the two block files, both in
-  markup position where the comment markers are ordinary HTML comments.
-- The `snippets/` directory holds exactly one file. Adding a second snippet
-  is almost always a mistake — inline it instead.
+The refined invariants (v1.7.0, when the seven preset partials were
+extracted from the core for the platform's Liquid size budget — since
+verified to be a TOTAL across the extension, not per-file; see "The shipped
+Liquid is minified on purpose" below):
+
+- **Capture-around-render is forbidden forever**, in every Liquid form (tag
+  form, `{% liquid %}` line form, `assign`/`echo`, and the legacy
+  `include` spelling).
+- **Renders happen only in direct-output markup position**, where the
+  comment markers land between elements as ordinary invisible HTML
+  comments: the single `{% render 'cx-buybox-core' %}` in each of the two
+  block files, and the seven preset renders in the core's `{% case %}`
+  dispatch. Nowhere else — never inside a `{% capture %}`, never as a line
+  inside a `{% liquid %}` block.
+- **Snippets never return values — a snippet is never a function.** All
+  string and value computation stays in the consumer: the core precomputes
+  every label, price string and flag and passes them as explicit render
+  arguments; a preset partial only prints. Capturing PURE MARKUP that
+  contains no render is fine — that is how the preset ordering knobs work.
+- The `snippets/` directory holds exactly `cx-buybox-core.liquid` plus the
+  seven `cx-preset-*.liquid` partials — the list is pinned by
+  `tests/liquid/lint.test.ts`, so a stray snippet fails CI. A preset
+  partial never renders another snippet.
 
 **2. `{{ 'key' | t }}` output is ALREADY HTML-escaped — never escape it again.**
 The locale string `Subscribe & Save` comes back from the `t` filter as
@@ -87,7 +104,233 @@ When editing, the whole convention is greppable:
   `style` attribute, which are zod-validated hex/px and are escaped purely
   as attribute-injection hardening);
 - `grep '| t'` — no hit may ever be followed by `| escape`;
-- `grep 'render'` — there must be none in `snippets/`.
+- `grep 'render'` — every hit must be one of: the two block files' render
+  of `cx-buybox-core`, or the core's seven direct preset renders in its
+  `{% case %}` dispatch. None may sit inside a `{% capture %}` and none may
+  appear in a preset partial.
+
+## Core snippet internals
+
+The full rationale that used to live as comments inside
+`cx-buybox-core.liquid`, moved here so the shipped Liquid fits the
+platform's TOTAL Liquid size budget. The compact comments in the file point here;
+**the rules below are still load-bearing** — the byte-stable snapshot and
+the goldens in `tests/liquid/` enforce them.
+
+### The shipped Liquid is minified on purpose — this README is where readability lives
+
+A real `shopify app deploy` proved the 100KB Liquid limit is enforced on
+the **TOTAL of all `.liquid` files in the extension**, not per file. Every
+shipped `.liquid` file is therefore kept minified:
+
+- **no leading indentation** — every line starts at column 0. This is
+  semantics-preserving: inside `{% liquid %}` blocks indentation is
+  cosmetic, and in HTML the indentation before a kept newline collapses to
+  the same single inter-element whitespace as the newline alone. **Every
+  newline is kept** — several are load-bearing (the widget root's
+  conditional attributes below, and each line of a `{% liquid %}` block is
+  its own statement);
+- **no blank lines**;
+- **comments trimmed to one line each**, pointing here (still delimiter-
+  and pipe-free — see the comment discipline above);
+- **`{% schema %}` JSON compacted** (`JSON.stringify` style — Shopify only
+  parses it, and `tests/liquid/schema.test.ts` still validates it);
+- the seven preset partials **end without a trailing newline**, so a
+  partial's rendered output ends flush at its last tag and no stray
+  whitespace lands before Shopify's `END app snippet` marker.
+
+When editing: edit in place at column 0, don't re-indent (the size guards
+in `tests/liquid/size-limits.test.ts` and this budget are why), and don't
+reformat a whole file — the render goldens and the byte-stable snapshot in
+`tests/liquid/__snapshots__/` pin the output. Prose explaining WHY the
+code is shaped the way it is belongs in this README, not in the Liquid.
+Byte budget at the time of minification: 72,760 bytes total across the 10
+files, against Shopify's 102,400-byte total and our own 90,112-byte (88KB)
+working ceiling.
+
+### Editing the file: comment discipline
+
+Comments in the core and the preset partials contain **no Liquid tag or
+output delimiters** — Liquid parses the body of a comment block even though
+it never renders it, so a half-written tag inside a comment can break the
+whole storefront page. Write tag names in prose (render / capture /
+assign), never as real tags. They also contain **no pipe characters**: the
+harness-fidelity lint (`tests/liquid/lint.test.ts` §6) reads every "pipe
+word" in the file as a filter name that the harness must implement.
+
+### The string-space contract (two spaces, never mixed)
+
+**RAW** — unescaped source text, exactly as authored: merchant text from
+the `cellexia.buybox_design` JSON metafield, theme-editor block settings,
+Shopify object names (`selling_plan.name`). Variables carry the `_raw`
+suffix. RAW is what travels in `data-cellexia-*` attributes (single escape
+filter, which the browser decodes back to raw on `getAttribute`) and in
+the JSON island (single `json` filter, whose values `buy-box.js` writes
+with `textContent`).
+
+**SAFE** — HTML-escaped text, ready to be printed. Variables carry no
+suffix. Printed with a plain output tag and **never filtered again**.
+
+Conversions — each happens exactly once, at a marked boundary:
+
+- RAW → SAFE: the escape filter (the only escape in the pipeline), at the
+  point of output.
+- SAFE → RAW: the documented un-escape chain in the core's "locale
+  defaults" block. It is applied **only** to t-filter output, which is the
+  one source that arrives pre-escaped, so that locale defaults and
+  merchant overrides can be resolved in one space. `&amp;` is replaced
+  **last** (otherwise `&amp;lt;` would decode twice). `escape(unescape(t))
+  == t`, so the chain is loss-free — and it stays correct in the
+  hypothetical where a future Shopify version stops escaping t output.
+
+**Money** — `money` + `strip_html` output is treated as SAFE. A shop's
+`money_format` may legitimately contain HTML entities: Shopify's own stock
+formats include `&pound;{{amount}}`, `&euro;{{amount_with_comma_separator}}`
+and the widely used `{{amount}}&nbsp;CHF`; `strip_html` removes tags,
+never entities. Money is therefore only ever injected into SAFE strings
+and **never escaped again, by any filter**. Strings that mix money with
+locale copy (the "then …", "Save …" and "… per delivery" lines) are
+consequently SAFE, and are un-escaped once on the way into the JSON island
+(where the JS needs RAW).
+
+**Island exception** — money that enters the JSON island is decoded
+SAFE → RAW there, exactly once, by the dedicated money chain at the
+island's variants map: the money-format entities Shopify's stock formats
+actually use (`&nbsp;` `&pound;` `&euro;` `&yen;` `&cent;`) plus the
+standard un-escape set, `&amp;` last. `<script>` is a raw-text element —
+the browser decodes entities in attributes and text nodes but **never**
+inside the island — so leaving island money SAFE paints literal
+`&nbsp;`/`&euro;` through `textContent` into every price line and breaks
+the theme price sync's byte-for-byte text match. The composed island
+strings (then / save / perDelivery) take their locale sentence through the
+same SAFE → RAW chain as the locale-defaults block, and only **then**
+receive the RAW plan label and the RAW money string (money decoded first;
+composing before un-escaping would run the chain over the money too). No
+value is ever escaped or un-escaped more than once.
+
+**Named t-filter arguments are only ever inert placeholder literals**
+(`{price}`, `{amount}`, `{frequency}`) — never a real value. The t filter
+escapes whatever it interpolates, so passing it a SAFE money string would
+turn `&euro;` into `&amp;euro;`, which prints as the literal characters
+`&euro;` on the page — the same visible-entity defect that corrupted the
+v1.2.0 render, one currency format away. (And in the mirror case where a
+future Shopify version stops escaping, a merchant-authored selling-plan
+name would reach the page unescaped instead: one placeholder rule is
+correct under both behaviours.) `{` and `}` are untouched by every escape,
+so the placeholders survive the filter intact and the real values are
+substituted with `replace` immediately afterwards — SAFE values into the
+SAFE result that is printed, RAW values into the un-escaped copy that
+feeds the JSON island. Exactly one escape per value, on either path.
+
+**`data-cellexia-tpl`** carries the RAW template so `buy-box.js` can
+re-resolve the percent/amount/frequency placeholders on variant/plan
+change and write the result with `textContent`. It is emitted only when
+the RAW template actually contains a `{` placeholder, with one exception:
+a merchant-authored `savingsTemplate` is always emitted, so the JS never
+overwrites it with the built-in "Save X" label.
+
+### The preset partials compute nothing
+
+`{% render %}` isolates scope, and the partials leverage that as a design
+principle: every value a preset prints — every label, price string, flag
+and precomputed markup fragment — is resolved in the core and passed as an
+explicit render argument. A variable missing from an argument list fails
+visibly in the harness goldens instead of silently rendering blank. The
+only filters inside a partial are `money` on price cents and the
+documented single `escape` of RAW template values into `data-cellexia-tpl`
+attributes. A partial resolves no text, reads no metafield and renders no
+further snippet.
+
+### The widget root's conditional attributes (whitespace control)
+
+The root `<div>` carries two conditional attributes — `data-section-id`
+('section' context only) and the `hidden data-cellexia-gated` pair (gated
+shops only) — each on its own source line, which puts every edit one
+whitespace-control mistake away from either of two bugs:
+
+- trim nothing, and a false condition leaves a whitespace-only line inside
+  the opening tag — harmless to browsers, but emitted on every render and
+  recorded forever in the byte-stable snapshot;
+- trim both sides, and the newline separating two attributes disappears
+  with the tag, gluing them into one token (`id="…"class="…"`) and
+  silently dropping an attribute the JS depends on.
+
+So each conditional attribute opens with a **left-trimming** tag delimiter
+(which eats the newline plus indentation that precedes it) and re-supplies
+that newline and indentation **inside its own body**, ahead of the
+attribute. The attribute is still written on its own line when the
+condition holds, and nothing at all is emitted when it does not; the
+separating newline always travels with the attribute it introduces. Never
+trim the trailing side of these tags, and never hoist that leading newline
+out of the body — either change re-creates one of the two bugs.
+`tests/liquid/render.test.ts` ("widget root attribute list") pins all four
+shapes.
+
+The root's `data-cellexia-money-*` / `data-cellexia-price-*` attributes
+drive the theme add-to-cart price sync (see the themeSync section below).
+Both money attributes are SAFE money and never escaped; only the double
+quote is converted to its entity, which the browser decodes back on
+`getAttribute`, so what the JS compares is byte-identical to what the
+theme printed. `data-cellexia-money-sub` is empty when the current variant
+has no allocation in our group — there is no subscription price to
+promise, and the JS then leaves the theme alone. `cx-buybox--no-sub` on
+the root's class list makes the **first paint** honest for such a variant,
+instead of showing a subscription card at the one-time price until the JS
+runs.
+
+### The nameless selling-plan mirror
+
+The hidden input tagged `data-cellexia-selling-plan` records the resolved
+plan id (recommended frequency, else the group's first plan — the same id
+the JSON island carries as `initialPlan`) in the DOM before any script
+runs, mirroring the visible preselection exactly: empty while one-time is
+preselected. **It must never carry `name="selling_plan"`.** The markup
+travels with the widget, and `buy-box-embed.js` can move the widget inside
+the theme's `/cart/add` form (placement heuristics 3 and 4); `buy-box.js`
+has by then already injected its own `selling_plan` input into that form,
+so a named mirror would make two `selling_plan` fields in one form — and
+Shopify's cart parser keeps the **last** duplicate, which is not the one
+the JS keeps updating. A shopper switching to "One-time" would still get a
+subscription line. The name therefore belongs to exactly one field, the
+one `buy-box.js` owns and tags `data-cellexia-plan-input`. No-JS safety
+follows from the same rule: with scripting off nothing here can reach the
+cart at all (and the `<noscript>` rule hides the widget, so no
+unfulfillable promise is shown).
+
+### The JSON island
+
+Fully localized price strings per variant × selling plan; `buy-box.js`
+only swaps strings — it never formats money or builds copy. `freq` and
+`savePct` feed the client-side `{frequency}`/`{percent}` template
+re-resolution; `pd` feeds the per-delivery hooks; `oneTime` (per variant)
+and `first` (per variant × plan) are also the pair the theme add-to-cart
+price sync swaps, so a variant or frequency change re-syncs the theme's
+button without the JS ever formatting money. Every string in the island is
+RAW — see the island exception above for why.
+
+### Merchant custom CSS (brace containment)
+
+`style.customCss` is sanitized server-side (`sanitizeCustomCss`) before
+publish; the replaces and the brace walk in the core are an idempotent
+belt-and-suspenders against hand-edited metafields (the `slice` mirrors
+the server's 5000-char cap so the walk is bounded whatever the metafield
+holds). The css is emitted inside a wrapper rule scoped to the widget
+instance id, so a right brace that is not closing a brace opened inside
+the css would close the wrapper itself and turn every rule after it into
+unscoped, storefront-global CSS. The core walks the segments between right
+braces keeping a depth counter and drops the css entirely the moment depth
+would go negative; the `x` sentinel keeps `split` from collapsing trailing
+separators, so segment count is always close-count + 1 and only the last
+segment (never followed by a right brace) is skipped.
+
+### Group ownership, the no-owned-group marker, presets, price sync
+
+The full expositions live in their own sections of this README: "Running
+alongside another subscription app" (the ownership allow-list, its two
+mandatory factors and the forged-field history), "The admin-only
+diagnostic" (why the marker is a `<template>` with three independent
+layers against theme CSS), "Design presets", "Text resolution and
+templates" and "Theme add-to-cart price sync".
 
 ## Install as app embed (recommended — works on every theme)
 
@@ -294,7 +537,7 @@ storefront until the merchant explicitly goes live from the app admin.
   product-page link carrying `?cx_preview=<signed token>`. On load,
   `buy-box.js` stores the token in `sessionStorage` (key
   `cx_preview_token`) and validates it server-side via the app proxy
-  (`GET /apps/cellexia-subscriptions/preview/validate` — HMAC-signed, preview-only action,
+  (`GET /apps/cellexia-subs/preview/validate` — HMAC-signed, preview-only action,
   7-day expiry, never consumed). Only a `{ ok: true }` answer removes
   `hidden` and shows the localized "Preview — only you can see this" ribbon.
   Everything fails closed: an invalid or expired token is dropped from

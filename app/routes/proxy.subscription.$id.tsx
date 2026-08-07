@@ -42,7 +42,7 @@ import { OURS_ONLY } from "~/lib/ownership/ownership.server";
  * product (recurring or next-order-only), schedule (next date, frequency,
  * skip, delay), pause with auto-resume, address, payment method, cancel.
  *
- * Every mutation is a plain form POST to /apps/cellexia-subscriptions/api/{action} carrying
+ * Every mutation is a plain form POST to /apps/cellexia-subs/api/{action} carrying
  * the contract id + the session CSRF token; this page only reads.
  */
 

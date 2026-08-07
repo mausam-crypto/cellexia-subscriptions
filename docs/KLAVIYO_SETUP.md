@@ -112,7 +112,7 @@ and an explicit confirmation notification never double-fire a flow.
 | `items` | `[{title, variant_title, quantity, is_gift, is_one_time_addon}]` |
 | `next_billing_date` | `2026-08-12T00:00:00.000Z` |
 | `next_billing_date_formatted` | `12 August 2026` (shop timezone, contract locale) |
-| `portal_url` | `https://www.cellexia.com/apps/cellexia-subscriptions/` |
+| `portal_url` | `https://www.cellexia.com/apps/cellexia-subs/` |
 | `event_type` | internal type, e.g. `cycle.skipped` (state-change metrics) |
 | `template` | template key, e.g. `upcoming_order` (notification metrics) |
 

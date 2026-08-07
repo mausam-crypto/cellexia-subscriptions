@@ -1,0 +1,29 @@
+{%- comment -%} cx-preset-inline — one checkbox row with a slim expanding detail line. Direct-render partial dispatched by cx-buybox-core: prints ONLY values the core precomputed and passed as render args, computes nothing, renders nothing further. Rules, args, string-space contract, history: README "Core snippet internals". {%- endcomment -%}
+<div class="cx-buybox__group cx-buybox__group--inline">
+<label class="cx-buybox__inline-row{% if cx_sub_checked %} is-selected{% endif %}" data-cellexia-option-wrap="subscription">
+<input
+type="checkbox"
+class="cx-buybox__inline-box"
+data-cellexia-inline
+{% if cx_sub_checked %}checked{% endif %}
+{% if product.requires_selling_plan %}disabled{% endif %}
+aria-describedby="cx-inline-detail-{{ uid }}"
+>
+<span class="cx-buybox__inline-label"{% if cx_sub_label_raw contains '{' %} data-cellexia-tpl="{{ cx_sub_label_raw | escape }}"{% endif %}>{{ cx_sub_label }}</span>
+</label>
+<div class="cx-buybox__inline-detail" id="cx-inline-detail-{{ uid }}" data-cellexia-panel="subscription" {% unless cx_sub_checked %}hidden{% endunless %}>
+<span class="cx-buybox__price-row">
+<span class="cx-buybox__price" data-cellexia-sub-price{% if cx_show_compare %} data-cellexia-compare{% endif %}>
+<span class="cx-price">{{ cx_first | money }}</span>
+{%- if cx_show_compare and cx_variant.price > cx_first %} <s class="cx-price__compare">{{ cx_variant.price | money }}</s>{% endif -%}
+</span>
+<span class="cx-buybox__first-label" data-cellexia-first-label{% if cx_first_line_raw contains '{' %} data-cellexia-tpl="{{ cx_first_line_raw | escape }}"{% endif %} {% if cx_then == blank %}hidden{% endif %}>{{ cx_first_line }}</span>
+</span>
+<span class="cx-buybox__then" data-cellexia-then {% if cx_then == blank %}hidden{% endif %}>{{ cx_then }}</span>
+{%- if cx_show_pd -%}
+<span class="cx-buybox__per-delivery" data-cellexia-per-delivery {% if cx_pd == blank %}hidden{% endif %}>{{ cx_pd }}</span>
+{%- endif -%}
+{{ cx_freq_control }}
+{%- if cx_show_reassurance -%}{{ cx_reassurance_html }}{%- endif -%}
+</div>
+</div>

@@ -18,6 +18,19 @@ dispatcher gates), `tests/cancel-save-guards.test.ts`,
 they are not the only line of defense. The rest of this document is the
 *manual* E2E plan.
 
+The buy-box theme extension has its own suite under `tests/liquid/`: a
+harness that renders the real `.liquid` files with Shopify's theme-app-extension
+semantics (app-snippet comment wrapping, escaped `t` output), golden render
+tests, static lint guards for the forbidden Liquid shapes, schema-validity
+checks mirroring the Shopify CLI, and — since v1.6.3, corrected in v1.6.4 —
+`tests/liquid/size-limits.test.ts`, which enforces the deploy size budgets:
+primarily the **TOTAL** Liquid across the extension (a real
+`shopify app deploy` verified that Shopify's 100KB limit applies to the sum
+of every `.liquid` file, **not** per-file — the guard holds the total at
+88KB), plus a per-file belt at the same ceiling, block count, bundle size,
+locale-file caps, and our JS/CSS performance ceilings, so oversized Liquid
+fails `npm test` instead of `shopify app deploy`.
+
 ---
 
 ## 1. Setup
@@ -59,7 +72,7 @@ charge.
 
 ## 3. Scenario checklist — every customer verb
 
-Work through the portal (`https://<dev-store>/apps/cellexia-subscriptions`) and magic links.
+Work through the portal (`https://<dev-store>/apps/cellexia-subs`) and magic links.
 For each row: perform the action, then verify (a) Shopify admin shows the
 contract change, (b) the contract timeline (Audit/Subscriber page) logged the
 event, (c) the Klaviyo event arrived (or `NotificationLog` row exists).
@@ -251,7 +264,7 @@ widget only in your own browser session):
    natively on the line item. Abandon before paying, or pay with a test card
    if this store is still in test mode.
 5. **Zero-impact check**: open the same PDP in a private window *without* the
-   token — no widget, no layout shift. Visit `/apps/cellexia-subscriptions` — the "not yet
+   token — no widget, no layout shift. Visit `/apps/cellexia-subs` — the "not yet
    available" page. Audit page: no customer notification sent (anything
    attempted shows as `SUPPRESSED`).
 

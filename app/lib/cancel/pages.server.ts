@@ -26,7 +26,7 @@ import type { PageContent } from "./portal.server";
  *   CTAs (`.cx-btn--ghost` vs solid differ only in fill) — equal visual
  *   weight, no dark patterns, decline is never a buried text link.
  * - Every mutating form carries the portal session's `_csrf` token.
- * - Forms POST to the store-domain proxy paths (`/apps/cellexia-subscriptions/...`),
+ * - Forms POST to the store-domain proxy paths (`/apps/cellexia-subs/...`),
  *   preserving ?locale like every other portal page.
  */
 

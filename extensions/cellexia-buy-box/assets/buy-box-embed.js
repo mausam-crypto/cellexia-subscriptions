@@ -302,7 +302,7 @@
    * the parameter. Keying off that would show internal English vendor copy to
    * a Swiss customer on a live storefront. Only CellexiaSubs.previewValidated
    * — set exclusively on a { ok: true } answer from
-   * /apps/cellexia-subscriptions/preview/validate — opens this gate; the validation is
+   * /apps/cellexia-subs/preview/validate — opens this gate; the validation is
    * async, so buy-box.js also fires cx:preview:validated, which retries the
    * mount (and therefore this card) below. No element id (namespace hazard),
    * English only (admin-only diagnostics are not customer-facing copy).

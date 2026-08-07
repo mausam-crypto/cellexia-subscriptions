@@ -17,6 +17,7 @@ import {
 import { createMagicToken } from "~/lib/crypto/tokens.server";
 import { addDaysTz } from "~/lib/dates.server";
 import { logEvent } from "~/lib/events/log.server";
+import { PORTAL_PROXY_BASE } from "~/lib/portal/proxy-path";
 
 /**
  * Launch mode — the install-dark contract every customer-facing gate imports.
@@ -47,6 +48,9 @@ export const LAUNCH_METAFIELD_KEY = "launch_status";
 
 const PREVIEW_TOKEN_TTL_SECONDS = 7 * 24 * 3600;
 const PREVIEW_TOKEN_MAX_USES = 500;
+/** Proxy-identity probe: short-lived token + short fetch timeout (see below). */
+const PROXY_PROBE_TOKEN_TTL_SECONDS = 120;
+const PROXY_PROBE_TIMEOUT_MS = 5000;
 /** Overdue charges are spread over the next N days when going live. */
 const GO_LIVE_STAGGER_DAYS = 3;
 
@@ -464,6 +468,100 @@ export async function revertToSetup(
     actor,
     payload: { action: "revert_to_setup" },
   });
+}
+
+// ── Proxy-identity probe ─────────────────────────────────────────────────────
+
+export type ProxyIdentityStatus = "OK" | "MISMATCH" | "UNREACHABLE";
+
+export interface ProxyIdentityProbe {
+  status: ProxyIdentityStatus;
+  /** The store-domain URL probed (token stripped), for the checklist copy. */
+  url: string;
+  /** What actually came back (HTTP status / error), for the checklist copy. */
+  detail: string | null;
+}
+
+/**
+ * "Portal proxy answers as Cellexia" — the launch-checklist probe that makes
+ * the /apps/cellexia collision structurally impossible to re-ship. The
+ * merchant's other live app ("AOV & LTV Booster") already serves
+ * /apps/cellexia on this store, and that collision shipped repeatedly, so a
+ * config-file agreement (tests/proxy-subpath.test.ts) is not enough: this
+ * checks the LIVE store. A short-lived PREVIEW token is minted server-side
+ * and GET https://{store}/apps/cellexia-subs/preview/validate?token=… is
+ * fetched with a short timeout. Only our own endpoint
+ * (app/routes/proxy.preview.validate.tsx) answers 200 { ok: true } to a token
+ * this app signed — any other status or body means something else owns the
+ * path (a colliding app, or our [app_proxy] config was never deployed) and
+ * the row shows MISMATCH with remediation copy.
+ *
+ * Never throws, never blocks the page render: network failures (timeout, DNS,
+ * TLS) are UNREACHABLE — a warning, not a failed row, because a hiccup
+ * between the app host and the storefront proves nothing about ownership.
+ */
+export async function probeProxyIdentity(
+  shopId: string,
+): Promise<ProxyIdentityProbe> {
+  let url = `${PORTAL_PROXY_BASE}/preview/validate`;
+  try {
+    const shop = await prisma.shop.findUnique({ where: { id: shopId } });
+    const host = shop?.primaryDomain ?? shop?.domain;
+    if (!host) {
+      return { status: "UNREACHABLE", url, detail: "no shop domain on record" };
+    }
+    url = `https://${host}${PORTAL_PROXY_BASE}/preview/validate`;
+
+    const token = await createMagicToken({
+      action: "PREVIEW",
+      params: { shopId },
+      ttlSeconds: PROXY_PROBE_TOKEN_TTL_SECONDS,
+      maxUses: 1,
+      createdVia: "ADMIN",
+    });
+
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(),
+      PROXY_PROBE_TIMEOUT_MS,
+    );
+    let response: Response;
+    try {
+      response = await fetch(`${url}?token=${encodeURIComponent(token)}`, {
+        signal: controller.signal,
+        headers: { accept: "application/json" },
+        redirect: "follow",
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!response.ok) {
+      return { status: "MISMATCH", url, detail: `HTTP ${response.status}` };
+    }
+    let body: unknown;
+    try {
+      body = await response.json();
+    } catch {
+      return { status: "MISMATCH", url, detail: "non-JSON response body" };
+    }
+    const isOurs =
+      typeof body === "object" &&
+      body !== null &&
+      (body as { ok?: unknown }).ok === true;
+    return isOurs
+      ? { status: "OK", url, detail: null }
+      : { status: "MISMATCH", url, detail: "unexpected response body" };
+  } catch (err) {
+    const detail =
+      err instanceof Error && err.name === "AbortError"
+        ? `no answer within ${PROXY_PROBE_TIMEOUT_MS / 1000}s`
+        : err instanceof Error
+          ? err.message
+          : String(err);
+    console.error("[launch] proxy-identity probe failed", detail);
+    return { status: "UNREACHABLE", url, detail };
+  }
 }
 
 // ── Storefront preview ───────────────────────────────────────────────────────

@@ -1,0 +1,65 @@
+{%- comment -%} cx-preset-toggle — segmented pill tabs (role tablist) swapping a subscription and a one-time detail panel. Direct-render partial dispatched by cx-buybox-core: prints ONLY values the core precomputed and passed as render args, computes nothing, renders nothing further. Rules, args, string-space contract, history: README "Core snippet internals". {%- endcomment -%}
+<div class="cx-buybox__group cx-buybox__group--toggle">
+{%- unless product.requires_selling_plan -%}
+{%- capture cx_tab_sub -%}
+<button
+type="button"
+class="cx-buybox__tab{% if cx_sub_checked %} is-selected{% endif %}"
+role="tab"
+id="cx-tab-sub-{{ uid }}"
+aria-controls="cx-panel-sub-{{ uid }}"
+aria-selected="{% if cx_sub_checked %}true{% else %}false{% endif %}"
+{% unless cx_sub_checked %}tabindex="-1"{% endunless %}
+data-cellexia-tab="subscription"
+><span class="cx-buybox__tab-label"{% if cx_sub_label_raw contains '{' %} data-cellexia-tpl="{{ cx_sub_label_raw | escape }}"{% endif %}>{{ cx_sub_label }}</span></button>
+{%- endcapture -%}
+{%- capture cx_tab_one -%}
+<button
+type="button"
+class="cx-buybox__tab{% unless cx_sub_checked %} is-selected{% endunless %}"
+role="tab"
+id="cx-tab-one-{{ uid }}"
+aria-controls="cx-panel-one-{{ uid }}"
+aria-selected="{% unless cx_sub_checked %}true{% else %}false{% endunless %}"
+{% if cx_sub_checked %}tabindex="-1"{% endif %}
+data-cellexia-tab="one_time"
+><span class="cx-buybox__tab-label">{{ cx_onetime_label_short }}</span></button>
+{%- endcapture -%}
+<div class="cx-buybox__tabs" role="tablist" aria-label="{{ 'purchase_options' | t }}">
+{%- if cx_order == 'one_time_first' -%}{{ cx_tab_one }}{{ cx_tab_sub }}{%- else -%}{{ cx_tab_sub }}{{ cx_tab_one }}{%- endif -%}
+</div>
+{%- endunless -%}
+<div
+class="cx-buybox__panel cx-buybox__option--sub"
+role="tabpanel"
+id="cx-panel-sub-{{ uid }}"
+aria-labelledby="cx-tab-sub-{{ uid }}"
+data-cellexia-panel="subscription"
+{% unless cx_sub_checked %}hidden{% endunless %}
+>
+{%- if cx_show_savings -%}
+<span class="cx-buybox__save" data-cellexia-save{% if cx_save_tpl_raw != blank %} data-cellexia-tpl="{{ cx_save_tpl_raw | escape }}"{% endif %} {% if cx_save == blank %}hidden{% endif %}>{{ cx_save }}</span>
+{%- endif -%}
+{{ cx_price_block }}
+{{ cx_freq_control }}
+{{ cx_benefits_html }}
+{%- if cx_show_reassurance -%}{{ cx_reassurance_html }}{%- endif -%}
+</div>
+{%- unless product.requires_selling_plan -%}
+<div
+class="cx-buybox__panel"
+role="tabpanel"
+id="cx-panel-one-{{ uid }}"
+aria-labelledby="cx-tab-one-{{ uid }}"
+data-cellexia-panel="one_time"
+{% if cx_sub_checked %}hidden{% endif %}
+>
+<span class="cx-buybox__title-row">
+<span class="cx-buybox__title">{{ cx_onetime_label }}</span>
+<span class="cx-buybox__price" data-cellexia-onetime-price>
+<span class="cx-price">{{ cx_variant.price | money }}</span>
+</span>
+</span>
+</div>
+{%- endunless -%}
+</div>

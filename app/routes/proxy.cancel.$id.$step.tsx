@@ -51,7 +51,7 @@ import {
 
 /**
  * Cancel flow — steps 2..5, served through the app proxy at
- * /apps/cellexia-subscriptions/cancel/:id/:step. Resource route (liquid HTML, no React).
+ * /apps/cellexia-subs/cancel/:id/:step. Resource route (liquid HTML, no React).
  *
  * Steps: reason → saves → final → confirm → done (+ saved confirmation).
  *

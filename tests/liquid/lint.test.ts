@@ -24,12 +24,18 @@ import {
  * corrupted storefront in the first place, so a future edit cannot reach a
  * broken render even by a route the golden tests do not cover.
  *
- *   1. Never capture a render. Shopify wraps every app-snippet render in
+ *   1. Never capture a render — forbidden forever. Shopify wraps every
+ *      app-snippet render in
  *      "<!-- BEGIN app snippet: x -->…<!-- END app snippet -->"; capturing it
  *      pulls those markers into a STRING, and the next escape filter prints
  *      them on the page. This is the exact production bug.
- *   2. The extension ships ONE snippet, and it renders no other snippet — the
- *      structural version of rule 1.
+ *   2. Renders happen ONLY in direct-output markup position (v1.7.0, when the
+ *      seven preset partials were extracted from the core for the platform's
+ *      per-file size limit): no render token inside any capture span, and no
+ *      render as a bare line inside a liquid block. The snippet set is pinned
+ *      — cx-buybox-core.liquid plus the seven cx-preset-*.liquid partials —
+ *      and a preset partial renders nothing further: snippets never return
+ *      values, all string/value computation stays in the consumer.
  *   3. Never escape the output of `| t`: it is already HTML-escaped, so a
  *      second escape renders "&amp;" as visible characters.
  *   4. No STATIC element id starting with "cx-": the live storefront also
@@ -509,11 +515,24 @@ describe("no captured renders (the v1.2.0 storefront bug)", () => {
 
   it("sees the capture blocks and the renders it is checking", () => {
     /* Vacuity guard: if liquidTags ever stops parsing this extension the
-       three rules above would pass by finding nothing at all. */
+       three rules above would pass by finding nothing at all. The counts
+       reflect the v1.7.0 shape: the core keeps its five markup captures
+       (frequency control, benefit list, reassurance, the two price-block
+       variants) and dispatches the seven preset partials; the partials add
+       their own pure-markup captures; each block file renders the core. */
     const snippet = read(join(SNIPPETS_DIR, "cx-buybox-core.liquid"));
     expect(captureRanges(snippet).length, "capture blocks found").toBeGreaterThan(
-      5,
+      3,
     );
+    const partialCaptures = readdirSync(SNIPPETS_DIR)
+      .filter((name) => name.startsWith("cx-preset-") && name.endsWith(".liquid"))
+      .flatMap((name) => captureRanges(read(join(SNIPPETS_DIR, name))));
+    expect(partialCaptures.length, "capture blocks found in the partials")
+      .toBeGreaterThan(3);
+    const coreRenders = liquidTags(snippet).filter(
+      (tag) => tag.name === "render",
+    );
+    expect(coreRenders.length, "preset renders found in the core").toBe(7);
     const blockRenders = readdirSync(BLOCKS_DIR)
       .filter((name) => name.endsWith(".liquid"))
       .flatMap((name) =>
@@ -578,27 +597,99 @@ describe("no captured renders (the v1.2.0 storefront bug)", () => {
   });
 });
 
-// ── 2. One snippet, and it renders nothing ───────────────────────────────────
+// ── 2. Renders only in direct-output markup position; the snippet set is
+//       pinned ────────────────────────────────────────────────────────────────
+
+/** The seven design presets, one partial each, dispatched by the core. */
+const PRESET_NAMES = [
+  "classic",
+  "inline",
+  "planner",
+  "subscription_max",
+  "tiles",
+  "toggle",
+  "value_stack",
+] as const;
 
 describe("snippet surface", () => {
-  it("ships exactly one snippet: cx-buybox-core.liquid", () => {
-    const snippets = readdirSync(SNIPPETS_DIR).filter((name) =>
-      name.endsWith(".liquid"),
-    );
-    expect(snippets).toEqual(["cx-buybox-core.liquid"]);
+  it("ships exactly the core snippet plus the seven preset partials", () => {
+    /* Pinned, not counted: a stray snippet is a review event, because every
+       new render target is a new set of app-snippet comment markers and a
+       new opportunity to stringify one. */
+    const snippets = readdirSync(SNIPPETS_DIR)
+      .filter((name) => name.endsWith(".liquid"))
+      .sort();
+    expect(snippets).toEqual([
+      "cx-buybox-core.liquid",
+      ...PRESET_NAMES.map((preset) => `cx-preset-${preset}.liquid`),
+    ]);
   });
 
-  it("no snippet contains a render or include tag, in either Liquid form", () => {
-    for (const name of readdirSync(SNIPPETS_DIR).filter((f) =>
-      f.endsWith(".liquid"),
-    )) {
+  it("every render in every .liquid sits in direct-output markup position", () => {
+    /* The refined form of "no renders in snippets": a render is allowed —
+       the core dispatches the preset partials with one — but ONLY where its
+       app-snippet comment markers land between elements as ordinary HTML
+       comments. That means never inside a {% capture %} span (rule 1 above
+       forbids that shape everywhere; restated here so this rule stands on
+       its own) and never as a bare line inside a {% liquid %} block, which
+       is not markup position. */
+    for (const file of liquidFiles) {
+      const source = read(file);
+      const ranges: Array<[number, number]> = [];
+      const open: number[] = [];
+      for (const tag of liquidTags(source)) {
+        if (tag.name === "capture") open.push(tag.index);
+        else if (tag.name === "endcapture") {
+          const start = open.pop();
+          if (start !== undefined) ranges.push([start, tag.index]);
+        }
+      }
+      const offenders = liquidTags(source)
+        .filter((tag) => isSnippetTag(tag.name))
+        .filter(
+          (tag) =>
+            tag.lineForm ||
+            ranges.some(([from, to]) => tag.index > from && tag.index < to),
+        )
+        .map((tag) => `line ${tag.line}: ${tag.name} ${tag.body.slice(0, 40)}`);
+      expect(
+        offenders,
+        `${repoPath(file)} has a render outside direct-output markup ` +
+          `position:\n${offenders.join("\n")}`,
+      ).toEqual([]);
+    }
+  });
+
+  it("the core renders exactly the seven preset partials, once each", () => {
+    /* The dispatch is pinned both ways: every branch of the {% case %}
+       reaches a preset partial, and no render targets anything else — a
+       renamed partial, a helper snippet or a second render of the same
+       preset all fail here. */
+    const renders = liquidTags(read(join(SNIPPETS_DIR, "cx-buybox-core.liquid")))
+      .filter((tag) => isSnippetTag(tag.name));
+    expect(renders.every((tag) => tag.name === "render")).toBe(true);
+    const targets = renders
+      .map((tag) => /^'([^']+)'/.exec(tag.body)?.[1] ?? tag.body.slice(0, 40))
+      .sort();
+    expect(targets).toEqual(
+      PRESET_NAMES.map((preset) => `cx-preset-${preset}`),
+    );
+  });
+
+  it("a preset partial renders nothing further and computes nothing", () => {
+    /* Snippets never return values: all string/value computation stays in
+       the consumer (the core), so a partial contains no render, no include
+       and no capture-of-render — only markup and the captures of pure
+       markup its ordering knobs need. */
+    for (const preset of PRESET_NAMES) {
+      const name = `cx-preset-${preset}.liquid`;
       const renders = liquidTags(read(join(SNIPPETS_DIR, name)))
         .filter((tag) => isSnippetTag(tag.name))
         .map((tag) => `line ${tag.line}: ${tag.name} ${tag.body.slice(0, 40)}`);
       expect(
         renders,
-        `${name}: a snippet may only emit final markup — see RULE 1 in the ` +
-          `header of cx-buybox-core.liquid`,
+        `${name}: a preset partial only prints what the core passed it — ` +
+          `see the Liquid rules in extensions/cellexia-buy-box/README.md`,
       ).toEqual([]);
     }
   });

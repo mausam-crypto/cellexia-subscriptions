@@ -30,6 +30,21 @@ The version lives in `package.json` and at the top of [CHANGELOG.md](../CHANGELO
    compile (a route component referenced a `.server` module), so a release is
    only a release once all three are green. No ZIP is cut from a tree where
    `npm run verify` exits non-zero.
+
+   Since v1.6.3 (limit model corrected in v1.6.4) the gate also covers what
+   used to be discoverable only on the deploy console: theme-extension
+   **size budgets** (**TOTAL** shipped Liquid ≤ 88KB against Shopify's 100KB
+   hard reject — a real `shopify app deploy` verified the 100KB limit is
+   enforced on the sum of every `.liquid` file in the extension, *not*
+   per-file — plus a per-file belt at the same ceiling, block count, bundle
+   and locale-file caps, plus our own JS/CSS performance ceilings —
+   `tests/liquid/size-limits.test.ts`), block **schema validity** mirroring
+   the Shopify CLI's checks (`tests/liquid/schema.test.ts`), and **app-proxy
+   subpath consistency** across `shopify.app.toml`, the portal code and the
+   storefront JS, including the permanent ban on the colliding legacy value
+   (`tests/proxy-subpath.test.ts`). A tree that would fail
+   `shopify app deploy` for any of those reasons now fails `npm run verify`
+   first.
 2. A **CHANGELOG entry** (Keep-a-Changelog style: Added / Changed / Fixed /
    Migration notes) — read it *before* updating.
 3. **Additive migrations**: new tables/columns/indexes only, applied with

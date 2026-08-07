@@ -185,7 +185,7 @@ a price increase properly:
 |---|---|---|
 | `APP_SIGNING_SECRET` | **Invalidates every outstanding magic link, portal session and pending OTP immediately.** Links already sitting in customers' inboxes (skip links in upcoming-order emails, card-update links in dunning emails) will show "link expired". | Rotate only on suspicion of compromise or scheduled hygiene. Do it at a low-traffic hour: set the new value, restart. Then **send fresh links**: Bulk ops → re-send card-update links for all open dunning cases, and accept that pre-rotation upcoming-order emails will route customers to portal login (OTP) instead — that path always works. |
 | `CRON_SECRET` | External cron gets 401s until updated. | Set new value on host **and** in the cron service in the same minute. Internal-scheduler installs: no urgency. |
-| `SHOPIFY_API_SECRET` | Webhook HMACs + app-proxy signatures fail → webhooks rejected, portal 401s. | Rotate in the Partner Dashboard, update the host secret immediately, redeploy. Verify a webhook arrives and `/apps/cellexia-subscriptions` loads. |
+| `SHOPIFY_API_SECRET` | Webhook HMACs + app-proxy signatures fail → webhooks rejected, portal 401s. | Rotate in the Partner Dashboard, update the host secret immediately, redeploy. Verify a webhook arrives and `/apps/cellexia-subs` loads. |
 | SMTP / Klaviyo keys | Notifications fail (contained — billing unaffected). With the Klaviyo key absent, lifecycle **emails** fall back to plain direct-SMTP delivery, **SMS is not sent at all**, and outbox rows are aged out (DEAD) after 24h rather than fired late; a stalled/dying outbox raises `KLAVIYO_OUTBOX_BACKLOG`. | Update, restart, confirm the outbox drains and `notification.sent` events resume; resolve the `KLAVIYO_OUTBOX_BACKLOG` alert once it stops re-raising. |
 
 ## 11. GDPR requests
@@ -611,6 +611,27 @@ group still renders nothing. Consequences worth knowing:
 cockpit with a banner, and every action on it (pause, resume, cancel, charge
 now, retry, edit items, change the date, card-update email, portal link) is
 refused server-side. Claim it, or take it over properly, first.
+
+**App-proxy subpath (`/apps/cellexia-subs`).** The portal's store-domain path
+is the `[app_proxy]` subpath in `shopify.app.toml`, mirrored by
+`PORTAL_PROXY_SUBPATH` in `app/lib/portal/proxy-path.ts` and hardcoded in the
+theme-extension JS (`buy-box.js` / `buy-box-embed.js`, which cannot import app
+modules) — `tests/proxy-subpath.test.ts` keeps all four in agreement. The value
+is `cellexia-subs`, **never** `cellexia`: the store's other live app ("AOV &
+LTV Booster") already serves `/apps/cellexia`, and shipping on that subpath
+handed portal traffic to the wrong app more than once. The Preview & launch
+checklist row **"Portal proxy answers as Cellexia"** probes the live path
+end-to-end (a signed preview-validate round trip on the store domain) and
+fails whenever anything else answers there — another app occupying the path,
+or an `[app_proxy]` config that was never deployed.
+
+Changing the subpath is a **deploy-gated, customer-visible** change: the proxy
+config only takes effect after `npm run deploy`, and the change **invalidates
+every customer-bookmarked portal link** (the old `/apps/...` URL stops being
+ours) as well as existing portal-session cookies, which are scoped to the old
+path — customers simply log in again at the new URL. **Magic links are
+unaffected**: they ride the app host (`SHOPIFY_APP_URL/magic/...`), not the
+store domain.
 
 ## 19. Analytics — the cost model, and what the numbers mean
 

@@ -2,154 +2,152 @@
 
 exports[`zero-config shop (no cellexia.buybox_design metafield) > is byte-stable 1`] = `
 "<!-- BEGIN app snippet: cx-buybox-core --><div
-    id="cx-buybox-cx-block-1"
-    class="cx-buybox cx-buybox--classic"
-    data-cellexia-buybox
-    data-cellexia-preset="classic"
-    data-block-id="cx-block-1"
-    data-cellexia-money-onetime="CHF 64.00"
-    data-cellexia-money-sub="CHF 51.20"
-    data-cellexia-price-sync="true"
-    data-cellexia-price-selector=""
-    data-section-id="template--1__main"
-    style="--cx-accent: #1d1d1b; --cx-accent-soft: rgba(29, 29, 27, 0.07);"
-    data-shopify-editor-block="{&quot;id&quot;:&quot;cx-block-1&quot;}"
-  ><h3 class="cx-buybox__heading">Choose your ritual</h3><span class="cx-buybox__sr" id="cx-buybox-label-cx-block-1">Purchase options</span><div class="cx-buybox__group" role="radiogroup" aria-labelledby="cx-buybox-label-cx-block-1"><div
-        class="cx-buybox__option cx-buybox__option--sub is-selected"
-        data-cellexia-option-wrap="subscription"
-      ><span class="cx-buybox__badge">Most popular</span><label class="cx-buybox__card">
-          <input
-            type="radio"
-            class="cx-buybox__radio cx-buybox__sr-input"
-            name="cx-purchase-cx-block-1"
-            value="subscription"
-            data-cellexia-option="subscription"
-            checked aria-checked="true"
-          >
-          <span class="cx-buybox__card-body">
-            <span class="cx-buybox__control" aria-hidden="true"></span>
-            <span class="cx-buybox__card-main">
-              <span class="cx-buybox__title-row">
-                <span class="cx-buybox__title">Subscribe &amp; Save</span><span class="cx-buybox__save" data-cellexia-save >Save 20%</span></span>
-              <span class="cx-buybox__price-row">
-      <span class="cx-buybox__price cx-buybox__price--lg" data-cellexia-sub-price>
-        <span class="cx-price">CHF 51.20</span></span>
-      <span class="cx-buybox__first-label" data-cellexia-first-label >First order</span>
-    </span>
-    <span class="cx-buybox__then" data-cellexia-then >then CHF 57.60 every 8 weeks</span><span class="cx-buybox__per-delivery" data-cellexia-per-delivery hidden></span>
-            </span>
-          </span>
-        </label>
-
-        <div class="cx-buybox__freq">
-          <label class="cx-buybox__sr" for="cx-freq-cx-block-1">Delivery every</label>
-          <select id="cx-freq-cx-block-1" class="cx-buybox__freq-select" data-cellexia-freq><option value="6881100001" >Delivery every 4 weeks</option><option value="6881100002" >Delivery every 6 weeks</option><option value="6881100003" selected>Delivery every 8 weeks</option></select>
-        </div><p class="cx-buybox__reassurance">
-        <svg class="cx-buybox__check" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
-          <path d="M6.5 11.3 3.4 8.2l1-1 2.1 2 5-5.1 1 1z" fill="currentColor"/>
-        </svg>Skip, pause or cancel anytime.</p>
-      </div><div
-          class="cx-buybox__option cx-buybox__option--onetime"
-          data-cellexia-option-wrap="one_time"
-        >
-          <label class="cx-buybox__card">
-            <input
-              type="radio"
-              class="cx-buybox__radio cx-buybox__sr-input"
-              name="cx-purchase-cx-block-1"
-              value="one_time"
-              data-cellexia-option="one_time"
-              aria-checked="false"
-            >
-            <span class="cx-buybox__card-body">
-              <span class="cx-buybox__control" aria-hidden="true"></span>
-              <span class="cx-buybox__card-main">
-                <span class="cx-buybox__title-row">
-                  <span class="cx-buybox__title">One-time purchase</span>
-                  <span class="cx-buybox__price" data-cellexia-onetime-price>
-                    <span class="cx-price">CHF 64.00</span>
-                  </span>
-                </span>
-              </span>
-            </span>
-          </label>
-        </div></div><input
-      type="hidden"
-      hidden
-      value="6881100003"
-      data-cellexia-selling-plan
-    ><script type="application/json" data-cellexia-data>
-      {
-        "initialVariant": "4411100011101",
-        "initialPlan": "6881100003",
-        "preselect": true,
-        "requiresSellingPlan": false,
-        "variants": {"4411100011101": {
-              "available": true,
-              "oneTime": "CHF 64.00",
-              "plans": {"6881100001": {
-                      "first": "CHF 51.20",
-                      "then": "then CHF 57.60 every 4 weeks",
-                      "save": "Save 20%",
-                      "perDelivery": "",
-                      "pd": "CHF 51.20",
-                      "freq": "4 weeks",
-                      "savePct": "20%"
-                    },"6881100002": {
-                      "first": "CHF 51.20",
-                      "then": "then CHF 57.60 every 6 weeks",
-                      "save": "Save 20%",
-                      "perDelivery": "",
-                      "pd": "CHF 51.20",
-                      "freq": "6 weeks",
-                      "savePct": "20%"
-                    },"6881100003": {
-                      "first": "CHF 51.20",
-                      "then": "then CHF 57.60 every 8 weeks",
-                      "save": "Save 20%",
-                      "perDelivery": "",
-                      "pd": "CHF 51.20",
-                      "freq": "8 weeks",
-                      "savePct": "20%"
-                    }}
-            },"4411100011102": {
-              "available": true,
-              "oneTime": "CHF 98.00",
-              "plans": {"6881100001": {
-                      "first": "CHF 78.40",
-                      "then": "then CHF 88.20 every 4 weeks",
-                      "save": "Save 20%",
-                      "perDelivery": "",
-                      "pd": "CHF 78.40",
-                      "freq": "4 weeks",
-                      "savePct": "20%"
-                    },"6881100002": {
-                      "first": "CHF 78.40",
-                      "then": "then CHF 88.20 every 6 weeks",
-                      "save": "Save 20%",
-                      "perDelivery": "",
-                      "pd": "CHF 78.40",
-                      "freq": "6 weeks",
-                      "savePct": "20%"
-                    },"6881100003": {
-                      "first": "CHF 78.40",
-                      "then": "then CHF 88.20 every 8 weeks",
-                      "save": "Save 20%",
-                      "perDelivery": "",
-                      "pd": "CHF 78.40",
-                      "freq": "8 weeks",
-                      "savePct": "20%"
-                    }}
-            }}
-      }
-    </script>
-
-    <noscript><style>
-        #cx-buybox-cx-block-1 .cx-buybox__group,
-        #cx-buybox-cx-block-1 .cx-buybox__heading,
-        #cx-buybox-cx-block-1 .cx-buybox__subheading { display: none; }
-      </style>
-    </noscript>
-  </div><!-- END app snippet -->
+id="cx-buybox-cx-block-1"
+class="cx-buybox cx-buybox--classic"
+data-cellexia-buybox
+data-cellexia-preset="classic"
+data-block-id="cx-block-1"
+data-cellexia-money-onetime="CHF 64.00"
+data-cellexia-money-sub="CHF 51.20"
+data-cellexia-price-sync="true"
+data-cellexia-price-selector=""
+data-section-id="template--1__main"
+style="--cx-accent: #1d1d1b; --cx-accent-soft: rgba(29, 29, 27, 0.07);"
+data-shopify-editor-block="{&quot;id&quot;:&quot;cx-block-1&quot;}"
+><h3 class="cx-buybox__heading">Choose your ritual</h3><span class="cx-buybox__sr" id="cx-buybox-label-cx-block-1">Purchase options</span><!-- BEGIN app snippet: cx-preset-classic --><div class="cx-buybox__group" role="radiogroup" aria-labelledby="cx-buybox-label-cx-block-1"><div
+class="cx-buybox__option cx-buybox__option--sub is-selected"
+data-cellexia-option-wrap="subscription"
+><span class="cx-buybox__badge">Most popular</span><label class="cx-buybox__card">
+<input
+type="radio"
+class="cx-buybox__radio cx-buybox__sr-input"
+name="cx-purchase-cx-block-1"
+value="subscription"
+data-cellexia-option="subscription"
+checked aria-checked="true"
+>
+<span class="cx-buybox__card-body">
+<span class="cx-buybox__control" aria-hidden="true"></span>
+<span class="cx-buybox__card-main">
+<span class="cx-buybox__title-row">
+<span class="cx-buybox__title">Subscribe &amp; Save</span><span class="cx-buybox__save" data-cellexia-save >Save 20%</span></span>
+<span class="cx-buybox__price-row">
+<span class="cx-buybox__price cx-buybox__price--lg" data-cellexia-sub-price>
+<span class="cx-price">CHF 51.20</span></span>
+<span class="cx-buybox__first-label" data-cellexia-first-label >First order</span>
+</span>
+<span class="cx-buybox__then" data-cellexia-then >then CHF 57.60 every 8 weeks</span><span class="cx-buybox__per-delivery" data-cellexia-per-delivery hidden></span>
+</span>
+</span>
+</label>
+<div class="cx-buybox__freq">
+<label class="cx-buybox__sr" for="cx-freq-cx-block-1">Delivery every</label>
+<select id="cx-freq-cx-block-1" class="cx-buybox__freq-select" data-cellexia-freq><option value="6881100001" >Delivery every 4 weeks</option><option value="6881100002" >Delivery every 6 weeks</option><option value="6881100003" selected>Delivery every 8 weeks</option></select>
+</div><p class="cx-buybox__reassurance">
+<svg class="cx-buybox__check" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
+<path d="M6.5 11.3 3.4 8.2l1-1 2.1 2 5-5.1 1 1z" fill="currentColor"/>
+</svg>Skip, pause or cancel anytime.</p>
+</div><div
+class="cx-buybox__option cx-buybox__option--onetime"
+data-cellexia-option-wrap="one_time"
+>
+<label class="cx-buybox__card">
+<input
+type="radio"
+class="cx-buybox__radio cx-buybox__sr-input"
+name="cx-purchase-cx-block-1"
+value="one_time"
+data-cellexia-option="one_time"
+aria-checked="false"
+>
+<span class="cx-buybox__card-body">
+<span class="cx-buybox__control" aria-hidden="true"></span>
+<span class="cx-buybox__card-main">
+<span class="cx-buybox__title-row">
+<span class="cx-buybox__title">One-time purchase</span>
+<span class="cx-buybox__price" data-cellexia-onetime-price>
+<span class="cx-price">CHF 64.00</span>
+</span>
+</span>
+</span>
+</span>
+</label>
+</div></div><!-- END app snippet --><input
+type="hidden"
+hidden
+value="6881100003"
+data-cellexia-selling-plan
+><script type="application/json" data-cellexia-data>
+{
+"initialVariant": "4411100011101",
+"initialPlan": "6881100003",
+"preselect": true,
+"requiresSellingPlan": false,
+"variants": {"4411100011101": {
+"available": true,
+"oneTime": "CHF 64.00",
+"plans": {"6881100001": {
+"first": "CHF 51.20",
+"then": "then CHF 57.60 every 4 weeks",
+"save": "Save 20%",
+"perDelivery": "",
+"pd": "CHF 51.20",
+"freq": "4 weeks",
+"savePct": "20%"
+},"6881100002": {
+"first": "CHF 51.20",
+"then": "then CHF 57.60 every 6 weeks",
+"save": "Save 20%",
+"perDelivery": "",
+"pd": "CHF 51.20",
+"freq": "6 weeks",
+"savePct": "20%"
+},"6881100003": {
+"first": "CHF 51.20",
+"then": "then CHF 57.60 every 8 weeks",
+"save": "Save 20%",
+"perDelivery": "",
+"pd": "CHF 51.20",
+"freq": "8 weeks",
+"savePct": "20%"
+}}
+},"4411100011102": {
+"available": true,
+"oneTime": "CHF 98.00",
+"plans": {"6881100001": {
+"first": "CHF 78.40",
+"then": "then CHF 88.20 every 4 weeks",
+"save": "Save 20%",
+"perDelivery": "",
+"pd": "CHF 78.40",
+"freq": "4 weeks",
+"savePct": "20%"
+},"6881100002": {
+"first": "CHF 78.40",
+"then": "then CHF 88.20 every 6 weeks",
+"save": "Save 20%",
+"perDelivery": "",
+"pd": "CHF 78.40",
+"freq": "6 weeks",
+"savePct": "20%"
+},"6881100003": {
+"first": "CHF 78.40",
+"then": "then CHF 88.20 every 8 weeks",
+"save": "Save 20%",
+"perDelivery": "",
+"pd": "CHF 78.40",
+"freq": "8 weeks",
+"savePct": "20%"
+}}
+}}
+}
+</script>
+<noscript><style>
+#cx-buybox-cx-block-1 .cx-buybox__group,
+#cx-buybox-cx-block-1 .cx-buybox__heading,
+#cx-buybox-cx-block-1 .cx-buybox__subheading { display: none; }
+</style>
+</noscript>
+</div><!-- END app snippet -->
 "
 `;

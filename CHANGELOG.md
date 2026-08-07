@@ -4,6 +4,126 @@ All notable changes to Cellexia Subscriptions. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [SemVer](https://semver.org) as contracted in [docs/UPDATE.md](docs/UPDATE.md).
 
+## [1.6.4] — 2026-08-07
+
+**Deploy-blocker release — the Liquid limit model was wrong.** The 100KB
+Liquid limit is **TOTAL extension-wide** (verified empirically by the
+merchant's developer via a real `shopify app deploy`) — v1.6.3's per-file
+model was wrong; all Liquid minified from 110,294 → 72,760 bytes; guard
+rewritten around the total budget. A plain PATCH: **no migrations, no schema
+changes, no env changes, no scope changes**. Applying this release requires
+`npm run deploy` (the whole point is getting the extension under the real
+budget).
+
+### Fixed
+
+- **Extension — combined Liquid over Shopify's 100KB TOTAL budget (deploy
+  rejected)**: v1.6.3 modeled the platform's 100KB Liquid limit as
+  per-file, so its guard passed a tree whose ten `.liquid` files summed to
+  110,294 bytes — and the real `shopify app deploy` rejected it, proving
+  the 102,400-byte budget is enforced on the **total of all `.liquid` files
+  in the extension**. All shipped Liquid is now minified
+  (110,294 → 72,760 bytes): leading indentation stripped (cosmetic inside
+  `{% liquid %}` blocks; in HTML it collapses to the same inter-element
+  whitespace as the kept newline — **every newline is kept**), blank lines
+  removed, remaining comments trimmed to one line each pointing at the
+  extension README's "Core snippet internals". No logic changes, no
+  renames, no reordering — the render goldens prove the output is
+  unchanged, and the byte-stability snapshots were regenerated with a
+  whitespace-only diff. The seven preset partials are kept (they no longer
+  buy budget under a total model, but they still buy maintainability).
+- **Guard — `tests/liquid/size-limits.test.ts` rewritten around the total
+  budget**: the PRIMARY assertion now holds the **TOTAL** of every shipped
+  `.liquid` file ≤ 90,112 bytes (88KB — 12% margin under the platform's
+  102,400-byte total, matching the working ceiling in the extension
+  README), with the empirical verification and the remediation
+  order (strip whitespace/comments first; merge partials second; move
+  logic to JS/assets last) in the failure message. The old per-file check
+  survives as a belt at the same ceiling. All other guards (block count,
+  bundle size, locale caps, JS/CSS performance ceilings, schema validity)
+  are unchanged.
+
+### Changed
+
+- Docs corrected to the total-budget model:
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
+  [docs/UPDATE.md](docs/UPDATE.md), [docs/TESTING.md](docs/TESTING.md) and
+  the extension README no longer describe the limit as per-file; the README's
+  "Core snippet internals" section now carries the minification discipline
+  (edit at column 0, keep every newline, prose lives in the README).
+
+### Migration notes
+
+None. Re-deploy the extension with `npm run deploy`.
+
+## [1.6.3] — 2026-08-07
+
+**Deployment-blocker release.** The first real `npm run deploy` of 1.6.2
+surfaced four blockers that nothing in CI exercised — every one of them was
+only discoverable on the deploy console (or, for the last item, on the hosting
+provider's health dashboard). Each is fixed AND now carries a permanent guard
+in the suite, so the whole class fails in `npm run verify` instead of at
+deploy time. A plain PATCH otherwise: **no migrations, no schema changes, no
+env changes, no new scopes** (one *invalid* scope entry is removed — nothing
+to re-approve, since it was never grantable). Because `shopify.app.toml`
+changed (scope list corrected, app-proxy subpath), applying this release
+requires `npm run deploy`.
+
+### Fixed
+
+- **Extension — core Liquid file over Shopify's 100KB hard limit (deploy
+  rejected)**: `snippets/cx-buybox-core.liquid` had grown to 111,374 bytes,
+  and `shopify app deploy` rejects any theme-extension Liquid file over
+  102,400 bytes. The seven design presets now live in seven partials
+  (`snippets/cx-preset-*.liquid`, 3–6KB each) rendered DIRECTLY from the
+  core's `{% case %}` — direct-to-markup renders leave Shopify's BEGIN/END
+  app-snippet comment markers as invisible HTML comments (they are never
+  captured: capture-around-render is the exact v1.2.0 corruption shape and
+  stays forbidden forever), and the remaining maintainer essays moved to the
+  extension README, bringing the core to ~64KB.
+  `tests/liquid/lint.test.ts` pins the refined invariants (renders only in
+  direct-output markup position, the snippet set itself, preset partials
+  render/compute nothing further), `tests/liquid/render.test.ts` proves the
+  refactor changed nothing but the inert comment markers, and NEW
+  `tests/liquid/size-limits.test.ts` makes the budgets permanent: every
+  `.liquid` ≤ 90KB (platform rejects at 100KB), combined Liquid ≤ 450KB,
+  ≤ 25 blocks, whole bundle ≤ 9MB, every locale file valid JSON and ≤ 16KB,
+  plus our own performance ceilings on the assets (JS ≤ 92KB, CSS ≤ 64KB).
+- **Config — invalid scope `write_customer_payment_methods` removed (deploy
+  rejected)**: the scope does not exist in Shopify's scope catalogue, so
+  config validation refused the whole push. Payment-method mutations are
+  authorized by `write_customers`, which the app already requests; the
+  phantom entry is gone from `shopify.app.toml` and
+  [docs/INSTALL.md](docs/INSTALL.md), and
+  `tests/deploy-config.test.ts` keeps the toml and `.env.example` scope lists
+  identical and covering every mutation the app calls.
+- **Config — app-proxy subpath collided with the merchant's other live app
+  (portal dead on arrival)**: the proxy was configured at `/apps/cellexia`,
+  but the merchant's "AOV & LTV Booster" app already serves that subpath on
+  the same store, so every portal URL would have been answered by the wrong
+  app. The subpath is now **`cellexia-subs`**, with a single source of truth
+  (`PORTAL_PROXY_SUBPATH` in `app/lib/portal/proxy-path.ts`);
+  `tests/proxy-subpath.test.ts` pins all four places the path appears into
+  agreement and bans the legacy value forever, and the go-live checklist
+  gained a **proxy-identity probe** that fetches the live proxy URL and
+  verifies OUR app answered (OK / MISMATCH / UNREACHABLE) before launch, so a
+  future collision is caught by the checklist rather than by a customer.
+- **Extension — embed block schema rejected by the CLI (`"default": ""`)**:
+  the anchor-selector text setting declared an explicit empty-string default,
+  which `shopify app deploy` schema validation rejects — an absent default IS
+  empty, so the key was removed (behaviour unchanged).
+  `tests/liquid/schema.test.ts` now mirrors the CLI's schema checks (labels
+  present, select defaults among their options, checkbox defaults boolean,
+  no empty-string defaults, …) so the next schema mistake fails in vitest,
+  not on the deploy console.
+- **Hosting — bare-root `HEAD /` health probe answered 500**: the root route
+  called `login()` from `shopify.server`, which reads the request body and
+  throws on the bodyless HEAD probes hosting health checks and load balancers
+  send — every probe became a 500 and the host flagged the deploy unhealthy.
+  The root loader now touches only the URL (`?shop=` still redirects into the
+  embedded app; everything else gets a plain 200); real monitoring belongs on
+  `/api/health`.
+
 ## [1.6.2] — 2026-08-06
 
 **Second pre-launch stabilisation sweep.** A further review pass over the

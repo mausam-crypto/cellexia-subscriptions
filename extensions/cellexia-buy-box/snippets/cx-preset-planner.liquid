@@ -1,0 +1,85 @@
+{%- comment -%} cx-preset-planner — frequency-forward cadence chips first, prices framed per delivery. Direct-render partial dispatched by cx-buybox-core: prints ONLY values the core precomputed and passed as render args, computes nothing, renders nothing further. Rules, args, string-space contract, history: README "Core snippet internals". {%- endcomment -%}
+<div class="cx-buybox__group cx-buybox__group--planner">
+{%- if cx_multi_plan -%}
+{%- if cx_show_freq -%}
+<p class="cx-buybox__planner-label">{{ cx_freq_label }}</p>
+{{ cx_freq_control }}
+{%- else -%}
+{%- comment -%} showFrequency=false degrades to one recommended-cadence line, default plan used. {%- endcomment -%}
+<p class="cx-buybox__planner-cadence">{{ cx_freq_full }}</p>
+{%- endif -%}
+{%- endif -%}
+{%- capture cx_planner_sub -%}
+<div
+class="cx-buybox__option cx-buybox__option--sub{% if cx_sub_checked %} is-selected{% endif %}"
+data-cellexia-option-wrap="subscription"
+>
+{%- if cx_show_badge and cx_badge != blank -%}
+<span class="cx-buybox__badge">{{ cx_badge }}</span>
+{%- endif -%}
+<label class="cx-buybox__card">
+<input
+type="radio"
+class="cx-buybox__radio cx-buybox__sr-input"
+name="cx-purchase-{{ uid }}"
+value="subscription"
+data-cellexia-option="subscription"
+{% if cx_sub_checked %}checked aria-checked="true"{% else %}aria-checked="false"{% endif %}
+>
+<span class="cx-buybox__card-body">
+<span class="cx-buybox__control" aria-hidden="true"></span>
+<span class="cx-buybox__card-main">
+<span class="cx-buybox__title-row">
+<span class="cx-buybox__title"{% if cx_sub_label_raw contains '{' %} data-cellexia-tpl="{{ cx_sub_label_raw | escape }}"{% endif %}>{{ cx_sub_label }}</span>
+{%- if cx_show_savings -%}
+<span class="cx-buybox__save" data-cellexia-save{% if cx_save_tpl_raw != blank %} data-cellexia-tpl="{{ cx_save_tpl_raw | escape }}"{% endif %} {% if cx_save == blank %}hidden{% endif %}>{{ cx_save }}</span>
+{%- endif -%}
+</span>
+<span class="cx-buybox__price-row">
+<span class="cx-buybox__price cx-buybox__price--lg" data-cellexia-pd-price>
+<span class="cx-price">{{ cx_pd_cents | money }}</span>
+</span>
+<span class="cx-buybox__first-label">{{ 'per_delivery' | t }}</span>
+</span>
+<span class="cx-buybox__then" data-cellexia-then {% if cx_then == blank %}hidden{% endif %}>{{ cx_then }}</span>
+</span>
+</span>
+</label>
+{{ cx_benefits_html }}
+{%- if cx_show_reassurance -%}{{ cx_reassurance_html }}{%- endif -%}
+</div>
+{%- endcapture -%}
+{%- capture cx_planner_one -%}
+{%- unless product.requires_selling_plan -%}
+<div
+class="cx-buybox__option cx-buybox__planner-onetime{% unless cx_sub_checked %} is-selected{% endunless %}"
+data-cellexia-option-wrap="one_time"
+>
+<label class="cx-buybox__card cx-buybox__card--slim">
+<input
+type="radio"
+class="cx-buybox__radio cx-buybox__sr-input"
+name="cx-purchase-{{ uid }}"
+value="one_time"
+data-cellexia-option="one_time"
+{% unless cx_sub_checked %}checked aria-checked="true"{% else %}aria-checked="false"{% endunless %}
+>
+<span class="cx-buybox__card-body">
+<span class="cx-buybox__control" aria-hidden="true"></span>
+<span class="cx-buybox__card-main">
+<span class="cx-buybox__title-row">
+<span class="cx-buybox__title">{{ cx_onetime_label }}</span>
+<span class="cx-buybox__price" data-cellexia-onetime-price>
+<span class="cx-price">{{ cx_variant.price | money }}</span>
+</span>
+</span>
+</span>
+</span>
+</label>
+</div>
+{%- endunless -%}
+{%- endcapture -%}
+<div class="cx-buybox__planner-options" role="radiogroup" aria-labelledby="cx-buybox-label-{{ uid }}">
+{%- if cx_order == 'one_time_first' -%}{{ cx_planner_one }}{{ cx_planner_sub }}{%- else -%}{{ cx_planner_sub }}{{ cx_planner_one }}{%- endif -%}
+</div>
+</div>

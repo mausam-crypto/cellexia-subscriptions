@@ -39,12 +39,21 @@ const mocks = vi.hoisted(() => ({
   // ORDERS_CREATE replay guard: an existing event for the order's id means a
   // manual redelivery — null (the default) means "first delivery".
   subscriberEventFindFirst: vi.fn(async (_args?: unknown): Promise<unknown> => null),
+  // Acquisition capture: the handler looks up a contract mirror by
+  // originOrderId to direct-persist the sanitized bundle. null (the default)
+  // means "no mirror yet" — the stash side still logs acquisition.captured
+  // and the direct-persist path is a no-op, which is the shape these tests
+  // exercise.
+  subscriptionContractFindFirst: vi.fn(
+    async (_args?: unknown): Promise<unknown> => null,
+  ),
 }));
 
 vi.mock("~/db.server", () => ({
   default: {
     sellingPlanConfig: { findMany: mocks.sellingPlanConfigFindMany },
     subscriberEvent: { findFirst: mocks.subscriberEventFindFirst },
+    subscriptionContract: { findFirst: mocks.subscriptionContractFindFirst },
   },
 }));
 
@@ -841,6 +850,7 @@ describe("ORDERS_CREATE design attribution", () => {
     });
     mocks.sellingPlanConfigFindMany.mockResolvedValue([]);
     mocks.subscriberEventFindFirst.mockResolvedValue(null);
+    mocks.subscriptionContractFindFirst.mockResolvedValue(null);
   });
 
   function orderPayload(lineItems: unknown[]): Record<string, unknown> {

@@ -77,9 +77,17 @@ api_version = "2025-01"
 
 [app_proxy]
 # The customer portal is served on the shop's own domain at:
-#   https://<your-store-domain>/apps/cellexia-subscriptions/...
+#   https://<your-store-domain>/apps/cellexia-subs/...
+# The subpath is "cellexia-subs" and must NEVER be "cellexia": the merchant's
+# other live app ("AOV & LTV Booster") already serves /apps/cellexia on the
+# same store, and reusing that subpath hands portal traffic to the wrong app.
+# Single source of truth: PORTAL_PROXY_SUBPATH in app/lib/portal/proxy-path.ts
+# — this value, that constant and the hardcoded paths in
+# extensions/cellexia-buy-box/assets/buy-box*.js must all agree (enforced by
+# tests/proxy-subpath.test.ts). Changing the subpath requires `npm run deploy`
+# and invalidates customer-bookmarked portal links (magic links unaffected).
 url = "https://cellexia-subscriptions.onrender.com/proxy"
-subpath = "cellexia-subscriptions"
+subpath = "cellexia-subs"
 prefix = "apps"
 
 [pos]

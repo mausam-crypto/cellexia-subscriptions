@@ -41,6 +41,8 @@
  *   the copy ("final offer", milestone progress) is enforced by data.
  */
 
+import { PORTAL_PROXY_BASE } from "~/lib/portal/proxy-path";
+
 /** The 7 save mechanics the flow can offer. */
 export const SAVE_KINDS = [
   "SKIP",
@@ -166,8 +168,10 @@ export const MAX_SWAP_OPTIONS = 3;
  */
 export const SESSION_FRESH_MINUTES = 60;
 
-/** Public (store-domain) base path of the app proxy — matches shopify.app.toml. */
-export const PROXY_PUBLIC_BASE = "/apps/cellexia-subscriptions";
+/** Public (store-domain) base path of the app proxy — single source of truth
+ * in app/lib/portal/proxy-path.ts (kept in lock-step with shopify.app.toml by
+ * tests/proxy-subpath.test.ts). */
+export const PROXY_PUBLIC_BASE = PORTAL_PROXY_BASE;
 
 /** Store-domain URL path for a cancel-flow step (used for links AND redirects —
  * Location headers resolve against the storefront host, never `/proxy/...`). */

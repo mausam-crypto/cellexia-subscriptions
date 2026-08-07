@@ -49,7 +49,7 @@ const ASSETS = fileURLToPath(
 const BUY_BOX_JS = join(ASSETS, "buy-box.js");
 const EMBED_JS = join(ASSETS, "buy-box-embed.js");
 
-const VALIDATE_PATH = "/apps/cellexia-subscriptions/preview/validate";
+const VALIDATE_PATH = "/apps/cellexia-subs/preview/validate";
 const EXPECTED_HINT =
   "Cellexia buy box: this product has subscription plans from another app " +
   "but none from Cellexia. Sync your Cellexia plan to this product in the " +

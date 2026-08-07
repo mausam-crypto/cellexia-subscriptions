@@ -1,4 +1,5 @@
 import { normalizeLocale, t } from "~/lib/i18n/i18n.server";
+import { PORTAL_PROXY_BASE } from "~/lib/portal/proxy-path";
 
 /**
  * Shared HTML layout for every portal page served through the app proxy.
@@ -259,7 +260,7 @@ const NAV_ICON_ACCOUNT = `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx
 /** Build the full portal content block for a `liquid()` response. */
 export function portalPage(input: PortalPageInput): string {
   const locale = input.locale;
-  const base = "/apps/cellexia-subscriptions";
+  const base = PORTAL_PROXY_BASE;
   const body = input.body ?? input.bodyHtml ?? "";
   // The theme's <html> is not ours to change, so language + direction are
   // declared on the portal root: Arabic (etc.) renders RTL with correct

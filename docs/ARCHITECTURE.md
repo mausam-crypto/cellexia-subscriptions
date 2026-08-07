@@ -11,7 +11,7 @@ flows, win-back, analytics.
 - **Prisma + PostgreSQL** — mirror + extension data model (`prisma/schema.prisma`)
 - **Polaris + App Bridge** — embedded admin UI at `/app/*`
 - **Theme app extension** — PDP buy box (`extensions/cellexia-buy-box`)
-- **App proxy** — customer portal served on the store domain at `/apps/cellexia-subscriptions/*` → app routes `/proxy/*`
+- **App proxy** — customer portal served on the store domain at `/apps/cellexia-subs/*` → app routes `/proxy/*`
 - **Klaviyo** — all lifecycle/transactional flows are driven by server-side events (outbox pattern)
 - **Jobs** — DB-leased locks (`JobLock`), 60s internal tick or external cron hitting `POST /api/jobs/run`
 
@@ -180,12 +180,27 @@ cannot be class-qualified at all: those may not name our `cx-*` namespace
 is pinned so a new one fails until a human has read it. Comments are blanked by
 a scanner, not a regex, so a `//` or `#` inside a string literal cannot hide an
 occurrence from the rule; §5d tests the scanner, and every widened receiver,
-against exactly that. §1–§2 forbid the captured-render shape in both Liquid
-forms — the tag form and the bare line form inside a `{% liquid %}` block,
-which no `{%\s*render` pattern can see — and for both spellings of the tag:
-the legacy `{% include %}` gets the same BEGIN/END app-snippet wrapping and,
-unlike `render`, shares the caller's scope, so a rule keyed on the word
-"render" alone would have waved the more dangerous form through. Two suites
+against exactly that. §1–§2 enforce the refined render invariants (v1.7.0,
+when the seven `cx-preset-*` partials were extracted from the core for the
+platform's Liquid size budget — a real `shopify app deploy` later verified
+that Shopify's 100KB Liquid limit is enforced on the TOTAL of all `.liquid`
+files in the extension, not per file, so the partials are kept for
+maintainability while `tests/liquid/size-limits.test.ts` guards the total at
+88KB and all shipped Liquid stays minified): (1) capture-around-render is
+forbidden forever — the v1.2.x corruption came from capturing a render,
+which pulls Shopify's BEGIN/END app-snippet comment markers into a string
+that a later escape prints as visible page text; (2) every render sits in
+direct-output markup position, where those markers land between elements as
+invisible HTML comments — never inside a `{% capture %}` span and never as a
+bare line inside a `{% liquid %}` block, which no `{%\s*render` pattern can
+see; (3) snippets never return values — all string/value computation stays
+in the consumer (`cx-buybox-core` precomputes everything and passes explicit
+render arguments; a preset partial only prints), and the snippet set is
+pinned to `cx-buybox-core.liquid` plus the seven preset partials so a stray
+snippet fails CI. Both spellings of the tag are covered: the legacy
+`{% include %}` gets the same BEGIN/END app-snippet wrapping and, unlike
+`render`, shares the caller's scope, so a rule keyed on the word "render"
+alone would have waved the more dangerous form through. Two suites
 reproduce the collision behaviourally: `tests/embed-mount.test.ts` (mount
 lifecycle, hand-built tree) and `tests/embed-hostile-neighbour.test.ts`,
 which parses the REAL server-rendered embed markup into a copy of the
@@ -218,7 +233,7 @@ would silently unbind the handler rather than raise anything.
 **Storefront preview (PREVIEW token).** Magic-token action `PREVIEW`,
 signature-verified but **never consumed** (TTL 7 days, generous max-use for
 audit only), appended to a storefront URL as `?cx_preview=<token>`. The block
-JS validates it via app proxy `GET /apps/cellexia-subscriptions/preview/validate`, stores it
+JS validates it via app proxy `GET /apps/cellexia-subs/preview/validate`, stores it
 in `sessionStorage` (so PDP → cart keeps the preview on) and reveals the
 widget with a "Preview — only you can see this" ribbon — in that browser
 session only. Checkout needs no reveal: recurring terms show natively once a

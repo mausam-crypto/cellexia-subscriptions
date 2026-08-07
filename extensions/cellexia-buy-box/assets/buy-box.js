@@ -164,7 +164,12 @@
      and never fetches. */
 
   var PREVIEW_STORAGE_KEY = 'cx_preview_token';
-  var PREVIEW_VALIDATE_PATH = '/apps/cellexia-subscriptions/preview/validate';
+  /* Hardcoded because theme-extension JS cannot import app modules — must
+     match PORTAL_PROXY_SUBPATH in app/lib/portal/proxy-path.ts and the
+     [app_proxy] subpath in shopify.app.toml (tests/proxy-subpath.test.ts
+     enforces the agreement). NEVER '/apps/cellexia': that subpath is served
+     by the merchant's other live app ("AOV & LTV Booster"). */
+  var PREVIEW_VALIDATE_PATH = '/apps/cellexia-subs/preview/validate';
   var previewValidated = false;
 
   function previewStorageGet() {
