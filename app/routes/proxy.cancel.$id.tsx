@@ -22,7 +22,7 @@ import {
 
 /**
  * Cancel flow — step 1 ("before you go"), served through the app proxy at
- * /apps/cellexia/cancel/:id (:id = local contract cuid). Resource route: the
+ * /apps/cellexia-subscriptions/cancel/:id (:id = local contract cuid). Resource route: the
  * loader returns theme-wrapped liquid HTML, no React component.
  *
  * Psychology: the page leads with loss aversion — the concrete yearly saving,

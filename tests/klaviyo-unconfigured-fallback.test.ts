@@ -40,7 +40,7 @@ const mocks = vi.hoisted(() => ({
     async (_mail: { to: string; subject: string; html: string }): Promise<void> => {},
   ),
   buildPortalUrl: vi.fn(
-    async (): Promise<string> => "https://www.cellexia.example/apps/cellexia/",
+    async (): Promise<string> => "https://www.cellexia.example/apps/cellexia-subscriptions/",
   ),
   buildActionLinkBundle: vi.fn(
     async (): Promise<Record<string, string>> => ({}),
@@ -187,7 +187,7 @@ describe("sendNotification without KLAVIYO_PRIVATE_API_KEY", () => {
       lines: [],
     });
     mocks.contractSnapshotProperties.mockResolvedValue({
-      portal_url: "https://www.cellexia.example/apps/cellexia/",
+      portal_url: "https://www.cellexia.example/apps/cellexia-subscriptions/",
     });
     mocks.buildActionLinkBundle.mockResolvedValue({
       skip_url: "https://www.cellexia.example/m/skip-tok",
@@ -223,7 +223,7 @@ describe("sendNotification without KLAVIYO_PRIVATE_API_KEY", () => {
     expect(mail.html).toContain("https://www.cellexia.example/m/skip-tok");
     expect(mail.html).toContain("https://www.cellexia.example/m/delay3-tok");
     expect(mail.html).toContain(
-      "https://www.cellexia.example/apps/cellexia/",
+      "https://www.cellexia.example/apps/cellexia-subscriptions/",
     );
     // ...and NO placeholder survives unrendered anywhere in subject or body.
     expect(mail.html).not.toMatch(/\{[a-z0-9_]+\}/i);

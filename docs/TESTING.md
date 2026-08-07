@@ -59,7 +59,7 @@ charge.
 
 ## 3. Scenario checklist — every customer verb
 
-Work through the portal (`https://<dev-store>/apps/cellexia`) and magic links.
+Work through the portal (`https://<dev-store>/apps/cellexia-subscriptions`) and magic links.
 For each row: perform the action, then verify (a) Shopify admin shows the
 contract change, (b) the contract timeline (Audit/Subscriber page) logged the
 event, (c) the Klaviyo event arrived (or `NotificationLog` row exists).
@@ -251,7 +251,7 @@ widget only in your own browser session):
    natively on the line item. Abandon before paying, or pay with a test card
    if this store is still in test mode.
 5. **Zero-impact check**: open the same PDP in a private window *without* the
-   token — no widget, no layout shift. Visit `/apps/cellexia` — the "not yet
+   token — no widget, no layout shift. Visit `/apps/cellexia-subscriptions` — the "not yet
    available" page. Audit page: no customer notification sent (anything
    attempted shows as `SUPPRESSED`).
 

@@ -294,7 +294,7 @@ storefront until the merchant explicitly goes live from the app admin.
   product-page link carrying `?cx_preview=<signed token>`. On load,
   `buy-box.js` stores the token in `sessionStorage` (key
   `cx_preview_token`) and validates it server-side via the app proxy
-  (`GET /apps/cellexia/preview/validate` — HMAC-signed, preview-only action,
+  (`GET /apps/cellexia-subscriptions/preview/validate` — HMAC-signed, preview-only action,
   7-day expiry, never consumed). Only a `{ ok: true }` answer removes
   `hidden` and shows the localized "Preview — only you can see this" ribbon.
   Everything fails closed: an invalid or expired token is dropped from

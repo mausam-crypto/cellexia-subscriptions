@@ -164,7 +164,7 @@
      and never fetches. */
 
   var PREVIEW_STORAGE_KEY = 'cx_preview_token';
-  var PREVIEW_VALIDATE_PATH = '/apps/cellexia/preview/validate';
+  var PREVIEW_VALIDATE_PATH = '/apps/cellexia-subscriptions/preview/validate';
   var previewValidated = false;
 
   function previewStorageGet() {

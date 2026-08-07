@@ -11,7 +11,7 @@ import { sha256 } from "~/lib/crypto/tokens.server";
  * The proxy signature (`authenticate.public.appProxy`) proves the request came
  * through Shopify; this module proves WHICH customer is browsing. After an OTP
  * login we set an HMAC-signed cookie `cx_portal` on the store domain (scoped
- * to /apps/cellexia). The cookie carries the raw session token; the database
+ * to /apps/cellexia-subscriptions). The cookie carries the raw session token; the database
  * stores only its SHA-256, so a leaked database cannot mint valid cookies.
  *
  * CSRF: every mutating portal form carries a token derived from the session
@@ -24,7 +24,7 @@ const PENDING_COOKIE_NAME = "cx_otp_pending";
 const PENDING_TTL_SECONDS = 15 * 60;
 
 /** Portal base path on the storefront domain (app proxy prefix + subpath). */
-export const PORTAL_BASE_PATH = "/apps/cellexia";
+export const PORTAL_BASE_PATH = "/apps/cellexia-subscriptions";
 const COOKIE_PATH = PORTAL_BASE_PATH;
 
 // ── Signing primitives ───────────────────────────────────────────────────────

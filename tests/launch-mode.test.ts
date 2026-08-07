@@ -33,7 +33,7 @@ const mocks = vi.hoisted(() => ({
     async (_mail: { to: string; subject: string; html: string }): Promise<void> => {},
   ),
   buildPortalUrl: vi.fn(
-    async (): Promise<string> => "https://www.cellexia.example/apps/cellexia/",
+    async (): Promise<string> => "https://www.cellexia.example/apps/cellexia-subscriptions/",
   ),
   buildActionLinkBundle: vi.fn(
     async (): Promise<Record<string, string>> => ({}),

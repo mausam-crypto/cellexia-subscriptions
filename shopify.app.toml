@@ -25,7 +25,12 @@ include_config_on_deploy = true
 # mutations (orderEditBegin/AddVariant/AddLineItemDiscount/Commit) that attach
 # the first-order gift to the origin order — without it every gift silently
 # defers to cycle 1. Keep in sync with SCOPES in .env / docs/INSTALL.md.
-scopes = "read_customers,write_customers,read_orders,write_orders,write_order_edits,read_products,write_products,read_purchase_options,write_purchase_options,read_own_subscription_contracts,write_own_subscription_contracts,read_customer_payment_methods,write_customer_payment_methods,read_locales,read_markets,read_inventory,read_fulfillments,read_discounts"
+# NOTE: "write_customer_payment_methods" is not a real Shopify scope (there is
+# no write variant of Customer Payment Methods) and was removed — verified
+# against Shopify's own mutation docs: customerPaymentMethodGetUpdateUrl and
+# customerPaymentMethodSendUpdateEmail (the only two payment-method mutations
+# this app calls) both require write_customers, already listed below.
+scopes = "read_customers,write_customers,read_orders,write_orders,write_order_edits,read_products,write_products,read_purchase_options,write_purchase_options,read_own_subscription_contracts,write_own_subscription_contracts,read_customer_payment_methods,read_locales,read_markets,read_inventory,read_fulfillments,read_discounts"
 
 [auth]
 redirect_urls = [
@@ -73,9 +78,9 @@ api_version = "2025-01"
 
 [app_proxy]
 # The customer portal is served on the shop's own domain at:
-#   https://<your-store-domain>/apps/cellexia/...
+#   https://<your-store-domain>/apps/cellexia-subscriptions/...
 url = "https://REPLACE_WITH_YOUR_APP_HOST/proxy"
-subpath = "cellexia"
+subpath = "cellexia-subscriptions"
 prefix = "apps"
 
 [pos]

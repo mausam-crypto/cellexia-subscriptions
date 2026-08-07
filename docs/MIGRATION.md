@@ -154,7 +154,12 @@ Stripe/Braintree).** Cards live in *Stripe's* vault, not Shopify's. Two routes:
    customer + payment method (`stripePaymentMethod: { customerId: "cus_…",
    paymentMethodId: "pm_…" }`). Renewals then charge through the connected
    Stripe account. Requires the store's Stripe account to be connectable to
-   Shopify and the `write_customer_payment_methods` scope (already in ours).
+   Shopify and the `write_customer_payment_methods` scope — NOT in this app's
+   standard scope list, and not offered in the normal Partner Dashboard scope
+   picker either; request it from Shopify Partner support specifically for
+   this migration if you need this route, or use the
+   `customerPaymentMethodGetUpdateUrl` route instead (§ above), which only
+   needs `write_customers`, already granted.
    Timeline: same-day once you have the Stripe id pairs (Recharge support can
    provide the customer↔Stripe mapping export). Use this when you cannot or do
    not want to move off Stripe billing.

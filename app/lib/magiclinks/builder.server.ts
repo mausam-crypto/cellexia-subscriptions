@@ -32,7 +32,7 @@ export async function buildPortalUrl(
   const host = shop?.primaryDomain ?? shop?.domain;
   if (!host) throw new Error("No shop domain available for portal URL");
   const clean = path.startsWith("/") ? path : `/${path}`;
-  return `https://${host}/apps/cellexia${clean}`;
+  return `https://${host}/apps/cellexia-subscriptions${clean}`;
 }
 
 const DEFAULT_TTL_DAYS = 14;

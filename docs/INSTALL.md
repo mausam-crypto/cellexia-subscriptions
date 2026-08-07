@@ -245,7 +245,7 @@ flyctl secrets set \
   SHOPIFY_API_KEY="<client id>" \
   SHOPIFY_API_SECRET="<client secret>" \
   SHOPIFY_APP_URL="https://cellexia-subscriptions.fly.dev" \
-  SCOPES="read_customers,write_customers,read_orders,write_orders,write_order_edits,read_products,write_products,read_purchase_options,write_purchase_options,read_own_subscription_contracts,write_own_subscription_contracts,read_customer_payment_methods,write_customer_payment_methods,read_locales,read_markets,read_inventory,read_fulfillments,read_discounts" \
+  SCOPES="read_customers,write_customers,read_orders,write_orders,write_order_edits,read_products,write_products,read_purchase_options,write_purchase_options,read_own_subscription_contracts,write_own_subscription_contracts,read_customer_payment_methods,read_locales,read_markets,read_inventory,read_fulfillments,read_discounts" \
   APP_SIGNING_SECRET="$(openssl rand -hex 32)" \
   CRON_SECRET="$(openssl rand -hex 32)" \
   DEFAULT_TIMEZONE="Europe/London" \
@@ -439,7 +439,7 @@ block wins and the embed stays dormant — you never get two widgets.
    **only after** you have QA'd the buy box end-to-end (one-time purchase path,
    subscription path, frequency selector, price/savings display) via the
    preview pass — see [TESTING.md](./TESTING.md#10-preview-based-qa-pre-launch-on-the-live-store).
-2. **App proxy check**: visit `https://<store-domain>/apps/cellexia` in a private
+2. **App proxy check**: visit `https://<store-domain>/apps/cellexia-subscriptions` in a private
    window. While in Setup mode you should see the branded **"not yet
    available"** page, served on the store's own domain — that page *is* the
    proof the proxy works (after go-live the same URL renders the portal login,
@@ -689,7 +689,7 @@ publishing/saving. A custom selector that matches nothing is *not* fatal: the
 embed waits 1.5s for late-rendered markup, then falls back to the automatic
 heuristics and warns in the console.
 
-**401 / signature error on `/apps/cellexia` (app proxy).**
+**401 / signature error on `/apps/cellexia-subscriptions` (app proxy).**
 The proxy request signature is computed with your **client secret** — if
 `SHOPIFY_API_SECRET` doesn't match the Partner Dashboard value (e.g. after
 rotating credentials), every proxy request 401s. Also confirm the `[app_proxy]`

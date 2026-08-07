@@ -167,7 +167,7 @@ export const MAX_SWAP_OPTIONS = 3;
 export const SESSION_FRESH_MINUTES = 60;
 
 /** Public (store-domain) base path of the app proxy — matches shopify.app.toml. */
-export const PROXY_PUBLIC_BASE = "/apps/cellexia";
+export const PROXY_PUBLIC_BASE = "/apps/cellexia-subscriptions";
 
 /** Store-domain URL path for a cancel-flow step (used for links AND redirects —
  * Location headers resolve against the storefront host, never `/proxy/...`). */

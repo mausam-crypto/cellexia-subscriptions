@@ -1552,7 +1552,7 @@ export default function PreviewPage() {
                 • The subscription widget becomes visible on your product pages
               </Text>
               <Text as="p" variant="bodySm">
-                • The customer portal opens at /apps/cellexia
+                • The customer portal opens at /apps/cellexia-subscriptions
               </Text>
               <Text as="p" variant="bodySm">
                 • Renewal billing, reminders, dunning and win-back start running

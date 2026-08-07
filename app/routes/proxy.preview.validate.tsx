@@ -4,7 +4,7 @@ import { verifyMagicTokenSignature } from "~/lib/crypto/tokens.server";
 import { authenticate } from "~/shopify.server";
 
 /**
- * GET /apps/cellexia/preview/validate?token=... (app proxy → this route).
+ * GET /apps/cellexia-subscriptions/preview/validate?token=... (app proxy → this route).
  *
  * Storefront-preview token check for the buy-box launch gate: while the app
  * is in setup mode the theme block renders hidden, and buy-box.js calls this

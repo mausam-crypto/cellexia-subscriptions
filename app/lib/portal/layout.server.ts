@@ -259,7 +259,7 @@ const NAV_ICON_ACCOUNT = `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx
 /** Build the full portal content block for a `liquid()` response. */
 export function portalPage(input: PortalPageInput): string {
   const locale = input.locale;
-  const base = "/apps/cellexia";
+  const base = "/apps/cellexia-subscriptions";
   const body = input.body ?? input.bodyHtml ?? "";
   // The theme's <html> is not ours to change, so language + direction are
   // declared on the portal root: Arabic (etc.) renders RTL with correct

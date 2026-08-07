@@ -106,7 +106,7 @@ const mocks = vi.hoisted(() => {
       async (): Promise<unknown> => ({ ok: false, reason: "UNKNOWN" }),
     ),
     buildPortalUrl: vi.fn(
-      async (): Promise<string> => "https://cellexialabs.com/apps/cellexia",
+      async (): Promise<string> => "https://cellexialabs.com/apps/cellexia-subscriptions",
     ),
     buildMagicUrl: vi.fn(
       async (): Promise<string> => "https://app.example/magic/tok",

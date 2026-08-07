@@ -16,7 +16,7 @@ const mocks = vi.hoisted(() => ({
   shopFindUnique: vi.fn(async (): Promise<unknown> => null),
   dunningCaseFindFirst: vi.fn(async (): Promise<unknown> => null),
   buildPortalUrl: vi.fn(
-    async (): Promise<string> => "https://www.cellexia.example/apps/cellexia/",
+    async (): Promise<string> => "https://www.cellexia.example/apps/cellexia-subscriptions/",
   ),
   buildActionLinkBundle: vi.fn(
     async (): Promise<Record<string, string>> => ({
@@ -177,7 +177,7 @@ describe("enqueueKlaviyoForEvent", () => {
     expect(input.properties.interval_weeks).toBe(8);
     expect(input.properties.item_titles).toEqual(["Cellexia Renewal Serum"]); // gifts excluded
     expect(input.properties.portal_url).toBe(
-      "https://www.cellexia.example/apps/cellexia/",
+      "https://www.cellexia.example/apps/cellexia-subscriptions/",
     );
     // …and profile attributes for the standing segments.
     expect(input.profileAttrs.cellexia_subscription_status).toBe("ACTIVE");

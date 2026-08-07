@@ -11,7 +11,7 @@ flows, win-back, analytics.
 - **Prisma + PostgreSQL** — mirror + extension data model (`prisma/schema.prisma`)
 - **Polaris + App Bridge** — embedded admin UI at `/app/*`
 - **Theme app extension** — PDP buy box (`extensions/cellexia-buy-box`)
-- **App proxy** — customer portal served on the store domain at `/apps/cellexia/*` → app routes `/proxy/*`
+- **App proxy** — customer portal served on the store domain at `/apps/cellexia-subscriptions/*` → app routes `/proxy/*`
 - **Klaviyo** — all lifecycle/transactional flows are driven by server-side events (outbox pattern)
 - **Jobs** — DB-leased locks (`JobLock`), 60s internal tick or external cron hitting `POST /api/jobs/run`
 
@@ -218,7 +218,7 @@ would silently unbind the handler rather than raise anything.
 **Storefront preview (PREVIEW token).** Magic-token action `PREVIEW`,
 signature-verified but **never consumed** (TTL 7 days, generous max-use for
 audit only), appended to a storefront URL as `?cx_preview=<token>`. The block
-JS validates it via app proxy `GET /apps/cellexia/preview/validate`, stores it
+JS validates it via app proxy `GET /apps/cellexia-subscriptions/preview/validate`, stores it
 in `sessionStorage` (so PDP → cart keeps the preview on) and reveals the
 widget with a "Preview — only you can see this" ribbon — in that browser
 session only. Checkout needs no reveal: recurring terms show natively once a

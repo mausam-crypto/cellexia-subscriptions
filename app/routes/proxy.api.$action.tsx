@@ -44,7 +44,7 @@ import { OURS_ONLY } from "~/lib/ownership/ownership.server";
 
 /**
  * Single POST dispatcher for every portal mutation:
- *   /apps/cellexia/api/{skip|unskip|delay|frequency|swap|quantity|add_line|
+ *   /apps/cellexia-subscriptions/api/{skip|unskip|delay|frequency|swap|quantity|add_line|
  *                       remove_line|addon|pause|resume|reactivate|next_date|
  *                       address|payment_update}
  *
