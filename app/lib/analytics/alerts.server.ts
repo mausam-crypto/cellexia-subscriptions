@@ -79,6 +79,7 @@ export async function runAlertScan(
     ],
     ["FOREIGN_CONTRACTS", () => checkForeignContracts(shopId)],
     ["KLAVIYO_OUTBOX_BACKLOG", () => checkKlaviyoOutboxBacklog(shopId, now)],
+    ["PLAN_GROUP_DRIFT", () => checkPlanGroupDrift(shopId, shopDomain, now)],
   ];
 
   for (const [name, check] of checks) {
@@ -640,6 +641,145 @@ async function checkForeignContracts(shopId: string): Promise<boolean> {
       foreign: counts.foreign,
       unknown: counts.unknown,
       ours: counts.ours,
+    },
+  });
+}
+
+/**
+ * Event type that timestamps a completed plan-attachment drift sweep. The
+ * alert scan runs every 15 minutes but this check talks to the Shopify Admin
+ * API, so it self-gates to once per PLAN_DRIFT_CHECK_HOURS on the most recent
+ * event of this type — a daily check riding the existing sweep, no new job.
+ */
+export const PLAN_DRIFT_CHECK_EVENT_TYPE = "system.plan_group_drift_check";
+const PLAN_DRIFT_CHECK_HOURS = 24;
+
+/**
+ * WARNING when a SYNCED selling plan config's group is no longer attached to
+ * every product in the config — drift the merchant cannot see: the Plans row
+ * says SYNCED while the product page renders no Cellexia widget at all.
+ *
+ * The observed cause on the live store is another subscription app's product
+ * sync reconciling products it also manages and detaching our group in the
+ * process (a deleted product produces the same signature). The check runs
+ * entirely in ADMIN id space (config product GIDs vs. the group GID the sync
+ * recorded — reliable exact equality, unlike storefront Liquid group ids) and
+ * re-uses the same batched verification the post-sync check uses.
+ *
+ * Resilient by construction: one config's failed verification is contained
+ * (logged, counted, never blocks the others), the completed sweep is
+ * timestamped even when partially failed so a broken store cannot turn this
+ * into a 15-minute Shopify hammer, and the alert itself is deduped like every
+ * other type (one open row). Returns null when gated (ran within the last
+ * 24h) — the scan reports it as skipped, not silently clear.
+ */
+async function checkPlanGroupDrift(
+  shopId: string,
+  shopDomain: string,
+  now: Date,
+): Promise<boolean | null> {
+  const configs = await prisma.sellingPlanConfig.findMany({
+    where: { shopId, syncStatus: "SYNCED", shopifyGroupId: { not: null } },
+    select: { id: true, name: true, shopifyGroupId: true, productIds: true },
+  });
+  if (configs.length === 0) return false;
+
+  const recentSweep = await prisma.subscriberEvent.findFirst({
+    where: {
+      shopId,
+      type: PLAN_DRIFT_CHECK_EVENT_TYPE,
+      createdAt: { gte: subHours(now, PLAN_DRIFT_CHECK_HOURS) },
+    },
+    select: { id: true },
+  });
+  if (recentSweep) return null;
+
+  // Lazy imports on purpose (see the module docs of ownership.server.ts):
+  // this module is otherwise Shopify-free, and unit tests that mock the db
+  // must not have to know about Shopify sessions unless this check runs.
+  const { adminClientForShop } = await import("~/shopify.server");
+  const admin = await adminClientForShop(shopDomain);
+  const { findProductsMissingFromGroup } = await import(
+    "~/lib/graphql/sellingPlans.server"
+  );
+
+  const drifted: Array<{
+    configId: string;
+    configName: string;
+    groupId: string;
+    missingProductIds: string[];
+  }> = [];
+  let checkErrors = 0;
+  for (const config of configs) {
+    try {
+      const productIds = Array.isArray(config.productIds)
+        ? config.productIds.filter(
+            (id): id is string => typeof id === "string" && id.trim() !== "",
+          )
+        : [];
+      if (productIds.length === 0) continue;
+      const missing = await findProductsMissingFromGroup(
+        admin,
+        config.shopifyGroupId!,
+        productIds,
+      );
+      if (missing.length > 0) {
+        drifted.push({
+          configId: config.id,
+          configName: config.name,
+          groupId: config.shopifyGroupId!,
+          missingProductIds: missing,
+        });
+      }
+    } catch (err) {
+      checkErrors += 1;
+      console.error("[alerts] plan drift verification failed for config", config.id, err);
+    }
+  }
+
+  // Timestamp the sweep BEFORE deciding the verdict, clean or not: the gate
+  // exists to bound Admin API traffic, and a sweep that found drift (or
+  // partially failed) has still spent that budget for today.
+  await logEvent({
+    shopId,
+    type: PLAN_DRIFT_CHECK_EVENT_TYPE,
+    source: "SYSTEM",
+    actor: "system",
+    payload: {
+      configsChecked: configs.length,
+      driftedConfigs: drifted.length,
+      checkErrors,
+    },
+  });
+  if (drifted.length === 0) return false;
+
+  // Name the detached products for the merchant; a title lookup failure
+  // falls back to the GIDs rather than hiding which products are affected.
+  const missingIds = [...new Set(drifted.flatMap((d) => d.missingProductIds))];
+  let titleById = new Map<string, string>();
+  try {
+    const { getProducts } = await import("~/lib/graphql/products.server");
+    titleById = new Map(
+      (await getProducts(admin, missingIds)).map((p) => [p.id, p.title]),
+    );
+  } catch (err) {
+    console.error("[alerts] plan drift title lookup failed", err);
+  }
+  const names = missingIds.map((id) => titleById.get(id) ?? id);
+
+  return raiseAlert({
+    shopId,
+    type: "PLAN_GROUP_DRIFT",
+    severity: "WARNING",
+    message: `Your Cellexia plan was detached from ${names.join(", ")} — another subscription app's sync may be reconciling products it manages. Re-sync on the Plans page, and exclude these products from the other app's management.`,
+    context: {
+      drifted: drifted.map((d) => ({
+        configId: d.configId,
+        configName: d.configName,
+        groupId: d.groupId,
+        missingProductIds: d.missingProductIds.slice(0, CONTEXT_SAMPLE),
+      })),
+      checkErrors,
     },
   });
 }

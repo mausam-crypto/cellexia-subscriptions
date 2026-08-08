@@ -4,6 +4,217 @@ All notable changes to Cellexia Subscriptions. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [SemVer](https://semver.org) as contracted in [docs/UPDATE.md](docs/UPDATE.md).
 
+## [1.6.7] — 2026-08-07
+
+**Diagnosability release — the blank storefront preview now explains
+itself.** Reported live by the merchant: they created a plan, opened a
+storefront preview, and NOTHING showed — no error anywhere, just an ordinary
+product page. Triage against the live store found the extension and app proxy
+had simply never been deployed (deploys were rejected for size until v1.6.4)
+and the plan possibly not synced to the product — but establishing that took
+a developer bisecting the store by hand. The widget render chain has ~7
+independent gates (extension deployed + app embed enabled on the published
+theme, plan synced, selling plan group attached to the product,
+`cellexia.plan_groups` allow-list published, launch gate, valid preview token
++ reachable proxy, JS mount), and every closed gate produced the identical
+symptom: a silently blank page. v1.6.7 makes the chain self-explaining at
+both ends — a **Preview Doctor** in the admin that walks the chain against
+the live store and names the first closed gate, and admin-only diagnostic
+cards on the storefront when preview validation itself fails. Fail-closed
+rendering for customers is unchanged everywhere. **No schema changes, no
+migrations, no env changes, no new scopes**, and the extension `.liquid`
+size budget is unchanged (the size suite still enforces the total).
+
+### Added
+
+- **Preview Doctor** (`app/lib/launch/doctor.server.ts`, surfaced on
+  **Preview & launch → Storefront preview**, intent `run-doctor`): walks the
+  render chain in order, against the LIVE store, caching nothing — (a) plan
+  synced (active, `SYNCED`, Shopify group **and** selling plan ids
+  recorded); (b) the diagnosed product is in the plan's product list;
+  (c) Shopify attachment read-back (Admin GIDs against Admin GIDs — one id
+  space); (d) the `cellexia.plan_groups` allow-list is published and carries
+  our group id **and our plan ids** — the v1.6.6 id-space model: the
+  storefront matches ownership on PLAN ids, so a list with group ids but an
+  empty/foreign `planIds` renders nothing and is a FAIL here; (e) the
+  app-proxy identity probe — HTTP 404 reads as "Shopify has no proxy
+  registered for this app" (the undeployed-app incident), a foreign body as
+  "something else owns the path", and unlike the launch-checklist row an
+  unreachable proxy is a FAIL, because this exact probe is what the
+  visitor-side reveal runs; (f) a real fetch of the live product-page HTML
+  looking for our markup markers — the end-to-end proof that the deployed
+  extension + enabled embed actually reach the storefront; (g) launch mode,
+  informational. Each step reports **PASS/FAIL/WARN/SKIP** with a detail
+  line and a remediation; the report carries verdict **READY/BLOCKED** plus
+  `firstBlockedStep`; WARN means inconclusive (storefront password page, bot
+  protection, a network hiccup between app host and store) and never
+  blocks. Every step is independently contained — a throwing step becomes a
+  FAIL row with the error, never a crashed report — and each run logs one
+  `preview_doctor_run` audit event with the verdict.
+- **The storefront preview gates on the doctor**: "Preview on product page"
+  runs the diagnosis before opening the tab. On BLOCKED, the report renders
+  inline in the admin (the toast names the first failing step) instead of
+  opening the blank page — with an **Open anyway** escape hatch, so nothing
+  is ever hard-blocked; a doctor that itself cannot run fails open and never
+  blocks the preview on its own error — but not silently: the preview opens
+  with a toast saying the pre-flight diagnosis was skipped (pointing at
+  **Run diagnosis**), and the `storefront_preview_created` audit event
+  carries `doctorSkipped: true`, so an un-vetted preview never reads as a
+  vetted one. The "Storefront previewed" checklist item now ticks **only off
+  a doctor-vetted open**: a blocked preview ticks nothing, and neither does
+  an un-vetted open — **Open anyway** (the doctor just said BLOCKED) or the
+  fail-open path (the doctor crashed, chain state unknown) opens the tab but
+  leaves the checklist alone, says so in the toast, and stamps the audit
+  event with `checklistPreviewedStorefront: false` (plus `openAnyway`/
+  `doctorSkipped`) — the checklist can never be ticked off a preview that
+  opened a blank page.
+- **Storefront-side failure cards, admin-only**
+  (`extensions/cellexia-buy-box/assets/buy-box.js`): when the URL of THIS
+  page load carries `?cx_preview=` and the validation round-trip completes
+  with a failure, the existing admin-diagnostic card style names the reason
+  — `{ ok: false }` → "this preview link is expired or invalid … generate a
+  fresh preview link from Preview & launch"; an HTTP error status or network
+  failure → "the preview could not be validated (HTTP 404) … run the
+  Preview Doctor" (the exact blank page an undeployed app produces; the
+  admin-gated doctor then names the undeployed proxy and the deploy
+  command). Gated on the URL parameter, never `sessionStorage`, so a token
+  following the tab to other pages raises nothing there and a customer can
+  never be shown vendor English; the widget itself stays fail-closed and is
+  revealed only by a validated session, exactly as before. A transport
+  failure keeps the stored token, so a reload after deploying just works.
+  Because this card's gate is the URL parameter alone (validation failed —
+  no admin is proven), its copy is treated as an **unauthenticated
+  surface**: it names no proxy paths and no operator commands; that detail
+  lives behind admin auth in the Preview Doctor it points to.
+- **Preview picker honesty**: products whose page can never show the widget
+  — draft or archived in Shopify, or no selling plan group attached — stay
+  listed in the storefront-preview picker but disabled, with the reason on
+  the option. The preview no longer offers a link that opens a 404 or a page
+  this app deliberately renders nothing on (while ticking "Storefront
+  previewed" for a preview that never happened). The Preview Doctor's own
+  product picker deliberately keeps every product selectable — the broken
+  ones are exactly the ones worth diagnosing.
+
+### Changed
+
+- **Every admin diagnostic card now requires `?cx_preview=` in the URL of
+  the page it appears on.** The two pre-existing cards — the no-owned-group
+  hint (`buy-box.js`) and the placement-anchor hint (`buy-box-embed.js`) —
+  kept their server-validated-session gate but could ride the
+  `sessionStorage` token onto same-tab pages the admin never previewed
+  (PDP → cart keeps the validated session alive by design, for the widget
+  reveal). They now additionally require the `cx_preview` parameter in the
+  current page's own URL, the same gate the new failure card uses — so a
+  diagnostic card can only ever appear on a page actually opened through a
+  preview link, and only with the proxy's `{ ok: true }` on top. The widget
+  reveal itself (PDP → cart persistence) is unchanged.
+
+### Tests
+
+- `tests/preview-doctor.test.ts` (30 tests, DB-free): each step PASSes on
+  the all-green world and FAILs on its own broken fixture (unsynced plan,
+  product not in the config, missing/junk/empty-`planIds`/foreign-`planIds`
+  allow-list, proxy 404 vs foreign body vs unreachable, marker-less live
+  HTML, DRAFT product); a THROWING storefront fetch is WARN, not FAIL, and
+  WARN never blocks; verdict/`firstBlockedStep` follow chain order over a
+  full walk (no short-circuit); a throwing step — up to and including an
+  unreadable shop — never crashes the report; the `preview-storefront`
+  action returns the report instead of a URL on BLOCKED, honours
+  `openAnyway`, and opens normally on READY; the fail-open path is pinned
+  as NOT silent (a doctor that itself throws still opens the preview, but
+  the response carries the skipped-diagnosis toast and the audit event
+  `doctorSkipped: true`); plus a mutation check on the proxy-identity
+  assertion (flip the probe to a foreign body → FAIL, restore → PASS).
+- `tests/preview-failure.test.ts`: the storefront failure cards, driven over
+  the real server-rendered Liquid and the real `buy-box.js` in both install
+  shapes (section block and app embed) — including the customer gate
+  (storage-only token: silence), the one-card guarantee on the embed
+  shape, and a no-internal-detail assertion (the failure card, being an
+  unauthenticated surface, must never name proxy paths or operator
+  commands). Plus the placement-anchor card's double gate: it appears for a
+  validated admin on the preview-linked page and stays silent on a VALIDATED
+  storage-only hop.
+- `tests/server-bundle-size.test.ts`: tracked-growth guard on the app
+  server build — biggest chunk ≤ 3MB, whole `build/server` tree ≤ 4MB
+  (today ~2.3MB); skips when no build output exists. The extension has had
+  size gates since v1.6.3; the app server had none, and its bundle had
+  grown to ~2.3MB unnoticed.
+- `tests/buybox-no-owned-group.test.ts` extended for the double gate: a fully
+  validated storage-only session (the PDP → cart hop) raises no hint card in
+  either install shape — while the widget reveal itself still follows the
+  hop. Both new pins were mutation-checked (gate reverted to validated-only →
+  each suite fails on exactly its new test; gate restored → green).
+
+### Documentation
+
+- **OPERATIONS.md §20** — new runbook **"Widget not showing?"** that starts
+  with "Run the Preview Doctor", maps the 7 gates to their fixes, and
+  explains WARN vs FAIL; pointers added from §14 (launch mode) and §16
+  (buy box embed).
+- **INSTALL.md §9/§10** — the Preview Doctor is named as the first debugging
+  step whenever a preview shows no widget, and §10b notes the preview button
+  runs it automatically.
+- **TESTING.md §10** — the preview QA pass starts with the doctor when the
+  widget is missing.
+
+## [1.6.6] — 2026-08-07
+
+**Live-blocker release — the buy box treated our own synced plan as another
+app's.** The merchant saw the "plans from another subscription app" admin
+card (and no widget) on a product whose Cellexia plan sync had SUCCEEDED,
+because storefront Liquid exposes selling plan **group** ids in a different
+id space than the Admin API ids the `cellexia.plan_groups` allow-list
+publishes — group-id equality can never match in Liquid, so storefront
+ownership matches on selling **plan** ids (numeric and identical in both
+APIs; the same ids the cart's `selling_plan` param already uses). This
+release also closes the follow-on trust gap on the admin side: **SYNCED is
+now a verified claim** — the app re-reads product attachment from the Admin
+API after every sync and re-checks it daily, so the Plans page can never say
+SYNCED while the storefront disagrees. **No schema changes, no migrations,
+no env changes, no new scopes.**
+
+### Added
+
+- **Post-sync attachment verification (Plans → Sync to Shopify)**: after the
+  selling plan group mutations succeed, the app re-queries every product in
+  the config for its `sellingPlanGroups` (Admin API GIDs against Admin API
+  GIDs — one id space, reliable exact equality, unlike storefront Liquid
+  group ids) and records `SYNCED` only on a full attach. Any product missing
+  the group — the signature another subscription app's product sync leaves
+  when it reconciles products it also manages, or a deleted product — sets
+  `syncStatus` **`ATTACH_FAILED`** with `syncError` naming the products, and
+  the Plans row shows a critical **Attach failed** badge with that message
+  instead of Synced. An unverifiable attach (the verification read itself
+  failing) is also `ATTACH_FAILED`, never silently `SYNCED`. New
+  `findProductsMissingFromGroup` in `app/lib/graphql/sellingPlans.server.ts`
+  (batched `nodes(ids:)`, 25 products per query); ownership evidence and the
+  allow-list metafield are still recorded either way, since the group and its
+  plans do exist on Shopify.
+- **Daily drift alert (`PLAN_GROUP_DRIFT`)**: the alert scan now re-verifies
+  every `SYNCED` config's product attachment (same batched Admin API check),
+  self-gated to one sweep per 24h on the `system.plan_group_drift_check`
+  event trail so the 15-minute scan cadence never hammers Shopify. On drift
+  it raises a deduped WARNING — "Your Cellexia plan was detached from
+  {products} — another subscription app's sync may be reconciling products it
+  manages. Re-sync on the Plans page, and exclude these products from the
+  other app's management." Resilient by construction: per-config try/catch,
+  title-lookup failures fall back to product GIDs, and a partially failed
+  sweep still timestamps itself.
+
+### Changed
+
+- [docs/OPERATIONS.md](docs/OPERATIONS.md) §18 (running alongside another
+  subscription app): documents the id-space lesson (storefront group ids ≠
+  admin group ids; ownership matches on plan ids) and the drift scenario with
+  its remediation (re-sync, then exclude the products from the other app's
+  management — the exclusion is the durable fix).
+
+### Migration notes
+
+None. No schema change; the new `ATTACH_FAILED` value lives in the existing
+`syncStatus` string column. Re-deploy the app; re-deploy the extension with
+`npm run deploy` if this release ships with the buy-box ownership fix.
+
 ## [1.6.4] — 2026-08-07
 
 **Deploy-blocker release — the Liquid limit model was wrong.** The 100KB

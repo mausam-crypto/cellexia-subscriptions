@@ -405,14 +405,18 @@ Embed behaviours worth knowing:
 - If the widget does not appear during preview, look for a small dark card
   bottom-left: **"Cellexia buy box: no placement anchor found — set a
   custom CSS selector in the Buy box designer → Placement."** That card is
-  admin-only: it appears only once the app proxy has **validated** the
-  preview token (`CellexiaSubs.previewValidated`), never on the mere
-  presence of a `?cx_preview=` parameter — a leaked or expired link, or
-  anyone appending that parameter, must not be shown internal English
-  vendor copy on a customer-facing page. Because validation is a network
-  round-trip, `buy-box.js` fires `cx:preview:validated` when it lands and
-  the mount (and this card) is retried then. Real visitors never see it —
-  for them a failed mount just means no widget, never breakage. A
+  admin-only and double-gated: it appears only on a page whose own URL
+  carries `?cx_preview=` **and** only once the app proxy has **validated**
+  the token (`CellexiaSubs.previewValidated`). Never on the mere presence
+  of the parameter — a leaked or expired link, or anyone appending it, must
+  not be shown internal English vendor copy on a customer-facing page — and
+  never off the stored session alone: the validated token persists in
+  `sessionStorage` across same-tab navigation (that is how the widget
+  reveal follows PDP → cart), so without the URL half the card could
+  surface on pages the admin never previewed. Because validation is a
+  network round-trip, `buy-box.js` fires `cx:preview:validated` when it
+  lands and the mount (and this card) is retried then. Real visitors never
+  see it — for them a failed mount just means no widget, never breakage. A
   `console.warn` with the same diagnosis is logged for every merchant.
 - Fix it by setting a selector: either on the embed (theme editor → App
   embeds → Cellexia Buy Box → Custom anchor selector, e.g. `.pdp__grey`)
@@ -542,6 +546,27 @@ storefront until the merchant explicitly goes live from the app admin.
   `hidden` and shows the localized "Preview — only you can see this" ribbon.
   Everything fails closed: an invalid or expired token is dropped from
   `sessionStorage`, and a network error simply leaves the widget hidden.
+- **A failed validation is named, not silent (v1.6.7).** Fail-closed
+  rendering is unchanged — the widget stays hidden — but when the URL of the
+  page you are on carries `?cx_preview=` **and** the validation round-trip
+  completes with a failure, `buy-box.js` raises the usual admin diagnostic
+  card (same style as the placement and no-owned-group hints) naming which
+  failure it was: an `{ ok: false }` answer means the token is expired or
+  invalid ("Generate a fresh preview link from Preview & launch"), while an
+  HTTP error status or a network failure means the round-trip itself did
+  not complete ("the preview could not be validated (HTTP 404) … run the
+  Preview Doctor" — the exact blank page you get when the extension was
+  never deployed; the admin-gated Preview Doctor names the undeployed proxy
+  and the deploy command). The gate is the URL parameter of *this* page
+  load, never `sessionStorage`: customers never carry the parameter, a
+  stored token following the tab to other pages raises nothing there, and a
+  transport failure keeps the token so a reload after deploying just works.
+  Because this card's gate is the URL parameter ALONE (validation failed,
+  so no admin is proven), its copy is treated as an unauthenticated
+  surface: it names no proxy paths and no operator commands — that detail
+  lives behind admin auth in the Preview Doctor. Pinned by
+  `tests/preview-failure.test.ts` in both install shapes, including a
+  no-internal-detail assertion.
 - **Session-scoped, PDP → cart carries over.** Because the token lives in
   `sessionStorage`, the preview follows that browser tab across pages — the
   admin can browse other product pages and the cart without re-appending the
@@ -605,22 +630,29 @@ every plan sync:
 { "v": 1, "groupIds": ["6612300000009"], "planIds": ["6881100003"] }
 ```
 
-`cx-buybox-core.liquid` renders the **first group on the product whose id is
-in `groupIds` and which also contains one of the ids in `planIds`**. Ids are
-compared **as strings, one entry at a time, by exact equality** — Liquid hands
-out numeric ids and the metafield holds strings, so both sides are normalised
-with an empty `append`. A substring test against a joined list would let group
-`12` match an allow-listed `123`, which is exactly how a foreign group gets
-rendered by accident. Do not "optimise" those loops.
+`cx-buybox-core.liquid` renders the **first group on the product that holds
+one of the ids in `planIds`** (with the old `groupIds` equality kept only as a
+harmless secondary OR — see below). Ids are compared **as strings, one entry
+at a time, by exact equality** — the metafield holds strings, plan ids arrive
+numeric, so both sides are normalised with an empty `append`. A substring test
+against a joined list would let plan `12` match an allow-listed `123`, which
+is exactly how a foreign group gets rendered by accident. Do not "optimise"
+those loops.
 
-`planIds` is the **second factor, and it is required, not a veto**. Matching
-on `groupIds` alone put the entire ownership decision on one field of one
-metafield: an allow-list naming the other app's group id resolved to *their*
-group, and every line below that point is written on the assumption that the
-group it was handed is ours — so their selling plan id reached the JSON island,
-the nameless mirror and the cart. The plan ids are independent evidence (they
-name plans this app created through the API), so requiring both means one
-forged field is not enough.
+**Why plan ids and not group ids (the id-space trap, fixed live):** storefront
+Liquid exposes `selling_plan_group.id` in a **different id space than the
+Admin API** — an opaque storefront identifier, not the numeric admin id the
+app knows and publishes in `groupIds`. A group-id comparison therefore matches
+*nothing* on a real storefront, and an ownership rule that required it
+rendered nothing on a product whose plan sync had **succeeded** (the merchant
+saw the "plans from another app" admin card next to a correctly-synced plan).
+Selling **plan** ids are numeric and identical in both APIs — they are what
+the cart's `selling_plan` param carries — so the plan-id intersection is the
+ownership test. `planIds` names plans this app created through the API, which
+also makes it the trust anchor the group id never was. The legacy `groupIds`
+equality survives as a secondary OR because it is inert by construction
+(admin-numeric ids cannot equal opaque storefront ids) and would only ever
+fire on a hand-written metafield carrying the opaque form.
 
 An allow-list with **no** `planIds` therefore renders nothing at all. It used
 to render on the group id alone, so that a shop upgrading from a build without
@@ -637,8 +669,8 @@ Everything else is fail-closed:
 
 | Situation | What renders |
 |---|---|
-| A group on this product is allow-listed, and holds an allow-listed plan | that group — the normal widget |
-| A group is allow-listed by id, but holds none of the allow-listed plans | **nothing** — the group is skipped and the scan continues, so a genuinely-ours group later on the product still renders |
+| A group on this product holds an allow-listed plan | that group — the normal widget (first such group, in product order) |
+| A group holds none of the allow-listed plans (and its Liquid id is not literally in `groupIds`) | **nothing** — the group is skipped and the scan continues, so a genuinely-ours group later on the product still renders |
 | Allow-list exists, no group on this product matches | **nothing** (plus the invisible marker below) |
 | Metafield absent or `groupIds` empty (plans never synced, or the write failed) | **nothing** — including when the product carries exactly one group, and including when that group is ours. Re-sync the plan from the admin Plans page to publish the allow-list |
 | Metafield malformed (a bare string, wrong shape, `groupIds` an object) | treated as absent → **nothing** |
@@ -648,8 +680,8 @@ contained `cellexia` when the allow-list was missing, and a name is
 merchant-chosen text: on a store called Cellexia Labs, the other app's group
 can perfectly well be called "Cellexia Subscribe & Save" — and then the name
 match rendered *their* group. Guessing from a name has no safe version, so the
-fallback was removed rather than narrowed. A group renders because its id is
-allow-listed, or it does not render.
+fallback was removed rather than narrowed. A group renders because it holds an
+allow-listed plan, or it does not render.
 
 "Nothing" means nothing: no wrapper, no JSON island, no hidden input, no
 `<style>`, no layout shift — byte-identical to the path a product with no
@@ -664,8 +696,19 @@ trace:
 
 ```html
 <template class="cx-buybox-nogroup" data-cellexia-no-owned-group hidden
-          style="display:none!important"></template>
+          style="display:none!important"
+          data-cellexia-diag-group-count="1"
+          data-cellexia-diag-groups="joy-subscriptions:Joy Subscriptions"
+          data-cellexia-diag-allowlist="present"
+          data-cellexia-diag-plan-count="3"></template>
 ```
+
+The `data-cellexia-diag-*` attributes say **why** nothing matched, readable in
+any browser inspector: every selling plan group on the product (`app_id:name`,
+names truncated to 40 characters and escaped once), whether the allow-list
+metafield was published at all, and how many plan ids it carries. They are
+diagnostic data for the admin card and for humans; nothing reads them at
+storefront runtime.
 
 Three independent reasons it can never take part in layout: a `<template>`
 renders nothing by definition (its contents are not even in the document
@@ -675,19 +718,23 @@ also empty, carries none of the widget's hooks, and is never a `querySelector`
 target for anything but the diagnostic below. `buy-box.js` turns it into the usual
 `.cx-buybox-diagnostic` card reading *"Cellexia buy box: this product has
 subscription plans from another app but none from Cellexia. Sync your Cellexia
-plan to this product in the app's Plans page."* — **only** when
+plan to this product in the app's Plans page."* — **only** when the current
+page's own URL carries `?cx_preview=` **and**
 `CellexiaSubs.previewValidated === true`, i.e. after the app proxy has
-validated a signed preview token. Never off the raw `?cx_preview=` parameter,
-which anyone can put in a URL (same rule, same reasons, as the placement
-diagnostic; see the namespace note). The app embed's own "no placement anchor"
-card stays quiet on an empty wrapper, so the two never stack.
+validated the signed token. Never off the raw parameter alone, which anyone
+can put in a URL, and never off the stored session alone, which follows the
+tab to pages the admin never previewed (same double gate, same reasons, as
+the placement diagnostic; see the namespace note). The app embed's own "no
+placement anchor" card stays quiet on an empty wrapper, so the two never
+stack.
 
 Pinned by `tests/liquid/render.test.ts` (§ selling plan group ownership,
 including a vacuity guard that allow-lists Joy's group and watches the widget
 render Joy's 5% plan — the reported symptom, reproduced) and by
 `tests/buybox-no-owned-group.test.ts`, which runs the real asset files over
 the real server-rendered markup and asserts the card is impossible to reach
-without a validated session.
+without a validated session on a page opened through a preview link — a
+fully validated storage-only session (the PDP → cart hop) raises nothing.
 
 ### What this does NOT fix
 

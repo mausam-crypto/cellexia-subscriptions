@@ -171,6 +171,13 @@
      by the merchant's other live app ("AOV & LTV Booster"). */
   var PREVIEW_VALIDATE_PATH = '/apps/cellexia-subs/preview/validate';
   var previewValidated = false;
+  /* True only when THIS page load carried ?cx_preview= in the URL — a gate
+     EVERY admin-only diagnostic card requires (the validation-failure card
+     alone, the other two in conjunction with the validated session).
+     Deliberately not derived from sessionStorage: the stored token follows
+     the tab across pages, and a card must only ever appear on the page the
+     admin is actually looking at through a preview link. */
+  var previewTokenInUrl = false;
 
   function previewStorageGet() {
     try {
@@ -221,9 +228,11 @@
    * previewBoot() stores the raw ?cx_preview= parameter in sessionStorage
    * BEFORE the proxy has seen it, so the mere presence of that value proves
    * nothing — a leaked, expired or invented link puts it there just as well.
-   * Only this flag (set exclusively on a { ok: true } answer) may gate
+   * Only this flag (set exclusively on a { ok: true } answer) — and only in
+   * conjunction with ?cx_preview= in the current page's own URL — may gate
    * admin-only behaviour such as buy-box-embed.js's English diagnostic card,
-   * which must never be shown to a customer.
+   * which must never be shown to a customer nor on a page the admin never
+   * opened through a preview link.
    */
   function markPreviewValidated() {
     try {
@@ -249,20 +258,25 @@
      correct page for a shopper and a mystery for the merchant, who is
      looking at a product page with no buy box and no explanation.
 
-     GATED ON THE VALIDATED SESSION, NEVER ON THE RAW TOKEN — same rule, and
-     the same reasons, as buy-box-embed.js's placement diagnostic:
-     previewBoot() puts the ?cx_preview= parameter into sessionStorage BEFORE
-     the app proxy has judged it, so its presence proves only that somebody
-     put a value in the URL. Only CellexiaSubs.previewValidated, set
-     exclusively on an { ok: true } answer from the proxy, opens this gate.
-     English only (an internal diagnostic is not customer-facing copy), no
-     element id (namespace hazard), and the same card style as the other
-     diagnostic so the two read as one voice. */
+     GATED ON THE VALIDATED SESSION *AND* THE ?cx_preview= URL PARAMETER OF
+     THIS PAGE LOAD — same rule, and the same reasons, as buy-box-embed.js's
+     placement diagnostic. Both halves are load-bearing: previewBoot() puts
+     the ?cx_preview= parameter into sessionStorage BEFORE the app proxy has
+     judged it, so a raw token alone proves only that somebody put a value in
+     the URL — only CellexiaSubs.previewValidated, set exclusively on an
+     { ok: true } answer from the proxy, proves an admin. And the VALIDATED
+     token persists in sessionStorage across same-tab navigation (so the
+     widget reveal follows PDP → cart), so validation alone would raise this
+     card on pages the admin never previewed — the URL parameter pins it to
+     the page actually opened through a preview link. English only (an
+     internal diagnostic is not customer-facing copy), no element id
+     (namespace hazard), and the same card style as the other diagnostic so
+     the two read as one voice. */
   var noGroupDiagnosticShown = false;
 
   function maybeShowNoOwnedGroupDiagnostic() {
     try {
-      if (noGroupDiagnosticShown || !document.body) {
+      if (noGroupDiagnosticShown || !document.body || !previewTokenInUrl) {
         return;
       }
       var subs = window.CellexiaSubs;
@@ -280,6 +294,63 @@
         'Cellexia buy box: this product has subscription plans from another ' +
         'app but none from Cellexia. Sync your Cellexia plan to this product ' +
         "in the app's Plans page.";
+      document.body.appendChild(card);
+    } catch (err) {
+      /* a diagnostic that cannot be shown is never worth an exception */
+    }
+  }
+
+  /* ── Admin-only diagnostic: preview validation FAILED ────────────────────
+     The blank page this explains: the admin followed a ?cx_preview= link,
+     the assets loaded, and /preview/validate said no — an expired or invalid
+     token ({ ok: false }), a proxy that is not there (HTTP 404 because the
+     app configuration was never deployed), a server error, or a network
+     failure. The WIDGET's fail-closed rendering is unchanged in every one of
+     those cases — it stays hidden — but the silence is replaced by the usual
+     diagnostic card naming which of the two failure families happened, so
+     the admin is not left staring at a blank page with seven possible
+     causes.
+
+     GATE: the cx_preview URL parameter ON THIS PAGE LOAD — by definition NOT
+     the validated session (validation just failed; there is none to gate
+     on), and deliberately NOT sessionStorage: the stored token follows the
+     browser tab across pages, so a card keyed off storage could surface on
+     pages the admin never previewed. The other two diagnostics require this
+     same URL-parameter gate PLUS the validated session on top.
+
+     COPY RULE — this card is an UNAUTHENTICATED surface. Because its gate
+     is the URL parameter ALONE (validation failed, so there is no proven
+     admin), anyone who appends ?cx_preview=x to a gated product page can
+     elicit it. The copy therefore discloses nothing a bearer does not
+     already have: no proxy paths, no configuration detail, no operator
+     commands ("npm run …"). Both branches route the admin to the
+     admin-gated Preview Doctor on Preview & launch, which names the exact
+     cause and fix behind authentication. tests/preview-failure.test.ts
+     pins both the copy and the no-internal-detail rule. */
+  var previewFailureShown = false;
+
+  function maybeShowPreviewFailureDiagnostic(kind, detail) {
+    try {
+      if (previewFailureShown || previewValidated || !previewTokenInUrl) {
+        return;
+      }
+      if (!document.body) {
+        return;
+      }
+      previewFailureShown = true;
+      var card = document.createElement('div');
+      card.className = 'cx-buybox-diagnostic';
+      card.setAttribute('role', 'status');
+      card.textContent =
+        kind === 'token'
+          ? 'Cellexia buy box: this preview link is expired or invalid, so ' +
+            'the widget stays hidden. Generate a fresh preview link from ' +
+            'Preview & launch.'
+          : 'Cellexia buy box: the preview could not be validated (' +
+            detail +
+            '), so the widget stays hidden. Open Preview & launch in the ' +
+            'Cellexia admin and run the Preview Doctor for the exact ' +
+            'cause and fix.';
       document.body.appendChild(card);
     } catch (err) {
       /* a diagnostic that cannot be shown is never worth an exception */
@@ -321,6 +392,7 @@
       fromUrl = null;
     }
     if (fromUrl) {
+      previewTokenInUrl = true;
       previewStorageSet(fromUrl);
     }
     var token = previewStorageGet();
@@ -348,8 +420,14 @@
         credentials: 'omit'
       })
       .then(function (response) {
-        /* Server hiccup (non-2xx) → fail closed, keep the token for retry. */
-        return response.ok ? response.json() : null;
+        /* Server hiccup (non-2xx) → fail closed, keep the token for retry —
+           but tell the admin behind a preview link WHICH hiccup: a 404 here
+           is the "app configuration never deployed" blank page. */
+        if (!response.ok) {
+          maybeShowPreviewFailureDiagnostic('proxy', 'HTTP ' + response.status);
+          return null;
+        }
+        return response.json();
       })
       .then(function (data) {
         if (!data) {
@@ -363,12 +441,19 @@
           revealGated();
           maybeShowNoOwnedGroupDiagnostic();
         } else {
-          /* Invalid or expired token: forget it so we stop asking. */
+          /* Invalid or expired token: forget it so we stop asking — and name
+             the reason for the admin whose link just went dark. */
           previewStorageClear();
+          maybeShowPreviewFailureDiagnostic('token', '');
         }
       })
       .catch(function () {
-        /* Network error → widget stays hidden. */
+        /* Network error (or a non-JSON answer on the subpath) → the widget
+           stays hidden; the card explains instead of nothing. The helper
+           refuses to fire after a successful validation, so an exception
+           thrown by the reveal path above can never masquerade as a proxy
+           failure. */
+        maybeShowPreviewFailureDiagnostic('proxy', 'a network error or timeout');
       });
   }
 

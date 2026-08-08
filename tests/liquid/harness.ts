@@ -468,8 +468,25 @@ export function defaultBlockSettings(
 // ── Product fixture ──────────────────────────────────────────────────────────
 
 /**
- * Ids chosen to look like the real thing (Shopify serves numeric ids to
- * Liquid) and to be stable, so the zero-config snapshot is byte-stable.
+ * Ids chosen to look like the real thing and to be stable, so the zero-config
+ * snapshot is byte-stable.
+ *
+ * TWO ID SPACES — the trap behind the live outage. The Admin API numbers
+ * every selling plan GROUP, and those numeric ids are what the app publishes
+ * in the cellexia.plan_groups allow-list. But storefront Liquid exposes
+ * `selling_plan_group.id` (and each allocation's `selling_plan_group_id`) as
+ * an OPAQUE storefront identifier that shares nothing with the admin id.
+ * Selling PLAN ids, by contrast, are numeric and IDENTICAL in both APIs —
+ * they are what the cart's `selling_plan` param carries. So `groupId` /
+ * `foreignGroupId` below are ADMIN ids; what Liquid sees is
+ * `storefrontGroupId(adminId)`. Plan ids are used verbatim on both sides.
+ *
+ * An earlier harness handed Liquid the numeric admin group ids directly —
+ * encoding the exact wrong assumption the Liquid ownership check was written
+ * against, so a group-id allow-list match passed in CI while matching NOTHING
+ * on the real storefront (the widget rendered nothing on a product whose plan
+ * sync had SUCCEEDED). These fixtures model both id spaces so that mistake
+ * fails tests instead of merchants.
  */
 export const FIXTURE = {
   productId: 7712300000001,
@@ -487,6 +504,16 @@ export const FIXTURE = {
   foreignPlanIds: { monthly: 9991100001 },
 } as const;
 
+/**
+ * The opaque storefront-Liquid id for a selling plan group, derived stably
+ * from its admin id. Deliberately non-numeric and never containing the admin
+ * id's decimal form, so any Liquid-side comparison of group ids against the
+ * published admin ids fails in tests exactly as it does on a real storefront.
+ */
+export function storefrontGroupId(adminId: number | string): string {
+  return `sfg-${Number(adminId).toString(36)}c4x9`;
+}
+
 export interface SellingPlanFixture {
   id: number;
   name: string;
@@ -496,7 +523,8 @@ export interface SellingPlanFixture {
 
 export interface AllocationFixture {
   selling_plan: SellingPlanFixture;
-  selling_plan_group_id: number;
+  /** The OPAQUE storefront group id — pairs with `selling_plan_group.id`. */
+  selling_plan_group_id: string;
   price: number;
   compare_at_price: number;
   /** Optional: an allocation drop can state no per-delivery price at all. */
@@ -521,7 +549,7 @@ export interface VariantFixture {
  * product. Nothing but the ownership allow-list distinguishes them from ours.
  */
 export interface OtherAppGroupFixture {
-  /** The group id, in the numeric form Liquid hands out. */
+  /** The group's ADMIN-API numeric id; Liquid sees storefrontGroupId(id). */
   id: number;
   name: string;
   /** `selling_plan_group.app_id` — never consulted by the widget. */
@@ -572,10 +600,10 @@ export interface ProductFixtureOptions {
    */
   selectedVariantHasNoAllocations?: boolean;
   /**
-   * OUR group's id (defaults to FIXTURE.groupId). Lets a test choose ids whose
-   * decimal forms are prefixes of one another ("12" vs "123") and pin that the
-   * allow-list comparison is exact string equality, not a substring test.
-   * `makeContext`'s default allow-list follows this id.
+   * OUR group's ADMIN-API id (defaults to FIXTURE.groupId). What Liquid sees
+   * is storefrontGroupId(ownGroupId) — the two id spaces are the point.
+   * `makeContext`'s default allow-list follows this id, in the numeric admin
+   * form the app actually publishes.
    */
   ownGroupId?: number;
   /**
@@ -627,7 +655,9 @@ function makeAllocations(
     const ongoing = hasSavings ? Math.round(variantPrice * 0.9) : variantPrice;
     const allocation: AllocationFixture = {
       selling_plan: plan,
-      selling_plan_group_id: options.ownGroupId ?? FIXTURE.groupId,
+      selling_plan_group_id: storefrontGroupId(
+        options.ownGroupId ?? FIXTURE.groupId,
+      ),
       price: first,
       compare_at_price: variantPrice,
       per_delivery_price: options.prepaid ? Math.round(first / 2) : first,
@@ -686,7 +716,7 @@ function makeOtherAllocations(
   const price = Math.round(variantPrice * (1 - (spec.discount ?? 0.05)));
   return makeOtherPlans(spec).map((plan) => ({
     selling_plan: plan,
-    selling_plan_group_id: spec.id,
+    selling_plan_group_id: storefrontGroupId(spec.id),
     price,
     compare_at_price: variantPrice,
     per_delivery_price: price,
@@ -734,7 +764,8 @@ export function makeProduct(options: ProductFixtureOptions = {}) {
     },
   ];
   const ownGroup = {
-    id: options.ownGroupId ?? FIXTURE.groupId,
+    // Liquid's group id: the OPAQUE storefront form, never the admin numeric.
+    id: storefrontGroupId(options.ownGroupId ?? FIXTURE.groupId),
     name: options.groupName ?? "Cellexia Ritual",
     app_id: "cellexia",
     selling_plans: plans,
@@ -762,7 +793,7 @@ export function makeProduct(options: ProductFixtureOptions = {}) {
   }
 
   const otherGroups = others.map((spec) => ({
-    id: spec.id,
+    id: storefrontGroupId(spec.id),
     name: spec.name,
     app_id: spec.appId ?? "another-subscription-app",
     selling_plans: makeOtherPlans(spec),
@@ -813,7 +844,10 @@ export interface MakeContextOptions extends ProductFixtureOptions {
   /**
    * shop.metafields.cellexia.plan_groups.value — the OWNERSHIP ALLOW-LIST the
    * app publishes on every plan sync ({ v, groupIds, planIds }, ids as
-   * strings). Only groups it names may be rendered.
+   * strings). Only groups it names may be rendered. Both fields carry
+   * ADMIN-API ids: the numeric group ids can therefore never match Liquid's
+   * opaque group ids (see FIXTURE), which is why ownership is decided by the
+   * PLAN ids — the one id space the two APIs share.
    *
    * `undefined` (the default) = a synced shop, i.e. this fixture's own group
    * is allow-listed — the state every pre-existing test was written against.

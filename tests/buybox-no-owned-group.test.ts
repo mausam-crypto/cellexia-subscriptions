@@ -75,6 +75,8 @@ interface RunOptions {
   markup: "sectionNoGroup" | "embedNoGroup" | "sectionWidget";
   /** A ?cx_preview= token in the URL (nothing = an ordinary shopper). */
   token?: string;
+  /** A token pre-seeded in sessionStorage only — the PDP → cart hop. */
+  storedToken?: string;
   /**
    * What /preview/validate answers for that token. "pending" never answers —
    * the window in which the raw token is already in sessionStorage and the
@@ -115,6 +117,9 @@ async function run(options: RunOptions): Promise<RunResult> {
 
   const requests: string[] = [];
   const storage = new Map<string, string>();
+  if (options.storedToken) {
+    storage.set("cx_preview_token", options.storedToken);
+  }
   const noop = (): void => {};
 
   const windowStub: Record<string, unknown> = {
@@ -256,7 +261,12 @@ describe("what a shopper gets", () => {
     }
   });
 
-  it("shows no card for a token the proxy rejects, and forgets it", async () => {
+  it("never shows the NO-GROUP hint for a rejected token, and forgets it", async () => {
+    /* v1.6.7: a rejected token from the URL now raises the preview-FAILURE
+       card (tests/preview-failure.test.ts owns that contract) — but the
+       no-owned-group hint stays behind the validated-session gate, because
+       it names shop configuration detail a dead forwarded link must never
+       unlock. */
     const page = await run({
       markup: "sectionNoGroup",
       token: "leaked-or-expired",
@@ -264,7 +274,9 @@ describe("what a shopper gets", () => {
     });
     expect(page.requests).toHaveLength(1);
     expect(page.requests[0]).toContain(VALIDATE_PATH);
-    expect(page.cards).toEqual([]);
+    expect(page.cards).toHaveLength(1);
+    expect(page.cards[0].textContent).not.toBe(EXPECTED_HINT);
+    expect(page.cards[0].textContent).toContain("expired or invalid");
     // A rejected token is dropped, so the page stops asking.
     expect([...page.storage.values()]).toEqual([]);
   });
@@ -283,6 +295,28 @@ describe("what a shopper gets", () => {
     expect(page.storage.get("cx_preview_token")).toBe("not-answered-yet");
     expect(page.requests).toHaveLength(1);
     expect(page.cards).toEqual([]);
+  });
+
+  it("shows no card for a VALIDATED storage-only session (PDP → cart hop)", async () => {
+    /* v1.6.7: the validated token deliberately persists in sessionStorage so
+       the widget reveal follows the admin across same-tab navigation — but a
+       page whose own URL carries no ?cx_preview= was never opened through a
+       preview link, and must raise no diagnostic there even though the proxy
+       says yes. Both halves of the double gate are load-bearing: this pins
+       the URL half against a fully validated session. */
+    for (const markup of ["sectionNoGroup", "embedNoGroup"] as const) {
+      const page = await run({
+        markup,
+        storedToken: "validated-on-a-previous-page",
+        validates: true,
+        withEmbed: markup === "embedNoGroup",
+      });
+      // Validation DID run and succeed — only the URL gate held the card.
+      expect(page.requests, markup).toHaveLength(1);
+      expect(page.requests[0], markup).toContain(VALIDATE_PATH);
+      expect(page.cards, markup).toEqual([]);
+      expect(page.body.textContent, markup).not.toContain("Cellexia buy box:");
+    }
   });
 });
 
@@ -334,6 +368,23 @@ describe("what a validated admin gets", () => {
     expect(
       page.document.querySelector("[data-cellexia-no-owned-group]"),
     ).toBeNull();
+    expect(page.cards).toEqual([]);
+  });
+
+  it("still reveals the widget on a storage-only hop — only the card is URL-gated", async () => {
+    /* The PDP → cart persistence is the whole point of storing the token:
+       the REVEAL must keep working on pages without ?cx_preview=. Only the
+       diagnostic cards are pinned to the preview-linked page. */
+    const page = await run({
+      markup: "sectionWidget",
+      storedToken: "validated-on-a-previous-page",
+      validates: true,
+    });
+    const widget = page.document.querySelector("[data-cellexia-buybox]");
+    expect(widget).not.toBeNull();
+    expect((widget as ElementNode).getAttribute("data-cellexia-preview")).toBe(
+      "true",
+    );
     expect(page.cards).toEqual([]);
   });
 });

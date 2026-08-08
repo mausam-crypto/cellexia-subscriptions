@@ -294,6 +294,10 @@ that, so treat them as private). Portal preview sessions are shorter-lived
 (the link is valid 1 hour; the session persists in that browser) and are
 read-only by construction — every mutating action is intercepted.
 
+**Preview opened but the widget is not there?** That is the
+[§20 "Widget not showing?" runbook](#20-runbook--widget-not-showing): run the
+Preview Doctor first.
+
 ## 15. Runbook — buy box design
 
 <a name="15-runbook--buy-box-design"></a>
@@ -403,6 +407,8 @@ the new markup and publish/save. Unmounted embeds fail safe — the widget
 simply stays hidden (with a hint card in preview sessions and a console
 warning) — but that means a silent theme redesign can silently remove your
 subscription offer: add the placement check to any theme-release checklist.
+(For a widget that is missing for any *other* reason, start with the Preview
+Doctor — [§20](#20-runbook--widget-not-showing).)
 Also re-run the app-embed cart checks in
 [TESTING.md §10](./TESTING.md#10-preview-based-qa-pre-launch-on-the-live-store)
 after a redesign — the embed injects the selling plan into the theme's cart
@@ -606,6 +612,45 @@ group still renders nothing. Consequences worth knowing:
 - Where both apps' plans sit on the same product, the page can show two
   subscribe widgets — ours and theirs. Cellexia cannot switch theirs off; do
   that in the other app before you go live.
+
+**The id-space lesson (why ownership matches on PLAN ids).** Storefront
+Liquid exposes selling plan **group** ids in a **different id space** than the
+Admin API: the `selling_plan_group.id` a theme sees is an opaque storefront
+identifier, not the numeric admin id the app records at sync time and
+publishes into the allow-list — so a group-id comparison in Liquid can never
+match, and a widget relying on it treats our own correctly-synced group as
+foreign and renders nothing (on the live store this surfaced as the "plans
+from another app" admin card on a product whose Cellexia sync had succeeded).
+Individual selling **plan** ids ARE numeric and identical in both APIs (they
+are what the cart's `selling_plan` parameter carries), so the buy box decides
+ownership on plan ids: a group is ours iff it contains one of the
+allow-list's `planIds`, with the group-id check kept only as a harmless
+secondary OR. Anything that compares storefront-observed ids against
+admin-recorded ones must use plan ids, never group ids; group-id equality is
+reliable only admin-to-admin, which is exactly where the app verifies
+attachment (below).
+
+**Drift: the plan silently disappears from a product.** The other app's own
+product sync can **detach our selling plan group** from products it also
+manages while reconciling them — the config row still says synced, but the
+product page has nothing of ours to render. Two guards close this:
+
+- **Post-sync verification** — after every sync the app re-reads each
+  product's selling plan groups from the Admin API and only reports
+  **Synced** when the group is attached to *every* product in the plan.
+  Anything less shows an **Attach failed** badge on the Plans row, naming the
+  missing products.
+- **Daily drift check** (`PLAN_GROUP_DRIFT`, part of the alert scan) —
+  re-verifies every synced plan once a day and raises a WARNING alert ("Your
+  Cellexia plan was detached from …") when a group has been detached after
+  the fact.
+
+Remediation, both cases: **re-sync the plan on the Plans page** (that
+re-attaches the products and republishes the allow-list), then **exclude
+those products from the other app's management** so its next sync does not
+detach them again. If the badge or alert keeps returning for the same
+products, the other app is still reconciling them — the exclusion, not the
+re-sync, is the durable fix.
 
 **Support actions.** Opening a `FOREIGN` or `UNKNOWN` subscriber shows the
 cockpit with a banner, and every action on it (pause, resume, cancel, charge
@@ -837,3 +882,58 @@ weekly review routine and targets, see
 - **Survival curves** wait for at least 10 subscribers to have either churned
   or renewed — below that the page says "too early to measure" instead of
   drawing noise.
+
+## 20. Runbook — widget not showing?
+
+<a name="20-runbook--widget-not-showing"></a>
+
+**Run the Preview Doctor.** Preview & launch → Storefront preview → **Preview
+Doctor** → pick the product → **Run diagnosis**. Everything else in this
+section is what to do with its answer — do not start bisecting by hand.
+
+The widget only appears when ~7 independent gates are all open, and every
+closed gate produces the identical symptom: a blank product page. The doctor
+walks the chain **in order, against the live store** (nothing is cached, and
+nothing on the store is changed) and names the first closed gate:
+
+1. **Subscription plan synced** — a plan exists, is active, `SYNCED`, with a
+   Shopify group **and** selling plan ids recorded.
+2. **Product is part of the plan** — the diagnosed product is in the plan's
+   product list.
+3. **Shopify shows the plan on this product** — the selling plan group is
+   actually attached (Admin API read-back, same check as §14 in
+   [INSTALL.md §10](./INSTALL.md#10-preview-then-go-live) drift terms).
+4. **Storefront allow-list published** — `cellexia.plan_groups` exists and
+   carries our group id **and our plan ids** (the storefront matches
+   ownership on plan ids; a list with group ids but no plan ids renders
+   nothing — that exact shape is a FAIL here).
+5. **App proxy answers as Cellexia** — the live
+   `/apps/cellexia-subs/preview/validate` probe; HTTP 404 means the app
+   configuration was never deployed (`npm run deploy`), a foreign body means
+   another app owns the path.
+6. **Widget markup reaches the live product page** — the doctor fetches the
+   real PDP HTML and looks for our markers; missing markers mean the
+   extension is not deployed or the app embed is off on the published theme
+   (§16).
+7. **Launch mode** — informational: SETUP means hidden-until-previewed by
+   design.
+
+Each step reports **Pass / Fail / Check / Skipped** with a detail line and the
+fix. Start at the **first Fail**, apply its fix, re-run. **Check** (WARN)
+means the probe was inconclusive — storefront password page, bot protection,
+or a network hiccup between app host and store — open the page in your own
+browser instead of treating it as broken. Every run is recorded on the Audit
+page as `admin.action` / `preview_doctor_run`.
+
+You usually do not need to run it by hand first: **Preview on product page
+runs the same diagnosis automatically** and, when a gate is closed, shows the
+report instead of opening the blank tab (with an **Open anyway** escape
+hatch). A doctor that cannot run at all never blocks the preview — it fails
+open, and says so: the preview opens with a toast that the pre-flight
+diagnosis was skipped (run **Run diagnosis** by hand if that page looks
+blank), and the `storefront_preview_created` audit event carries
+`doctorSkipped: true`. Only a doctor-vetted open ticks the **Storefront
+previewed** checklist item: **Open anyway** and the fail-open path open the
+tab but leave the item unticked (the audit event carries
+`checklistPreviewedStorefront: false`) — preview again once the diagnosis
+passes to tick it.

@@ -254,7 +254,11 @@ widget only in your own browser session):
 1. Generate a preview link for a product in a synced plan and open it.
    The buy box renders with the "Preview — only you can see this" ribbon:
    subscription option preselected, savings badge, frequency selector,
-   correct prices.
+   correct prices. If the widget does not show, run the **Preview Doctor**
+   (same card) — it names the first closed gate on the render chain
+   ([OPERATIONS.md §20](./OPERATIONS.md#20-runbook--widget-not-showing));
+   `tests/preview-doctor.test.ts` covers each step's PASS/FAIL fixtures and
+   the preview action's BLOCKED gate.
 2. Repeat on a **mobile** viewport (or your phone — the link works anywhere
    the session carries): layout, tap targets, ribbon visible.
 3. Select a plan → add to cart → the **cart line shows the selling plan**
@@ -387,7 +391,9 @@ nothing executes, no Shopify calls):
    (`app/lib/portal/demo.server.ts`) — it deletes and recreates the demo from
    the current catalog; the next demo preview picks it up.
 
-Both previews auto-tick the corresponding items on the go-live checklist.
+Both previews auto-tick the corresponding items on the go-live checklist
+(the storefront one only when its pre-flight diagnosis ran and passed —
+**Open anyway** and a skipped diagnosis leave it unticked).
 When this pass is green, go live per
 [INSTALL.md §10](./INSTALL.md#10-preview-then-go-live).
 
@@ -401,3 +407,10 @@ exists because typecheck and all tests once passed on a tree whose
 something neither tsc nor Vitest exercises); green tests alone do not prove a
 shippable build. Then re-run §3 rows 1/2/12/16/18, one §4 recovery, and one
 renewal end-to-end on the dev store. Quarterly: the full document.
+
+A green `vitest run` prints **no stderr at all**: `vitest.config.ts`
+(`onConsoleLog`) suppresses the app's own `[subsystem]`-prefixed error logs,
+which error-path tests trigger on purpose. Any stderr that DOES appear in a
+test run is therefore unexpected output worth investigating, not known noise
+to scroll past. Tests that assert on those logs use `vi.spyOn(console, …)`,
+which the output filter does not affect.

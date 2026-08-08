@@ -39,6 +39,7 @@ import { logEvent } from "~/lib/events/log.server";
 import { applyDiscountPct, formatMoney } from "~/lib/money";
 import {
   deleteSellingPlanGroup,
+  findProductsMissingFromGroup,
   getProducts,
   getVariants,
   searchProducts,
@@ -213,6 +214,25 @@ function boolFrom(formData: FormData, name: string): boolean {
 function intFrom(formData: FormData, name: string): number {
   const raw = String(formData.get(name) ?? "").trim();
   return raw === "" ? Number.NaN : Number(raw);
+}
+
+/**
+ * Product titles for an error message, falling back to the GID per product —
+ * a title lookup failure must never hide WHICH products lost the plan.
+ */
+async function bestEffortProductTitles(
+  admin: Parameters<typeof getProducts>[0],
+  productIds: string[],
+): Promise<string[]> {
+  try {
+    const titleById = new Map(
+      (await getProducts(admin, productIds)).map((p) => [p.id, p.title]),
+    );
+    return productIds.map((id) => titleById.get(id) ?? id);
+  } catch (err) {
+    console.error("[plans] product title lookup for attach error failed", err);
+    return productIds;
+  }
 }
 
 function actorFromSession(session: {
@@ -601,18 +621,57 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
     try {
       const result = await syncSellingPlanGroupFromConfig(admin, config);
+
+      // Post-sync attachment verification. The mutations returning without
+      // userErrors is not proof the storefront agrees: another subscription
+      // app's product sync can detach our group from products it also manages
+      // (observed live), and a deleted product vanishes silently. SYNCED is
+      // only ever written after the Admin API confirms the group sits on
+      // EVERY product in the config — anything else is ATTACH_FAILED with the
+      // products named, so the merchant never trusts a widget that is not
+      // there. Verification reads admin GIDs against admin GIDs (one id
+      // space, reliable — unlike storefront Liquid group ids).
+      const configProductIds = parseJsonStringArray(config.productIds);
+      let syncStatus = "SYNCED";
+      let syncError: string | null = null;
+      let missingProductIds: string[] = [];
+      try {
+        missingProductIds = await findProductsMissingFromGroup(
+          admin,
+          result.groupId,
+          configProductIds,
+        );
+        if (missingProductIds.length > 0) {
+          const names = await bestEffortProductTitles(admin, missingProductIds);
+          syncStatus = "ATTACH_FAILED";
+          syncError = `Synced to Shopify, but the plan is not attached to: ${names.join(
+            ", ",
+          )}. Another subscription app's sync may be reconciling products it manages — re-sync, and exclude these products from the other app's management.`;
+        }
+      } catch (verifyErr) {
+        // Unverifiable is not SYNCED: the whole point of this check is that
+        // the merchant never sees SYNCED while the storefront may disagree.
+        const message =
+          verifyErr instanceof Error ? verifyErr.message : String(verifyErr);
+        syncStatus = "ATTACH_FAILED";
+        syncError = `Synced to Shopify, but product attachment could not be verified (${message}). Re-sync to verify.`;
+      }
+
       await prisma.sellingPlanConfig.update({
         where: { id: config.id },
         data: {
           shopifyGroupId: result.groupId,
-          syncStatus: "SYNCED",
-          syncError: null,
+          syncStatus,
+          syncError,
         },
       });
       // Ownership evidence: remember this group's plan ids (append-only) and
       // republish the storefront allow-list metafield, so the buy box renders
       // OUR group only and the contract sync can tell our subscribers from
-      // another subscription app's. Never throws.
+      // another subscription app's. Never throws. Recorded even on
+      // ATTACH_FAILED — the group and its plans DO exist on Shopify, and the
+      // allow-list staying current is what keeps the widget correct on the
+      // products that are still attached.
       const ownership = await recordSellingPlanSync({
         shopId: shop.id,
         shopDomain: shop.domain,
@@ -634,8 +693,22 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           planGroupsMetafield: ownership.metafield.ok
             ? "published"
             : `failed: ${ownership.metafield.error ?? "unknown error"}`,
+          syncStatus,
+          ...(syncStatus === "ATTACH_FAILED"
+            ? { attachMissingProductIds: missingProductIds, attachError: syncError }
+            : {}),
         },
       });
+      if (syncStatus === "ATTACH_FAILED") {
+        return json<ActionData>({
+          intent,
+          ok: false,
+          toast:
+            missingProductIds.length > 0
+              ? `"${config.name}" synced, but ${missingProductIds.length} product(s) are missing the plan — see the Plans row`
+              : `"${config.name}" synced, but attachment could not be verified — re-sync to verify`,
+        });
+      }
       return json<ActionData>({
         intent,
         ok: true,
@@ -1595,6 +1668,22 @@ function CostRow({
 function syncBadge(plan: PlanView) {
   if (plan.syncStatus === "SYNCED") {
     return <Badge tone="success">Synced</Badge>;
+  }
+  if (plan.syncStatus === "ATTACH_FAILED") {
+    // The group exists on Shopify but is NOT attached to every product in the
+    // config (or that could not be verified) — the buy box is missing on
+    // those product pages. Never rendered as Synced; the tooltip names the
+    // products so the merchant knows exactly where to look.
+    return (
+      <Tooltip
+        content={
+          plan.syncError ??
+          "The plan is not attached to every product — re-sync, and exclude these products from the other subscription app's management"
+        }
+      >
+        <Badge tone="critical">Attach failed</Badge>
+      </Tooltip>
+    );
   }
   if (plan.syncStatus === "ERROR") {
     return (

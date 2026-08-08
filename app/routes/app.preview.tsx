@@ -46,6 +46,11 @@ import {
   syncLaunchMetafield,
   type ProxyIdentityProbe,
 } from "~/lib/launch/launch.server";
+import {
+  runPreviewDoctor,
+  type DoctorReport,
+  type DoctorStep,
+} from "~/lib/launch/doctor.server";
 import { PORTAL_PROXY_BASE } from "~/lib/portal/proxy-path";
 import { createDemoContract } from "~/lib/portal/demo.server";
 import { buildMagicUrl } from "~/lib/magiclinks/builder.server";
@@ -162,6 +167,12 @@ interface ActionData {
   toast?: string;
   /** Preview URL to open in a new tab (preview-* intents). */
   url?: string;
+  /**
+   * Preview Doctor step list (run-doctor, and preview-storefront when the
+   * doctor blocked the open). Rendered inline so a blocked preview explains
+   * itself instead of opening a blank page.
+   */
+  report?: DoctorReport;
 }
 
 const stringArraySchema = z.array(z.string());
@@ -600,14 +611,68 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     });
   }
 
+  if (intent === "run-doctor") {
+    // runPreviewDoctor never throws (every step is contained) and logs its
+    // own admin.action event — don't double-log here.
+    const productId = String(formData.get("productId") ?? "").trim();
+    const report = await runPreviewDoctor(shop.domain, productId || undefined);
+    return json<ActionData>({ intent, ok: true, report });
+  }
+
   if (intent === "preview-storefront") {
     const productHandle = String(formData.get("productHandle") ?? "").trim();
+    const productId = String(formData.get("productId") ?? "").trim();
+    const openAnyway = String(formData.get("openAnyway") ?? "") === "true";
+
+    // Run the doctor BEFORE opening the tab: every closed gate on the render
+    // chain used to look identical from the preview — a blank product page
+    // with no explanation. When a step fails, the report is returned inline
+    // instead of a URL; the "Open anyway" button re-submits with openAnyway
+    // so nothing is ever hard-blocked. A doctor that itself blew up must
+    // never block the preview either — fail open, but never SILENTLY: the
+    // merchant is told the pre-flight check was skipped (toast below), so a
+    // blank preview still has a named next step instead of looking vetted.
+    // Neither un-vetted path ticks the "Storefront previewed" checklist
+    // item — see the `vetted` gate below.
+    let doctorSkipped = false;
+    if (!openAnyway) {
+      try {
+        const report = await runPreviewDoctor(
+          shop.domain,
+          productId || undefined,
+        );
+        if (report.verdict === "BLOCKED") {
+          const blocked = report.steps.find(
+            (step) => step.key === report.firstBlockedStep,
+          );
+          return json<ActionData>({
+            intent,
+            ok: false,
+            report,
+            toast: `Preview blocked${blocked ? ` — ${blocked.label}` : ""}: see the diagnosis for the fix`,
+          });
+        }
+      } catch (err) {
+        console.error("[preview] doctor run before preview failed", err);
+        doctorSkipped = true;
+      }
+    }
     try {
       const url = await buildStorefrontPreviewUrl(
         shop.id,
         productHandle || undefined,
       );
-      await markPreviewed(shop.id, "previewedStorefront", actor);
+      // "Storefront previewed" ticks ONLY off a doctor-vetted open. An Open
+      // anyway (the doctor just said BLOCKED) or a fail-open (the doctor
+      // crashed — chain state unknown) may well open the exact blank page
+      // the checklist item exists to catch; a checklist that says
+      // "previewed" off a blank page defeats its purpose. Un-vetted opens
+      // stay un-ticked — fixing the diagnosis and previewing again ticks it
+      // — and the audit event says which kind this was.
+      const vetted = !openAnyway && !doctorSkipped;
+      if (vetted) {
+        await markPreviewed(shop.id, "previewedStorefront", actor);
+      }
       await logEvent({
         shopId: shop.id,
         type: "admin.action",
@@ -616,10 +681,27 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         payload: {
           action: "storefront_preview_created",
           productHandle: productHandle || null,
-          checklistPreviewedStorefront: true,
+          checklistPreviewedStorefront: vetted,
+          ...(openAnyway ? { openAnyway: true } : {}),
+          ...(doctorSkipped ? { doctorSkipped: true } : {}),
         },
       });
-      return json<ActionData>({ intent, ok: true, url });
+      return json<ActionData>({
+        intent,
+        ok: true,
+        url,
+        ...(doctorSkipped
+          ? {
+              toast:
+                "Preview opened, but its pre-flight diagnosis could not run and was skipped — if the page looks blank, use Run diagnosis below. “Storefront previewed” was not ticked.",
+            }
+          : openAnyway
+            ? {
+                toast:
+                  "Preview opened despite the blocked diagnosis — “Storefront previewed” stays unticked until a preview passes the diagnosis.",
+              }
+            : {}),
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return json<ActionData>({
@@ -804,6 +886,70 @@ function PreviewLinkFallback({
   );
 }
 
+// ── Preview Doctor ───────────────────────────────────────────────────────────
+
+const DOCTOR_BADGES: Record<
+  DoctorStep["status"],
+  { tone?: "success" | "critical" | "warning"; label: string }
+> = {
+  PASS: { tone: "success", label: "Pass" },
+  FAIL: { tone: "critical", label: "Fail" },
+  WARN: { tone: "warning", label: "Check" },
+  SKIP: { label: "Skipped" },
+};
+
+/**
+ * The doctor's step list: one row per render-chain gate, in chain order, with
+ * the diagnosis and (on failure) the fix. Shared by the "Run diagnosis" card
+ * and the blocked-preview banner.
+ */
+function DoctorReportView({ report }: { report: DoctorReport }) {
+  return (
+    <BlockStack gap="300">
+      <InlineStack gap="200" blockAlign="center">
+        <Badge tone={report.verdict === "READY" ? "success" : "critical"}>
+          {report.verdict === "READY" ? "Ready" : "Blocked"}
+        </Badge>
+        <Text as="p" variant="bodySm" tone="subdued">
+          {report.verdict === "READY"
+            ? "Every gate on the render chain is open — the preview should show the widget."
+            : "Start at the first failing step; fix it, then run the diagnosis again."}
+        </Text>
+      </InlineStack>
+      <BlockStack gap="200">
+        {report.steps.map((step) => {
+          const badge = DOCTOR_BADGES[step.status];
+          return (
+            <InlineStack
+              key={step.key}
+              gap="300"
+              blockAlign="start"
+              wrap={false}
+            >
+              <Box minWidth="72px">
+                <Badge tone={badge.tone}>{badge.label}</Badge>
+              </Box>
+              <BlockStack gap="050">
+                <Text as="p" variant="bodyMd" fontWeight="medium">
+                  {step.label}
+                </Text>
+                <Text as="p" variant="bodySm" tone="subdued">
+                  {step.detail}
+                </Text>
+                {step.remediation ? (
+                  <Text as="p" variant="bodySm" fontWeight="medium">
+                    {`Fix: ${step.remediation}`}
+                  </Text>
+                ) : null}
+              </BlockStack>
+            </InlineStack>
+          );
+        })}
+      </BlockStack>
+    </BlockStack>
+  );
+}
+
 // ── Checklist ────────────────────────────────────────────────────────────────
 
 function ChecklistRow({
@@ -952,6 +1098,33 @@ export default function PreviewPage() {
   );
   useOpenPreviewUrl(storefrontFetcher);
   useFetcherToast(storefrontFetcher);
+  const previewProductId =
+    products.find((p) => p.handle === productHandle)?.id ?? "";
+  const submitStorefrontPreview = (openAnyway: boolean) =>
+    storefrontFetcher.submit(
+      {
+        intent: "preview-storefront",
+        productHandle,
+        productId: previewProductId,
+        ...(openAnyway ? { openAnyway: "true" } : {}),
+      },
+      { method: "post" },
+    );
+  const blockedPreviewReport =
+    storefrontFetcher.data && !storefrontFetcher.data.ok
+      ? storefrontFetcher.data.report
+      : undefined;
+
+  // Preview Doctor — on-demand diagnosis of the widget render chain. Unlike
+  // the preview picker, EVERY synced product is selectable here (no disabled
+  // options): the broken products are exactly the ones worth diagnosing.
+  const doctorFetcher = useFetcher<ActionData>();
+  useFetcherToast(doctorFetcher);
+  const [doctorProductHandle, setDoctorProductHandle] = useState(
+    products[0]?.handle ?? "",
+  );
+  const doctorProductId =
+    products.find((p) => p.handle === doctorProductHandle)?.id ?? "";
 
   // Portal preview — demo contract.
   const demoFetcher = useFetcher<ActionData>();
@@ -1394,16 +1567,29 @@ export default function PreviewPage() {
                     variant="primary"
                     disabled={!productHandle}
                     loading={storefrontFetcher.state !== "idle"}
-                    onClick={() =>
-                      storefrontFetcher.submit(
-                        { intent: "preview-storefront", productHandle },
-                        { method: "post" },
-                      )
-                    }
+                    onClick={() => submitStorefrontPreview(false)}
                   >
                     Preview on product page
                   </Button>
                 </InlineStack>
+                {blockedPreviewReport ? (
+                  <Banner
+                    tone="critical"
+                    title="The preview would open a blank page — here's why"
+                  >
+                    <BlockStack gap="300">
+                      <DoctorReportView report={blockedPreviewReport} />
+                      <Box>
+                        <Button
+                          loading={storefrontFetcher.state !== "idle"}
+                          onClick={() => submitStorefrontPreview(true)}
+                        >
+                          Open anyway
+                        </Button>
+                      </Box>
+                    </BlockStack>
+                  </Banner>
+                ) : null}
                 <Text as="p" variant="bodySm" tone="subdued">
                   In the preview tab: pick the subscription option in the
                   widget, add to cart, then open /cart and continue into
@@ -1422,6 +1608,49 @@ export default function PreviewPage() {
                 />
               </BlockStack>
             )}
+            <Divider />
+            {/* ── Preview Doctor ── */}
+            <BlockStack gap="300">
+              <Text as="h3" variant="headingSm">
+                Preview Doctor
+              </Text>
+              <Text as="p" variant="bodySm" tone="subdued">
+                Widget not showing? This checks every gate between your plan
+                and the live product page — plan sync, product attachment,
+                storefront allow-list, app proxy, deployed extension and launch
+                mode — against the live store, and names the first one that's
+                closed. Read-only: nothing on the store is changed.
+              </Text>
+              <InlineStack gap="300" blockAlign="end" wrap>
+                {products.length > 0 ? (
+                  <Box minWidth="280px">
+                    <Select
+                      label="Product to diagnose"
+                      options={products.map((p) => ({
+                        label: p.title,
+                        value: p.handle,
+                      }))}
+                      value={doctorProductHandle}
+                      onChange={setDoctorProductHandle}
+                    />
+                  </Box>
+                ) : null}
+                <Button
+                  loading={doctorFetcher.state !== "idle"}
+                  onClick={() =>
+                    doctorFetcher.submit(
+                      { intent: "run-doctor", productId: doctorProductId },
+                      { method: "post" },
+                    )
+                  }
+                >
+                  Run diagnosis
+                </Button>
+              </InlineStack>
+              {doctorFetcher.data?.report ? (
+                <DoctorReportView report={doctorFetcher.data.report} />
+              ) : null}
+            </BlockStack>
             <Box>
               <Button url="/app/buy-box" variant="plain">
                 Customize the widget's design in the Buy box designer

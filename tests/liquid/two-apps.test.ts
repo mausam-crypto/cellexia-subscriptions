@@ -5,10 +5,12 @@ import {
   JOY_GROUP,
   attributeValue,
   attributeValues,
+  decodeEntitiesOnce,
   parseJsonIsland,
   renderEmbed,
   renderWidget,
   rootTag,
+  storefrontGroupId,
   tagsWithAttribute,
   visibleText,
 } from "./harness";
@@ -35,6 +37,19 @@ import type { MakeContextOptions, OtherAppGroupFixture } from "./harness";
  * that has copied our own name. Every assertion below is a concrete value —
  * a price, a plan id, a cadence — because "the widget rendered" was true
  * during the outage too.
+ *
+ * THE SECOND OUTAGE THIS FILE NOW PINS (the id-space trap): storefront Liquid
+ * exposes selling plan GROUP ids in a DIFFERENT id space than the Admin API —
+ * `selling_plan_group.id` is an opaque storefront identifier, while the
+ * allow-list metafield necessarily carries the numeric ADMIN ids the app
+ * knows. A group-id comparison therefore matches NOTHING on a real
+ * storefront, and an ownership rule that required it rendered nothing on a
+ * product whose plan sync had SUCCEEDED (the merchant saw the "plans from
+ * another app" admin card next to a correctly-synced plan). Selling PLAN ids
+ * are numeric and identical in both APIs — they are what the cart's
+ * `selling_plan` param carries — so PLAN-id intersection is the ownership
+ * factor, and the harness models both id spaces so the group-id assumption
+ * can never quietly return.
  *
  * The prices are fixed by the fixture and worth memorising:
  *
@@ -105,8 +120,10 @@ function expectNoForeignTrace(html: string): void {
   for (const id of [
     JOY_PLAN_ID,
     JOY_GROUP_ID,
+    storefrontGroupId(FIXTURE.foreignGroupId), // Joy's id as Liquid sees it
     RECHARGE_PLAN_ID,
     RECHARGE_GROUP_ID,
+    storefrontGroupId(RECHARGE_GROUP.id),
   ]) {
     expect(html, `foreign id ${id} reached the page`).not.toContain(id);
   }
@@ -157,6 +174,61 @@ describe("a product carrying three subscription apps' groups", () => {
     expectNoForeignTrace(html);
   });
 
+  it("THE LIVE-STORE BUG, REGRESSION-PROOFED: the published numeric group ids match NO Liquid group — plan ids decide", async () => {
+    /* Exactly what the app publishes after a successful sync: numeric ADMIN
+       group ids in `groupIds`. Liquid's `selling_plan_group.id` lives in a
+       different id space (opaque storefront identifiers — the harness now
+       models that), so the group-id field can never pick a group. Ownership
+       that REQUIRED a group-id match therefore rendered nothing on the
+       merchant's correctly-synced product; ownership resting on the PLAN ids
+       — numeric and identical in both APIs — renders ours. Revert the Liquid
+       to group-id(-first) matching and this test fails. */
+    const html = await renderWidget({
+      ...THREE_APPS,
+      planGroups: {
+        v: 1,
+        groupIds: [String(FIXTURE.groupId)], // admin-numeric: matches nothing in Liquid
+        planIds: OUR_PLAN_IDS,
+      },
+    });
+    const root = rootTag(html);
+    expect(root).not.toBeNull();
+    expect(cartSellingPlanId(html)).toBe(OUR_DEFAULT_PLAN_ID);
+    expect(attributeValue(root!, "data-cellexia-money-sub")).toBe("CHF 51.20");
+    expectNoForeignTrace(html);
+  });
+
+  it("renders OURS even when groupIds matches nothing anywhere (pure plan-id path)", async () => {
+    // Not even the admin id of a group on this product: a stale or foreign
+    // groupIds field is simply inert while planIds names our plans.
+    const html = await renderWidget({
+      ...THREE_APPS,
+      planGroups: { v: 1, groupIds: ["424242424242"], planIds: OUR_PLAN_IDS },
+    });
+    expect(cartSellingPlanId(html)).toBe(OUR_DEFAULT_PLAN_ID);
+    expect(parseJsonIsland(html).initialPlan).toBe(OUR_DEFAULT_PLAN_ID);
+    expectNoForeignTrace(html);
+  });
+
+  it("keeps the legacy group-id equality alive as a harmless secondary OR", async () => {
+    /* The old comparison survives, demoted: a group whose Liquid-visible id
+       is named EXACTLY in groupIds still renders even when planIds names
+       none of its plans. Harmless in production because the app publishes
+       admin-numeric ids, which cannot collide with the opaque storefront
+       form — this render is only reachable by writing the opaque id into
+       the metafield by hand. planIds must still be non-empty (the gate). */
+    const html = await renderWidget({
+      ...THREE_APPS,
+      planGroups: {
+        v: 1,
+        groupIds: [storefrontGroupId(FIXTURE.groupId)],
+        planIds: ["424242424242"], // names no plan anywhere
+      },
+    });
+    expect(cartSellingPlanId(html)).toBe(OUR_DEFAULT_PLAN_ID);
+    expectNoForeignTrace(html);
+  });
+
   it("VACUITY GUARD: this fixture CAN render a competitor's group", async () => {
     /* Every assertion above is a negative — "Joy is not on the page" — and a
        fixture whose foreign groups Liquid simply cannot render would satisfy
@@ -165,9 +237,12 @@ describe("a product carrying three subscription apps' groups", () => {
        back: Joy's plan id in the cart mirror, Joy's 5% on the page. The
        allow-list is the only thing standing between that render and a shopper.
 
-       Both fields have to be forged for this to render at all — naming only
-       the group is refused, and so is an allow-list with no plan ids — which
-       is exactly the bar the two mandatory factors are there to set. */
+       planIds is the field that decides (the groupIds entry here is inert —
+       it is Joy's ADMIN id, which matches no Liquid group id). The metafield
+       is written by this app alone, and buildPlanGroupsValue() only ever
+       emits plan ids read off our own SellingPlanConfig rows, so reaching
+       this render means forging the one load-bearing field — the honest
+       statement of the residual. */
     const html = await renderWidget({
       ...THREE_APPS,
       planGroups: { v: 1, groupIds: [JOY_GROUP_ID], planIds: [JOY_PLAN_ID] },
@@ -195,28 +270,33 @@ describe("a product carrying three subscription apps' groups", () => {
     );
   });
 
-  it("REGRESSION: one forged field is not enough — no plan ids, no render", async () => {
+  it("REGRESSION: an allow-list with no plan ids unlocks nothing at all", async () => {
     /* THE HOLE THIS PINS. `planIds` used to be a veto rather than a
        requirement: when it was absent or empty, a group-id match stood alone.
-       That collapsed the two factors back into one in precisely the state this
+       That collapsed ownership onto one field in precisely the state this
        app emits itself — publishOwnGroupsMetafield() writes
        {"groupIds":[…],"planIds":[]} whenever refreshOwnPlanIdsFromShopify()
-       cannot read the group back — so ONE corrupt or forged field put a
-       competitor's group on the page in full: Joy's 5% in the price, Joy's
-       selling plan id in the cart mirror and the JSON island, Joy's contract
-       at the end of it.
-
-       The guard is now symmetric with the group-id one: both fields must name
-       the group before anything renders. Each case below is the vacuity guard
-       above with exactly one field weakened, so a regression that restores the
-       fallback fails here and nowhere else. */
+       cannot read the group back. planIds is now the ownership factor AND a
+       hard gate: without plan ids nothing renders, not even through the
+       legacy group-id OR, and not even for our own group. Briefly absent
+       beats briefly wrong. */
     for (const [label, planGroups] of [
       ["planIds empty", { v: 1, groupIds: [JOY_GROUP_ID], planIds: [] }],
       ["planIds absent", { v: 1, groupIds: [JOY_GROUP_ID] }],
       ["planIds null", { v: 1, groupIds: [JOY_GROUP_ID], planIds: null }],
       [
-        "planIds names OUR plans, groupIds names Joy's group",
-        { v: 1, groupIds: [JOY_GROUP_ID], planIds: OUR_PLAN_IDS },
+        // Even the one groupIds form the legacy OR could match — the exact
+        // opaque storefront id — unlocks nothing without plan ids.
+        "planIds empty, groupIds the exact opaque Liquid id",
+        {
+          v: 1,
+          groupIds: [storefrontGroupId(FIXTURE.foreignGroupId)],
+          planIds: [],
+        },
+      ],
+      [
+        "planIds empty, groupIds OUR admin id",
+        { v: 1, groupIds: [String(FIXTURE.groupId)], planIds: [] },
       ],
     ] as Array<[string, unknown]>) {
       const html = await renderWidget({ ...THREE_APPS, planGroups });
@@ -226,17 +306,20 @@ describe("a product carrying three subscription apps' groups", () => {
       expect(visibleText(html), label).toBe("");
       expectNoForeignTrace(html);
     }
+  });
 
-    // The same weakening applied to OUR OWN group id: an allow-list with no
-    // plan ids unlocks nothing at all, ours included. Briefly absent beats
-    // briefly wrong.
-    const ours = await renderWidget({
+  it("a groupIds entry naming a competitor is inert — planIds still picks OURS", async () => {
+    // The fourth old "one forged field" case, under the real id spaces: a
+    // forged or corrupt groupIds naming Joy's ADMIN id matches no Liquid
+    // group (different id space), and planIds names only plans WE created —
+    // so the widget renders OURS, never Joy's, and never nothing.
+    const html = await renderWidget({
       ...THREE_APPS,
-      planGroups: { v: 1, groupIds: [String(FIXTURE.groupId)], planIds: [] },
+      planGroups: { v: 1, groupIds: [JOY_GROUP_ID], planIds: OUR_PLAN_IDS },
     });
-    expect(rootTag(ours)).toBeNull();
-    expect(visibleText(ours)).toBe("");
-    expectNoForeignTrace(ours);
+    expect(cartSellingPlanId(html)).toBe(OUR_DEFAULT_PLAN_ID);
+    expect(parseJsonIsland(html).initialPlan).toBe(OUR_DEFAULT_PLAN_ID);
+    expectNoForeignTrace(html);
   });
 
   it("does not care where our group sits in the list", async () => {
@@ -309,12 +392,117 @@ describe("a product with no group of ours", () => {
     const noPlans = await renderWidget({ noSellingPlans: true, launchStatus: "live" });
 
     const marker =
-      '<template class="cx-buybox-nogroup" data-cellexia-no-owned-group hidden style="display:none!important"></template>';
+      /<template class="cx-buybox-nogroup" data-cellexia-no-owned-group hidden style="display:none!important"(?: data-cellexia-diag-[a-z-]+="[^"]*")*><\/template>/;
+    expect(foreignOnly).toMatch(marker);
     expect(foreignOnly.replace(marker, "")).toBe(noPlans);
     // The marker is the admin-only diagnostic: empty, hidden, inert. The hint
     // text itself never reaches the storefront markup.
     expect(foreignOnly).not.toContain("Sync your Cellexia plan");
     expect(visibleText(foreignOnly)).toBe("");
+  });
+});
+
+// ── The marker's diagnostic data attributes ──────────────────────────────────
+
+describe("the no-owned-group marker's diagnostic attributes", () => {
+  /**
+   * The empty marker was correct and mute: the admin card could say THAT
+   * nothing matched but never WHY. These data-cellexia-diag-* attributes make
+   * the reason readable in a browser inspector (and available to the JS card):
+   * which groups the product actually carries (app id + truncated name),
+   * whether an allow-list was published at all, and how many plan ids it
+   * holds. They live on a <template> that renders nothing, carries [hidden]
+   * and an inline display:none — nothing here is shopper-perceivable.
+   */
+  const markerTag = (html: string): string => {
+    const markers = tagsWithAttribute(html, "data-cellexia-no-owned-group");
+    expect(markers).toHaveLength(1);
+    return markers[0];
+  };
+
+  it("says WHY nothing matched: every group, the allow-list state, the plan-id count", async () => {
+    const html = await renderWidget({
+      omitOwnGroup: true,
+      otherGroups: [JOY_GROUP, RECHARGE_GROUP],
+      launchStatus: "live",
+    });
+    const marker = markerTag(html);
+    expect(attributeValue(marker, "data-cellexia-diag-group-count")).toBe("2");
+    expect(
+      decodeEntitiesOnce(
+        attributeValue(marker, "data-cellexia-diag-groups") ?? "",
+      ),
+    ).toBe(
+      "joy-subscriptions:Joy Subscriptions — Save 5% ~ " +
+        "recharge:Recharge Refills — 15% off",
+    );
+    // The allow-list WAS published (it names our plans; this product simply
+    // does not carry our group): "present", with its 3 plan ids counted.
+    expect(attributeValue(marker, "data-cellexia-diag-allowlist")).toBe(
+      "present",
+    );
+    expect(attributeValue(marker, "data-cellexia-diag-plan-count")).toBe("3");
+    // Still invisible and inert.
+    expect(visibleText(html)).toBe("");
+    expectNoForeignTrace(html);
+  });
+
+  it("reports an absent allow-list (plans never synced) with a zero plan count", async () => {
+    const html = await renderWidget({
+      planGroups: null,
+      otherGroups: [JOY_GROUP],
+      launchStatus: "live",
+    });
+    const marker = markerTag(html);
+    expect(attributeValue(marker, "data-cellexia-diag-allowlist")).toBe(
+      "absent",
+    );
+    expect(attributeValue(marker, "data-cellexia-diag-plan-count")).toBe("0");
+    // Joy's group AND our (unprovable) own group are both listed — the card
+    // can say "a Cellexia-named group is here but no allow-list proves it".
+    expect(attributeValue(marker, "data-cellexia-diag-group-count")).toBe("2");
+    expect(
+      decodeEntitiesOnce(
+        attributeValue(marker, "data-cellexia-diag-groups") ?? "",
+      ),
+    ).toContain("cellexia:Cellexia Ritual");
+  });
+
+  it("truncates a long merchant group name to 40 characters", async () => {
+    const html = await renderWidget({
+      omitOwnGroup: true,
+      otherGroups: [{ ...JOY_GROUP, name: "A".repeat(60) }],
+      launchStatus: "live",
+    });
+    expect(
+      decodeEntitiesOnce(
+        attributeValue(markerTag(html), "data-cellexia-diag-groups") ?? "",
+      ),
+    ).toBe(`joy-subscriptions:${"A".repeat(40)}`);
+  });
+
+  it("escapes merchant text into the attribute exactly once", async () => {
+    const html = await renderWidget({
+      omitOwnGroup: true,
+      otherGroups: [{ ...JOY_GROUP, name: 'Joy "Save & Smile" <b>' }],
+      launchStatus: "live",
+    });
+    const raw =
+      attributeValue(markerTag(html), "data-cellexia-diag-groups") ?? "";
+    expect(raw).toContain("&quot;");
+    expect(raw).not.toContain("&amp;amp;");
+    expect(raw).not.toContain("<b>");
+    expect(decodeEntitiesOnce(raw)).toBe(
+      'joy-subscriptions:Joy "Save & Smile" <b>',
+    );
+    expect(visibleText(html)).toBe("");
+  });
+
+  it("carries no diagnostic attributes when a widget renders (nothing to explain)", async () => {
+    const html = await renderWidget(THREE_APPS);
+    expect(rootTag(html)).not.toBeNull();
+    expect(html).not.toContain("data-cellexia-diag-");
+    expect(html).not.toContain("data-cellexia-no-owned-group");
   });
 });
 
@@ -455,99 +643,32 @@ describe("before the first plan sync (no allow-list published yet)", () => {
   });
 });
 
-// ── e. Id comparison is exact string equality ────────────────────────────────
+// ── e. Plan-id comparison is exact string equality ───────────────────────────
 
-describe("allow-list ids are compared by exact equality", () => {
+describe("allow-list plan ids are compared by exact equality", () => {
   /**
-   * Group ids are decimal strings, and Liquid's `contains` works on strings.
-   * A comparison written as `cx_allow_ids contains cx_g_id`, or against a
-   * joined list, silently matches a PREFIX or a SUBSTRING — and on a two-app
-   * product the competitor's group is the one that comes first, so the sloppy
-   * comparison does not merely allow the wrong group, it PREFERS it.
-   *
-   * These ids are deliberately tiny so both directions of the containment are
-   * exercised: "12" is a substring of "123", and "123" contains "12".
+   * Plan ids are decimal strings, and Liquid's `contains` works on strings.
+   * A comparison written against a JOINED list silently matches a PREFIX or a
+   * SUBSTRING — and on a multi-app product the competitor's group is the one
+   * that comes first, so the sloppy comparison does not merely allow the
+   * wrong group, it PREFERS it. Now that plan ids decide ownership, the
+   * partial-match hazard lives HERE; the ids below are chosen so both
+   * directions of the containment are exercised.
    */
-  it("an allow-listed '12' does not match a competitor's group 123", async () => {
+  it("a foreign plan id that is a SUBSTRING of ours never matches (Joy first)", async () => {
+    // Joy's plan id is a 9-digit prefix of our weeks4 plan id 6881100001.
+    // `planIds joined` contains it, so a contains-comparison would render
+    // JOY — who sits first on the product. Exact equality skips Joy and
+    // renders ours.
     const html = await renderWidget({
-      ownGroupId: 12,
-      otherGroups: [{ ...JOY_GROUP, id: 123 }], // FIRST on the product
-      planGroups: { v: 1, groupIds: ["12"], planIds: OUR_PLAN_IDS },
-      launchStatus: "live",
-    });
-    expect(cartSellingPlanId(html)).toBe(OUR_DEFAULT_PLAN_ID);
-    expect(attributeValue(rootTag(html)!, "data-cellexia-money-sub")).toBe(
-      "CHF 51.20",
-    );
-    expect(html).not.toContain(JOY_PLAN_ID);
-  });
-
-  it("an allow-listed '123' does not match a competitor's group 12", async () => {
-    const html = await renderWidget({
-      ownGroupId: 123,
-      otherGroups: [{ ...JOY_GROUP, id: 12 }],
-      planGroups: { v: 1, groupIds: ["123"], planIds: OUR_PLAN_IDS },
-      launchStatus: "live",
-    });
-    expect(cartSellingPlanId(html)).toBe(OUR_DEFAULT_PLAN_ID);
-    expect(html).not.toContain(JOY_PLAN_ID);
-  });
-
-  it("renders nothing when the allow-list entry merely resembles both ids", async () => {
-    const html = await renderWidget({
-      ownGroupId: 12,
-      otherGroups: [{ ...JOY_GROUP, id: 123 }],
-      planGroups: { v: 1, groupIds: ["1"], planIds: OUR_PLAN_IDS }, // a prefix of both
-      launchStatus: "live",
-    });
-    expect(rootTag(html)).toBeNull();
-    expect(visibleText(html)).toBe("");
-    expect(html).not.toContain(JOY_PLAN_ID);
-  });
-
-  it("matches a real-length id exactly, and near misses not at all", async () => {
-    const ours = String(FIXTURE.groupId);
-    for (const entry of [
-      ours.slice(0, -1), // a prefix of ours
-      ours.slice(1), // a suffix of ours
-      `${ours}0`, // an id ours is a prefix of
-      ` ${ours}`, // whitespace is not equality
-      `${ours},${JOY_GROUP_ID}`, // a joined list is not a list
-    ]) {
-      const html = await renderWidget({
-        otherGroups: [JOY_GROUP],
-        planGroups: { v: 1, groupIds: [entry], planIds: OUR_PLAN_IDS },
-        launchStatus: "live",
-      });
-      expect(rootTag(html), `entry ${JSON.stringify(entry)}`).toBeNull();
-      expect(html, `entry ${JSON.stringify(entry)}`).not.toContain(JOY_PLAN_ID);
-    }
-
-    // The exact entry still renders: the loop above is not vacuous.
-    const exact = await renderWidget({
-      otherGroups: [JOY_GROUP],
-      planGroups: { v: 1, groupIds: [ours], planIds: OUR_PLAN_IDS },
-      launchStatus: "live",
-    });
-    expect(cartSellingPlanId(exact)).toBe(OUR_DEFAULT_PLAN_ID);
-  });
-
-  it("accepts the id in either JSON form (string or number)", async () => {
-    for (const entry of [String(FIXTURE.groupId), FIXTURE.groupId]) {
-      const html = await renderWidget({
-        otherGroups: [JOY_GROUP],
-        planGroups: { v: 1, groupIds: [entry], planIds: OUR_PLAN_IDS },
-        launchStatus: "live",
-      });
-      expect(cartSellingPlanId(html), typeof entry).toBe(OUR_DEFAULT_PLAN_ID);
-    }
-  });
-
-  it("picks OUR group even when a competitor is allow-listed alongside it", async () => {
-    // A stale allow-list (our group id plus one that was never ours) must not
-    // become "first match on the product wins" — Joy is first on the product.
-    const html = await renderWidget({
-      otherGroups: [JOY_GROUP],
+      otherGroups: [
+        {
+          ...JOY_GROUP,
+          plans: [
+            { id: 688110000, name: "Delivery every 1 month", optionValue: "1 month" },
+          ],
+        },
+      ],
       planGroups: {
         v: 1,
         groupIds: [String(FIXTURE.groupId)],
@@ -556,6 +677,125 @@ describe("allow-list ids are compared by exact equality", () => {
       launchStatus: "live",
     });
     expect(cartSellingPlanId(html)).toBe(OUR_DEFAULT_PLAN_ID);
+    expect(attributeValue(rootTag(html)!, "data-cellexia-money-sub")).toBe(
+      "CHF 51.20",
+    );
+    // Every plan reachable from the markup is exactly ours — the 9-digit
+    // foreign id would be caught here if it leaked anywhere.
+    expect(planIdsInMarkup(html)).toEqual([...OUR_PLAN_IDS].sort());
+  });
+
+  it("a foreign plan id that CONTAINS ours never matches either", async () => {
+    // The other direction: Joy's plan id has our weeks4 id as a prefix.
+    const html = await renderWidget({
+      otherGroups: [
+        {
+          ...JOY_GROUP,
+          plans: [
+            { id: 68811000019, name: "Delivery every 1 month", optionValue: "1 month" },
+          ],
+        },
+      ],
+      planGroups: {
+        v: 1,
+        groupIds: [String(FIXTURE.groupId)],
+        planIds: OUR_PLAN_IDS,
+      },
+      launchStatus: "live",
+    });
+    expect(cartSellingPlanId(html)).toBe(OUR_DEFAULT_PLAN_ID);
+    expect(planIdsInMarkup(html)).toEqual([...OUR_PLAN_IDS].sort());
+    expect(html).not.toContain("68811000019");
+  });
+
+  it("matches a real-length plan id exactly, and near misses not at all", async () => {
+    const ours = OUR_DEFAULT_PLAN_ID;
+    for (const entry of [
+      ours.slice(0, -1), // a prefix of ours
+      ours.slice(1), // a suffix of ours
+      `${ours}0`, // an id ours is a prefix of
+      ` ${ours}`, // whitespace is not equality
+      OUR_PLAN_IDS.join(","), // a joined list is not a list
+    ]) {
+      const html = await renderWidget({
+        otherGroups: [JOY_GROUP],
+        planGroups: {
+          v: 1,
+          groupIds: [String(FIXTURE.groupId)],
+          planIds: [entry],
+        },
+        launchStatus: "live",
+      });
+      expect(rootTag(html), `entry ${JSON.stringify(entry)}`).toBeNull();
+      expect(html, `entry ${JSON.stringify(entry)}`).not.toContain(JOY_PLAN_ID);
+    }
+
+    // The exact entry still renders: the loop above is not vacuous. ONE plan
+    // id is enough to prove the group.
+    const exact = await renderWidget({
+      otherGroups: [JOY_GROUP],
+      planGroups: {
+        v: 1,
+        groupIds: [String(FIXTURE.groupId)],
+        planIds: [ours],
+      },
+      launchStatus: "live",
+    });
+    expect(cartSellingPlanId(exact)).toBe(OUR_DEFAULT_PLAN_ID);
+  });
+
+  it("accepts plan ids in either JSON form (string or number)", async () => {
+    for (const planIds of [
+      [...OUR_PLAN_IDS],
+      [...OUR_PLAN_IDS].map(Number),
+    ] as const) {
+      const html = await renderWidget({
+        otherGroups: [JOY_GROUP],
+        planGroups: {
+          v: 1,
+          groupIds: [String(FIXTURE.groupId)],
+          planIds,
+        },
+        launchStatus: "live",
+      });
+      expect(cartSellingPlanId(html), typeof planIds[0]).toBe(
+        OUR_DEFAULT_PLAN_ID,
+      );
+    }
+  });
+
+  it("a stale groupIds entry naming a competitor cannot flip ownership", async () => {
+    // A stale allow-list (our group's admin id plus one that was never ours)
+    // must not become "first match on the product wins" — Joy is first on
+    // the product, but neither admin-numeric entry matches any Liquid group,
+    // and the plan ids name only ours.
+    const html = await renderWidget({
+      otherGroups: [JOY_GROUP],
+      planGroups: {
+        v: 1,
+        groupIds: [JOY_GROUP_ID, String(FIXTURE.groupId)],
+        planIds: OUR_PLAN_IDS,
+      },
+      launchStatus: "live",
+    });
+    expect(cartSellingPlanId(html)).toBe(OUR_DEFAULT_PLAN_ID);
+    expect(html).not.toContain(JOY_PLAN_ID);
+  });
+
+  it("the legacy group-id OR is exact too — a truncated opaque id matches nothing", async () => {
+    const sfg = storefrontGroupId(FIXTURE.groupId);
+    const html = await renderWidget({
+      otherGroups: [JOY_GROUP],
+      planGroups: {
+        v: 1,
+        groupIds: [sfg.slice(0, -1)], // near-miss of the only matchable form
+        planIds: ["424242424242"], // names no plan, so only the OR could fire
+      },
+      launchStatus: "live",
+    });
+    expect(rootTag(html)).toBeNull();
+    expect(visibleText(html)).toBe("");
+    expect(html).not.toContain(JOY_PLAN_ID);
   });
 });
 

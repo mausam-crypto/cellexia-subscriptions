@@ -243,6 +243,21 @@ const GROUP_DELETE_MUTATION = `#graphql
   }
 `;
 
+const PRODUCT_GROUPS_QUERY = `#graphql
+  query CellexiaProductSellingPlanGroups($ids: [ID!]!) {
+    nodes(ids: $ids) {
+      ... on Product {
+        id
+        sellingPlanGroups(first: 25) {
+          nodes {
+            id
+          }
+        }
+      }
+    }
+  }
+`;
+
 // ── Response shapes ──────────────────────────────────────────────────────────
 
 interface RawPlanNode {
@@ -296,6 +311,13 @@ interface GroupDeleteResponse {
   } | null;
 }
 
+interface ProductGroupsResponse {
+  nodes?: Array<{
+    id: string;
+    sellingPlanGroups?: { nodes?: Array<{ id: string }> | null } | null;
+  } | null> | null;
+}
+
 // ── Public API ───────────────────────────────────────────────────────────────
 
 export interface SellingPlanSyncResult {
@@ -347,6 +369,60 @@ export async function getSellingPlanGroupPlanIds(
 ): Promise<string[]> {
   const group = await fetchGroup(admin, groupId);
   return planIdsOf(group);
+}
+
+/**
+ * Products the `nodes(ids:)` query reads per round trip. Each product carries
+ * a 25-item sellingPlanGroups connection, so 25 products keeps a single query
+ * comfortably under Shopify's 1000-point single-query cost ceiling.
+ */
+const ATTACHMENT_QUERY_BATCH = 25;
+
+/**
+ * Attachment verification — which of `productIds` do NOT currently carry the
+ * selling plan group `groupId` on Shopify?
+ *
+ * WHY THIS EXISTS. `sellingPlanGroupAddProducts` returning without userErrors
+ * is not proof the storefront agrees: another subscription app's own product
+ * sync can detach our group from products it also manages (observed live with
+ * Joy on the merchant's store), and a deleted product simply vanishes. A
+ * config must never sit at SYNCED while the product page has nothing of ours
+ * to render — so the sync flow verifies after attaching, and the daily drift
+ * check re-verifies, both through this one function.
+ *
+ * Deliberately in ADMIN id space end to end: the product GIDs come from the
+ * config, the group GID from the sync result, and the query returns admin
+ * GIDs — exact string equality is reliable here. (Storefront Liquid exposes
+ * GROUP ids in a different, opaque id space — that comparison lives in the
+ * buy box and matches on PLAN ids instead; never mix the two id spaces.)
+ *
+ * A product that cannot be read back (null node — deleted, or not a Product)
+ * counts as MISSING: the group is provably not attached to anything a
+ * customer can buy under that id. Throws on transport/GraphQL errors — the
+ * caller decides what an unverifiable state means for it.
+ */
+export async function findProductsMissingFromGroup(
+  admin: AdminClient,
+  groupId: string,
+  productIds: string[],
+): Promise<string[]> {
+  const missing: string[] = [];
+  for (let i = 0; i < productIds.length; i += ATTACHMENT_QUERY_BATCH) {
+    const chunk = productIds.slice(i, i + ATTACHMENT_QUERY_BATCH);
+    const data = await gql<ProductGroupsResponse>(admin, PRODUCT_GROUPS_QUERY, {
+      ids: chunk,
+    });
+    const attachedById = new Map<string, boolean>();
+    for (const node of data.nodes ?? []) {
+      if (!node?.id) continue;
+      const groups = node.sellingPlanGroups?.nodes ?? [];
+      attachedById.set(node.id, groups.some((g) => g.id === groupId));
+    }
+    for (const productId of chunk) {
+      if (attachedById.get(productId) !== true) missing.push(productId);
+    }
+  }
+  return missing;
 }
 
 /** Delete the group on Shopify (plans go with it). Returns the deleted GID. */

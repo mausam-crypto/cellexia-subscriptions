@@ -313,11 +313,12 @@ describe("plan_groups metafield", () => {
   });
 
   it("repairs missing plan ids BEFORE publishing, so planIds is never needlessly empty", async () => {
-    // The snippet uses planIds as a second factor on the group id: an
-    // allow-list naming another app's group is only refused if we also
-    // published plan ids to contradict it. A shop upgrading from a build that
-    // never recorded shopifyPlanIds would otherwise have go-live freeze an
-    // empty planIds into the metafield and disarm that check.
+    // The snippet decides ownership on planIds (Liquid's group ids live in a
+    // different id space than the admin ids groupIds carries, so plan-id
+    // intersection is the one comparison that can match), and an allow-list
+    // with no plan ids renders nothing at all. A shop upgrading from a build
+    // that never recorded shopifyPlanIds would otherwise have go-live freeze
+    // an empty planIds into the metafield and go dark storefront-wide.
     mocks.planConfigFindMany.mockResolvedValue([
       { id: "cfg_1", shopifyGroupId: "gid://shopify/SellingPlanGroup/77", shopifyPlanIds: null },
     ]);

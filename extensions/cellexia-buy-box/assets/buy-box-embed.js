@@ -290,26 +290,44 @@
 
   var diagnosticShown = false;
 
+  /* True only when THIS page load carries ?cx_preview= in its own URL.
+     Computed here rather than trusted off a global: it is one URLSearchParams
+     read, and a gate this sensitive should not depend on script load order. */
+  var previewTokenInUrl = false;
+  try {
+    previewTokenInUrl = !!new URLSearchParams(window.location.search).get(
+      'cx_preview'
+    );
+  } catch (err) {
+    previewTokenInUrl = false;
+  }
+
   /**
    * Preview sessions must never fail silently: when no anchor matched, the
    * admin who followed a ?cx_preview= link gets a plain-English hint card.
    *
-   * IT IS GATED ON THE VALIDATED SESSION, NEVER ON THE RAW TOKEN.
-   * buy-box.js writes the ?cx_preview= URL parameter into sessionStorage
-   * BEFORE the app proxy has judged it, so "a token is in sessionStorage"
-   * only means "somebody put a value in the URL" — a leaked or expired link
-   * forwarded in a chat, a crawler replaying an old URL, or anyone appending
-   * the parameter. Keying off that would show internal English vendor copy to
-   * a Swiss customer on a live storefront. Only CellexiaSubs.previewValidated
-   * — set exclusively on a { ok: true } answer from
-   * /apps/cellexia-subs/preview/validate — opens this gate; the validation is
-   * async, so buy-box.js also fires cx:preview:validated, which retries the
-   * mount (and therefore this card) below. No element id (namespace hazard),
-   * English only (admin-only diagnostics are not customer-facing copy).
+   * IT IS GATED ON THE VALIDATED SESSION *AND* THE ?cx_preview= PARAMETER IN
+   * THIS PAGE LOAD'S URL — never on the raw token alone, never on
+   * sessionStorage alone. buy-box.js writes the ?cx_preview= URL parameter
+   * into sessionStorage BEFORE the app proxy has judged it, so "a token is
+   * in sessionStorage" only means "somebody put a value in the URL" — a
+   * leaked or expired link forwarded in a chat, a crawler replaying an old
+   * URL, or anyone appending the parameter. Keying off that would show
+   * internal English vendor copy to a Swiss customer on a live storefront.
+   * And the VALIDATED token also persists in sessionStorage across same-tab
+   * navigation (that is how the widget reveal follows PDP → cart), so the
+   * validated session alone would raise this card on pages the admin never
+   * previewed — the URL parameter pins it to the page actually opened
+   * through a preview link. CellexiaSubs.previewValidated is set exclusively
+   * on a { ok: true } answer from /apps/cellexia-subs/preview/validate; the
+   * validation is async, so buy-box.js also fires cx:preview:validated,
+   * which retries the mount (and therefore this card) below. No element id
+   * (namespace hazard), English only (admin-only diagnostics are not
+   * customer-facing copy).
    */
   function maybeShowDiagnostic() {
     try {
-      if (diagnosticShown || !document.body) {
+      if (diagnosticShown || !document.body || !previewTokenInUrl) {
         return;
       }
       if (subs.previewValidated !== true) {

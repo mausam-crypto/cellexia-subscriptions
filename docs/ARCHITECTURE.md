@@ -240,6 +240,17 @@ session only. Checkout needs no reveal: recurring terms show natively once a
 line was added with a selling plan, and only the previewing admin ever does
 that while in SETUP.
 
+When validation **fails** (rejected token, proxy 404/5xx, network error) the
+widget stays fail-closed but `buy-box.js` raises a diagnostic card gated on
+`?cx_preview=` being in the page's own URL — the only gate available, since
+there is no validated session to require. That makes the card an
+**unauthenticated surface** (anyone can append `?cx_preview=x` to a gated
+page), so its copy names no internal paths and no operator commands: it
+carries the transport detail (e.g. `HTTP 404`) and routes the admin to the
+admin-gated **Preview Doctor**, which names the exact cause and fix behind
+authentication. `tests/preview-failure.test.ts` pins the copy and the
+no-internal-detail rule.
+
 **Portal preview.** `PortalSession.isPreview` renders the full portal UI with
 a persistent "Preview mode" banner; every mutating action is intercepted with
 an explanatory toast — nothing executes, no Shopify calls. Preview a real
@@ -347,8 +358,12 @@ empty, `hidden`, `display:none!important`, and carrying none of the widget's
 own hooks so no selector in either asset file can mistake it for a widget.
 `assets/buy-box.js` turns it into the admin-only "this product has subscription
 plans from another app but none from Cellexia" hint card, and only inside a
-server-validated preview session (`CellexiaSubs.previewValidated`) — the same
-gate as the placement-anchor diagnostic. A customer can never see it.
+server-validated preview session (`CellexiaSubs.previewValidated`) **and** on a
+page whose own URL carries `?cx_preview=` — the same double gate as the
+placement-anchor diagnostic. The validated session persists in
+`sessionStorage` for the widget reveal (PDP → cart), so the URL half pins every
+diagnostic card to the page actually opened through a preview link. A customer
+can never see it.
 
 **Admin surfacing.** The merchant must be able to see the situation without
 reading a database: `app/lib/ownership/foreign-groups.server.ts` scans the

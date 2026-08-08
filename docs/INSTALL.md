@@ -512,7 +512,13 @@ products, and each renders its own widget.
    product → open the preview link. The buy box should show the subscription
    option preselected with the savings badge. (In Setup mode the widget is
    hidden on the plain storefront — only the preview link reveals it, and only
-   in your own browser.)
+   in your own browser.) **Widget not showing?** Run the **Preview Doctor**
+   first (same card, under the preview picker): it walks every gate between
+   your plan and the live page — sync, product attachment, allow-list, app
+   proxy, deployed extension — and names the first closed one. The preview
+   button also runs it automatically and shows the report instead of opening
+   a blank tab. See
+   [OPERATIONS.md §20](./OPERATIONS.md#20-runbook--widget-not-showing).
 3. Place a test subscription with a [test card](./TESTING.md#test-cards)
    (dev store / Shopify Payments test mode: `4242 4242 4242 4242`) — add to
    cart from your preview session; checkout shows the recurring terms natively.
@@ -554,6 +560,11 @@ On **Preview & launch**:
    own browser session). Check the PDP widget (desktop + mobile), add to cart
    with a plan selected (the cart line shows the plan), continue to checkout
    (recurring terms shown natively). Real visitors see none of this.
+   A blank page here is never something to debug by hand: the **Preview
+   Doctor** runs automatically before the tab opens and, when a gate on the
+   render chain is closed, shows the diagnosis (first failing step + fix)
+   instead of the blank tab — and you can run it on demand from the same
+   card ([OPERATIONS.md §20](./OPERATIONS.md#20-runbook--widget-not-showing)).
 2. **Portal preview** — one click creates a local-only **demo subscription**
    (never billed, never synced, invisible to analytics), or pick a real
    imported subscriber. The full portal opens with a "Preview mode" banner;
@@ -562,7 +573,10 @@ On **Preview & launch**:
 3. The full QA script for this pass is
    [TESTING.md §10](./TESTING.md#10-preview-based-qa-pre-launch-on-the-live-store).
 
-Both previews tick their checklist items on the page automatically.
+Both previews tick their checklist items on the page automatically — except
+a storefront preview opened via **Open anyway** (or one whose pre-flight
+diagnosis could not run): those open un-vetted and leave "Storefront
+previewed" unticked until a preview passes the diagnosis.
 
 ### 10c. Go live
 
@@ -635,8 +649,8 @@ nothing at all on products without selling plans).
 If the embed is on and the page still shows no widget, the automatic
 placement found no anchor in your theme's markup: the embed leaves the widget
 unmounted rather than guess, logs a console warning naming the selector that
-failed, and — inside a validated preview session only — shows a small "no
-placement anchor found" hint card. **Do not "fix" this by entering
+failed, and — inside a validated preview session, on the `?cx_preview=` page
+itself only — shows a small "no placement anchor found" hint card. **Do not "fix" this by entering
 `.pdp__info .pdp__grey`**: that selector is heuristic #1 in
 `assets/buy-box-embed.js`, so it has already been tried and matched nothing.
 The panel must have been renamed or restructured (a theme update). Inspect

@@ -1510,6 +1510,15 @@ describe("entity-bearing money formats", () => {
  * The fix is an allow-list published by the app (shop metafield
  * cellexia.plan_groups), and one absolute rule: render OUR group, or render
  * NOTHING. There is no "closest match", and no fallback to the first group.
+ *
+ * WHAT PROVES A GROUP OURS: its PLAN ids. Storefront Liquid exposes selling
+ * plan GROUP ids in a different id space than the Admin API (opaque
+ * storefront identifiers vs the numeric admin ids the metafield carries), so
+ * the published groupIds can never match a Liquid group id — plan ids are
+ * numeric and identical in both APIs, and the intersection with planIds is
+ * the ownership test. The legacy group-id equality survives only as a
+ * harmless secondary OR. tests/liquid/two-apps.test.ts owns the full id-space
+ * story; the harness models both spaces.
  */
 describe("selling plan group ownership", () => {
   /** The plan ids the rendered markup would put in a cart. */
@@ -1530,12 +1539,12 @@ describe("selling plan group ownership", () => {
   /**
    * Our plan ids, in the string form the metafield carries.
    *
-   * Nearly every case below has to supply these, because BOTH allow-list
-   * fields are mandatory: a group is rendered only when `groupIds` names it
-   * AND `planIds` names one of the plans it actually contains. An allow-list
-   * with no plan ids unlocks nothing at all, so `planIds: []` is no longer a
-   * shorthand for "test the group-id match on its own" — it is a second way of
-   * saying "render nothing", and using it would make these tests vacuous.
+   * These are the load-bearing field: a group is rendered only when `planIds`
+   * names one of the plans it actually contains (or, residually, when
+   * `groupIds` names its exact Liquid-visible id — a form the app never
+   * publishes). An allow-list with no plan ids unlocks nothing at all, so
+   * `planIds: []` is a second way of saying "render nothing", and using it
+   * would make these tests vacuous.
    */
   const OUR_PLAN_IDS = [...ALL_PLAN_IDS].map(String);
 
@@ -1572,16 +1581,14 @@ describe("selling plan group ownership", () => {
        ONLY thing standing between that render and a shopper is the
        allow-list.
 
-       Note that BOTH fields have to be forged, and that this is the honest
-       statement of the residual. Naming the foreign group in `groupIds` alone
-       is not enough (pinned next door in "planIds is a SECOND FACTOR on the
-       group id") and neither is an allow-list with no plan ids at all: a group
-       is rendered only when both fields agree on it. So reaching this render
-       means someone wrote a metafield that names another app's group AND that
-       app's plan — nothing this app can produce, since buildPlanGroupsValue()
-       only ever emits ids read off our own SellingPlanConfig rows. Two
-       mandatory factors raise the bar to "forge both"; they cannot make a
-       merchant-writable metafield unforgeable, and that is the residual. */
+       The field that decides is `planIds` (the forged groupIds entry is
+       admin-numeric and matches no Liquid group id — it is inert either
+       way), and an allow-list with no plan ids at all unlocks nothing. So
+       reaching this render means someone wrote a metafield naming another
+       app's PLAN — nothing this app can produce, since
+       buildPlanGroupsValue() only ever emits ids read off our own
+       SellingPlanConfig rows. The allow-list cannot make a merchant-writable
+       metafield unforgeable, and that is the residual. */
     const html = await renderWidget({
       foreignGroupFirst: true,
       planGroups: {
@@ -1627,34 +1634,38 @@ describe("selling plan group ownership", () => {
     expect(visibleText(html)).toBe("");
   });
 
-  it("matches group ids exactly — never by prefix or substring", async () => {
-    const ourId = String(FIXTURE.groupId);
-    for (const nearMiss of [
-      ourId.slice(0, 4), // a prefix: "6612" must not match 6612300000009
-      ourId.slice(1), // a suffix
-      ourId + "9", // an id ours is a prefix of
-      ` ${ourId}`, // whitespace is not equality
-    ]) {
-      const html = await renderWidget({
-        planGroups: { v: 1, groupIds: [nearMiss], planIds: OUR_PLAN_IDS },
-        launchStatus: "live",
-      });
-      expect(html, nearMiss).not.toContain("data-cellexia-buybox");
-    }
-
-    // …and the exact id still renders, so the loop above is not vacuous. The
-    // plan ids are identical in both, which is what isolates the group-id
-    // comparison as the only thing that changed.
-    const exact = await renderWidget({
-      planGroups: { v: 1, groupIds: [ourId], planIds: OUR_PLAN_IDS },
+  it("group ids live in different id spaces — the exact ADMIN id matches nothing, plan ids decide", async () => {
+    // The exact admin-numeric group id with planIds naming nothing: NOTHING
+    // renders, because Liquid's group ids are opaque storefront identifiers
+    // the admin id can never equal…
+    const adminIdOnly = await renderWidget({
+      planGroups: {
+        v: 1,
+        groupIds: [String(FIXTURE.groupId)],
+        planIds: ["424242424242"],
+      },
       launchStatus: "live",
     });
-    expect(rootTag(exact)).not.toBeNull();
+    expect(rootTag(adminIdOnly)).toBeNull();
+
+    // …while the production shape — the same admin-numeric groupIds plus the
+    // real plan ids — renders through the plan-id intersection. An ownership
+    // rule that requires the group-id match fails THIS assertion.
+    const production = await renderWidget({
+      planGroups: {
+        v: 1,
+        groupIds: [String(FIXTURE.groupId)],
+        planIds: OUR_PLAN_IDS,
+      },
+      launchStatus: "live",
+    });
+    expect(rootTag(production)).not.toBeNull();
+    expect(parseJsonIsland(production).initialPlan).toBe(DEFAULT_PLAN_ID);
   });
 
   it("accepts a numeric id in the metafield (both sides are normalised)", async () => {
     // Numbers on BOTH fields: JSON may carry either form and the snippet
-    // normalises each with an empty append before comparing.
+    // normalises each with an empty append before comparing plan ids.
     const html = await renderWidget({
       planGroups: {
         v: 1,
@@ -1759,22 +1770,19 @@ describe("selling plan group ownership", () => {
     });
   });
 
-  describe("planIds is a SECOND FACTOR on the group id", () => {
+  describe("planIds decide ownership (groupIds cannot, by construction)", () => {
     /**
-     * Matching on `groupIds` alone made the whole ownership decision rest on
-     * one field of one metafield. An allow-list naming the OTHER app's group
-     * id — a hand-edit in Settings → Custom data, any app holding
-     * write_metafields, a bad group id persisted on a SellingPlanConfig —
-     * resolved to JOY'S GROUP, and every line of the widget below that point
-     * is written on the documented assumption that the group it was handed is
-     * ours: Joy's selling plan id went into the JSON island as initialPlan,
-     * into the hidden nameless mirror, and into the cart, with Joy's 5% as the
-     * price on our page.
-     *
-     * `planIds` is independent evidence (it names plans WE created), so a
-     * group must clear both fields to be rendered.
+     * The ownership factor is the PLAN-id intersection: plan ids are the one
+     * id space storefront Liquid and the Admin API share, and they name plans
+     * THIS APP created through the API. The groupIds field still travels in
+     * the metafield, but it is admin-numeric and Liquid's group ids are
+     * opaque, so it can neither pick a group nor veto one; the exact-equality
+     * comparison against it survives only as a residual OR
+     * (tests/liquid/two-apps.test.ts pins that path).
      */
-    it("refuses a foreign group even when the allow-list names its id", async () => {
+    it("refuses a foreign group even when the allow-list names its admin id", async () => {
+      // Doubly dead: the admin-numeric id matches no Liquid group id, and
+      // Joy's plans are not in planIds.
       const html = await renderWidget({
         planGroups: {
           v: 1,
@@ -1789,9 +1797,9 @@ describe("selling plan group ownership", () => {
       expect(html).not.toContain("data-cellexia-buybox");
     });
 
-    it("skips the forged entry and still renders ours when both are listed", async () => {
-      // A failed second factor must not abort the scan: the product may carry
-      // a group that is genuinely ours further down the list.
+    it("skips the foreign entry and still renders ours when both are listed", async () => {
+      // A group matching nothing must not abort the scan: the product may
+      // carry a group that is genuinely ours further down the list.
       const html = await renderWidget({
         planGroups: {
           v: 1,
@@ -1806,8 +1814,15 @@ describe("selling plan group ownership", () => {
       expect(html).not.toContain(FOREIGN_PLAN_ID);
     });
 
-    it("refuses OUR group id when the listed plans belong to the other app", async () => {
-      // The mirror image: neither field is trusted on its own.
+    it("renders whoever planIds names — the honest residual", async () => {
+      /* planIds naming the OTHER app's plan renders the other app's group,
+         whatever groupIds says (here it says OUR group, and is inert). This
+         is the same bar the old two-factor rule set, restated for the real
+         id spaces: the metafield is written by this app alone and
+         buildPlanGroupsValue() only ever emits ids read off our own
+         SellingPlanConfig rows, so reaching this render means someone forged
+         the one load-bearing field. A field the app could not overrule with
+         groupIds — that field CAN never match, so it can never veto. */
       const html = await renderWidget({
         planGroups: {
           v: 1,
@@ -1817,8 +1832,8 @@ describe("selling plan group ownership", () => {
         foreignGroupFirst: true,
         launchStatus: "live",
       });
-      expect(rootTag(html)).toBeNull();
-      expect(html).not.toContain(FOREIGN_PLAN_ID);
+      expect(parseJsonIsland(html).initialPlan).toBe(FOREIGN_PLAN_ID);
+      expect(html).not.toContain(String(FIXTURE.planIds.weeks8));
     });
 
     it("renders normally in the steady state (both fields ours)", async () => {
@@ -1841,18 +1856,20 @@ describe("selling plan group ownership", () => {
       ["absent", undefined],
       ["an empty list", []],
     ])(
-      "renders NOTHING when planIds is %s — both factors are mandatory",
+      "renders NOTHING when planIds is %s — plan ids are mandatory",
       async (_label, planIds) => {
         /* This used to render on the group id alone, on the reasoning that a
            shop upgraded from a build without SellingPlanConfig.shopifyPlanIds
            would otherwise lose its buy box until the repair ran. That made the
-           second factor a veto rather than a requirement, and it was a hole:
+           plan ids a veto rather than a requirement, and it was a hole:
            "planIds is empty" is a state THIS APP EMITS — publishOwnGroupsMetafield()
            writes {"groupIds":["77"],"planIds":[]} whenever the plan-id repair
            cannot read the group back (see tests/ownership.test.ts, "publishes
            group ids anyway when the repair cannot read the group"). In that
            state one corrupt or forged field — groupIds naming another app's
-           group — was enough to render that app's group in full.
+           group — was enough to render that app's group in full. Today the
+           plan ids are the ownership factor itself, so without them there is
+           no evidence to render on at all.
 
            So the cost is paid in the other direction now: an allow-list with
            no plan ids unlocks nothing, and the widget is briefly absent rather
@@ -1906,9 +1923,17 @@ describe("selling plan group ownership", () => {
       expect(marker[0]).toContain("<template");
       expect(marker[0]).toContain("cx-buybox-nogroup");
       expect(marker[0]).toContain("hidden");
-      // Nothing inside it, and no widget hook on it.
-      expect(html).toContain(
-        '<template class="cx-buybox-nogroup" data-cellexia-no-owned-group hidden style="display:none!important"></template>',
+      // Nothing inside it, and no widget hook on it — only the fixed hiding
+      // attributes plus the data-cellexia-diag-* attributes that say why
+      // nothing matched (pinned in tests/liquid/two-apps.test.ts).
+      expect(html).toMatch(
+        /<template class="cx-buybox-nogroup" data-cellexia-no-owned-group hidden style="display:none!important"(?: data-cellexia-diag-[a-z-]+="[^"]*")*><\/template>/,
+      );
+      expect(attributeValue(marker[0], "data-cellexia-diag-group-count")).toBe(
+        "1",
+      );
+      expect(attributeValue(marker[0], "data-cellexia-diag-allowlist")).toBe(
+        "present",
       );
       expect(visibleText(html)).toBe("");
       // The English hint itself lives in the JS, never in the served markup.
@@ -1920,10 +1945,8 @@ describe("selling plan group ownership", () => {
         foreignGroupOnly: true,
         launchStatus: "live",
       });
-      expect(section.trim()).toBe(
-        "<!-- BEGIN app snippet: cx-buybox-core -->" +
-          '<template class="cx-buybox-nogroup" data-cellexia-no-owned-group hidden style="display:none!important"></template>' +
-          "<!-- END app snippet -->",
+      expect(section.trim()).toMatch(
+        /^<!-- BEGIN app snippet: cx-buybox-core --><template class="cx-buybox-nogroup" data-cellexia-no-owned-group hidden style="display:none!important"(?: data-cellexia-diag-[a-z-]+="[^"]*")*><\/template><!-- END app snippet -->$/,
       );
 
       // The embed still ships its wrapper + scripts (that is what turns the
