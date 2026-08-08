@@ -5,7 +5,10 @@ import { logEvent } from "~/lib/events/log.server";
 import type { AdminClient } from "~/lib/graphql/client.server";
 import { getShopMetafield } from "~/lib/graphql/metafields.server";
 import { getProducts } from "~/lib/graphql/products.server";
-import { findProductsMissingFromGroup } from "~/lib/graphql/sellingPlans.server";
+import {
+  findProductsMissingFromGroup,
+  getCurrentAppId,
+} from "~/lib/graphql/sellingPlans.server";
 import {
   PLAN_GROUPS_METAFIELD_KEY,
   PLAN_GROUPS_METAFIELD_NAMESPACE,
@@ -34,10 +37,13 @@ import { getLaunchState, probeProxyIdentity } from "./launch.server";
  * Id spaces (the v1.6.6 lesson, do not regress): `group_on_product` compares
  * Admin API group GIDs against Admin API reads — one id space, exact equality
  * is reliable. `allow_list` mirrors what storefront Liquid actually gates on:
- * numeric ids, and the PRIMARY ownership factor is the PLAN ids (storefront
- * Liquid exposes group ids in a different, opaque id space, so the group-id
- * factor is inert there) — an allow-list with group ids but no plan ids
- * renders NOTHING and must fail this step.
+ * numeric ids, and ownership requires TWO factors together — the PLAN ids
+ * (storefront Liquid exposes group ids in a different, opaque id space, so
+ * the group-id factor is inert there) AND the owning app's id (read off
+ * `selling_plan_group.app_id`, which — unlike group ids — is directly
+ * comparable between the Admin API and storefront Liquid). An allow-list
+ * missing group ids, plan ids, OR the app id renders NOTHING and must fail
+ * this step.
  */
 
 export type DoctorStepStatus = "PASS" | "FAIL" | "WARN" | "SKIP";
@@ -352,13 +358,20 @@ export async function runPreviewDoctor(
         remediation: REMEDIATIONS.allow_list,
       };
     }
-    const published = parsed as { groupIds?: unknown; planIds?: unknown };
+    const published = parsed as {
+      groupIds?: unknown;
+      planIds?: unknown;
+      appId?: unknown;
+    };
     const publishedGroupIds = Array.isArray(published.groupIds)
       ? published.groupIds.map(String)
       : [];
     const publishedPlanIds = Array.isArray(published.planIds)
       ? published.planIds.map(String)
       : [];
+    const publishedAppId =
+      typeof published.appId === "string" ? published.appId : null;
+    const ourAppId = await getCurrentAppId(admin);
 
     const ownGroups = configs.filter((c) => c.shopifyGroupId != null);
     const preferred = ownGroups.filter(isRenderableConfig);
@@ -401,6 +414,15 @@ export async function runPreviewDoctor(
         "its planIds list contains none of our selling plan ids (the storefront matches on plan ids)",
       );
     }
+    if (publishedAppId == null) {
+      problems.push(
+        "its appId field is missing — the widget requires an appId match alongside the plan ids and renders nothing until republished",
+      );
+    } else if (publishedAppId !== ourAppId) {
+      problems.push(
+        `its appId (${publishedAppId}) does not match this app's installed id (${ourAppId})`,
+      );
+    }
     if (problems.length > 0) {
       return {
         status: "FAIL",
@@ -414,7 +436,7 @@ export async function runPreviewDoctor(
         ownGroupNumericIds.length === 1 ? "" : "s"
       } (${ownGroupNumericIds.join(", ")}) plus ${publishedPlanIds.length} plan id${
         publishedPlanIds.length === 1 ? "" : "s"
-      }.`,
+      } and a matching appId.`,
     };
   });
 

@@ -64,11 +64,12 @@ const SYNCED_CONFIG = {
   productIds: [PRODUCT_GID],
 };
 
-/** The published allow-list, both lists populated (the only renderable shape). */
+/** The published allow-list, both lists and appId populated (the only renderable shape). */
 const ALLOW_LIST_VALUE = JSON.stringify({
   v: 1,
   groupIds: ["111"],
   planIds: ["901", "902"],
+  appId: "cellexia",
 });
 
 const METAFIELD = {
@@ -136,6 +137,7 @@ const mocks = vi.hoisted(() => ({
   getShopMetafield: vi.fn(async (): Promise<unknown> => null),
   getProducts: vi.fn(async (): Promise<unknown[]> => []),
   findProductsMissingFromGroup: vi.fn(async (): Promise<string[]> => []),
+  getCurrentAppId: vi.fn(async (): Promise<string> => "cellexia"),
   getLaunchState: vi.fn(async (): Promise<unknown> => ({})),
   probeProxyIdentity: vi.fn(async (): Promise<unknown> => ({})),
   buildStorefrontPreviewUrl: vi.fn(async (): Promise<string> => ""),
@@ -172,6 +174,7 @@ vi.mock("~/lib/graphql/products.server", () => ({
 
 vi.mock("~/lib/graphql/sellingPlans.server", () => ({
   findProductsMissingFromGroup: mocks.findProductsMissingFromGroup,
+  getCurrentAppId: mocks.getCurrentAppId,
 }));
 
 vi.mock("~/lib/launch/launch.server", () => ({
@@ -293,6 +296,7 @@ beforeEach(() => {
   mocks.getShopMetafield.mockResolvedValue({ ...METAFIELD });
   mocks.getProducts.mockResolvedValue([{ ...PRODUCT }]);
   mocks.findProductsMissingFromGroup.mockResolvedValue([]);
+  mocks.getCurrentAppId.mockResolvedValue("cellexia");
   mocks.getLaunchState.mockResolvedValue({ ...SETUP_LAUNCH });
   mocks.probeProxyIdentity.mockResolvedValue({
     status: "OK",
@@ -509,6 +513,37 @@ describe("allow_list — plan ids are the storefront's ownership factor", () => 
     const s = step(report, "allow_list");
     expect(s.status).toBe("FAIL");
     expect(s.detail).toContain("111");
+  });
+
+  it("FAILs an allow-list with correct plan ids but a MISSING appId", async () => {
+    // A metafield written by a pre-appId-fix app version: correct group and
+    // plan ids, no appId field at all. The widget requires both factors, so
+    // this must FAIL rather than report PASS on a dark storefront.
+    mocks.getShopMetafield.mockResolvedValue({
+      ...METAFIELD,
+      value: JSON.stringify({ v: 1, groupIds: ["111"], planIds: ["901", "902"] }),
+    });
+    const report = await runPreviewDoctor(SHOP_DOMAIN, PRODUCT_GID);
+    const s = step(report, "allow_list");
+    expect(s.status).toBe("FAIL");
+    expect(s.detail).toContain("appId field is missing");
+    expect(report.firstBlockedStep).toBe("allow_list");
+  });
+
+  it("FAILs an allow-list whose appId names a different app", async () => {
+    mocks.getShopMetafield.mockResolvedValue({
+      ...METAFIELD,
+      value: JSON.stringify({
+        v: 1,
+        groupIds: ["111"],
+        planIds: ["901", "902"],
+        appId: "another-subscription-app",
+      }),
+    });
+    const report = await runPreviewDoctor(SHOP_DOMAIN, PRODUCT_GID);
+    const s = step(report, "allow_list");
+    expect(s.status).toBe("FAIL");
+    expect(s.detail).toContain("does not match this app's installed id");
   });
 });
 

@@ -86,8 +86,12 @@ data-cellexia-selling-plan
 "variants": {"4411100011101": {
 "available": true,
 "oneTime": "CHF 64.00",
+"oneTimeCents": 6400,
+"compareAt": "",
 "plans": {"6881100001": {
 "first": "CHF 51.20",
+"firstCents": 5120,
+"ongoing": "CHF 57.60",
 "then": "then CHF 57.60 every 4 weeks",
 "save": "Save 20%",
 "perDelivery": "",
@@ -96,6 +100,8 @@ data-cellexia-selling-plan
 "savePct": "20%"
 },"6881100002": {
 "first": "CHF 51.20",
+"firstCents": 5120,
+"ongoing": "CHF 57.60",
 "then": "then CHF 57.60 every 6 weeks",
 "save": "Save 20%",
 "perDelivery": "",
@@ -104,6 +110,8 @@ data-cellexia-selling-plan
 "savePct": "20%"
 },"6881100003": {
 "first": "CHF 51.20",
+"firstCents": 5120,
+"ongoing": "CHF 57.60",
 "then": "then CHF 57.60 every 8 weeks",
 "save": "Save 20%",
 "perDelivery": "",
@@ -114,8 +122,12 @@ data-cellexia-selling-plan
 },"4411100011102": {
 "available": true,
 "oneTime": "CHF 98.00",
+"oneTimeCents": 9800,
+"compareAt": "",
 "plans": {"6881100001": {
 "first": "CHF 78.40",
+"firstCents": 7840,
+"ongoing": "CHF 88.20",
 "then": "then CHF 88.20 every 4 weeks",
 "save": "Save 20%",
 "perDelivery": "",
@@ -124,6 +136,8 @@ data-cellexia-selling-plan
 "savePct": "20%"
 },"6881100002": {
 "first": "CHF 78.40",
+"firstCents": 7840,
+"ongoing": "CHF 88.20",
 "then": "then CHF 88.20 every 6 weeks",
 "save": "Save 20%",
 "perDelivery": "",
@@ -132,6 +146,8 @@ data-cellexia-selling-plan
 "savePct": "20%"
 },"6881100003": {
 "first": "CHF 78.40",
+"firstCents": 7840,
+"ongoing": "CHF 88.20",
 "then": "then CHF 88.20 every 8 weeks",
 "save": "Save 20%",
 "perDelivery": "",

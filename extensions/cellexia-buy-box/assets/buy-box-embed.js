@@ -977,8 +977,12 @@
      the add-to-cart button while the theme shows another — one price on the
      page, another at checkout. So both events are handled, and the deferred
      re-read consults the URL first and the theme's own current-variant field
-     second. Interval-free by design; ids the widget does not recognise are
-     ignored inside buy-box.js, so every push here is safe. */
+     second. Since v1.6.8 buy-box.js also carries the GENERIC event-free
+     layers (product-area click delegation + a visibility-gated [name="id"]
+     poll), which catch pickers this file has never heard of — this module
+     stays the picker-specific fast path and keeps no interval of its own.
+     Ids the widget does not recognise are ignored inside buy-box.js, so
+     every push here is safe. */
 
   function pushVariant(value) {
     if (value == null || value === '') {

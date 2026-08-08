@@ -98,7 +98,12 @@ describe("a product carrying ONLY another app's group", () => {
   it("VACUITY GUARD: this exact fixture DOES render that group once it is allow-listed", async () => {
     const html = await renderWidget({
       ...FOREIGN_ONLY,
-      planGroups: { v: 1, groupIds: [JOY_GROUP_ID], planIds: [JOY_PLAN_ID] },
+      planGroups: {
+        v: 1,
+        groupIds: [JOY_GROUP_ID],
+        planIds: [JOY_PLAN_ID],
+        appId: "joy-subscriptions",
+      },
     });
 
     expect(html).toContain("data-cellexia-buybox");

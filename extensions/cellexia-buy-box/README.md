@@ -305,8 +305,14 @@ only swaps strings — it never formats money or builds copy. `freq` and
 re-resolution; `pd` feeds the per-delivery hooks; `oneTime` (per variant)
 and `first` (per variant × plan) are also the pair the theme add-to-cart
 price sync swaps, so a variant or frequency change re-syncs the theme's
-button without the JS ever formatting money. Every string in the island is
-RAW — see the island exception above for why.
+button without the JS ever formatting money. Since v1.6.8 the matrix is
+complete per variant: `oneTimeCents` and `compareAt` (formatted, emitted
+only when it beats the price) per variant, `firstCents` and the formatted
+`ongoing` price per variant × plan, plus `available` — the cents exist so
+the ONE client-side price comparison (the strike-through decision) is
+exact instead of a string inequality; every displayed string still comes
+pre-formatted from Liquid. Every string in the island is RAW — see the
+island exception above for why.
 
 ### Merchant custom CSS (brace containment)
 
@@ -391,14 +397,51 @@ Embed behaviours worth knowing:
   anything at all errors. An add-to-cart can never break. Covered by
   `tests/embed-cart-injection.test.ts`, which drives the real file through
   `window.fetch` and asserts on the outgoing bodies.
-- **Variant tracking.** Beyond the standard form/URL handling in
-  `buy-box.js`, the embed watches the Sleepify size picker
-  (`.pdp__options`) for **clicks as well as `change` events** — swatch
-  buttons and labels fire no `change`, and a widget stuck on the first
-  variant's prices would quote a price the checkout does not honour — then
-  re-reads `?variant=` and, if the theme does not use it, the theme's own
-  current-variant field (`[name="id"]`, or a `[data-variant-id]` outside the
-  picker). Ids that are not this product's are ignored. No polling.
+- **Variant tracking (layered, event-independent since v1.6.8).** Events
+  are the fast path: product-form `change` and `?variant=` (history patch +
+  popstate) in `buy-box.js`, plus this embed's Sleepify size-picker watcher
+  (`.pdp__options`, **clicks as well as `change` events** — swatch buttons
+  and labels fire no `change`). Underneath them, `buy-box.js` also tracks
+  variants **with no event at all** — the fix for the live merchant report:
+  their theme sells jar packs as separate variants switched by its own pill
+  buttons, setting state programmatically (jQuery `.val()`, no `change`
+  event, no `?variant=` write), and every widget price stayed frozen on the
+  landing variant. Three layers, all funnelling into one authoritative
+  re-read (the theme's `[name="id"]` input-or-select — bound form first,
+  then a READ-ONLY document-wide scan that skips our own markup — then
+  `?variant=`, else keep current): click delegation over the product area
+  (re-read next macrotask + again at +350 ms, themes update state
+  asynchronously), and a 600 ms poll of the same field — a string compare,
+  only while the document is visible, ONE interval per widget, cleared on
+  pagehide and detach, re-armed by `resync()` — which catches ANY
+  mechanism, including pure-JS themes. The poll reuses the last scan's
+  field list (validated for liveness, re-queried every 10th tick);
+  click-driven re-reads always re-query. A page carrying SEVERAL
+  `[name="id"]` fields for this product (quick-buy modal, sticky
+  add-to-cart bar) is settled on evidence, not document order: when
+  island-known values disagree, the field whose value **changed** since
+  the last read wins, then a field inside the widget's own section, else
+  keep current — a stale duplicate can never freeze or flip the widget. On
+  a change, every price surface of every preset repaints from the island's
+  per-variant matrix, the root `data-cellexia-money-*` pair re-anchors, and
+  the theme add-to-cart price sync swaps the new variant's strings.
+- **Un-synced variants park the widget.** A NUMERIC id the island has no
+  row for, read from the bound (ownership-checked) form or from a field
+  that was previously seen holding this product's ids, is conclusive: the
+  product gained a variant after the last plan sync, and nothing the
+  widget could show would price it. The widget **parks** — root `[hidden]`
+  plus its own `data-cellexia-unsynced` marker, the theme's form released
+  (no `selling_plan` left to 422 the new variant, design property
+  disabled), the theme's button text restored, `getState()` null so the
+  embed's cart patcher carries no plan either — and un-parks with a full
+  repaint the moment a known variant returns. Foreign numeric ids with no
+  such history (another product's quick-add) never park anything. A plan
+  re-sync ships a fresh island, so a reloaded page prices the new variant
+  normally. Covered by `tests/buybox-variant-tracking.test.ts` (real
+  Liquid render + real JS, programmatic switch with NO events), including
+  mutation checks that disable the poll and the disagreement rules and
+  prove the respective tests fail without them, and by the two-nets
+  vacuity guard in `tests/buybox-foreign-section-form.test.ts`.
 
 ### Anchor-selector troubleshooting
 

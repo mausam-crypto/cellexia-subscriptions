@@ -31,6 +31,7 @@ const mocks = vi.hoisted(() => ({
   getSellingPlanGroupPlanIds: vi.fn(
     async (_admin: unknown, _groupId: string): Promise<string[]> => [],
   ),
+  getCurrentAppId: vi.fn(async (_admin: unknown): Promise<string> => "cellexia"),
 }));
 
 vi.mock("~/db.server", () => ({
@@ -71,6 +72,7 @@ vi.mock("~/lib/events/log.server", () => ({
 
 vi.mock("~/lib/graphql/sellingPlans.server", () => ({
   getSellingPlanGroupPlanIds: mocks.getSellingPlanGroupPlanIds,
+  getCurrentAppId: mocks.getCurrentAppId,
 }));
 
 import {
@@ -108,6 +110,7 @@ beforeEach(() => {
   mocks.contractCount.mockResolvedValue(0);
   mocks.syncContractFromShopify.mockResolvedValue({});
   mocks.getSellingPlanGroupPlanIds.mockResolvedValue([]);
+  mocks.getCurrentAppId.mockResolvedValue("cellexia");
 });
 
 describe("numericIdFromGid", () => {
@@ -302,6 +305,7 @@ describe("plan_groups metafield", () => {
       v: 1,
       groupIds: ["77"],
       planIds: ["111", "112"],
+      appId: "cellexia",
     });
   });
 
@@ -347,7 +351,12 @@ describe("plan_groups metafield", () => {
 
     const result = await publishOwnGroupsMetafield("cellexia.myshopify.com");
     expect(result.ok).toBe(true);
-    expect(result.value).toEqual({ v: 1, groupIds: ["77"], planIds: [] });
+    expect(result.value).toEqual({
+      v: 1,
+      groupIds: ["77"],
+      planIds: [],
+      appId: "cellexia",
+    });
   });
 
   it("omits groups that were never synced", async () => {

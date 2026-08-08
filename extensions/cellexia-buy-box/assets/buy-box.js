@@ -42,12 +42,21 @@
  *    subscription radio natively through its for attribute — the browser's
  *    label click fires the radio change event this file already handles.
  *    Do not add a parallel handler for it.
- *  - Re-render prices when the variant changes: product form `change`
- *    events, plus a ?variant= URL fallback (history patch + popstate) for
- *    themes that update the URL without a reachable DOM event. Price nodes
- *    carry stable data-cellexia-* hooks in every preset (data-cellexia-sub-price,
- *    data-cellexia-onetime-price, data-cellexia-pd-price, data-cellexia-then, data-cellexia-save,
- *    data-cellexia-per-delivery, data-cellexia-first-label).
+ *  - Re-render prices when the variant changes — for ANY switching
+ *    mechanism. Product form `change` events and the ?variant= URL fallback
+ *    (history patch + popstate) are the fast paths; under them sit
+ *    EVENT-FREE layers (v1.6.8, from the live Sleepify defect: the theme's
+ *    size pills set the variant programmatically — jQuery .val(), no change
+ *    event, no URL write — and every price surface froze on the landing
+ *    variant): click delegation over the product area and a cheap 600ms
+ *    visibility-gated poll of the theme's [name="id"] field, both funnelling
+ *    into one authoritative re-read. See "Event-independent variant
+ *    tracking" inside init(). Price nodes carry stable data-cellexia-* hooks
+ *    in every preset (data-cellexia-sub-price, data-cellexia-onetime-price,
+ *    data-cellexia-pd-price, data-cellexia-then, data-cellexia-save,
+ *    data-cellexia-per-delivery, data-cellexia-first-label); a variant change
+ *    also re-anchors the root's data-cellexia-money-* pair so the theme
+ *    add-to-cart price sync swaps the NEW variant's strings.
  *  - Re-resolve {percent}/{amount}/{frequency} text templates carried in
  *    data-cellexia-tpl attributes with per-plan values from the JSON island.
  *  - Keep the THEME's own add-to-cart button honest: when a theme prints the
@@ -1541,11 +1550,23 @@
       });
 
       if (subAvailable) {
+        /* Strike-through compare: exact via the island's cents when present
+           (a one-time price NOT above the subscription price earns no
+           strike), string inequality as the pre-matrix fallback inside
+           setPrice(). */
+        var compareText = variant.oneTime || null;
+        if (
+          typeof variant.oneTimeCents === 'number' &&
+          typeof plan.firstCents === 'number' &&
+          variant.oneTimeCents <= plan.firstCents
+        ) {
+          compareText = null;
+        }
         els.subPrice.forEach(function (el) {
           setPrice(
             el,
             plan.first,
-            el.hasAttribute('data-cellexia-compare') ? variant.oneTime : null
+            el.hasAttribute('data-cellexia-compare') ? compareText : null
           );
         });
         els.pdPrice.forEach(function (el) {
@@ -1595,6 +1616,20 @@
         }
       } else if (state.mode === 'subscription' && !data.requiresSellingPlan) {
         setMode('one_time');
+      }
+      /* Re-anchor the theme add-to-cart price-sync pair on what was just
+         painted. The island is the sync's primary source, but the root
+         attributes are its server-rendered fallback and the pair external
+         readers see — left stale they re-freeze the theme's button on the
+         landing variant, which is half of the live v1.6.8 bug. */
+      try {
+        root.setAttribute('data-cellexia-money-onetime', variant.oneTime || '');
+        root.setAttribute(
+          'data-cellexia-money-sub',
+          plan && plan.first ? plan.first : ''
+        );
+      } catch (err) {
+        /* attribute write is a nicety — the island still carries the pair */
       }
       /* The variant/plan the widget just painted is also the pair the theme's
          add-to-cart button has to quote. */
@@ -1677,10 +1712,17 @@
              the re-render that moved us — re-bind before writing. */
           ensureForm();
           applySellingPlan(true);
+          /* A detach stops the variant poll; a re-insert re-arms it (no-op
+             while it is already running). */
+          startVariantPoll();
           /* A reveal (validated preview token) or an embed mount is also the
              moment the theme's button becomes ours to keep honest — and a
              re-hide is the moment to give it back. */
           syncThemePrice();
+          /* …and the moment to re-read the theme's CURRENT variant with a
+             fresh field scan: the page may have moved (or landed on an
+             un-synced variant) while this widget was hidden or detached. */
+          reReadVariant(true);
         }
       });
       if (!subs.pruneWidgets) {
@@ -1918,11 +1960,361 @@
     window.addEventListener('popstate', onUrlChange);
     window.addEventListener('cx:locationchange', onUrlChange);
 
+    /* ── Event-independent variant tracking (v1.6.8) ─────────────────────────
+       Observed live on the client's Sleepify theme: jar packs are separate
+       VARIANTS switched by the theme's own pill buttons, and the theme sets
+       its current-variant state programmatically (jQuery .val()) — no change
+       event ever fires and ?variant= is never written, so every listener
+       above stays silent while the theme's own price display and the cart
+       move on. The widget then quotes the landing variant's prices next to a
+       button selling another variant. Events stay the fast path; these
+       layers sit underneath and need no event at all:
+
+         1. readThemeVariant() — the authoritative re-read: the theme's
+            [name="id"] input-or-select (our bound form first, then a
+            READ-ONLY document-wide scan that skips our own markup). Then
+            ?variant=, else keep the current variant. A page can carry
+            SEVERAL such fields for this product (quick-buy modal, sticky
+            add-to-cart bar, featured-product section), so when island-known
+            values DISAGREE the scan settles on evidence instead of document
+            order: the field whose value actually CHANGED since the last
+            read (the one the shopper is driving) wins, then a field inside
+            the widget's own section, else keep the current variant — a
+            stale duplicate can never freeze or flip the widget. A numeric
+            id the island does NOT know, appearing in our bound form or in a
+            field we watched hold our own ids, is CONCLUSIVE: the product
+            gained a variant after plan sync, and the widget parks (below)
+            rather than quote another variant's prices;
+         2. click delegation over the product area (host section, else the
+            bound form, else the whole page): any click schedules a re-read
+            on the next macrotask and again at +350ms, because themes update
+            their state asynchronously;
+         3. a 600ms poll of the same field — a string compare against the
+            current variant, only while the document is visible, ONE
+            interval per widget, cleared on pagehide and on detach, re-armed
+            by resync() — which catches ANY switching mechanism, including
+            pure-JS themes with no clicks near us. The poll reuses the last
+            scan's field list (validated for liveness) and only re-runs the
+            document-wide query every 10th tick; click-driven re-reads
+            always re-query, so a form the theme just opened is seen at the
+            interaction that opened it.
+
+       All three funnel into onVariantMaybeChanged(), whose render() repaints
+       every price surface of every preset from the island matrix and
+       re-anchors the theme add-to-cart price sync. */
+
+    /** Island row exists for this id? (own-property — never the prototype). */
+    function knownVariant(value) {
+      return (
+        !!value && Object.prototype.hasOwnProperty.call(data.variants, value)
+      );
+    }
+
+    var THEME_FIELDS_MAX_AGE = 10;
+    var themeFields = null;
+    var themeFieldsAge = 0;
+
+    /**
+     * The THEME's [name="id"] fields — strictly read-only, foreign by
+     * design (it is the theme's state we are after): skip anything of ours.
+     * `fresh` forces the document-wide query; otherwise the previous list is
+     * reused while every field in it is still connected and the list is
+     * younger than THEME_FIELDS_MAX_AGE polls, so the widget's lifetime poll
+     * does not pay a document-wide querySelectorAll per tick.
+     */
+    function scanThemeFields(fresh) {
+      if (!fresh && themeFields && themeFieldsAge < THEME_FIELDS_MAX_AGE) {
+        var reusable = true;
+        for (var i = 0; i < themeFields.length; i++) {
+          if (!inDocument(themeFields[i])) {
+            reusable = false;
+            break;
+          }
+        }
+        if (reusable) {
+          themeFieldsAge += 1;
+          return themeFields;
+        }
+      }
+      var fields;
+      try {
+        fields = document.querySelectorAll(
+          'input[name="id"], select[name="id"]'
+        );
+      } catch (err) {
+        themeFields = null;
+        return [];
+      }
+      var found = [];
+      for (var j = 0; j < fields.length; j++) {
+        var field = fields[j];
+        if (
+          field.closest &&
+          (field.closest(OWN_WIDGET) || field.closest(OWN_WRAPPER))
+        ) {
+          continue;
+        }
+        found.push(field);
+      }
+      themeFields = found;
+      themeFieldsAge = 0;
+      return found;
+    }
+
+    /* Last-seen value per scanned field — the evidence the disagreement and
+       un-synced rules read. Rebuilt on every scan pass, so entries for
+       fields that left the document fall away on their own. */
+    var fieldMemory = [];
+
+    function rememberedValue(field) {
+      for (var i = 0; i < fieldMemory.length; i++) {
+        if (fieldMemory[i].field === field) {
+          return fieldMemory[i].value;
+        }
+      }
+      return null;
+    }
+
+    /**
+     * The theme's current variant, as { id, unsynced }: `id` is an
+     * island-known variant id or null; `unsynced: true` is the CONCLUSIVE
+     * "this product now sells a variant the island has no row for" verdict
+     * (see the section comment) — never raised from a value that could
+     * belong to another product's form.
+     */
+    function readThemeVariant(fresh) {
+      if (form && inDocument(form)) {
+        var idInput = form.querySelector('[name="id"]');
+        if (idInput) {
+          var formValue = idInput.value == null ? '' : String(idInput.value);
+          if (knownVariant(formValue)) {
+            return { id: formValue, unsynced: false };
+          }
+          if (/^\d+$/.test(formValue)) {
+            /* The bound form passed the ownership check, so a numeric id
+               the island does not know is OUR product's un-synced variant. */
+            return { id: null, unsynced: true };
+          }
+        }
+      }
+      var fields = scanThemeFields(fresh);
+      var known = [];
+      var distinct = [];
+      var changedKnown = null;
+      var changedConflict = false;
+      var changedUnsynced = false;
+      var memory = [];
+      for (var i = 0; i < fields.length; i++) {
+        var field = fields[i];
+        var value = field.value == null ? '' : String(field.value);
+        var last = rememberedValue(field);
+        memory.push({ field: field, value: value });
+        if (knownVariant(value)) {
+          known.push({ field: field, value: value });
+          if (distinct.indexOf(value) === -1) {
+            distinct.push(value);
+          }
+          if (last !== null && last !== value) {
+            if (changedKnown === null) {
+              changedKnown = value;
+            } else if (changedKnown !== value) {
+              changedConflict = true;
+            }
+          }
+        } else if (
+          /^\d+$/.test(value) &&
+          last !== null &&
+          knownVariant(last)
+        ) {
+          /* A field we watched hold OUR ids now holds a numeric id the
+             island does not know — an un-synced variant of this product. */
+          changedUnsynced = true;
+        }
+      }
+      fieldMemory = memory;
+      if (changedKnown !== null && !changedConflict) {
+        return { id: changedKnown, unsynced: false };
+      }
+      if (changedUnsynced) {
+        return { id: null, unsynced: true };
+      }
+      if (distinct.length === 1) {
+        return { id: distinct[0], unsynced: false };
+      }
+      if (distinct.length > 1) {
+        var section = null;
+        try {
+          section = root.closest('.shopify-section');
+        } catch (err) {
+          section = null;
+        }
+        if (section && section.contains) {
+          var sectionValue = null;
+          var sectionConflict = false;
+          for (var k = 0; k < known.length; k++) {
+            if (!section.contains(known[k].field)) {
+              continue;
+            }
+            if (sectionValue === null) {
+              sectionValue = known[k].value;
+            } else if (sectionValue !== known[k].value) {
+              sectionConflict = true;
+            }
+          }
+          if (sectionValue !== null && !sectionConflict) {
+            return { id: sectionValue, unsynced: false };
+          }
+        }
+      }
+      return { id: null, unsynced: false };
+    }
+
+    /* ── Un-synced variant posture ("parked") ────────────────────────────────
+       The theme is selling a variant of THIS product that the island has no
+       row for — one added after the last plan sync. Every price string the
+       widget could show belongs to ANOTHER variant, and a selling_plan left
+       in the form could 422 the theme's add-to-cart (the plan may not cover
+       the new variant). So the widget steps aside: root [hidden] plus the
+       data-cellexia-unsynced marker (ours to remove, unlike the launch
+       gate's), the theme's form released through the existing hidden-widget
+       write path, the theme's button given its own text back, getState()
+       null so the embed's cart patcher carries no plan either. The theme
+       sells the variant one-time, exactly as if the widget were not
+       installed. The moment the theme returns to a variant the island
+       knows, the widget un-parks, repaints and re-writes the form. A plan
+       re-sync ships a fresh island, so a reloaded page prices the new
+       variant normally. */
+
+    function parkUnsynced() {
+      if (root.getAttribute('data-cellexia-unsynced') === 'true') {
+        return; /* already parked */
+      }
+      if (widgetHidden()) {
+        return; /* gated or unmounted: nothing shown, nothing written */
+      }
+      root.setAttribute('data-cellexia-unsynced', 'true');
+      root.setAttribute('hidden', 'hidden');
+      /* widgetHidden() is true from here on: this releases the theme's form
+         (selling_plan emptied or removed, design prop disabled) and gives
+         the theme's add-to-cart button its own text back. */
+      applySellingPlan(true);
+      syncThemePrice();
+    }
+
+    function unparkUnsynced() {
+      if (root.getAttribute('data-cellexia-unsynced') !== 'true') {
+        return false;
+      }
+      root.removeAttribute('data-cellexia-unsynced');
+      root.removeAttribute('hidden');
+      return true;
+    }
+
+    function reReadVariant(fresh) {
+      var read = readThemeVariant(fresh);
+      if (read.unsynced) {
+        parkUnsynced();
+        return;
+      }
+      var next = read.id || variantIdFromUrl();
+      if (!next || !knownVariant(String(next))) {
+        /* No signal, or an id the island does not know without conclusive
+           evidence it is ours: keep the current variant, as before. */
+        return;
+      }
+      next = String(next);
+      if (unparkUnsynced()) {
+        /* Back on a variant the island knows: repaint and re-write
+           everything the parked state released — even when it is the very
+           variant the widget froze on. */
+        state.variantId = next;
+        render();
+        applySellingPlan(true);
+        return;
+      }
+      onVariantMaybeChanged(next);
+    }
+
+    function onProductAreaClick(event) {
+      if (!inDocument(root)) {
+        return; /* a ghost re-reads nothing */
+      }
+      var area = null;
+      try {
+        area = root.closest('.shopify-section');
+      } catch (err) {
+        area = null;
+      }
+      if (!area && form && inDocument(form)) {
+        area = form;
+      }
+      if (
+        area &&
+        event &&
+        event.target &&
+        area.contains &&
+        !area.contains(event.target)
+      ) {
+        return;
+      }
+      /* fresh: the click may have OPENED the form it is about to drive
+         (quick-buy modal), so the cached field list must not be trusted. */
+      window.setTimeout(function () {
+        reReadVariant(true);
+      }, 0);
+      window.setTimeout(function () {
+        reReadVariant(true);
+      }, 350);
+    }
+    document.addEventListener('click', onProductAreaClick, true);
+
+    var variantPoll = null;
+    function stopVariantPoll() {
+      if (variantPoll === null) {
+        return;
+      }
+      try {
+        window.clearInterval(variantPoll);
+      } catch (err) {
+        /* ignore */
+      }
+      variantPoll = null;
+    }
+    function startVariantPoll() {
+      if (variantPoll !== null || typeof window.setInterval !== 'function') {
+        return;
+      }
+      variantPoll = window.setInterval(function () {
+        if (
+          document.visibilityState &&
+          document.visibilityState !== 'visible'
+        ) {
+          return;
+        }
+        if (!inDocument(root)) {
+          /* Detached (theme-editor section re-render). The app embed can
+             re-insert this same widget, and resync() re-arms the poll then;
+             a widget that never comes back must not tick forever. */
+          stopVariantPoll();
+          return;
+        }
+        reReadVariant();
+      }, 600);
+    }
+    startVariantPoll();
+    window.addEventListener('pagehide', stopVariantPoll);
+
     /* ── Initial paint + sync (injects the hidden input on load so the very
           first Add to Cart already carries the preselected plan) ─────────── */
     render();
     setMode(state.mode);
     applySellingPlan(true);
+    /* Seed the tracking layers with the page's CURRENT theme state: fills
+       the per-field memory (so the very first change is already a "changed"
+       signal), parks immediately when the page LANDED on an un-synced
+       variant, and adopts a theme field that already disagrees with the
+       server-rendered initial variant. No-op on a page that agrees. */
+    reReadVariant(true);
   }
 
   function scan() {

@@ -371,6 +371,41 @@ export async function getSellingPlanGroupPlanIds(
   return planIdsOf(group);
 }
 
+const CURRENT_APP_ID_QUERY = `#graphql
+  query CellexiaCurrentAppId {
+    currentAppInstallation {
+      app {
+        id
+      }
+    }
+  }
+`;
+
+interface CurrentAppIdResponse {
+  currentAppInstallation: { app: { id: string } } | null;
+}
+
+/**
+ * This app's own numeric Shopify App id — the same value Liquid's
+ * `selling_plan_group.app_id` returns for a group this app created. Unlike a
+ * SellingPlanGroup id, an app id is not a per-shop opaque storefront
+ * identifier: it names the app itself, so it reads the same way from the
+ * Admin API (here) and from Storefront Liquid (`selling_plan_group.app_id`),
+ * making it usable as a genuine ownership factor (see
+ * publishOwnGroupsMetafield). Throws on a transport/GraphQL failure or an
+ * unparseable id — callers must not publish an allow-list without it, the
+ * same "outage over wrong render" rule as the rest of this module.
+ */
+export async function getCurrentAppId(admin: AdminClient): Promise<string> {
+  const data = await gql<CurrentAppIdResponse>(admin, CURRENT_APP_ID_QUERY);
+  const gid = data.currentAppInstallation?.app?.id;
+  const numeric = typeof gid === "string" ? /\/(\d+)(?:\?.*)?$/.exec(gid)?.[1] : undefined;
+  if (!numeric) {
+    throw new Error("Could not read this app's own Shopify App id");
+  }
+  return numeric;
+}
+
 /**
  * Products the `nodes(ids:)` query reads per round trip. Each product carries
  * a 25-item sellingPlanGroups connection, so 25 products keeps a single query

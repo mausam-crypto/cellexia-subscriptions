@@ -82,14 +82,17 @@ export const PLAN_GROUPS_METAFIELD_VERSION = 1;
 /**
  * Shape written to `shop.metafields.cellexia.plan_groups` (type: json).
  *
- * Both id lists are load-bearing and BOTH must be non-empty for the storefront
- * to render anything: the snippet requires a group to be named in `groupIds`
- * AND to contain one of `planIds`. Either list empty means "render nothing",
- * on every product.
+ * `planIds` (matched against the group's OWN plans) and `appId` are the two
+ * MANDATORY ownership factors the storefront requires before rendering a
+ * group — see the OWNERSHIP comment at the top of cx-buybox-core.liquid.
+ * `groupIds` is published for backward compatibility with the legacy
+ * group-id check the snippet still carries as an inert fallback, but is not
+ * itself sufficient: it compares admin-space ids against Liquid's opaque
+ * storefront-space group ids, which can never match on a real storefront.
  */
 export interface PlanGroupsMetafieldValue {
   v: number;
-  /** Numeric SellingPlanGroup ids as strings — Liquid's `group.id` form. */
+  /** Numeric SellingPlanGroup ids as strings — legacy, inert on the storefront. */
   groupIds: string[];
   /**
    * Numeric SellingPlan ids as strings — Liquid's `plan.id` form. Empty here
@@ -97,7 +100,18 @@ export interface PlanGroupsMetafieldValue {
    * publishOwnGroupsMetafield().
    */
   planIds: string[];
+  /**
+   * This app's own numeric Shopify App id (see getCurrentAppId). Compared
+   * against `selling_plan_group.app_id` in Liquid — the genuine second
+   * ownership factor, since (unlike group ids) app ids are consistent
+   * between the Admin and Storefront APIs.
+   */
+  appId: string;
 }
+
+/** What buildPlanGroupsValue can compute from the DB alone, before the
+ *  Shopify-API-only appId is merged in by publishOwnGroupsMetafield. */
+export type PlanGroupsDbValue = Omit<PlanGroupsMetafieldValue, "appId">;
 
 // ── GID helpers ──────────────────────────────────────────────────────────────
 
@@ -465,8 +479,14 @@ export async function publishOwnGroupsMetafield(
     }
 
     await refreshOwnPlanIdsFromShopify(shopDomain, shop.id);
-    const value = await buildPlanGroupsValue(shop.id);
+    const dbValue = await buildPlanGroupsValue(shop.id);
     const adminClient = await admin(shopDomain);
+    // Lazy import, same reason as refreshOwnPlanIdsFromShopify above: this
+    // module loads in nearly every server module graph, and getCurrentAppId
+    // is only ever needed on the publish path.
+    const { getCurrentAppId } = await import("~/lib/graphql/sellingPlans.server");
+    const appId = await getCurrentAppId(adminClient);
+    const value: PlanGroupsMetafieldValue = { ...dbValue, appId };
     await setShopMetafield(adminClient, {
       namespace: PLAN_GROUPS_METAFIELD_NAMESPACE,
       key: PLAN_GROUPS_METAFIELD_KEY,
@@ -484,10 +504,11 @@ export async function publishOwnGroupsMetafield(
   }
 }
 
-/** The allow-list value for a shop, numeric ids only (Liquid's id form). */
+/** The allow-list value for a shop, numeric ids only (Liquid's id form),
+ *  minus the Shopify-API-only appId — see publishOwnGroupsMetafield. */
 export async function buildPlanGroupsValue(
   shopId: string,
-): Promise<PlanGroupsMetafieldValue> {
+): Promise<PlanGroupsDbValue> {
   const configs = await prisma.sellingPlanConfig.findMany({
     where: { shopId, shopifyGroupId: { not: null } },
     select: { shopifyGroupId: true, shopifyPlanIds: true },

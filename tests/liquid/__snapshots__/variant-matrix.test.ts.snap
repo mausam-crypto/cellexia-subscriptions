@@ -1,0 +1,241 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`byte-golden island snapshots (jar fixture) > classic (zero-config), three jar variants 1`] = `
+"
+{
+"initialVariant": "4411100011201",
+"initialPlan": "6881100003",
+"preselect": true,
+"requiresSellingPlan": false,
+"variants": {"4411100011201": {
+"available": true,
+"oneTime": "CHF 64.00",
+"oneTimeCents": 6400,
+"compareAt": "",
+"plans": {"6881100001": {
+"first": "CHF 51.20",
+"firstCents": 5120,
+"ongoing": "CHF 57.60",
+"then": "then CHF 57.60 every 4 weeks",
+"save": "Save 20%",
+"perDelivery": "",
+"pd": "CHF 51.20",
+"freq": "4 weeks",
+"savePct": "20%"
+},"6881100002": {
+"first": "CHF 51.20",
+"firstCents": 5120,
+"ongoing": "CHF 57.60",
+"then": "then CHF 57.60 every 6 weeks",
+"save": "Save 20%",
+"perDelivery": "",
+"pd": "CHF 51.20",
+"freq": "6 weeks",
+"savePct": "20%"
+},"6881100003": {
+"first": "CHF 51.20",
+"firstCents": 5120,
+"ongoing": "CHF 57.60",
+"then": "then CHF 57.60 every 8 weeks",
+"save": "Save 20%",
+"perDelivery": "",
+"pd": "CHF 51.20",
+"freq": "8 weeks",
+"savePct": "20%"
+}}
+},"4411100011202": {
+"available": true,
+"oneTime": "CHF 108.80",
+"oneTimeCents": 10880,
+"compareAt": "CHF 128.00",
+"plans": {"6881100001": {
+"first": "CHF 87.04",
+"firstCents": 8704,
+"ongoing": "CHF 97.92",
+"then": "then CHF 97.92 every 4 weeks",
+"save": "Save 20%",
+"perDelivery": "",
+"pd": "CHF 87.04",
+"freq": "4 weeks",
+"savePct": "20%"
+},"6881100002": {
+"first": "CHF 87.04",
+"firstCents": 8704,
+"ongoing": "CHF 97.92",
+"then": "then CHF 97.92 every 6 weeks",
+"save": "Save 20%",
+"perDelivery": "",
+"pd": "CHF 87.04",
+"freq": "6 weeks",
+"savePct": "20%"
+},"6881100003": {
+"first": "CHF 87.04",
+"firstCents": 8704,
+"ongoing": "CHF 97.92",
+"then": "then CHF 97.92 every 8 weeks",
+"save": "Save 20%",
+"perDelivery": "",
+"pd": "CHF 87.04",
+"freq": "8 weeks",
+"savePct": "20%"
+}}
+},"4411100011203": {
+"available": false,
+"oneTime": "CHF 153.60",
+"oneTimeCents": 15360,
+"compareAt": "CHF 192.00",
+"plans": {"6881100001": {
+"first": "CHF 122.88",
+"firstCents": 12288,
+"ongoing": "CHF 138.24",
+"then": "then CHF 138.24 every 4 weeks",
+"save": "Save 20%",
+"perDelivery": "",
+"pd": "CHF 122.88",
+"freq": "4 weeks",
+"savePct": "20%"
+},"6881100002": {
+"first": "CHF 122.88",
+"firstCents": 12288,
+"ongoing": "CHF 138.24",
+"then": "then CHF 138.24 every 6 weeks",
+"save": "Save 20%",
+"perDelivery": "",
+"pd": "CHF 122.88",
+"freq": "6 weeks",
+"savePct": "20%"
+},"6881100003": {
+"first": "CHF 122.88",
+"firstCents": 12288,
+"ongoing": "CHF 138.24",
+"then": "then CHF 138.24 every 8 weeks",
+"save": "Save 20%",
+"perDelivery": "",
+"pd": "CHF 122.88",
+"freq": "8 weeks",
+"savePct": "20%"
+}}
+}}
+}
+"
+`;
+
+exports[`byte-golden island snapshots (jar fixture) > subscription_max (the merchant's preset), three jar variants 1`] = `
+"
+{
+"initialVariant": "4411100011201",
+"initialPlan": "6881100003",
+"preselect": true,
+"requiresSellingPlan": false,
+"variants": {"4411100011201": {
+"available": true,
+"oneTime": "CHF 64.00",
+"oneTimeCents": 6400,
+"compareAt": "",
+"plans": {"6881100001": {
+"first": "CHF 51.20",
+"firstCents": 5120,
+"ongoing": "CHF 57.60",
+"then": "then CHF 57.60 every 4 weeks",
+"save": "Save 20%",
+"perDelivery": "",
+"pd": "CHF 51.20",
+"freq": "4 weeks",
+"savePct": "20%"
+},"6881100002": {
+"first": "CHF 51.20",
+"firstCents": 5120,
+"ongoing": "CHF 57.60",
+"then": "then CHF 57.60 every 6 weeks",
+"save": "Save 20%",
+"perDelivery": "",
+"pd": "CHF 51.20",
+"freq": "6 weeks",
+"savePct": "20%"
+},"6881100003": {
+"first": "CHF 51.20",
+"firstCents": 5120,
+"ongoing": "CHF 57.60",
+"then": "then CHF 57.60 every 8 weeks",
+"save": "Save 20%",
+"perDelivery": "",
+"pd": "CHF 51.20",
+"freq": "8 weeks",
+"savePct": "20%"
+}}
+},"4411100011202": {
+"available": true,
+"oneTime": "CHF 108.80",
+"oneTimeCents": 10880,
+"compareAt": "CHF 128.00",
+"plans": {"6881100001": {
+"first": "CHF 87.04",
+"firstCents": 8704,
+"ongoing": "CHF 97.92",
+"then": "then CHF 97.92 every 4 weeks",
+"save": "Save 20%",
+"perDelivery": "",
+"pd": "CHF 87.04",
+"freq": "4 weeks",
+"savePct": "20%"
+},"6881100002": {
+"first": "CHF 87.04",
+"firstCents": 8704,
+"ongoing": "CHF 97.92",
+"then": "then CHF 97.92 every 6 weeks",
+"save": "Save 20%",
+"perDelivery": "",
+"pd": "CHF 87.04",
+"freq": "6 weeks",
+"savePct": "20%"
+},"6881100003": {
+"first": "CHF 87.04",
+"firstCents": 8704,
+"ongoing": "CHF 97.92",
+"then": "then CHF 97.92 every 8 weeks",
+"save": "Save 20%",
+"perDelivery": "",
+"pd": "CHF 87.04",
+"freq": "8 weeks",
+"savePct": "20%"
+}}
+},"4411100011203": {
+"available": false,
+"oneTime": "CHF 153.60",
+"oneTimeCents": 15360,
+"compareAt": "CHF 192.00",
+"plans": {"6881100001": {
+"first": "CHF 122.88",
+"firstCents": 12288,
+"ongoing": "CHF 138.24",
+"then": "then CHF 138.24 every 4 weeks",
+"save": "Save 20%",
+"perDelivery": "",
+"pd": "CHF 122.88",
+"freq": "4 weeks",
+"savePct": "20%"
+},"6881100002": {
+"first": "CHF 122.88",
+"firstCents": 12288,
+"ongoing": "CHF 138.24",
+"then": "then CHF 138.24 every 6 weeks",
+"save": "Save 20%",
+"perDelivery": "",
+"pd": "CHF 122.88",
+"freq": "6 weeks",
+"savePct": "20%"
+},"6881100003": {
+"first": "CHF 122.88",
+"firstCents": 12288,
+"ongoing": "CHF 138.24",
+"then": "then CHF 138.24 every 8 weeks",
+"save": "Save 20%",
+"perDelivery": "",
+"pd": "CHF 122.88",
+"freq": "8 weeks",
+"savePct": "20%"
+}}
+}}
+}
+"
+`;

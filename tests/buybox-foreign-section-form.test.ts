@@ -279,14 +279,28 @@ describe("the inconclusive token form (what the fallback existed for)", () => {
 // ── Vacuity guard: the pre-fix fallback, put back ────────────────────────────
 
 /** Rebuild `pickOwnedForm(scoped, variants) || scoped[0]` — the old fallback. */
-const PRE_FIX_FALLBACK = (source: string): string =>
+const OLD_FALLBACK_ONLY = (source: string): string =>
   source.replace(
     /var owned = pickOwnedForm\(scoped, variants\);[\s\S]*?return null;\n {4}\}/,
     "return pickOwnedForm(scoped, variants) || scoped[0];\n    }",
   );
 
+/**
+ * The old fallback AND the v1.6.8 un-synced park disarmed. The park is a
+ * SECOND, independent net over the very same shape: a bound form whose
+ * [name="id"] is numeric-but-not-ours makes the boot re-read park the widget
+ * and RELEASE the form, so with the park alive the old fallback's poison is
+ * cleaned up right after it lands (see the two-nets test below). Reproducing
+ * the pre-fix 422 therefore needs both nets cut.
+ */
+const PRE_FIX_FALLBACK = (source: string): string =>
+  OLD_FALLBACK_ONLY(source).replace(
+    "function parkUnsynced() {",
+    "function parkUnsynced() { return;",
+  );
+
 describe("vacuity guard (the defect, put back)", () => {
-  it("the old `|| scoped[0]` fallback poisons the foreign quick-add again", () => {
+  it("the old `|| scoped[0]` fallback (park disarmed) poisons the foreign quick-add again", () => {
     const page = run({
       sectionHtml: FOREIGN_QUICK_ADD,
       mutate: PRE_FIX_FALLBACK,
@@ -299,8 +313,28 @@ describe("vacuity guard (the defect, put back)", () => {
     expect(findings).toContain(`selling_plan=${PLAN_ID}`);
   });
 
-  it("proves the guard rewrites the file it claims to rewrite", () => {
+  it("the un-synced park alone already defuses the old fallback (two independent nets)", () => {
+    // Only the first net is cut: the old fallback binds product B's form and
+    // applySellingPlan poisons it at boot — then the boot re-read sees a
+    // numeric [name="id"] the island does not know in the BOUND form, parks
+    // the widget and releases the form. No enabled selling_plan survives, so
+    // product B's quick-add posts cleanly again.
+    const page = run({
+      sectionHtml: FOREIGN_QUICK_ADD,
+      mutate: OLD_FALLBACK_ONLY,
+    });
+    expect(page.sourceChanged).toBe(true);
+
+    const findings = poison(page.form(".quick-add-form"));
+    expect(findings).not.toContain(`selling_plan=${PLAN_ID}`);
+    expect(page.widget!.getAttribute("data-cellexia-unsynced")).toBe("true");
+    expect(page.widget!.hasAttribute("hidden")).toBe(true);
+  });
+
+  it("proves the guards rewrite the file they claim to rewrite", () => {
     const original = readFileSync(BUY_BOX_JS, "utf8");
-    expect(PRE_FIX_FALLBACK(original)).not.toBe(original);
+    const fallbackOnly = OLD_FALLBACK_ONLY(original);
+    expect(fallbackOnly).not.toBe(original);
+    expect(PRE_FIX_FALLBACK(original)).not.toBe(fallbackOnly);
   });
 });

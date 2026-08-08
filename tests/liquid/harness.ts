@@ -495,6 +495,19 @@ export const FIXTURE = {
   planIds: { weeks4: 6881100001, weeks6: 6881100002, weeks8: 6881100003 },
   prices: { small: 6400, large: 9800 },
   /**
+   * The merchant's live "Sleepify" PDP shape (v1.6.8): pack sizes sold as
+   * three SEPARATE VARIANTS ("1 Jar", "2 Jars", "3 Jars") that the theme
+   * switches with its own pill buttons — programmatically (jQuery .val()),
+   * with no native change event and no ?variant= write. Three different
+   * prices so every per-variant row of the island's price matrix is
+   * distinguishable; the multi-jar variants carry a compare-at price and
+   * the third is sold out, so compareAt and availability both have
+   * something real to say.
+   */
+  jarVariantIds: { jar1: 4411100011201, jar2: 4411100011202, jar3: 4411100011203 },
+  jarPrices: { jar1: 6400, jar2: 10880, jar3: 15360 },
+  jarCompareAt: { jar2: 12800, jar3: 19200 },
+  /**
    * A SECOND subscription app's selling plan group — the shape of the defect
    * this fixture exists to reproduce. cellexialabs.com runs Joy Subscriptions
    * alongside this app, and Joy's group comes FIRST on the product, which is
@@ -552,7 +565,7 @@ export interface OtherAppGroupFixture {
   /** The group's ADMIN-API numeric id; Liquid sees storefrontGroupId(id). */
   id: number;
   name: string;
-  /** `selling_plan_group.app_id` — never consulted by the widget. */
+  /** `selling_plan_group.app_id` — the real ownership factor since the app-id fix. */
   appId?: string;
   /** Fraction off the variant price, e.g. 0.05 for Joy's "save 5%". */
   discount?: number;
@@ -613,6 +626,15 @@ export interface ProductFixtureOptions {
    * canned Joy group.)
    */
   omitOwnGroup?: boolean;
+  /**
+   * The merchant's jar-pack PDP (v1.6.8): THREE variants at three different
+   * prices — "1 Jar" (no compare-at), "2 Jars" (compare-at above price),
+   * "3 Jars" (compare-at, sold out) — switched by the theme's own pill
+   * buttons with NO native change event and NO ?variant= write. This is the
+   * fixture the per-variant island matrix and the event-independent variant
+   * tracking are tested against.
+   */
+  jarVariants?: boolean;
   /**
    * OTHER subscription apps' groups on this product, in order. Supersedes the
    * canned Joy fixture behind `foreignGroupFirst` / `foreignGroupOnly`, so a
@@ -737,7 +759,46 @@ function otherGroupSpecs(
 /** A product shaped exactly like the storefront `product` drop the block reads. */
 export function makeProduct(options: ProductFixtureOptions = {}) {
   const plans = makePlans(options.planCount ?? 3);
-  const variants: VariantFixture[] = [
+  const variants: VariantFixture[] = options.jarVariants
+    ? [
+        {
+          id: FIXTURE.jarVariantIds.jar1,
+          title: "1 Jar",
+          price: FIXTURE.jarPrices.jar1,
+          compare_at_price: null,
+          available: true,
+          selling_plan_allocations: makeAllocations(
+            FIXTURE.jarPrices.jar1,
+            plans,
+            options,
+          ),
+        },
+        {
+          id: FIXTURE.jarVariantIds.jar2,
+          title: "2 Jars",
+          price: FIXTURE.jarPrices.jar2,
+          compare_at_price: FIXTURE.jarCompareAt.jar2,
+          available: true,
+          selling_plan_allocations: makeAllocations(
+            FIXTURE.jarPrices.jar2,
+            plans,
+            options,
+          ),
+        },
+        {
+          id: FIXTURE.jarVariantIds.jar3,
+          title: "3 Jars",
+          price: FIXTURE.jarPrices.jar3,
+          compare_at_price: FIXTURE.jarCompareAt.jar3,
+          available: false,
+          selling_plan_allocations: makeAllocations(
+            FIXTURE.jarPrices.jar3,
+            plans,
+            options,
+          ),
+        },
+      ]
+    : [
     {
       id: FIXTURE.variantIds.small,
       title: "30 ml",
@@ -843,11 +904,12 @@ export interface MakeContextOptions extends ProductFixtureOptions {
   launchStatus?: "live" | "setup" | (string & {}) | null;
   /**
    * shop.metafields.cellexia.plan_groups.value — the OWNERSHIP ALLOW-LIST the
-   * app publishes on every plan sync ({ v, groupIds, planIds }, ids as
-   * strings). Only groups it names may be rendered. Both fields carry
-   * ADMIN-API ids: the numeric group ids can therefore never match Liquid's
-   * opaque group ids (see FIXTURE), which is why ownership is decided by the
-   * PLAN ids — the one id space the two APIs share.
+   * app publishes on every plan sync ({ v, groupIds, planIds, appId }, ids as
+   * strings). Only a group matching BOTH planIds and appId may be rendered.
+   * groupIds carries ADMIN-API numeric ids, which can never match Liquid's
+   * opaque group ids (see FIXTURE) — the legacy field survives in the shape
+   * but is not consulted. Ownership is decided by planIds AND appId, the two
+   * id spaces the Admin and Storefront APIs actually share.
    *
    * `undefined` (the default) = a synced shop, i.e. this fixture's own group
    * is allow-listed — the state every pre-existing test was written against.
@@ -910,6 +972,9 @@ export function makeContext(options: MakeContextOptions = {}): RenderContext {
           // is allow-listed" whichever id this fixture gave it.
           groupIds: [String(options.ownGroupId ?? FIXTURE.groupId)],
           planIds: Object.values(FIXTURE.planIds).map(String),
+          // Matches ownGroup.app_id ("cellexia") in makeProduct — the real
+          // ownership factor now; groupIds is kept only for the legacy shape.
+          appId: "cellexia",
         }
       : options.planGroups;
 
@@ -1119,10 +1184,18 @@ export interface JsonIsland {
     {
       available: boolean;
       oneTime: string;
+      /** v1.6.8 matrix: cents for exact client-side comparisons (no math on strings). */
+      oneTimeCents: number;
+      /** v1.6.8 matrix: variant compare-at, formatted; "" when none above the price. */
+      compareAt: string;
       plans: Record<
         string,
         {
           first: string;
+          /** v1.6.8 matrix: allocation (first-order) price in cents. */
+          firstCents: number;
+          /** v1.6.8 matrix: ongoing/recurring price, formatted (also inside `then`). */
+          ongoing: string;
           then: string;
           save: string;
           perDelivery: string;

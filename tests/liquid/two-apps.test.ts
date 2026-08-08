@@ -189,6 +189,7 @@ describe("a product carrying three subscription apps' groups", () => {
         v: 1,
         groupIds: [String(FIXTURE.groupId)], // admin-numeric: matches nothing in Liquid
         planIds: OUR_PLAN_IDS,
+        appId: "cellexia",
       },
     });
     const root = rootTag(html);
@@ -203,29 +204,35 @@ describe("a product carrying three subscription apps' groups", () => {
     // groupIds field is simply inert while planIds names our plans.
     const html = await renderWidget({
       ...THREE_APPS,
-      planGroups: { v: 1, groupIds: ["424242424242"], planIds: OUR_PLAN_IDS },
+      planGroups: {
+        v: 1,
+        groupIds: ["424242424242"],
+        planIds: OUR_PLAN_IDS,
+        appId: "cellexia",
+      },
     });
     expect(cartSellingPlanId(html)).toBe(OUR_DEFAULT_PLAN_ID);
     expect(parseJsonIsland(html).initialPlan).toBe(OUR_DEFAULT_PLAN_ID);
     expectNoForeignTrace(html);
   });
 
-  it("keeps the legacy group-id equality alive as a harmless secondary OR", async () => {
-    /* The old comparison survives, demoted: a group whose Liquid-visible id
-       is named EXACTLY in groupIds still renders even when planIds names
-       none of its plans. Harmless in production because the app publishes
-       admin-numeric ids, which cannot collide with the opaque storefront
-       form — this render is only reachable by writing the opaque id into
-       the metafield by hand. planIds must still be non-empty (the gate). */
+  it("the legacy group-id OR is gone — a matching Liquid id alone renders nothing", async () => {
+    /* The old comparison is deleted, not demoted: a group whose Liquid-visible
+       id is named EXACTLY in groupIds no longer renders on its own. Ownership
+       now requires a real plan id AND a matching appId together — a group-id
+       match (even the exact opaque storefront id, hand-written into the
+       metafield) proves neither, so it must not be enough by itself. */
     const html = await renderWidget({
       ...THREE_APPS,
       planGroups: {
         v: 1,
         groupIds: [storefrontGroupId(FIXTURE.groupId)],
         planIds: ["424242424242"], // names no plan anywhere
+        appId: "cellexia",
       },
     });
-    expect(cartSellingPlanId(html)).toBe(OUR_DEFAULT_PLAN_ID);
+    expect(rootTag(html)).toBeNull();
+    expect(cartSellingPlanId(html)).toBeNull();
     expectNoForeignTrace(html);
   });
 
@@ -237,15 +244,21 @@ describe("a product carrying three subscription apps' groups", () => {
        back: Joy's plan id in the cart mirror, Joy's 5% on the page. The
        allow-list is the only thing standing between that render and a shopper.
 
-       planIds is the field that decides (the groupIds entry here is inert —
-       it is Joy's ADMIN id, which matches no Liquid group id). The metafield
-       is written by this app alone, and buildPlanGroupsValue() only ever
-       emits plan ids read off our own SellingPlanConfig rows, so reaching
-       this render means forging the one load-bearing field — the honest
-       statement of the residual. */
+       planIds and appId are the fields that decide (the groupIds entry here
+       is inert — it is Joy's ADMIN id, which matches no Liquid group id).
+       The metafield is written by this app alone, and
+       buildPlanGroupsValue()/publishOwnGroupsMetafield() only ever emit our
+       own plan ids and our own app id, so reaching this render means forging
+       BOTH load-bearing fields together — the honest statement of the
+       residual. */
     const html = await renderWidget({
       ...THREE_APPS,
-      planGroups: { v: 1, groupIds: [JOY_GROUP_ID], planIds: [JOY_PLAN_ID] },
+      planGroups: {
+        v: 1,
+        groupIds: [JOY_GROUP_ID],
+        planIds: [JOY_PLAN_ID],
+        appId: "joy-subscriptions",
+      },
     });
     expect(cartSellingPlanId(html)).toBe(JOY_PLAN_ID);
     expect(parseJsonIsland(html).initialPlan).toBe(JOY_PLAN_ID);
@@ -262,6 +275,7 @@ describe("a product carrying three subscription apps' groups", () => {
         v: 1,
         groupIds: [RECHARGE_GROUP_ID],
         planIds: [RECHARGE_PLAN_ID],
+        appId: "recharge",
       },
     });
     expect(cartSellingPlanId(recharge)).toBe(RECHARGE_PLAN_ID);
@@ -315,7 +329,12 @@ describe("a product carrying three subscription apps' groups", () => {
     // so the widget renders OURS, never Joy's, and never nothing.
     const html = await renderWidget({
       ...THREE_APPS,
-      planGroups: { v: 1, groupIds: [JOY_GROUP_ID], planIds: OUR_PLAN_IDS },
+      planGroups: {
+        v: 1,
+        groupIds: [JOY_GROUP_ID],
+        planIds: OUR_PLAN_IDS,
+        appId: "cellexia",
+      },
     });
     expect(cartSellingPlanId(html)).toBe(OUR_DEFAULT_PLAN_ID);
     expect(parseJsonIsland(html).initialPlan).toBe(OUR_DEFAULT_PLAN_ID);
@@ -553,7 +572,12 @@ describe("before the first plan sync (no allow-list published yet)", () => {
   it("VACUITY GUARD: the same lone group renders once its id is allow-listed", async () => {
     const html = await renderWidget({
       groupName: "Cellexia Subscribe & Save",
-      planGroups: { v: 1, groupIds: [String(FIXTURE.groupId)], planIds: OUR_PLAN_IDS },
+      planGroups: {
+        v: 1,
+        groupIds: [String(FIXTURE.groupId)],
+        planIds: OUR_PLAN_IDS,
+        appId: "cellexia",
+      },
       launchStatus: "live",
     });
     expect(rootTag(html)).not.toBeNull();
@@ -673,6 +697,7 @@ describe("allow-list plan ids are compared by exact equality", () => {
         v: 1,
         groupIds: [String(FIXTURE.groupId)],
         planIds: OUR_PLAN_IDS,
+        appId: "cellexia",
       },
       launchStatus: "live",
     });
@@ -700,6 +725,7 @@ describe("allow-list plan ids are compared by exact equality", () => {
         v: 1,
         groupIds: [String(FIXTURE.groupId)],
         planIds: OUR_PLAN_IDS,
+        appId: "cellexia",
       },
       launchStatus: "live",
     });
@@ -723,6 +749,7 @@ describe("allow-list plan ids are compared by exact equality", () => {
           v: 1,
           groupIds: [String(FIXTURE.groupId)],
           planIds: [entry],
+          appId: "cellexia",
         },
         launchStatus: "live",
       });
@@ -738,6 +765,7 @@ describe("allow-list plan ids are compared by exact equality", () => {
         v: 1,
         groupIds: [String(FIXTURE.groupId)],
         planIds: [ours],
+        appId: "cellexia",
       },
       launchStatus: "live",
     });
@@ -755,6 +783,7 @@ describe("allow-list plan ids are compared by exact equality", () => {
           v: 1,
           groupIds: [String(FIXTURE.groupId)],
           planIds,
+          appId: "cellexia",
         },
         launchStatus: "live",
       });
@@ -775,6 +804,7 @@ describe("allow-list plan ids are compared by exact equality", () => {
         v: 1,
         groupIds: [JOY_GROUP_ID, String(FIXTURE.groupId)],
         planIds: OUR_PLAN_IDS,
+        appId: "cellexia",
       },
       launchStatus: "live",
     });
@@ -782,20 +812,76 @@ describe("allow-list plan ids are compared by exact equality", () => {
     expect(html).not.toContain(JOY_PLAN_ID);
   });
 
-  it("the legacy group-id OR is exact too — a truncated opaque id matches nothing", async () => {
-    const sfg = storefrontGroupId(FIXTURE.groupId);
+  it("groupIds is not consulted at all — the legacy field is decoration only", async () => {
+    // Junk groupIds, a real plan id and the real appId: still renders. The
+    // field is published for backward compatibility with the old metafield
+    // shape but is not read by the ownership decision any more.
     const html = await renderWidget({
       otherGroups: [JOY_GROUP],
       planGroups: {
         v: 1,
-        groupIds: [sfg.slice(0, -1)], // near-miss of the only matchable form
-        planIds: ["424242424242"], // names no plan, so only the OR could fire
+        groupIds: ["not-even-numeric"],
+        planIds: OUR_PLAN_IDS,
+        appId: "cellexia",
+      },
+      launchStatus: "live",
+    });
+    expect(cartSellingPlanId(html)).toBe(OUR_DEFAULT_PLAN_ID);
+    expect(html).not.toContain(JOY_PLAN_ID);
+  });
+
+  it("a correct plan id with the WRONG appId still renders nothing", async () => {
+    // The two-factor guarantee this whole model exists for: a corrupted or
+    // foreign appId must not be rescued by an otherwise-correct planIds list.
+    const html = await renderWidget({
+      otherGroups: [JOY_GROUP],
+      planGroups: {
+        v: 1,
+        groupIds: [String(FIXTURE.groupId)],
+        planIds: OUR_PLAN_IDS,
+        appId: "another-subscription-app",
       },
       launchStatus: "live",
     });
     expect(rootTag(html)).toBeNull();
     expect(visibleText(html)).toBe("");
     expect(html).not.toContain(JOY_PLAN_ID);
+  });
+
+  it("the right appId with the WRONG plan ids still renders nothing", async () => {
+    // The other half of the guarantee: appId alone cannot unlock a group
+    // either. Both factors are mandatory, always.
+    const html = await renderWidget({
+      otherGroups: [JOY_GROUP],
+      planGroups: {
+        v: 1,
+        groupIds: [String(FIXTURE.groupId)],
+        planIds: [JOY_PLAN_ID],
+        appId: "cellexia",
+      },
+      launchStatus: "live",
+    });
+    expect(rootTag(html)).toBeNull();
+    expect(visibleText(html)).toBe("");
+    expect(html).not.toContain(JOY_PLAN_ID);
+  });
+
+  it("an allow-list published before the appId fix fails closed until republished", async () => {
+    // A metafield written by a pre-fix app version has planIds but no appId
+    // at all. Must render nothing rather than fall back to the old (broken)
+    // group-id check — the whole point of the fix is that path is gone.
+    const html = await renderWidget({
+      otherGroups: [JOY_GROUP],
+      planGroups: {
+        v: 1,
+        groupIds: [String(FIXTURE.groupId)],
+        planIds: OUR_PLAN_IDS,
+        // appId omitted on purpose.
+      },
+      launchStatus: "live",
+    });
+    expect(rootTag(html)).toBeNull();
+    expect(visibleText(html)).toBe("");
   });
 });
 

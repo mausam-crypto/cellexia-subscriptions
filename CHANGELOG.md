@@ -4,6 +4,143 @@ All notable changes to Cellexia Subscriptions. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [SemVer](https://semver.org) as contracted in [docs/UPDATE.md](docs/UPDATE.md).
 
+## [1.6.9] — 2026-08-08
+
+**Variant-switch price fix — merchant-reported, live on their store
+(subscription_max preset).** Their theme sells jar packs as SEPARATE
+VARIANTS switched by its own pill buttons ("1 Jar | 2 Jars - 15% Off |
+3 Jars - 20% Off"): clicking a pill updates the theme's price display and
+the cart, while every price the widget shows — first-order price, the
+"then … every …" line, savings, the quiet "or buy once for …" link, and
+the money pair feeding the theme add-to-cart price sync — stayed frozen
+on the landing variant. Two root causes, both fixed: the theme sets its
+variant state **programmatically** (jQuery `.val()` — no `change` event,
+no `?variant=` write), so every listener the widget had stayed silent;
+and the data a full repaint anchors on was not entirely per-variant —
+the root `data-cellexia-money-*` pair stayed server-rendered for the
+landing variant, and the island's matrix lacked per-variant compare-at,
+cents and the ongoing price. **No schema changes, no migrations, no env
+changes, no new scopes**; total extension Liquid 74,762 bytes, still
+under the size suite's ceiling.
+
+### Fixed
+
+- **`buy-box.js`: event-independent variant tracking**, layered under the
+  existing (kept) listeners: an authoritative re-read — the theme's
+  `[name="id"]` input-or-select (bound form first, then a read-only
+  document-wide scan that skips our own markup and accepts only ids the
+  island knows), then `?variant=`, else keep the current variant; click
+  delegation over the product area scheduling that re-read on the next
+  macrotask and again at +350 ms (themes update state asynchronously);
+  and a 600 ms poll of the same field — string compare, only while
+  `document.visibilityState === 'visible'`, one interval per widget,
+  cleared on pagehide and on detach, re-armed by `resync()` — which
+  catches ANY switching mechanism, including pure-JS themes.
+- **Several `[name="id"]` fields for one product no longer race on
+  document order.** A page can carry duplicates of the theme's variant
+  field (quick-buy modal, sticky add-to-cart bar, featured-product
+  section); the scan formerly trusted the FIRST island-known value, so a
+  stale duplicate could freeze the widget — or flip it to the wrong
+  variant. Disagreements between island-known values are now settled on
+  evidence: the field whose value actually **changed** since the last
+  read (the one the shopper is driving) wins, then a field inside the
+  widget's own section, else the current variant is kept. The poll also
+  stopped paying a document-wide `querySelectorAll` per tick: it reuses
+  the last scan's field list (validated for liveness, fully re-queried
+  every 10th tick), while click-driven re-reads always re-query.
+- **A variant added AFTER plan sync parks the widget instead of freezing
+  it on stale prices.** A numeric id the island has no row for — read
+  from the bound (ownership-checked) form, or from a field previously
+  seen holding this product's ids — is conclusive: nothing the widget
+  shows could price it, and a `selling_plan` left in the form could 422
+  the theme's add-to-cart. The widget hides itself (root `[hidden]` +
+  `data-cellexia-unsynced`), releases the form (plan field removed or
+  emptied, design property disabled), restores the theme's button text
+  and serves no `getState()` (so the embed's cart patcher carries no plan
+  either); it un-parks with a full repaint the moment a known variant
+  returns. Foreign numeric ids with no such history (another product's
+  quick-add) never park anything. Re-syncing the plan ships a fresh
+  island, so a reloaded page prices the new variant normally.
+- **On a variant change, every price surface of every one of the seven
+  presets repaints** from the island matrix (option cards, first-order
+  line, then-line with `{frequency}` preserved, savings from matrix
+  strings, per-delivery, tiles compare rows, the subscription_max quiet
+  link amount), the root `data-cellexia-money-onetime`/`-sub` pair
+  re-anchors, and the theme add-to-cart price sync re-syncs so the
+  theme's button quotes the NEW variant's subscription price. A sold-out
+  variant still renders its prices; add-to-cart behaviour stays the
+  theme's. `textContent` writes only, as everywhere.
+
+### Added
+
+- **Per-variant price matrix completion in the JSON island**
+  (`cx-buybox-core.liquid`): every available variant row now also carries
+  `oneTimeCents` and `compareAt` (formatted, only when it beats the
+  price), and every variant × plan entry carries `firstCents` and the
+  formatted `ongoing` price — money strings pre-formatted in the shop
+  money format and RAW-decoded at the island boundary, as before. The
+  cents feed exact client-side comparisons (the strike-through decision),
+  so the JS still never formats money or does price math for copy.
+- **Tests**: `tests/buybox-variant-tracking.test.ts` drives the REAL
+  Liquid render (new three-variant jar fixture: distinct prices, one
+  compare-at, one sold out) and the REAL `buy-box.js` through a
+  programmatic variant switch — `[name="id"].value` set with NO events —
+  and asserts every price surface, both money attributes and the theme
+  button re-anchor for classic and subscription_max, plus the
+  click-delegation path and the visibility gate; **mutation checks**
+  disable the poll and the disagreement rules in the loaded source and
+  prove the respective tests fail without them. Multi-field pages
+  (stale quick-buy duplicate first in document order, boot-time
+  disagreement, a field injected after boot crossing the scan-cache
+  window) and the un-synced-variant park/un-park cycle (formless and
+  bound-form, including the form release and reinstatement) are each
+  pinned. Dropdown themes are covered on their own: a `<select
+  name="id">` page (formless and bound-form — ownership proven through
+  the select) is caught by the poll after a programmatic option flip,
+  with a mutation check cutting the scan's `select[name="id"]` half to
+  prove that branch load-bearing. The poll's lifecycle is pinned too:
+  `pagehide` clears the widget's single interval (the window stub
+  records real listeners now), a switch made while the poll is dead is
+  provably missed, and `CellexiaSubs.resync()` re-arms a genuinely live
+  poll that catches the next switch. The 600 ms period itself is pinned
+  as a value at both arm sites (mount and resync re-arm): the interval
+  stub records the registered delay and the suite asserts it, so a poll
+  quietly regressed to a long period fails the suite instead of passing
+  on tick-driven tests alone.
+  `tests/buybox-foreign-section-form.test.ts` gained a two-nets
+  vacuity guard proving the park alone already defuses the old
+  `|| scoped[0]` fallback defect. `tests/liquid/variant-matrix.test.ts`
+  is the golden render of the island matrix (every variant × every plan,
+  prices, cents, compare-at, availability, selected-variant id), now
+  including **byte-golden snapshots** of the three-jar island for
+  classic and subscription_max.
+
+## [1.6.8] — 2026-08-08
+
+**Ownership hardening — a second, independently-checkable factor added
+alongside the plan-id match.** The v1.6.6 fix made PLAN ids the storefront's
+ownership factor (group ids live in a different id space and cannot be
+compared), but the legacy group-id comparison it demoted was still reachable
+as an inert "secondary OR" — decoration, not defense. This removes that path
+entirely and requires a second, genuinely-independent factor instead:
+`selling_plan_group.app_id`, which — unlike group ids — is NOT an opaque
+per-shop identifier, so it compares directly between the Admin API and
+storefront Liquid. Ownership now requires BOTH the plan-id match AND a
+matching `app_id`, published by this app alone.
+
+### Changed
+
+- **`publishOwnGroupsMetafield` now publishes this app's own Shopify App ID**
+  alongside `groupIds`/`planIds` in the `cellexia.plan_groups` metafield,
+  read via a new `getCurrentAppId()` helper.
+- **The storefront ownership gate (`cx-buybox-core.liquid`) requires a
+  matching `app_id` in addition to a plan-id match.** The old inert
+  group-id-equality OR is removed outright, not just demoted — a metafield
+  naming a correct plan id is no longer sufficient by itself.
+- **Preview Doctor's `allow_list` step** now also fails when the published
+  `appId` is missing or does not match this app's installed id, instead of
+  reporting PASS on a storefront that is dark for that reason.
+
 ## [1.6.7] — 2026-08-07
 
 **Diagnosability release — the blank storefront preview now explains
