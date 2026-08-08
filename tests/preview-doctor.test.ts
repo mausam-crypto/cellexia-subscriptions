@@ -64,12 +64,13 @@ const SYNCED_CONFIG = {
   productIds: [PRODUCT_GID],
 };
 
-/** The published allow-list, both lists and appId populated (the only renderable shape). */
+/** The published allow-list, all factors present (the only renderable shape). */
 const ALLOW_LIST_VALUE = JSON.stringify({
-  v: 1,
+  v: 2,
   groupIds: ["111"],
   planIds: ["901", "902"],
-  appId: "cellexia",
+  planSets: [["901", "902"]],
+  appId: "4477001",
 });
 
 const METAFIELD = {
@@ -137,12 +138,19 @@ const mocks = vi.hoisted(() => ({
   getShopMetafield: vi.fn(async (): Promise<unknown> => null),
   getProducts: vi.fn(async (): Promise<unknown[]> => []),
   findProductsMissingFromGroup: vi.fn(async (): Promise<string[]> => []),
-  getCurrentAppId: vi.fn(async (): Promise<string> => "cellexia"),
+  getCurrentAppId: vi.fn(async (): Promise<string> => "4477001"),
+  getSellingPlanGroupOwnershipStates: vi.fn(
+    async (): Promise<Map<string, { appId: string | null; planIds: string[] }>> =>
+      new Map(),
+  ),
   getLaunchState: vi.fn(async (): Promise<unknown> => ({})),
   probeProxyIdentity: vi.fn(async (): Promise<unknown> => ({})),
   buildStorefrontPreviewUrl: vi.fn(async (): Promise<string> => ""),
   markChecklist: vi.fn(async (): Promise<void> => {}),
 }));
+
+/** This app's own numeric App id, as the mocked Admin API reports it. */
+const OUR_APP_ID = "4477001";
 
 vi.mock("~/db.server", () => ({
   default: {
@@ -175,6 +183,7 @@ vi.mock("~/lib/graphql/products.server", () => ({
 vi.mock("~/lib/graphql/sellingPlans.server", () => ({
   findProductsMissingFromGroup: mocks.findProductsMissingFromGroup,
   getCurrentAppId: mocks.getCurrentAppId,
+  getSellingPlanGroupOwnershipStates: mocks.getSellingPlanGroupOwnershipStates,
 }));
 
 vi.mock("~/lib/launch/launch.server", () => ({
@@ -296,7 +305,12 @@ beforeEach(() => {
   mocks.getShopMetafield.mockResolvedValue({ ...METAFIELD });
   mocks.getProducts.mockResolvedValue([{ ...PRODUCT }]);
   mocks.findProductsMissingFromGroup.mockResolvedValue([]);
-  mocks.getCurrentAppId.mockResolvedValue("cellexia");
+  mocks.getCurrentAppId.mockResolvedValue(OUR_APP_ID);
+  // The group on Shopify carries our stamp and exactly the recorded plans
+  // (the post-v1.6.9 steady state).
+  mocks.getSellingPlanGroupOwnershipStates.mockResolvedValue(
+    new Map([[GROUP_GID, { appId: OUR_APP_ID, planIds: PLAN_GIDS }]]),
+  );
   mocks.getLaunchState.mockResolvedValue({ ...SETUP_LAUNCH });
   mocks.probeProxyIdentity.mockResolvedValue({
     status: "OK",
@@ -507,6 +521,7 @@ describe("allow_list — plan ids are the storefront's ownership factor", () => 
         v: 1,
         groupIds: ["424242"],
         planIds: ["901", "902"],
+        appId: OUR_APP_ID,
       }),
     });
     const report = await runPreviewDoctor(SHOP_DOMAIN, PRODUCT_GID);
@@ -515,10 +530,11 @@ describe("allow_list — plan ids are the storefront's ownership factor", () => 
     expect(s.detail).toContain("111");
   });
 
-  it("FAILs an allow-list with correct plan ids but a MISSING appId", async () => {
-    // A metafield written by a pre-appId-fix app version: correct group and
-    // plan ids, no appId field at all. The widget requires both factors, so
-    // this must FAIL rather than report PASS on a dark storefront.
+  it("FAILs a metafield published before v1.6.9 — plan ids fine, appId missing", async () => {
+    /* THE FALSE PASS THIS RELEASE CLOSES. The storefront requires the appId
+       factor and renders nothing from a pre-upgrade metafield; a doctor
+       checking only the plan ids would report a green chain over a dark
+       storefront. */
     mocks.getShopMetafield.mockResolvedValue({
       ...METAFIELD,
       value: JSON.stringify({ v: 1, groupIds: ["111"], planIds: ["901", "902"] }),
@@ -530,20 +546,110 @@ describe("allow_list — plan ids are the storefront's ownership factor", () => 
     expect(report.firstBlockedStep).toBe("allow_list");
   });
 
-  it("FAILs an allow-list whose appId names a different app", async () => {
+  it("FAILs a published appId that is not this app's installed id", async () => {
     mocks.getShopMetafield.mockResolvedValue({
       ...METAFIELD,
       value: JSON.stringify({
         v: 1,
         groupIds: ["111"],
         planIds: ["901", "902"],
-        appId: "another-subscription-app",
+        appId: "999999",
       }),
     });
     const report = await runPreviewDoctor(SHOP_DOMAIN, PRODUCT_GID);
     const s = step(report, "allow_list");
     expect(s.status).toBe("FAIL");
-    expect(s.detail).toContain("does not match this app's installed id");
+    expect(s.detail).toContain("999999");
+    expect(s.detail).toContain(OUR_APP_ID);
+  });
+
+  it("FAILs when the GROUP on Shopify is not stamped with our app id", async () => {
+    /* The other half of the upgrade window: metafield perfect, but the group
+       predates the stamp (app_id nil in Liquid) — the storefront renders
+       nothing from it, so the doctor must say so instead of passing. */
+    mocks.getSellingPlanGroupOwnershipStates.mockResolvedValue(
+      new Map([[GROUP_GID, { appId: null, planIds: PLAN_GIDS }]]),
+    );
+    const report = await runPreviewDoctor(SHOP_DOMAIN, PRODUCT_GID);
+    const s = step(report, "allow_list");
+    expect(s.status).toBe("FAIL");
+    expect(s.detail).toContain("does not carry our app id");
+    expect(s.remediation).toContain("Sync to Shopify");
+  });
+
+  it("FAILs when the group cannot be read back at all (not provably stamped)", async () => {
+    mocks.getSellingPlanGroupOwnershipStates.mockResolvedValue(new Map());
+    const report = await runPreviewDoctor(SHOP_DOMAIN, PRODUCT_GID);
+    expect(step(report, "allow_list").status).toBe("FAIL");
+  });
+
+  it("FAILs a whitespace-padded appId instead of trimming it into a false PASS", async () => {
+    /* The storefront compares EXACTLY (`| append: ''` never trims): appId
+       " 4477001" is a dark widget on every product. A doctor that trims
+       before comparing would call it a match — the green-dashboard/
+       dark-storefront trap this step exists to prevent. */
+    mocks.getShopMetafield.mockResolvedValue({
+      ...METAFIELD,
+      value: JSON.stringify({
+        v: 2,
+        groupIds: ["111"],
+        planIds: ["901", "902"],
+        planSets: [["901", "902"]],
+        appId: ` ${OUR_APP_ID}`,
+      }),
+    });
+    const report = await runPreviewDoctor(SHOP_DOMAIN, PRODUCT_GID);
+    const s = step(report, "allow_list");
+    expect(s.status).toBe("FAIL");
+    expect(s.detail).toContain("whitespace");
+    expect(report.firstBlockedStep).toBe("allow_list");
+  });
+
+  it("FAILs when no published set exactly covers the group's LIVE plans", async () => {
+    // The storefront's exact-set factor: the group grew a plan (or the
+    // metafield went stale) — any-member would still pass, exact equality
+    // renders nothing, and the doctor must say so.
+    mocks.getSellingPlanGroupOwnershipStates.mockResolvedValue(
+      new Map([
+        [
+          GROUP_GID,
+          {
+            appId: OUR_APP_ID,
+            planIds: [...PLAN_GIDS, "gid://shopify/SellingPlan/903"],
+          },
+        ],
+      ]),
+    );
+    const report = await runPreviewDoctor(SHOP_DOMAIN, PRODUCT_GID);
+    const s = step(report, "allow_list");
+    expect(s.status).toBe("FAIL");
+    expect(s.detail).toContain("matches no published planSets entry");
+    expect(s.remediation).toContain("Sync to Shopify");
+  });
+
+  it("FAILs a metafield with appId but no planSets (partial upgrade state)", async () => {
+    mocks.getShopMetafield.mockResolvedValue({
+      ...METAFIELD,
+      value: JSON.stringify({
+        v: 1,
+        groupIds: ["111"],
+        planIds: ["901", "902"],
+        appId: OUR_APP_ID,
+      }),
+    });
+    const report = await runPreviewDoctor(SHOP_DOMAIN, PRODUCT_GID);
+    const s = step(report, "allow_list");
+    expect(s.status).toBe("FAIL");
+    expect(s.detail).toContain("planSets");
+  });
+
+  it("PASSes only when appId, group stamp AND exact set coverage all hold — and says so", async () => {
+    const report = await runPreviewDoctor(SHOP_DOMAIN, PRODUCT_GID);
+    const s = step(report, "allow_list");
+    expect(s.status).toBe("PASS");
+    expect(s.detail).toContain(`appId matches this app (${OUR_APP_ID})`);
+    expect(s.detail).toContain("stamped");
+    expect(s.detail).toContain("exactly covered");
   });
 });
 

@@ -4,7 +4,121 @@ All notable changes to Cellexia Subscriptions. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [SemVer](https://semver.org) as contracted in [docs/UPDATE.md](docs/UPDATE.md).
 
-## [1.6.9] — 2026-08-08
+## [1.6.10] — 2026-08-08
+
+**Ownership hardening: two factors, exact sets.** After the v1.6.6 id-space
+fix, a single field — one `planIds` entry in the `cellexia.plan_groups` shop
+metafield — decided storefront ownership by itself: anything that could
+write a plan id into that metafield (a bug, a bad migration, a forged
+request, any app holding `write_metafields`) was sufficient **alone** to
+render a foreign selling plan group through our buy box. Ownership now
+requires BOTH, together: the group's `selling_plan_group.app_id` equal to
+the `appId` this app publishes about itself, AND the group's live plan set
+**exactly equal** to a published `planSets` entry — same members, same
+count. Exact set equality (not "any one plan on a list") is deliberate: an
+app id is public and any app can stamp any string onto its own groups, so
+against a competitor that pre-stamped our id onto its single-plan group, an
+any-member rule would collapse straight back to one corruptible field. Under
+exact sets, corrupting one entry darkens the widget (fails closed, ours
+included); rendering a foreign group requires authoring its complete
+coherent set — wholesale forgery of the trust anchor, the documented
+residual. **No schema changes, no migrations, no new scopes** (the app-id
+read uses `currentAppInstallation`, already covered).
+
+> **⚠️ Upgrade order for a live store (avoid a dark-widget window):**
+> `selling_plan_group.app_id` is **nil** until this app stamps it — Shopify
+> never fills it in — and the new storefront gate requires it plus the new
+> `planSets` field. Deploy in this order: **(1)** deploy the app server
+> (this ZIP), **(2)** press **Sync to Shopify** on the Plans page (stamps
+> the group + republishes the allow-list with `appId`/`planSets` — the old
+> extension ignores the new fields and keeps rendering off
+> `groupIds`/`planIds`, which are still published), **(3)** `npm run deploy`
+> the extension. Doing (3) before (2) blanks the buy box until the sync
+> runs; the Preview Doctor names the exact missing half, and the daily
+> alert sweep now republishes automatically within 24h as a backstop.
+
+### Added
+
+- **`appId` + `planSets` in the `cellexia.plan_groups` metafield (v2)**:
+  published on every plan sync, go-live and config delete. `appId` is this
+  app's own numeric App id (`getCurrentAppId()` via
+  `currentAppInstallation`) — unlike selling plan group ids (opaque,
+  per-shop identifiers in storefront Liquid: the v1.6.6 outage), an app id
+  reads identically from the Admin API and from Liquid. `planSets` is each
+  owned group's **live** plan-id set, read off Shopify at publish time via
+  `getSellingPlanGroupOwnershipStates()` — deliberately NOT the append-only
+  DB evidence, which keeps dead plan ids for billing safety and can never
+  serve an exact-count comparison. If the live state cannot be read, the
+  publish fails and the previous metafield stays: stale-but-valid beats
+  fresh-but-dark.
+- **The app-id stamp**: every group create AND update writes
+  `SellingPlanGroupInput.appId`, and `publishOwnGroupsMetafield()` heals
+  unstamped (pre-1.6.9) groups via `stampSellingPlanGroupAppIds()` before
+  writing the metafield — so flows that republish without a full group sync
+  (go-live, config delete) can never publish an `appId` the groups don't
+  carry. The heal's outcome is **surfaced, never swallowed**:
+  `PublishResult.heal` lists stamped/already-stamped/failed groups, and the
+  go-live audit records `published but INCOMPLETE (appId stamp failed …)`
+  instead of a bare "published" over a dark storefront. A sync that cannot
+  read the app id fails loudly on the plan row rather than producing a
+  group that can never render.
+- **Preview Doctor honesty** (`allow_list` step): verifies the published
+  `appId` against the installed app **verbatim** (the storefront never
+  trims — a whitespace-padded appId is reported as exactly that, not
+  trimmed into a false PASS), the group-side stamp, AND exact set coverage
+  of each group's live plans, all off one
+  `getSellingPlanGroupOwnershipStates()` read. New diagnostic attributes on
+  the no-owned-group marker — `data-cellexia-diag-allow-app-id` ("none" for
+  a pre-1.6.9 metafield) and `data-cellexia-diag-set-count` (plan-count 3
+  with set-count 0 reads as a pre-1.6.9 metafield) — make the same states
+  readable in a browser inspector next to the per-group app ids.
+- **`OWNERSHIP_FACTORS` daily alert with self-heal** (riding the existing
+  PLAN_GROUP_DRIFT 24h Admin-API budget): the sweep verifies both
+  storefront factors against the live state — the dark-widget class that
+  attachment verification cannot see (e.g. the extension deployed before
+  Sync during this upgrade) — **republishes automatically**
+  (`publishOwnGroupsMetafield` stamps + rewrites), and raises the WARNING
+  only when the republish did not fix it.
+
+### Changed
+
+- **The storefront gate** (`cx-buybox-core.liquid`) requires both factors,
+  each mandatory and fail-closed: the correct plan set with the wrong or
+  missing appId renders nothing; the right appId with a partial, superset,
+  or one-member-mutated set renders nothing; a metafield published before
+  this release renders nothing until the next sync republishes it —
+  briefly absent beats briefly wrong, and every degraded state self-heals
+  on the next sync, publish, or daily sweep.
+
+### Removed
+
+- **The legacy group-id OR** in the storefront gate — the v1.6.6 demotion
+  left it in the code although it could never fire in production
+  (admin-numeric ids cannot equal Liquid's opaque group ids), making it
+  pure attack surface reachable only by a hand-written metafield carrying
+  the opaque id form. The branch is gone; `groupIds` and the any-member
+  `planIds` union still travel in the metafield for the Preview Doctor,
+  debuggability and the pre-1.6.9 extension, but the new storefront gate
+  reads neither.
+
+### Tests
+
+- 2160 tests (39 new). Mutation-proven three ways on the Liquid gate:
+  disabling the app-id comparison fails 3 tests, deleting the blank-appId
+  guard fails the dedicated mutation-killer (nil-vs-nil must never match,
+  pinned against stamped/unstamped groups and missing/empty/whitespace
+  appIds), and weakening set equality to any-member fails 2 (partial and
+  superset sets). Also pinned: the single-entry-corruption scenarios with a
+  competitor that copied our appId (legacy planIds corruption is inert; set
+  corruption darkens everything; only the full authored forgery renders —
+  the honest residual), live-set-vs-dead-DB-evidence separation on the
+  publish path, publish failing closed when the live read fails, heal
+  outcome surfaced through publish → go-live audit, the Doctor's seven FAIL
+  shapes (missing/mismatched/whitespace appId, missing planSets, unstamped
+  group, unreadable group, uncovered live set), and the daily sweep's
+  verify → republish → alert ladder.
+
+## [1.6.8] — 2026-08-08
 
 **Variant-switch price fix — merchant-reported, live on their store
 (subscription_max preset).** Their theme sells jar packs as SEPARATE
@@ -114,32 +228,6 @@ under the size suite's ceiling.
   prices, cents, compare-at, availability, selected-variant id), now
   including **byte-golden snapshots** of the three-jar island for
   classic and subscription_max.
-
-## [1.6.8] — 2026-08-08
-
-**Ownership hardening — a second, independently-checkable factor added
-alongside the plan-id match.** The v1.6.6 fix made PLAN ids the storefront's
-ownership factor (group ids live in a different id space and cannot be
-compared), but the legacy group-id comparison it demoted was still reachable
-as an inert "secondary OR" — decoration, not defense. This removes that path
-entirely and requires a second, genuinely-independent factor instead:
-`selling_plan_group.app_id`, which — unlike group ids — is NOT an opaque
-per-shop identifier, so it compares directly between the Admin API and
-storefront Liquid. Ownership now requires BOTH the plan-id match AND a
-matching `app_id`, published by this app alone.
-
-### Changed
-
-- **`publishOwnGroupsMetafield` now publishes this app's own Shopify App ID**
-  alongside `groupIds`/`planIds` in the `cellexia.plan_groups` metafield,
-  read via a new `getCurrentAppId()` helper.
-- **The storefront ownership gate (`cx-buybox-core.liquid`) requires a
-  matching `app_id` in addition to a plan-id match.** The old inert
-  group-id-equality OR is removed outright, not just demoted — a metafield
-  naming a correct plan id is no longer sufficient by itself.
-- **Preview Doctor's `allow_list` step** now also fails when the published
-  `appId` is missing or does not match this app's installed id, instead of
-  reporting PASS on a storefront that is dark for that reason.
 
 ## [1.6.7] — 2026-08-07
 

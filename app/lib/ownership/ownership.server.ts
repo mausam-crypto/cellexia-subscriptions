@@ -28,11 +28,12 @@ async function admin(shopDomain: string) {
  *  1. Storefront: `product.selling_plan_groups` contains the other app's group
  *     too, so a buy box that picks "the first group" renders the competitor's
  *     plan — their discount, their frequencies, their selling plan id in the
- *     cart. `publishOwnGroupsMetafield()` mirrors our group/plan ids into the
- *     shop metafield `cellexia.plan_groups` so Liquid can render our group and
- *     ONLY our group (and render nothing at all when we have none on that
- *     product). Liquid requires BOTH ids to agree before rendering a group, so
- *     neither list alone can unlock one.
+ *     cart. `publishOwnGroupsMetafield()` mirrors our plan ids AND our own
+ *     app id into the shop metafield `cellexia.plan_groups` so Liquid can
+ *     render our group and ONLY our group (and render nothing at all when we
+ *     have none on that product). Liquid requires BOTH factors to agree —
+ *     a plan-id intersection and the group's stamped `app_id` — so neither
+ *     field alone can unlock a group.
  *  2. Billing: SUBSCRIPTION_CONTRACTS_* webhooks fire for EVERY contract on the
  *     shop, whoever created it, and `syncContractFromShopify` mirrors them all.
  *     Without a marker our scheduler would charge the other app's subscribers
@@ -77,41 +78,65 @@ export type { ContractOwnership } from "./shared";
 
 export const PLAN_GROUPS_METAFIELD_NAMESPACE = "cellexia";
 export const PLAN_GROUPS_METAFIELD_KEY = "plan_groups";
-export const PLAN_GROUPS_METAFIELD_VERSION = 1;
+export const PLAN_GROUPS_METAFIELD_VERSION = 2;
 
 /**
  * Shape written to `shop.metafields.cellexia.plan_groups` (type: json).
  *
- * `planIds` (matched against the group's OWN plans) and `appId` are the two
- * MANDATORY ownership factors the storefront requires before rendering a
- * group — see the OWNERSHIP comment at the top of cx-buybox-core.liquid.
- * `groupIds` is published for backward compatibility with the legacy
- * group-id check the snippet still carries as an inert fallback, but is not
- * itself sufficient: it compares admin-space ids against Liquid's opaque
- * storefront-space group ids, which can never match on a real storefront.
+ * The storefront (v2, since v1.6.9) requires BOTH factors before rendering a
+ * group: `appId` (the group's stamped `app_id` equal to it) AND `planSets`
+ * (the group's live selling plan ids EXACTLY equal to one published set —
+ * same members, same count). Either factor missing means "render nothing",
+ * on every product. `groupIds` and `planIds` are legacy — inert on the new
+ * storefront but still read by the Preview Doctor, by humans debugging a
+ * shop, and by a pre-v1.6.9 extension during the upgrade window (its old
+ * gate needs both non-empty, which keeps the widget alive until the new
+ * extension deploys).
  */
 export interface PlanGroupsMetafieldValue {
   v: number;
-  /** Numeric SellingPlanGroup ids as strings — legacy, inert on the storefront. */
+  /**
+   * Numeric SellingPlanGroup ids as strings — legacy. Storefront Liquid never
+   * consults these (its group ids are opaque, per-shop identifiers that can
+   * never equal an admin id); the v1.6.6→v1.6.9 lesson lives in the module
+   * header. Kept for the Preview Doctor, debuggability and the pre-v1.6.9
+   * extension.
+   */
   groupIds: string[];
   /**
-   * Numeric SellingPlan ids as strings — Liquid's `plan.id` form. Empty here
-   * is NOT "skip the second factor", it is a widget outage: see
-   * publishOwnGroupsMetafield().
+   * Numeric SellingPlan ids as strings, the union across groups — legacy
+   * (the pre-v1.6.9 extension's ownership factor; the new gate reads
+   * `planSets`). Sourced from the append-only DB evidence, so it may carry
+   * dead plan ids — which is exactly why it CANNOT serve an exact-set
+   * comparison and `planSets` exists.
    */
   planIds: string[];
   /**
+   * One entry per owned group: the group's LIVE selling plan ids (numeric
+   * strings), read off Shopify at publish time. The storefront renders a
+   * group only when its plan set EXACTLY equals one of these sets — same
+   * members, same count. Exact equality is the point: an any-member rule
+   * would let ONE corrupted entry render a competitor's single-plan group
+   * whose owner stamped our (public) app id onto it, collapsing ownership
+   * back to a single field. Under set equality, tampering with an existing
+   * set darkens the widget (fails closed) and rendering a foreign group
+   * requires authoring a complete, well-formed set for it — wholesale
+   * forgery of the trust anchor, the documented residual.
+   */
+  planSets: string[][];
+  /**
    * This app's own numeric Shopify App id (see getCurrentAppId). Compared
-   * against `selling_plan_group.app_id` in Liquid — the genuine second
-   * ownership factor, since (unlike group ids) app ids are consistent
-   * between the Admin and Storefront APIs.
+   * against `selling_plan_group.app_id` in Liquid — the other mandatory
+   * ownership factor. Unlike group ids, app ids read the same from the Admin
+   * API and from Storefront Liquid; unlike Shopify defaults, `app_id` is nil
+   * unless this app stamped it onto the group, so publishing also heals
+   * unstamped groups (see publishOwnGroupsMetafield). NOTE the honest limit:
+   * the value is public and any app can stamp any string onto its OWN
+   * groups, so appId alone proves nothing — it is the exact-set factor that
+   * carries the single-field-corruption guarantee, and both are required.
    */
   appId: string;
 }
-
-/** What buildPlanGroupsValue can compute from the DB alone, before the
- *  Shopify-API-only appId is merged in by publishOwnGroupsMetafield. */
-export type PlanGroupsDbValue = Omit<PlanGroupsMetafieldValue, "appId">;
 
 // ── GID helpers ──────────────────────────────────────────────────────────────
 
@@ -424,13 +449,23 @@ export interface PublishResult {
   ok: boolean;
   error?: string;
   value?: PlanGroupsMetafieldValue;
+  /**
+   * The group-side appId heal's outcome (GIDs). Present whenever the publish
+   * reached the heal. `failed` non-empty means the metafield was published
+   * (ok:true) but the named groups are NOT stamped — the storefront renders
+   * nothing from them until a sync or the next publish succeeds. Callers
+   * that log "published" must surface this (go-live audit does), because
+   * "ok:true with failed heals" is a dark storefront behind a green line.
+   */
+  heal?: { stamped: string[]; alreadyStamped: string[]; failed: string[] };
 }
 
 /**
  * Build the storefront allow-list from the synced configs of `shopDomain` and
  * write it to the shop metafield `cellexia.plan_groups` (type json):
  *
- *   {"v":1,"groupIds":["123"],"planIds":["456","789"]}
+ *   {"v":2,"groupIds":["123"],"planIds":["456","789"],
+ *    "planSets":[["456","789"]],"appId":"4830258"}
  *
  * Ids are the NUMERIC form because that is what Liquid gives for
  * `group.id` / `selling_plan.id`. Never throws — and a failed write is not a
@@ -443,28 +478,51 @@ export interface PublishResult {
  * publish is a full widget outage rather than a wrong widget: re-running the
  * plan sync, or Preview & launch, republishes it.
  *
- * PUBLISH THE PLAN IDS, NOT JUST THE GROUP IDS — the snippet renders NOTHING
- * without them. `planIds` is the second of two MANDATORY factors: a group is
- * rendered only when `groupIds` names it AND it actually contains one of the
- * allow-listed plans. That is what stops a single forged or corrupted
- * `groupIds` entry from handing the renderer another app's group.
+ * TWO MANDATORY STOREFRONT FACTORS, BOTH FROM THIS VALUE (v1.6.9):
  *
- * It used to be a veto instead — enforced only when `planIds` was non-empty —
- * and that was a hole, because "empty" is a state THIS FUNCTION emits: when a
- * synced config never recorded `shopifyPlanIds` and the repair below cannot
- * read the group back, the published allow-list is
- * `{"groupIds":["77"],"planIds":[]}`. In that state one bad `groupIds` entry
- * was enough to render a competitor's group in full. Both factors are now
- * required, so that same state renders nothing at all instead.
+ *  1. `planSets` — a group renders only when its LIVE plan ids EXACTLY equal
+ *     one published set (same members, same count; plan ids are the one id
+ *     space Liquid and the Admin API share). Exact equality — not "any one
+ *     plan on a list" — is what makes single-entry corruption harmless: an
+ *     appended or altered entry breaks the equality and darkens the widget
+ *     (fails closed) instead of unlocking a competitor's group. The sets are
+ *     read off Shopify AT PUBLISH TIME, never off the append-only DB
+ *     evidence (which keeps dead plan ids for billing safety and would break
+ *     the count).
+ *  2. `appId` — the group's `selling_plan_group.app_id` must equal it. The
+ *     value exists on the group only because this app stamps it there
+ *     (Shopify leaves `app_id` nil otherwise), which is why the publish
+ *     below also HEALS unstamped groups before writing the metafield:
+ *     several flows republish without running the full group sync (go-live,
+ *     config delete), and publishing an appId the groups don't carry would
+ *     darken the widget until the next manual sync. Honest limit: the app id
+ *     is public and any app can stamp any string onto its OWN groups, so
+ *     this factor alone is not proof — it exists to force a forger to author
+ *     BOTH factors coherently, and the exact-set factor is what carries the
+ *     single-field guarantee.
  *
- * Which makes the repair below load-bearing rather than merely tidy: an
- * allow-list published without plan ids is a widget outage until the next
- * successful sync. It is one indexed query returning nothing once every synced
- * config has its plans (the steady state), it never throws, and a config it
- * cannot repair keeps its null column. Publishing group ids anyway is still
- * right — there is no earlier good allow-list being overwritten, since empty
- * `planIds` means we never recorded any — and the outage is the safe
- * direction: briefly absent beats briefly wrong.
+ * `groupIds` and `planIds` are legacy: inert on the new storefront
+ * (`groupIds` since the v1.6.6 opaque-id lesson, `planIds` since the v1.6.9
+ * exact-set factor), kept for the Preview Doctor, humans, and the
+ * pre-v1.6.9 extension during the upgrade window.
+ *
+ * The one-field history, because it keeps trying to repeat: `groupIds` alone
+ * decided ownership (v1.3.0) — broken by the id-space trap; `planIds`-any-
+ * member decided it alone (v1.6.6) — one corrupted entry could render a
+ * competitor's single-plan group whose owner stamped our public app id.
+ * Exact sets plus the app-id stamp mean every degraded or tampered state
+ * renders NOTHING: briefly absent beats briefly wrong. The same direction
+ * governs a failed appId or live-state read: the publish returns `{ok:false}`
+ * and leaves the previous allow-list in place — stale-but-valid beats
+ * fresh-but-dark.
+ *
+ * Which makes the repairs below load-bearing rather than merely tidy. The
+ * plan-id repair is one indexed query returning nothing once every synced
+ * config has its plans (the steady state); the appId heal shares the one
+ * live read the plan sets need anyway (a write happens only for groups
+ * still unstamped). The heal is contained per group and its outcome is
+ * surfaced on the result (`heal.failed`) — go-live audits it, the Preview
+ * Doctor names it, and the daily alert sweep re-publishes on it.
  */
 export async function publishOwnGroupsMetafield(
   shopDomain: string,
@@ -481,19 +539,56 @@ export async function publishOwnGroupsMetafield(
     await refreshOwnPlanIdsFromShopify(shopDomain, shop.id);
     const dbValue = await buildPlanGroupsValue(shop.id);
     const adminClient = await admin(shopDomain);
-    // Lazy import, same reason as refreshOwnPlanIdsFromShopify above: this
-    // module loads in nearly every server module graph, and getCurrentAppId
-    // is only ever needed on the publish path.
-    const { getCurrentAppId } = await import("~/lib/graphql/sellingPlans.server");
+    // Lazy import: this module loads in nearly every server module graph,
+    // and the group-sync layer is only ever needed on the publish path.
+    const {
+      getCurrentAppId,
+      getSellingPlanGroupOwnershipStates,
+      stampSellingPlanGroupAppIds,
+    } = await import("~/lib/graphql/sellingPlans.server");
     const appId = await getCurrentAppId(adminClient);
-    const value: PlanGroupsMetafieldValue = { ...dbValue, appId };
+
+    // One live read serves both halves of the app-id factor AND the exact
+    // plan sets. NOT contained: if the live state cannot be read, there is
+    // no truthful value to publish — failing here keeps the PREVIOUS
+    // metafield in place, and stale-but-valid beats fresh-but-dark.
+    const { gids } = await getOwnGroupIds(shop.id);
+    const states = await getSellingPlanGroupOwnershipStates(adminClient, gids);
+
+    // Heal groups that predate the appId stamp (pre-v1.6.9, or a failed
+    // stamp): this publish path is reachable from flows that never run the
+    // full group sync (go-live, config delete), so the publish itself
+    // repairs the group-side factor. Per-group containment lives inside;
+    // the outcome is surfaced on the result, never swallowed.
+    const heal = await stampSellingPlanGroupAppIds(
+      adminClient,
+      states,
+      gids,
+      appId,
+    );
+
+    // The exact-set factor: each owned group's LIVE plan ids, numeric. A
+    // group that could not be read back gets NO set — it cannot be
+    // truthfully attested, so it stays dark (fail closed) and shows up in
+    // heal.failed above.
+    const planSets: string[][] = [];
+    for (const gid of gids) {
+      const state = states.get(gid);
+      if (!state) continue;
+      const set = state.planIds
+        .map((planId) => numericIdFromGid(planId))
+        .filter((id): id is string => id != null);
+      if (set.length > 0) planSets.push(set);
+    }
+
+    const value: PlanGroupsMetafieldValue = { ...dbValue, planSets, appId };
     await setShopMetafield(adminClient, {
       namespace: PLAN_GROUPS_METAFIELD_NAMESPACE,
       key: PLAN_GROUPS_METAFIELD_KEY,
       type: "json",
       value: JSON.stringify(value),
     });
-    return { ok: true, value };
+    return { ok: true, value, heal };
   } catch (err) {
     console.error(
       "[ownership] plan_groups metafield publish failed",
@@ -504,11 +599,17 @@ export async function publishOwnGroupsMetafield(
   }
 }
 
-/** The allow-list value for a shop, numeric ids only (Liquid's id form),
- *  minus the Shopify-API-only appId — see publishOwnGroupsMetafield. */
+/**
+ * The allow-list value for a shop, numeric ids only (Liquid's id form) —
+ * everything the DB alone can answer (the legacy fields). The publish path
+ * merges in `appId` and `planSets`, which need the Admin API: `planIds`
+ * here is the append-only DB evidence (dead plan ids included, for billing
+ * safety), which is legitimate for the legacy union field and disqualifying
+ * for the exact-set factor.
+ */
 export async function buildPlanGroupsValue(
   shopId: string,
-): Promise<PlanGroupsDbValue> {
+): Promise<Omit<PlanGroupsMetafieldValue, "appId" | "planSets">> {
   const configs = await prisma.sellingPlanConfig.findMany({
     where: { shopId, shopifyGroupId: { not: null } },
     select: { shopifyGroupId: true, shopifyPlanIds: true },

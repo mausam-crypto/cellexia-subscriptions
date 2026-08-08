@@ -90,8 +90,8 @@ describe("a product carrying ONLY another app's group", () => {
    * VACUITY GUARD. Every assertion above is a negative, and negatives pass
    * just as happily against a renderer that has been broken outright, a
    * fixture that stopped producing a group, or a harness that returns "".
-   * Allow-list Joy's group id — the one thing that could ever make the widget
-   * treat it as ours — and the SAME fixture must render Joy's group in full.
+   * Forge the FULL allow-list for Joy — plan id AND app id, both factors at
+   * once (v1.6.9) — and the SAME fixture must render Joy's group in full.
    * That is also the concrete demonstration of why the allow-list is the only
    * input trusted to choose a group.
    */
@@ -99,10 +99,11 @@ describe("a product carrying ONLY another app's group", () => {
     const html = await renderWidget({
       ...FOREIGN_ONLY,
       planGroups: {
-        v: 1,
+        v: 2,
         groupIds: [JOY_GROUP_ID],
         planIds: [JOY_PLAN_ID],
-        appId: "joy-subscriptions",
+        planSets: [[JOY_PLAN_ID]],
+        appId: JOY_GROUP.appId,
       },
     });
 

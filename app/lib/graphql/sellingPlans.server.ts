@@ -132,12 +132,21 @@ function buildDesiredPlans(config: SellingPlanConfig): DesiredSellingPlan[] {
   return plans;
 }
 
-function groupInputBase(config: SellingPlanConfig): Record<string, unknown> {
+function groupInputBase(
+  config: SellingPlanConfig,
+  appId: string,
+): Record<string, unknown> {
   return {
     name: config.name,
     merchantCode: config.merchantCode,
     options: ["Delivery frequency"],
     position: 1,
+    // Storefront ownership factor: Liquid's `selling_plan_group.app_id` is
+    // NOT auto-filled by Shopify — it is nil unless the app provides it here.
+    // The buy box refuses to render a group whose app_id differs from the
+    // appId published in cellexia.plan_groups, so every create AND update
+    // stamps it (update also heals groups created before v1.6.9).
+    appId,
   };
 }
 
@@ -258,6 +267,47 @@ const PRODUCT_GROUPS_QUERY = `#graphql
   }
 `;
 
+const CURRENT_APP_ID_QUERY = `#graphql
+  query CellexiaCurrentAppId {
+    currentAppInstallation {
+      app {
+        id
+      }
+    }
+  }
+`;
+
+const GROUP_OWNERSHIP_STATES_QUERY = `#graphql
+  query CellexiaSellingPlanGroupOwnershipStates($ids: [ID!]!) {
+    nodes(ids: $ids) {
+      ... on SellingPlanGroup {
+        id
+        appId
+        sellingPlans(first: 50) {
+          nodes {
+            id
+          }
+        }
+      }
+    }
+  }
+`;
+
+const GROUP_SET_APP_ID_MUTATION = `#graphql
+  mutation CellexiaSellingPlanGroupSetAppId($id: ID!, $input: SellingPlanGroupInput!) {
+    sellingPlanGroupUpdate(id: $id, input: $input) {
+      sellingPlanGroup {
+        id
+        appId
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
 // ── Response shapes ──────────────────────────────────────────────────────────
 
 interface RawPlanNode {
@@ -318,11 +368,159 @@ interface ProductGroupsResponse {
   } | null> | null;
 }
 
+interface CurrentAppIdResponse {
+  currentAppInstallation?: { app?: { id?: string | null } | null } | null;
+}
+
+interface GroupOwnershipStatesResponse {
+  nodes?: Array<{
+    id?: string;
+    appId?: string | null;
+    sellingPlans?: { nodes?: Array<{ id: string }> | null } | null;
+  } | null> | null;
+}
+
+interface GroupSetAppIdResponse {
+  sellingPlanGroupUpdate?: {
+    sellingPlanGroup?: { id: string; appId?: string | null } | null;
+    userErrors?: UserError[];
+  } | null;
+}
+
 // ── Public API ───────────────────────────────────────────────────────────────
 
 export interface SellingPlanSyncResult {
   groupId: string;
   planIds: string[];
+}
+
+/**
+ * This app's own numeric Shopify App id — the value Liquid's
+ * `selling_plan_group.app_id` returns for a group this app has stamped (via
+ * `appId` in the group input; Shopify does NOT fill it in automatically).
+ * Unlike a SellingPlanGroup id, an app id is not a per-shop opaque storefront
+ * identifier: it names the app itself, so the value read here is the same
+ * value the storefront sees, making it usable as a genuine ownership factor.
+ *
+ * Throws when the id cannot be read — callers on the sync path let that fail
+ * the sync loudly (an unstamped group cannot render under the two-factor
+ * gate, so a visible sync error beats a silently dark widget), and the
+ * publish path converts it into its usual `{ok:false}`.
+ */
+export async function getCurrentAppId(admin: AdminClient): Promise<string> {
+  const data = await gql<CurrentAppIdResponse>(admin, CURRENT_APP_ID_QUERY);
+  const gid = data.currentAppInstallation?.app?.id;
+  const numeric =
+    typeof gid === "string" ? /\/(\d+)(?:\?.*)?$/.exec(gid)?.[1] : undefined;
+  if (!numeric) {
+    throw new Error("Could not read this app's own Shopify App id");
+  }
+  return numeric;
+}
+
+/**
+ * Everything the storefront ownership gate depends on, per group, read off
+ * Shopify in one query: the group's stamped `appId` (nil until this app
+ * stamps it — Shopify never backfills it) and its CURRENT selling plan GIDs
+ * (what Liquid iterates — deliberately NOT the append-only DB evidence,
+ * which keeps dead plan ids for billing safety and must never leak into an
+ * exact-set comparison).
+ */
+export interface GroupOwnershipState {
+  appId: string | null;
+  /** The group's live selling plan GIDs, in Shopify order. */
+  planIds: string[];
+}
+
+/**
+ * The ownership state of each of `groupIds`, by group GID. A group that
+ * cannot be read back (deleted, or not a SellingPlanGroup) is absent from
+ * the map — callers treat absence as "not provably ours to render". Throws
+ * on transport/GraphQL errors: a caller that cannot read the live state
+ * cannot truthfully publish or verify it.
+ */
+export async function getSellingPlanGroupOwnershipStates(
+  admin: AdminClient,
+  groupIds: string[],
+): Promise<Map<string, GroupOwnershipState>> {
+  const out = new Map<string, GroupOwnershipState>();
+  if (groupIds.length === 0) return out;
+  const data = await gql<GroupOwnershipStatesResponse>(
+    admin,
+    GROUP_OWNERSHIP_STATES_QUERY,
+    { ids: groupIds },
+  );
+  for (const node of data.nodes ?? []) {
+    if (!node?.id) continue;
+    out.set(node.id, {
+      appId: node.appId ?? null,
+      planIds: (node.sellingPlans?.nodes ?? []).map((n) => n.id),
+    });
+  }
+  return out;
+}
+
+/** The outcome of one appId-heal pass, group by group — never a silent one. */
+export interface StampAppIdsResult {
+  /** Groups that were unstamped/mismatched and are now stamped. */
+  stamped: string[];
+  /** Groups that already carried the appId — nothing written. */
+  alreadyStamped: string[];
+  /** Groups that could not be stamped (unreadable, or the write failed). */
+  failed: string[];
+}
+
+/**
+ * Stamp `appId` onto every group of `groupIds` that does not already carry
+ * it — the storefront-side heal for groups created before v1.6.9 (Shopify
+ * never backfills `app_id`, and the buy box refuses a group without it).
+ *
+ * Reached from `publishOwnGroupsMetafield()` on purpose: several flows
+ * republish the allow-list WITHOUT running the full group sync (go-live,
+ * config delete), and publishing an `appId` the groups don't carry would
+ * darken the widget until someone pressed Sync. Contained per group — one
+ * unstampable group must not block the others or the metafield write — and
+ * the outcome is REPORTED, not swallowed: callers surface `failed` groups
+ * (publish result, go-live audit, Preview Doctor) instead of letting a dark
+ * storefront hide behind a green log line. `states` is the map an earlier
+ * getSellingPlanGroupOwnershipStates() call returned, so the heal costs no
+ * second read; a group absent from it counts as failed.
+ */
+export async function stampSellingPlanGroupAppIds(
+  admin: AdminClient,
+  states: Map<string, GroupOwnershipState>,
+  groupIds: string[],
+  appId: string,
+): Promise<StampAppIdsResult> {
+  const result: StampAppIdsResult = {
+    stamped: [],
+    alreadyStamped: [],
+    failed: [],
+  };
+  for (const groupId of groupIds) {
+    const state = states.get(groupId);
+    if (!state) {
+      result.failed.push(groupId);
+      continue;
+    }
+    if (state.appId === appId) {
+      result.alreadyStamped.push(groupId);
+      continue;
+    }
+    try {
+      const data = await gql<GroupSetAppIdResponse>(
+        admin,
+        GROUP_SET_APP_ID_MUTATION,
+        { id: groupId, input: { appId } },
+      );
+      ensureNoUserErrors("sellingPlanGroupUpdate", data.sellingPlanGroupUpdate);
+      result.stamped.push(groupId);
+    } catch (err) {
+      console.error("[sellingPlans] appId stamp failed for group", groupId, err);
+      result.failed.push(groupId);
+    }
+  }
+  return result;
 }
 
 /**
@@ -343,18 +541,23 @@ export async function syncSellingPlanGroupFromConfig(
 ): Promise<SellingPlanSyncResult> {
   const productIds = parseProductIds(config);
   const desired = buildDesiredPlans(config);
+  // Read before any mutation: a failure here fails the whole sync, visibly.
+  // A group synced without its appId stamp cannot render on the storefront
+  // (the buy box requires the app_id match), and an error on the plan row is
+  // the honest version of that state.
+  const appId = await getCurrentAppId(admin);
 
   if (!config.shopifyGroupId) {
-    return createGroup(admin, config, desired, productIds);
+    return createGroup(admin, config, desired, productIds, appId);
   }
 
   const existing = await fetchGroup(admin, config.shopifyGroupId);
   if (!existing) {
     // Group vanished on Shopify (deleted in admin) — recreate from scratch.
-    return createGroup(admin, config, desired, productIds);
+    return createGroup(admin, config, desired, productIds, appId);
   }
 
-  return updateGroup(admin, config, existing, desired, productIds);
+  return updateGroup(admin, config, existing, desired, productIds, appId);
 }
 
 /**
@@ -369,41 +572,6 @@ export async function getSellingPlanGroupPlanIds(
 ): Promise<string[]> {
   const group = await fetchGroup(admin, groupId);
   return planIdsOf(group);
-}
-
-const CURRENT_APP_ID_QUERY = `#graphql
-  query CellexiaCurrentAppId {
-    currentAppInstallation {
-      app {
-        id
-      }
-    }
-  }
-`;
-
-interface CurrentAppIdResponse {
-  currentAppInstallation: { app: { id: string } } | null;
-}
-
-/**
- * This app's own numeric Shopify App id — the same value Liquid's
- * `selling_plan_group.app_id` returns for a group this app created. Unlike a
- * SellingPlanGroup id, an app id is not a per-shop opaque storefront
- * identifier: it names the app itself, so it reads the same way from the
- * Admin API (here) and from Storefront Liquid (`selling_plan_group.app_id`),
- * making it usable as a genuine ownership factor (see
- * publishOwnGroupsMetafield). Throws on a transport/GraphQL failure or an
- * unparseable id — callers must not publish an allow-list without it, the
- * same "outage over wrong render" rule as the rest of this module.
- */
-export async function getCurrentAppId(admin: AdminClient): Promise<string> {
-  const data = await gql<CurrentAppIdResponse>(admin, CURRENT_APP_ID_QUERY);
-  const gid = data.currentAppInstallation?.app?.id;
-  const numeric = typeof gid === "string" ? /\/(\d+)(?:\?.*)?$/.exec(gid)?.[1] : undefined;
-  if (!numeric) {
-    throw new Error("Could not read this app's own Shopify App id");
-  }
-  return numeric;
 }
 
 /**
@@ -497,10 +665,11 @@ async function createGroup(
   config: SellingPlanConfig,
   desired: DesiredSellingPlan[],
   productIds: string[],
+  appId: string,
 ): Promise<SellingPlanSyncResult> {
   const data = await gql<GroupCreateResponse>(admin, GROUP_CREATE_MUTATION, {
     input: {
-      ...groupInputBase(config),
+      ...groupInputBase(config, appId),
       sellingPlansToCreate: desired.map((d) => d.input),
     },
     resources: { productIds },
@@ -519,6 +688,7 @@ async function updateGroup(
   existing: RawGroup,
   desired: DesiredSellingPlan[],
   productIds: string[],
+  appId: string,
 ): Promise<SellingPlanSyncResult> {
   const existingPlans = existing.sellingPlans?.nodes ?? [];
   const existingByKey = new Map(existingPlans.map((p) => [planKey(p), p]));
@@ -537,7 +707,7 @@ async function updateGroup(
   const data = await gql<GroupUpdateResponse>(admin, GROUP_UPDATE_MUTATION, {
     id: existing.id,
     input: {
-      ...groupInputBase(config),
+      ...groupInputBase(config, appId),
       sellingPlansToCreate,
       sellingPlansToUpdate,
       sellingPlansToDelete,

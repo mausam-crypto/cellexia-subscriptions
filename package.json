@@ -1,6 +1,6 @@
 {
   "name": "cellexia-subscriptions",
-  "version": "1.6.9",
+  "version": "1.6.10",
   "private": true,
   "description": "Cellexia private subscription engine for Shopify — selling plans, billing scheduler, dunning, portal, magic links, cancel-save flows, analytics.",
   "type": "module",

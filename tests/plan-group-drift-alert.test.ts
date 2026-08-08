@@ -21,6 +21,24 @@ const GROUP_A = "gid://shopify/SellingPlanGroup/111";
 const GROUP_B = "gid://shopify/SellingPlanGroup/222";
 const PRODUCT_1 = "gid://shopify/Product/1001";
 const PRODUCT_2 = "gid://shopify/Product/1002";
+const OUR_APP_ID = "4477001";
+const PLAN_A = "gid://shopify/SellingPlan/901";
+const PLAN_B = "gid://shopify/SellingPlan/902";
+
+/** A fully healthy v1.6.9 allow-list matching the GROUP_A/GROUP_B fixtures. */
+const HEALTHY_ALLOW_LIST = {
+  id: "gid://shopify/Metafield/1",
+  namespace: "cellexia",
+  key: "plan_groups",
+  type: "json",
+  value: JSON.stringify({
+    v: 2,
+    groupIds: ["111", "222"],
+    planIds: ["901", "902"],
+    planSets: [["901"], ["902"]],
+    appId: OUR_APP_ID,
+  }),
+};
 
 const mocks = vi.hoisted(() => ({
   sellingPlanConfigFindMany: vi.fn(async (): Promise<unknown[]> => []),
@@ -44,6 +62,15 @@ const mocks = vi.hoisted(() => ({
   getProducts: vi.fn(
     async (_admin: unknown, ids: string[]): Promise<unknown[]> =>
       ids.map((id) => ({ id, title: `Title of ${id.split("/").pop()}` })),
+  ),
+  getShopMetafield: vi.fn(async (): Promise<unknown> => null),
+  getCurrentAppId: vi.fn(async (): Promise<string> => "4477001"),
+  getSellingPlanGroupOwnershipStates: vi.fn(
+    async (): Promise<Map<string, { appId: string | null; planIds: string[] }>> =>
+      new Map(),
+  ),
+  publishOwnGroupsMetafield: vi.fn(
+    async (): Promise<Record<string, unknown>> => ({ ok: true }),
   ),
 }));
 
@@ -112,7 +139,25 @@ vi.mock("~/shopify.server", () => ({
 
 vi.mock("~/lib/graphql/sellingPlans.server", () => ({
   findProductsMissingFromGroup: mocks.findProductsMissingFromGroup,
+  getCurrentAppId: mocks.getCurrentAppId,
+  getSellingPlanGroupOwnershipStates: mocks.getSellingPlanGroupOwnershipStates,
 }));
+
+vi.mock("~/lib/graphql/metafields.server", () => ({
+  getShopMetafield: mocks.getShopMetafield,
+  setShopMetafield: vi.fn(),
+}));
+
+// The scan's static ownership imports (OURS_ONLY, numericIdFromGid) stay
+// REAL; only the publish side effect is stubbed so the self-heal path is
+// observable without booting Shopify.
+vi.mock("~/lib/ownership/ownership.server", async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  return {
+    ...actual,
+    publishOwnGroupsMetafield: mocks.publishOwnGroupsMetafield,
+  };
+});
 
 vi.mock("~/lib/graphql/products.server", () => ({
   getProducts: mocks.getProducts,
@@ -143,6 +188,12 @@ function driftSweepEvents(): Record<string, unknown>[] {
     .filter((e) => e.type === PLAN_DRIFT_CHECK_EVENT_TYPE);
 }
 
+function raisedOwnershipAlert(): Record<string, unknown> | undefined {
+  return mocks.alertCreate.mock.calls
+    .map((c) => (c[0] as { data: Record<string, unknown> }).data)
+    .find((d) => d.type === "OWNERSHIP_FACTORS");
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.alertFindFirst.mockResolvedValue(null);
@@ -152,6 +203,17 @@ beforeEach(() => {
   mocks.getProducts.mockImplementation(async (_admin: unknown, ids: string[]) =>
     ids.map((id) => ({ id, title: `Title of ${id.split("/").pop()}` })),
   );
+  // Ownership factors healthy by default: stamped groups, live sets matching
+  // the published planSets, our appId in the metafield.
+  mocks.getShopMetafield.mockResolvedValue({ ...HEALTHY_ALLOW_LIST });
+  mocks.getCurrentAppId.mockResolvedValue(OUR_APP_ID);
+  mocks.getSellingPlanGroupOwnershipStates.mockResolvedValue(
+    new Map([
+      [GROUP_A, { appId: OUR_APP_ID, planIds: [PLAN_A] }],
+      [GROUP_B, { appId: OUR_APP_ID, planIds: [PLAN_B] }],
+    ]),
+  );
+  mocks.publishOwnGroupsMetafield.mockResolvedValue({ ok: true });
 });
 
 describe("PLAN_GROUP_DRIFT", () => {
@@ -295,5 +357,133 @@ describe("PLAN_GROUP_DRIFT", () => {
 
     expect(result.errors).toEqual([]);
     expect(mocks.alertCreate).not.toHaveBeenCalled();
+  });
+});
+
+// ── The v1.6.9 ownership factors, on the same daily sweep ────────────────────
+
+describe("OWNERSHIP_FACTORS (the dark-widget class attachment cannot see)", () => {
+  /**
+   * The upgrade-order trap: extension deployed before Sync, or a hand-edited
+   * metafield. Every plan row says SYNCED, every attachment verifies — and
+   * the storefront renders nothing because the two-factor gate (published
+   * appId + exact plan sets, group-side app_id stamp) is unsatisfied. The
+   * sweep verifies the factors against the live state, SELF-HEALS by
+   * republishing, and alerts only when the republish did not fix it.
+   */
+  const healedPublish = {
+    ok: true,
+    value: {
+      v: 2,
+      groupIds: ["111"],
+      planIds: ["901"],
+      planSets: [["901"]],
+      appId: OUR_APP_ID,
+    },
+    heal: { stamped: [GROUP_A], alreadyStamped: [], failed: [] },
+  };
+
+  it("a pre-v1.6.9 metafield (no appId, no planSets) triggers the self-heal — and a successful republish raises NO alert", async () => {
+    mocks.sellingPlanConfigFindMany.mockResolvedValue([
+      syncedConfig("cfg_1", GROUP_A, [PRODUCT_1]),
+    ]);
+    mocks.getShopMetafield.mockResolvedValue({
+      ...HEALTHY_ALLOW_LIST,
+      value: JSON.stringify({ v: 1, groupIds: ["111"], planIds: ["901"] }),
+    });
+    mocks.publishOwnGroupsMetafield.mockResolvedValue(healedPublish);
+
+    const result = await runAlertScan("shop_1", { now: NOW });
+
+    expect(result.errors).toEqual([]);
+    expect(mocks.publishOwnGroupsMetafield).toHaveBeenCalledWith(
+      "cellexia.myshopify.com",
+    );
+    expect(raisedOwnershipAlert()).toBeUndefined();
+    expect(driftSweepEvents()[0].payload).toMatchObject({
+      ownershipFactorsHealed: true,
+    });
+  });
+
+  it("an UNSTAMPED group whose stamp still fails after the republish raises the alert, naming the problem", async () => {
+    mocks.sellingPlanConfigFindMany.mockResolvedValue([
+      syncedConfig("cfg_1", GROUP_A, [PRODUCT_1]),
+    ]);
+    mocks.getSellingPlanGroupOwnershipStates.mockResolvedValue(
+      new Map([[GROUP_A, { appId: null, planIds: [PLAN_A] }]]),
+    );
+    mocks.publishOwnGroupsMetafield.mockResolvedValue({
+      ...healedPublish,
+      heal: { stamped: [], alreadyStamped: [], failed: [GROUP_A] },
+    });
+
+    const result = await runAlertScan("shop_1", { now: NOW });
+
+    expect(result.errors).toEqual([]);
+    const raised = raisedOwnershipAlert();
+    expect(raised).toBeDefined();
+    expect(raised?.severity).toBe("WARNING");
+    expect(String(raised?.message)).toContain("not stamped");
+    expect(String(raised?.message)).toContain("Sync to Shopify");
+    expect(String(raised?.message)).toContain("Preview Doctor");
+  });
+
+  it("a live plan set no published set covers is caught — the exact-set factor, verified daily", async () => {
+    mocks.sellingPlanConfigFindMany.mockResolvedValue([
+      syncedConfig("cfg_1", GROUP_A, [PRODUCT_1]),
+    ]);
+    // The group grew a plan; the published set is stale.
+    mocks.getSellingPlanGroupOwnershipStates.mockResolvedValue(
+      new Map([[GROUP_A, { appId: OUR_APP_ID, planIds: [PLAN_A, PLAN_B] }]]),
+    );
+    mocks.publishOwnGroupsMetafield.mockResolvedValue(healedPublish);
+
+    const result = await runAlertScan("shop_1", { now: NOW });
+
+    expect(result.errors).toEqual([]);
+    // Self-heal ran (a republish reads the live set and fixes exactly this).
+    expect(mocks.publishOwnGroupsMetafield).toHaveBeenCalled();
+    expect(raisedOwnershipAlert()).toBeUndefined();
+  });
+
+  it("a whitespace-padded appId is NOT trimmed into a false all-clear", async () => {
+    mocks.sellingPlanConfigFindMany.mockResolvedValue([
+      syncedConfig("cfg_1", GROUP_A, [PRODUCT_1]),
+    ]);
+    mocks.getShopMetafield.mockResolvedValue({
+      ...HEALTHY_ALLOW_LIST,
+      value: JSON.stringify({
+        v: 2,
+        groupIds: ["111"],
+        planIds: ["901"],
+        planSets: [["901"]],
+        appId: ` ${OUR_APP_ID}`,
+      }),
+    });
+    mocks.publishOwnGroupsMetafield.mockResolvedValue(healedPublish);
+
+    const result = await runAlertScan("shop_1", { now: NOW });
+
+    expect(result.errors).toEqual([]);
+    // The padded value is a dark storefront: the sweep must treat it as a
+    // problem (and republish over it), never trim it into a match.
+    expect(mocks.publishOwnGroupsMetafield).toHaveBeenCalled();
+  });
+
+  it("healthy factors touch nothing: no republish, no alert", async () => {
+    mocks.sellingPlanConfigFindMany.mockResolvedValue([
+      syncedConfig("cfg_1", GROUP_A, [PRODUCT_1]),
+      syncedConfig("cfg_2", GROUP_B, [PRODUCT_2]),
+    ]);
+
+    const result = await runAlertScan("shop_1", { now: NOW });
+
+    expect(result.errors).toEqual([]);
+    expect(mocks.publishOwnGroupsMetafield).not.toHaveBeenCalled();
+    expect(raisedOwnershipAlert()).toBeUndefined();
+    expect(driftSweepEvents()[0].payload).toMatchObject({
+      ownershipFactorProblems: 0,
+      ownershipFactorsHealed: false,
+    });
   });
 });

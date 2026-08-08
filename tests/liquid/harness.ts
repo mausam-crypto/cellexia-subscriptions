@@ -491,6 +491,17 @@ export function defaultBlockSettings(
 export const FIXTURE = {
   productId: 7712300000001,
   groupId: 6612300000009,
+  /**
+   * This app's own numeric Shopify App id, as a string — the SECOND ownership
+   * factor (v1.6.9). Two places carry it and both must agree with the group:
+   * the allow-list's `appId` field, and the group's own `app_id`, which
+   * exists ONLY because the app stamped it via SellingPlanGroupInput.appId on
+   * sync (Shopify does NOT auto-fill it; unstamped groups read nil — model
+   * that with `ownGroupAppId: null`). Unlike group ids, app ids are not
+   * per-shop opaque identifiers: the Admin API and Liquid read the same
+   * value, which is what makes the comparison usable at all.
+   */
+  appId: "77199220001",
   variantIds: { small: 4411100011101, large: 4411100011102 },
   planIds: { weeks4: 6881100001, weeks6: 6881100002, weeks8: 6881100003 },
   prices: { small: 6400, large: 9800 },
@@ -565,8 +576,16 @@ export interface OtherAppGroupFixture {
   /** The group's ADMIN-API numeric id; Liquid sees storefrontGroupId(id). */
   id: number;
   name: string;
-  /** `selling_plan_group.app_id` — the real ownership factor since the app-id fix. */
-  appId?: string;
+  /**
+   * `selling_plan_group.app_id` — whatever string THAT app stamped onto its
+   * own group (any app can write any value on its own groups, including OUR
+   * public id — which is why appId never decides alone). Since v1.6.9 the
+   * widget compares this against the allow-list's appId as one of the two
+   * ownership factors. `null` models an app that never stamped its groups:
+   * the key is then ABSENT and Liquid reads nil, like admin-created groups
+   * and most real-world apps. Undefined keeps the canned default.
+   */
+  appId?: string | null;
   /** Fraction off the variant price, e.g. 0.05 for Joy's "save 5%". */
   discount?: number;
   /** The group's selling plans. Defaults to one monthly plan. */
@@ -612,6 +631,15 @@ export interface ProductFixtureOptions {
    * that variant, and the widget must say so from the first paint.
    */
   selectedVariantHasNoAllocations?: boolean;
+  /**
+   * OUR group's `app_id` as Liquid sees it. Defaults to FIXTURE.appId — the
+   * stamped steady state every synced shop is in after v1.6.9. Pass `null`
+   * for the UNSTAMPED group (created before v1.6.9, or the stamp failed):
+   * Liquid then reads nil, and the widget must render NOTHING however
+   * correct the published allow-list is — that is the upgrade-window
+   * fail-closed direction, pinned by tests.
+   */
+  ownGroupAppId?: string | null;
   /**
    * OUR group's ADMIN-API id (defaults to FIXTURE.groupId). What Liquid sees
    * is storefrontGroupId(ownGroupId) — the two id spaces are the point.
@@ -824,13 +852,18 @@ export function makeProduct(options: ProductFixtureOptions = {}) {
       ),
     },
   ];
-  const ownGroup = {
+  const ownGroup: Record<string, unknown> = {
     // Liquid's group id: the OPAQUE storefront form, never the admin numeric.
     id: storefrontGroupId(options.ownGroupId ?? FIXTURE.groupId),
     name: options.groupName ?? "Cellexia Ritual",
-    app_id: "cellexia",
     selling_plans: plans,
   };
+  // Stamped by default (the post-v1.6.9 steady state). `null` = the key is
+  // ABSENT, the way Liquid presents a group whose app never stamped it —
+  // never an empty string, which would hide the nil-handling under test.
+  const ownGroupAppId =
+    options.ownGroupAppId === undefined ? FIXTURE.appId : options.ownGroupAppId;
+  if (ownGroupAppId !== null) ownGroup.app_id = ownGroupAppId;
   const others = otherGroupSpecs(options);
   const omitOwn = options.omitOwnGroup === true || options.foreignGroupOnly === true;
   const othersFirst = (options.otherGroupsPosition ?? "before") === "before";
@@ -853,12 +886,18 @@ export function makeProduct(options: ProductFixtureOptions = {}) {
     variants[0].selling_plan_allocations = [];
   }
 
-  const otherGroups = others.map((spec) => ({
-    id: storefrontGroupId(spec.id),
-    name: spec.name,
-    app_id: spec.appId ?? "another-subscription-app",
-    selling_plans: makeOtherPlans(spec),
-  }));
+  const otherGroups = others.map((spec) => {
+    const group: Record<string, unknown> = {
+      id: storefrontGroupId(spec.id),
+      name: spec.name,
+      selling_plans: makeOtherPlans(spec),
+    };
+    // null = the other app never stamped its group: key ABSENT, Liquid nil.
+    if (spec.appId !== null) {
+      group.app_id = spec.appId ?? "another-subscription-app";
+    }
+    return group;
+  });
   const ownGroups = omitOwn ? [] : [ownGroup];
   const groups = options.noSellingPlans
     ? []
@@ -904,12 +943,13 @@ export interface MakeContextOptions extends ProductFixtureOptions {
   launchStatus?: "live" | "setup" | (string & {}) | null;
   /**
    * shop.metafields.cellexia.plan_groups.value — the OWNERSHIP ALLOW-LIST the
-   * app publishes on every plan sync ({ v, groupIds, planIds, appId }, ids as
-   * strings). Only a group matching BOTH planIds and appId may be rendered.
-   * groupIds carries ADMIN-API numeric ids, which can never match Liquid's
-   * opaque group ids (see FIXTURE) — the legacy field survives in the shape
-   * but is not consulted. Ownership is decided by planIds AND appId, the two
-   * id spaces the Admin and Storefront APIs actually share.
+   * app publishes on every plan sync ({ v, groupIds, planIds, appId }, ids
+   * as strings). Only groups it proves may be rendered. The id lists carry
+   * ADMIN-API ids: the numeric group ids can therefore never match Liquid's
+   * opaque group ids (see FIXTURE), which is why ownership is decided by the
+   * PLAN ids — the one id space the two APIs share — AND, since v1.6.9, by
+   * the `appId` second factor (must equal the group's stamped `app_id`;
+   * both factors mandatory, either missing renders nothing).
    *
    * `undefined` (the default) = a synced shop, i.e. this fixture's own group
    * is allow-listed — the state every pre-existing test was written against.
@@ -964,17 +1004,28 @@ export function makeContext(options: MakeContextOptions = {}): RenderContext {
     options.launchStatus === undefined ? "live" : options.launchStatus;
   const config = options.config ?? null;
 
+  // The plan ids the fixture's OWN group actually carries — the same slice
+  // makeProduct built. The default allow-list must follow them: a real
+  // publish reads the LIVE plan set off Shopify, so a planCount:1 shop
+  // publishes a one-plan set, not the full catalogue.
+  const ownPlanIds = PLAN_SPECS.slice(0, options.planCount ?? 3).map((spec) =>
+    String(spec.id),
+  );
   const planGroups =
     options.planGroups === undefined
       ? {
-          v: 1,
+          v: 2,
           // Follows `ownGroupId`, so "a synced shop" keeps meaning "our group
           // is allow-listed" whichever id this fixture gave it.
           groupIds: [String(options.ownGroupId ?? FIXTURE.groupId)],
-          planIds: Object.values(FIXTURE.planIds).map(String),
-          // Matches ownGroup.app_id ("cellexia") in makeProduct — the real
-          // ownership factor now; groupIds is kept only for the legacy shape.
-          appId: "cellexia",
+          // Legacy union field (pre-v1.6.9 extensions + the Doctor).
+          planIds: ownPlanIds,
+          // The two storefront factors a real publish always carries
+          // (v1.6.9): the EXACT live plan set per group, and our appId.
+          // Tests model a PRE-v1.6.9 metafield by passing planGroups
+          // without them.
+          planSets: [ownPlanIds],
+          appId: FIXTURE.appId,
         }
       : options.planGroups;
 

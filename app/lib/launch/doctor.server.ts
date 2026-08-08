@@ -8,6 +8,7 @@ import { getProducts } from "~/lib/graphql/products.server";
 import {
   findProductsMissingFromGroup,
   getCurrentAppId,
+  getSellingPlanGroupOwnershipStates,
 } from "~/lib/graphql/sellingPlans.server";
 import {
   PLAN_GROUPS_METAFIELD_KEY,
@@ -36,14 +37,19 @@ import { getLaunchState, probeProxyIdentity } from "./launch.server";
  *
  * Id spaces (the v1.6.6 lesson, do not regress): `group_on_product` compares
  * Admin API group GIDs against Admin API reads — one id space, exact equality
- * is reliable. `allow_list` mirrors what storefront Liquid actually gates on:
- * numeric ids, and ownership requires TWO factors together — the PLAN ids
- * (storefront Liquid exposes group ids in a different, opaque id space, so
- * the group-id factor is inert there) AND the owning app's id (read off
- * `selling_plan_group.app_id`, which — unlike group ids — is directly
- * comparable between the Admin API and storefront Liquid). An allow-list
- * missing group ids, plan ids, OR the app id renders NOTHING and must fail
- * this step.
+ * is reliable. `allow_list` mirrors what storefront Liquid actually gates on
+ * (v1.6.9): numeric ids, and ownership needs BOTH an EXACT plan-set match —
+ * the group's live plan ids equal to one published `planSets` entry, same
+ * members, same count (storefront Liquid exposes group ids in a different,
+ * opaque id space, so the group-id field is inert there, and the legacy
+ * any-member `planIds` rule is gone) — AND an app-id match: the metafield's
+ * appId must be this app's own id, VERBATIM (the snippet never trims), and
+ * the group itself must carry that id as its stamped `app_id` — Shopify
+ * leaves `app_id` nil unless the app stamps it, so a group synced before
+ * v1.6.9 renders NOTHING until re-stamped. An allow-list missing either
+ * factor, an unstamped group, or a live plan set no published set covers
+ * must fail this step; a false PASS here is a dark storefront with a green
+ * dashboard.
  */
 
 export type DoctorStepStatus = "PASS" | "FAIL" | "WARN" | "SKIP";
@@ -100,7 +106,8 @@ const REMEDIATIONS = {
     "This product isn't part of your plan — edit the plan on the Plans page and add it, then re-sync.",
   group_on_product:
     "The plan is synced but Shopify doesn't show it attached to this product — press Sync to Shopify again.",
-  allow_list: "Republish by pressing Sync to Shopify on the Plans page.",
+  allow_list:
+    "Press Sync to Shopify on the Plans page — the sync stamps our app id onto the selling plan group and republishes the allow-list.",
   proxy:
     "The app configuration isn't deployed — run npm run deploy from the app folder, then retry. A 404 here means Shopify has no proxy registered for this app.",
   storefront_markup:
@@ -361,6 +368,7 @@ export async function runPreviewDoctor(
     const published = parsed as {
       groupIds?: unknown;
       planIds?: unknown;
+      planSets?: unknown;
       appId?: unknown;
     };
     const publishedGroupIds = Array.isArray(published.groupIds)
@@ -369,9 +377,24 @@ export async function runPreviewDoctor(
     const publishedPlanIds = Array.isArray(published.planIds)
       ? published.planIds.map(String)
       : [];
+    const publishedPlanSets = Array.isArray(published.planSets)
+      ? published.planSets.map((set) =>
+          Array.isArray(set) ? set.map(String) : [],
+        )
+      : [];
+    // Mirror the snippet EXACTLY. Its `| append: ''` stringifies (so a JSON
+    // number is as good as a string) but NEVER trims, and `!= blank` treats
+    // a whitespace-only string as missing. So: whitespace-only → the
+    // "missing" branch (gate closed), but a PADDED value is kept VERBATIM —
+    // trimming it here would report a match the storefront will never make
+    // (" 4477001" vs "4477001" is a dark widget), the exact false PASS this
+    // step exists to prevent.
     const publishedAppId =
-      typeof published.appId === "string" ? published.appId : null;
-    const ourAppId = await getCurrentAppId(admin);
+      typeof published.appId === "string" && published.appId.trim() !== ""
+        ? published.appId
+        : typeof published.appId === "number"
+          ? String(published.appId)
+          : null;
 
     const ownGroups = configs.filter((c) => c.shopifyGroupId != null);
     const preferred = ownGroups.filter(isRenderableConfig);
@@ -407,22 +430,84 @@ export async function runPreviewDoctor(
     }
     if (publishedPlanIds.length === 0) {
       problems.push(
-        "its planIds list is empty — the widget requires BOTH lists and renders nothing",
+        "its planIds list is empty — the widget requires plan ids and renders nothing",
       );
     } else if (!planIdPublished) {
       problems.push(
         "its planIds list contains none of our selling plan ids (the storefront matches on plan ids)",
       );
     }
+
+    // The app-id factor, metafield half. The comparison is VERBATIM, like
+    // the snippet's — a padded-but-right value gets its own message because
+    // "the digits match" is precisely the trap.
+    const ourAppId = await getCurrentAppId(admin);
     if (publishedAppId == null) {
       problems.push(
-        "its appId field is missing — the widget requires an appId match alongside the plan ids and renders nothing until republished",
+        "its appId field is missing — the widget requires an appId match alongside the plan sets and renders nothing until republished",
       );
     } else if (publishedAppId !== ourAppId) {
+      if (publishedAppId.trim() === ourAppId) {
+        problems.push(
+          `its appId (${JSON.stringify(publishedAppId)}) carries stray whitespace around this app's id (${ourAppId}) — the storefront compares exactly and renders nothing; republish to fix`,
+        );
+      } else {
+        problems.push(
+          `its appId (${publishedAppId}) does not match this app's installed id (${ourAppId})`,
+        );
+      }
+    }
+    if (publishedPlanSets.length === 0) {
       problems.push(
-        `its appId (${publishedAppId}) does not match this app's installed id (${ourAppId})`,
+        "its planSets field is missing or empty (published before v1.6.9?) — the widget requires an exact plan-set match and renders nothing until republished",
       );
     }
+
+    // The group-side halves, against the LIVE Shopify state — exactly what
+    // storefront Liquid will see: the group must be stamped with our app id
+    // (`app_id` is nil on any group synced before v1.6.9), and its live
+    // plan set must EXACTLY equal one published set (same members, same
+    // count) — the storefront's other factor since v1.6.9.
+    const groupGids = relevant
+      .map((c) => c.shopifyGroupId)
+      .filter((id): id is string => id != null);
+    const states = await getSellingPlanGroupOwnershipStates(admin, groupGids);
+    const unstamped = groupGids.filter(
+      (gid) => states.get(gid)?.appId !== ourAppId,
+    );
+    if (unstamped.length > 0) {
+      problems.push(
+        `our selling plan group${unstamped.length === 1 ? "" : "s"} ${unstamped
+          .map((gid) => numericIdFromGid(gid) ?? gid)
+          .join(", ")} ${
+          unstamped.length === 1 ? "does" : "do"
+        } not carry our app id on Shopify (created before the app-id stamp, or the stamp failed) — the storefront requires the group-side app_id match and renders nothing from ${
+          unstamped.length === 1 ? "it" : "them"
+        }`,
+      );
+    }
+    const setsAsKeys = new Set(
+      publishedPlanSets.map((set) => [...set].sort().join(",")),
+    );
+    const uncovered = groupGids.filter((gid) => {
+      const state = states.get(gid);
+      if (!state) return false; // already reported as unstamped above
+      const liveSet = state.planIds
+        .map((id) => numericIdFromGid(id))
+        .filter((id): id is string => id != null);
+      if (liveSet.length === 0) return true;
+      return !setsAsKeys.has([...liveSet].sort().join(","));
+    });
+    if (uncovered.length > 0) {
+      problems.push(
+        `the live plan set of group${uncovered.length === 1 ? "" : "s"} ${uncovered
+          .map((gid) => numericIdFromGid(gid) ?? gid)
+          .join(", ")} matches no published planSets entry — the storefront requires exact set equality and renders nothing from ${
+          uncovered.length === 1 ? "it" : "them"
+        } until republished`,
+      );
+    }
+
     if (problems.length > 0) {
       return {
         status: "FAIL",
@@ -436,7 +521,11 @@ export async function runPreviewDoctor(
         ownGroupNumericIds.length === 1 ? "" : "s"
       } (${ownGroupNumericIds.join(", ")}) plus ${publishedPlanIds.length} plan id${
         publishedPlanIds.length === 1 ? "" : "s"
-      } and a matching appId.`,
+      } and ${publishedPlanSets.length} plan set${
+        publishedPlanSets.length === 1 ? "" : "s"
+      }, its appId matches this app (${ourAppId}), and the group${
+        groupGids.length === 1 ? " is" : "s are"
+      } stamped with it and exactly covered.`,
     };
   });
 

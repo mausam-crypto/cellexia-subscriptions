@@ -221,15 +221,69 @@ describe("goLive", () => {
       return call?.payload?.planGroupsMetafield ?? "";
     }
 
-    it("reports counts when both id lists are populated", async () => {
+    it("reports counts when every factor is populated and healed", async () => {
       mocks.publishOwnGroupsMetafield.mockImplementation(async () => ({
         ok: true,
-        value: { v: 1, groupIds: ["77"], planIds: ["1", "2"] },
+        value: {
+          v: 2,
+          groupIds: ["77"],
+          planIds: ["1", "2"],
+          planSets: [["1", "2"]],
+          appId: "4477001",
+        },
+        heal: { stamped: [], alreadyStamped: ["gid"], failed: [] },
       }));
 
       await goLive(SHOP_DOMAIN, { shiftOverdue: false, actor: "admin@x" });
 
-      expect(auditedPlanGroups()).toBe("published (1 group id(s), 2 plan id(s))");
+      expect(auditedPlanGroups()).toBe(
+        "published (1 group id(s), 2 plan id(s), 1 plan set(s), appId stamped)",
+      );
+    });
+
+    it("flags a publish whose planSets came out empty as incomplete (v1.6.9)", async () => {
+      mocks.publishOwnGroupsMetafield.mockImplementation(async () => ({
+        ok: true,
+        value: {
+          v: 2,
+          groupIds: ["77"],
+          planIds: ["1", "2"],
+          planSets: [],
+          appId: "4477001",
+        },
+        heal: { stamped: [], alreadyStamped: [], failed: [] },
+      }));
+
+      await goLive(SHOP_DOMAIN, { shiftOverdue: false, actor: "admin@x" });
+
+      const audited = auditedPlanGroups();
+      expect(audited).toContain("INCOMPLETE");
+      expect(audited).toContain("no plan sets");
+    });
+
+    it("flags a contained appId-stamp failure instead of hiding a dark storefront behind ok:true", async () => {
+      mocks.publishOwnGroupsMetafield.mockImplementation(async () => ({
+        ok: true,
+        value: {
+          v: 2,
+          groupIds: ["77"],
+          planIds: ["1", "2"],
+          planSets: [["1", "2"]],
+          appId: "4477001",
+        },
+        heal: {
+          stamped: [],
+          alreadyStamped: [],
+          failed: ["gid://shopify/SellingPlanGroup/77"],
+        },
+      }));
+
+      await goLive(SHOP_DOMAIN, { shiftOverdue: false, actor: "admin@x" });
+
+      const audited = auditedPlanGroups();
+      expect(audited).toContain("INCOMPLETE");
+      expect(audited).toContain("appId stamp failed");
+      expect(audited).toContain("gid://shopify/SellingPlanGroup/77");
     });
 
     it("flags an allow-list with group ids but NO plan ids as incomplete", async () => {

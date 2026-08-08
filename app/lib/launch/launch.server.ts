@@ -402,13 +402,24 @@ export async function goLive(
     }
     const groupIds = planGroupsSync.value?.groupIds ?? [];
     const planIds = planGroupsSync.value?.planIds ?? [];
+    const planSets = planGroupsSync.value?.planSets ?? [];
+    const healFailed = planGroupsSync.heal?.failed ?? [];
     if (groupIds.length === 0) {
       return "published but EMPTY (no synced selling plan group) — the buy box renders nothing; sync a plan from Plans";
     }
     if (planIds.length === 0) {
       return `published but INCOMPLETE (${groupIds.length} group id(s), no plan ids) — the buy box renders nothing until the plan ids are recorded; re-run the plan sync from Plans`;
     }
-    return `published (${groupIds.length} group id(s), ${planIds.length} plan id(s))`;
+    // ok:true is still not "the buy box works": the storefront also needs
+    // the exact plan sets and the group-side appId stamp (v1.6.9), and a
+    // contained heal failure would otherwise hide behind this line.
+    if (planSets.length === 0) {
+      return `published but INCOMPLETE (${groupIds.length} group id(s), no plan sets) — the buy box renders nothing until the live plan sets are published; re-run the plan sync from Plans`;
+    }
+    if (healFailed.length > 0) {
+      return `published but INCOMPLETE (appId stamp failed for ${healFailed.length} group(s): ${healFailed.join(", ")}) — the buy box renders nothing from those groups; re-run the plan sync from Plans or run the Preview Doctor`;
+    }
+    return `published (${groupIds.length} group id(s), ${planIds.length} plan id(s), ${planSets.length} plan set(s), appId stamped)`;
   }
 
   await logEvent({

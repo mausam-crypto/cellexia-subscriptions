@@ -670,17 +670,53 @@ The app publishes the shop metafield `cellexia.plan_groups` (type `json`) on
 every plan sync:
 
 ```json
-{ "v": 1, "groupIds": ["6612300000009"], "planIds": ["6881100003"] }
+{ "v": 2, "groupIds": ["6612300000009"], "planIds": ["6881100003"],
+  "planSets": [["6881100001", "6881100002", "6881100003"]], "appId": "4830258" }
 ```
 
-`cx-buybox-core.liquid` renders the **first group on the product that holds
-one of the ids in `planIds`** (with the old `groupIds` equality kept only as a
-harmless secondary OR — see below). Ids are compared **as strings, one entry
-at a time, by exact equality** — the metafield holds strings, plan ids arrive
-numeric, so both sides are normalised with an empty `append`. A substring test
+`cx-buybox-core.liquid` renders the **first group on the product that passes
+BOTH factors: its `app_id` equals `appId`, AND its live plan set EXACTLY
+equals one `planSets` entry — same members, same count** (v1.6.9 — the old
+`groupIds` equality is gone entirely, and the any-member `planIds` rule went
+with it; both legacy fields still travel for the Preview Doctor and the
+pre-v1.6.9 extension). Ids are compared **as strings, one entry at a time,
+by exact equality** — the metafield holds strings, plan ids arrive numeric,
+so both sides are normalised with an empty `append`. A substring test
 against a joined list would let plan `12` match an allow-listed `123`, which
-is exactly how a foreign group gets rendered by accident. Do not "optimise"
-those loops.
+is exactly how a foreign group gets rendered by accident. And the set must
+match by COUNT as well as by members: an any-member rule would let ONE
+corrupted entry render a competitor's single-plan group whose owner stamped
+our public app id onto it (see below). Do not "optimise" those loops.
+
+**The two v1.6.9 factors, and why they have this exact shape.** After the
+id-space fix below, a single field — one `planIds` entry — decided ownership
+by itself; anything that could write a plan id into the metafield (a bug, a
+bad migration, a forged request) was sufficient alone.
+
+1. **`app_id` = `appId`.** `selling_plan_group.app_id` lives on the
+   **group**, not in the metafield, and exists only because this app
+   **stamps** it there (`SellingPlanGroupInput.appId` on every group
+   create/update, plus a heal on every allow-list publish — Shopify leaves
+   `app_id` nil otherwise). Unlike group ids, app ids read the same from
+   the Admin API and from Liquid, which is what makes the comparison usable
+   at all. HONEST LIMIT: the value is public and any app can stamp any
+   string onto its OWN groups — a competitor can copy ours — so this factor
+   forces coherence but never decides alone.
+2. **Exact plan-set equality**, not any-member. Because of that honest
+   limit, an any-member plan rule would collapse back to one field against
+   a competitor who pre-stamped our app id: ONE forged `planIds` entry
+   would render their single-plan group (Joy's group has exactly one plan).
+   Under exact set equality, tampering with an existing set darkens the
+   widget — ours included, fail closed — and rendering a foreign group
+   requires authoring its complete, well-formed set: wholesale forgery of
+   the trust anchor, the documented residual no storefront-side rule can
+   close.
+
+Missing either half — a pre-v1.6.9 metafield with no `appId`/`planSets`, a
+pre-v1.6.9 group not yet stamped, or a stale set after a plan change —
+renders **nothing** until the next plan sync or publish heals it (fail
+closed; the Preview Doctor names the exact half, and the daily alert sweep
+republishes automatically and alerts only if that did not fix it).
 
 **Why plan ids and not group ids (the id-space trap, fixed live):** storefront
 Liquid exposes `selling_plan_group.id` in a **different id space than the
@@ -693,9 +729,12 @@ Selling **plan** ids are numeric and identical in both APIs — they are what
 the cart's `selling_plan` param carries — so the plan-id intersection is the
 ownership test. `planIds` names plans this app created through the API, which
 also makes it the trust anchor the group id never was. The legacy `groupIds`
-equality survives as a secondary OR because it is inert by construction
-(admin-numeric ids cannot equal opaque storefront ids) and would only ever
-fire on a hand-written metafield carrying the opaque form.
+equality survived v1.6.6 as a demoted secondary OR — inert by construction
+(admin-numeric ids cannot equal opaque storefront ids), reachable only by a
+hand-written metafield carrying the opaque form — which made it pure attack
+surface for zero benefit, so **v1.6.9 removed the branch outright**: the
+storefront never reads `groupIds` at all now. The field still travels in the
+metafield for the Preview Doctor and for humans debugging a shop.
 
 An allow-list with **no** `planIds` therefore renders nothing at all. It used
 to render on the group id alone, so that a shop upgrading from a build without
@@ -712,11 +751,12 @@ Everything else is fail-closed:
 
 | Situation | What renders |
 |---|---|
-| A group on this product holds an allow-listed plan | that group — the normal widget (first such group, in product order) |
-| A group holds none of the allow-listed plans (and its Liquid id is not literally in `groupIds`) | **nothing** — the group is skipped and the scan continues, so a genuinely-ours group later on the product still renders |
-| Allow-list exists, no group on this product matches | **nothing** (plus the invisible marker below) |
-| Metafield absent or `groupIds` empty (plans never synced, or the write failed) | **nothing** — including when the product carries exactly one group, and including when that group is ours. Re-sync the plan from the admin Plans page to publish the allow-list |
-| Metafield malformed (a bare string, wrong shape, `groupIds` an object) | treated as absent → **nothing** |
+| A group on this product carries the allow-listed `appId` AND its live plan set exactly equals a `planSets` entry | that group — the normal widget (first such group, in product order) |
+| A group fails either factor (wrong/nil `app_id`, or its plan set matches no published set — partial, superset, or one mutated member) | **nothing** — the group is skipped and the scan continues, so a genuinely-ours group later on the product still renders |
+| Allow-list exists, no group on this product passes both factors | **nothing** (plus the invisible marker below) |
+| Metafield absent, `planSets` empty/missing, or `appId` missing (plans never synced, the write failed, or the metafield predates v1.6.9) | **nothing** — including when the product carries exactly one group, and including when that group is ours. Re-sync the plan from the admin Plans page to republish |
+| OUR group not yet stamped with `app_id` (synced before v1.6.9) | **nothing** until the next sync or allow-list publish stamps it |
+| Metafield malformed (a bare string, wrong shape, lists as objects) | treated as absent → **nothing** |
 
 There is **no name heuristic**. An earlier build matched a group whose *name*
 contained `cellexia` when the allow-list was missing, and a name is
@@ -743,15 +783,20 @@ trace:
           data-cellexia-diag-group-count="1"
           data-cellexia-diag-groups="joy-subscriptions:Joy Subscriptions"
           data-cellexia-diag-allowlist="present"
-          data-cellexia-diag-plan-count="3"></template>
+          data-cellexia-diag-plan-count="3"
+          data-cellexia-diag-set-count="1"
+          data-cellexia-diag-allow-app-id="4830258"></template>
 ```
 
 The `data-cellexia-diag-*` attributes say **why** nothing matched, readable in
 any browser inspector: every selling plan group on the product (`app_id:name`,
 names truncated to 40 characters and escaped once), whether the allow-list
-metafield was published at all, and how many plan ids it carries. They are
-diagnostic data for the admin card and for humans; nothing reads them at
-storefront runtime.
+metafield was published at all, how many legacy plan ids and how many plan
+SETS it carries (`plan-count` 3 with `set-count` 0 reads as a pre-v1.6.9
+metafield), and which `appId` it expects (`none` when the field is missing;
+read next to the per-group app ids, an unstamped or mismatched group is
+visible in the same inspector view). They are diagnostic data for the admin
+card and for humans; nothing reads them at storefront runtime.
 
 Three independent reasons it can never take part in layout: a `<template>`
 renders nothing by definition (its contents are not even in the document

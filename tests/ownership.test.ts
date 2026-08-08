@@ -31,8 +31,30 @@ const mocks = vi.hoisted(() => ({
   getSellingPlanGroupPlanIds: vi.fn(
     async (_admin: unknown, _groupId: string): Promise<string[]> => [],
   ),
-  getCurrentAppId: vi.fn(async (_admin: unknown): Promise<string> => "cellexia"),
+  getCurrentAppId: vi.fn(async (_admin: unknown): Promise<string> => OUR_APP_ID),
+  getSellingPlanGroupOwnershipStates: vi.fn(
+    async (
+      _admin: unknown,
+      _groupIds: string[],
+    ): Promise<Map<string, { appId: string | null; planIds: string[] }>> =>
+      new Map(),
+  ),
+  stampSellingPlanGroupAppIds: vi.fn(
+    async (
+      _admin: unknown,
+      _states: unknown,
+      _groupIds: string[],
+      _appId: string,
+    ): Promise<{ stamped: string[]; alreadyStamped: string[]; failed: string[] }> => ({
+      stamped: [],
+      alreadyStamped: [],
+      failed: [],
+    }),
+  ),
 }));
+
+/** This app's own numeric App id, as the mocked Admin API reports it. */
+const OUR_APP_ID = "4477001";
 
 vi.mock("~/db.server", () => ({
   default: {
@@ -73,6 +95,8 @@ vi.mock("~/lib/events/log.server", () => ({
 vi.mock("~/lib/graphql/sellingPlans.server", () => ({
   getSellingPlanGroupPlanIds: mocks.getSellingPlanGroupPlanIds,
   getCurrentAppId: mocks.getCurrentAppId,
+  getSellingPlanGroupOwnershipStates: mocks.getSellingPlanGroupOwnershipStates,
+  stampSellingPlanGroupAppIds: mocks.stampSellingPlanGroupAppIds,
 }));
 
 import {
@@ -110,7 +134,22 @@ beforeEach(() => {
   mocks.contractCount.mockResolvedValue(0);
   mocks.syncContractFromShopify.mockResolvedValue({});
   mocks.getSellingPlanGroupPlanIds.mockResolvedValue([]);
-  mocks.getCurrentAppId.mockResolvedValue("cellexia");
+  mocks.getCurrentAppId.mockResolvedValue(OUR_APP_ID);
+  // Steady state: the one synced group is stamped and its live plans are
+  // the recorded ones (numeric forms of OUR_PLAN / OUR_PLAN_2).
+  mocks.getSellingPlanGroupOwnershipStates.mockResolvedValue(
+    new Map([
+      [
+        "gid://shopify/SellingPlanGroup/77",
+        { appId: OUR_APP_ID, planIds: [OUR_PLAN, OUR_PLAN_2] },
+      ],
+    ]),
+  );
+  mocks.stampSellingPlanGroupAppIds.mockResolvedValue({
+    stamped: [],
+    alreadyStamped: ["gid://shopify/SellingPlanGroup/77"],
+    failed: [],
+  });
 });
 
 describe("numericIdFromGid", () => {
@@ -302,11 +341,136 @@ describe("plan_groups metafield", () => {
       type: "json",
     });
     expect(JSON.parse(input.value)).toEqual({
-      v: 1,
+      v: 2,
       groupIds: ["77"],
       planIds: ["111", "112"],
-      appId: "cellexia",
+      planSets: [["111", "112"]],
+      appId: OUR_APP_ID,
     });
+  });
+
+  it("publishes this app's own appId — one of the storefront's two ownership factors", async () => {
+    mocks.planConfigFindMany.mockResolvedValue([
+      {
+        shopifyGroupId: "gid://shopify/SellingPlanGroup/77",
+        shopifyPlanIds: [OUR_PLAN],
+      },
+    ]);
+    const result = await publishOwnGroupsMetafield("cellexia.myshopify.com");
+    expect(result.ok).toBe(true);
+    expect(result.value?.appId).toBe(OUR_APP_ID);
+    expect(mocks.getCurrentAppId).toHaveBeenCalledTimes(1);
+  });
+
+  it("publishes the LIVE plan set per group, never the append-only DB evidence", async () => {
+    // The DB column keeps dead plan ids on purpose (billing safety). The
+    // exact-set factor must come from the live read, or a shop that ever
+    // dropped a frequency would publish a set the group can never equal —
+    // a permanent dark widget in the steady state.
+    mocks.planConfigFindMany.mockResolvedValue([
+      {
+        shopifyGroupId: "gid://shopify/SellingPlanGroup/77",
+        // DB remembers a dead plan (999) alongside the live ones.
+        shopifyPlanIds: [OUR_PLAN, OUR_PLAN_2, "gid://shopify/SellingPlan/999"],
+      },
+    ]);
+    mocks.getSellingPlanGroupOwnershipStates.mockResolvedValue(
+      new Map([
+        [
+          "gid://shopify/SellingPlanGroup/77",
+          { appId: OUR_APP_ID, planIds: [OUR_PLAN, OUR_PLAN_2] },
+        ],
+      ]),
+    );
+    const result = await publishOwnGroupsMetafield("cellexia.myshopify.com");
+    expect(result.ok).toBe(true);
+    // Union field keeps the dead id (legacy consumers), the SET does not.
+    expect(result.value?.planIds).toEqual(["111", "112", "999"]);
+    expect(result.value?.planSets).toEqual([["111", "112"]]);
+  });
+
+  it("heals unstamped groups BEFORE writing the metafield, from the same live read", async () => {
+    // Reachable from flows that never run the full group sync (go-live,
+    // config delete): publishing an appId the groups don't carry would
+    // darken the widget, so the publish path itself stamps them.
+    mocks.planConfigFindMany.mockResolvedValue([
+      {
+        shopifyGroupId: "gid://shopify/SellingPlanGroup/77",
+        shopifyPlanIds: [OUR_PLAN],
+      },
+    ]);
+    const result = await publishOwnGroupsMetafield("cellexia.myshopify.com");
+    expect(mocks.stampSellingPlanGroupAppIds).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.any(Map),
+      ["gid://shopify/SellingPlanGroup/77"],
+      OUR_APP_ID,
+    );
+    // Heal first, then publish — never an appId-bearing metafield ahead of
+    // an unstamped group when both calls succeed.
+    const healOrder =
+      mocks.stampSellingPlanGroupAppIds.mock.invocationCallOrder[0];
+    const writeOrder = mocks.setShopMetafield.mock.invocationCallOrder[0];
+    expect(healOrder).toBeLessThan(writeOrder);
+    // …and the outcome is on the result, never swallowed.
+    expect(result.heal).toEqual({
+      stamped: [],
+      alreadyStamped: ["gid://shopify/SellingPlanGroup/77"],
+      failed: [],
+    });
+  });
+
+  it("a failed stamp is contained but VISIBLE: published, with the group named in heal.failed", async () => {
+    mocks.planConfigFindMany.mockResolvedValue([
+      {
+        shopifyGroupId: "gid://shopify/SellingPlanGroup/77",
+        shopifyPlanIds: [OUR_PLAN],
+      },
+    ]);
+    mocks.stampSellingPlanGroupAppIds.mockResolvedValueOnce({
+      stamped: [],
+      alreadyStamped: [],
+      failed: ["gid://shopify/SellingPlanGroup/77"],
+    });
+    const result = await publishOwnGroupsMetafield("cellexia.myshopify.com");
+    expect(result.ok).toBe(true);
+    expect(mocks.setShopMetafield).toHaveBeenCalledTimes(1);
+    expect(result.heal?.failed).toEqual(["gid://shopify/SellingPlanGroup/77"]);
+  });
+
+  it("a failed live-state read fails the whole publish — stale-but-valid beats fresh-but-dark", async () => {
+    // Without the live read there is no truthful plan set to publish; a
+    // fresh metafield missing planSets would darken the widget exactly the
+    // same while looking like a successful publish. The previous allow-list
+    // stays in place instead.
+    mocks.planConfigFindMany.mockResolvedValue([
+      {
+        shopifyGroupId: "gid://shopify/SellingPlanGroup/77",
+        shopifyPlanIds: [OUR_PLAN],
+      },
+    ]);
+    mocks.getSellingPlanGroupOwnershipStates.mockRejectedValueOnce(
+      new Error("throttled"),
+    );
+    const result = await publishOwnGroupsMetafield("cellexia.myshopify.com");
+    expect(result).toMatchObject({ ok: false, error: "throttled" });
+    expect(mocks.setShopMetafield).not.toHaveBeenCalled();
+  });
+
+  it("a failed appId read fails the publish and leaves the previous allow-list alone", async () => {
+    // Fail closed by staleness: without the appId there is no valid value to
+    // write — a value missing the field would darken the widget exactly the
+    // same, while silently looking like a successful publish.
+    mocks.planConfigFindMany.mockResolvedValue([
+      {
+        shopifyGroupId: "gid://shopify/SellingPlanGroup/77",
+        shopifyPlanIds: [OUR_PLAN],
+      },
+    ]);
+    mocks.getCurrentAppId.mockRejectedValueOnce(new Error("no app id"));
+    const result = await publishOwnGroupsMetafield("cellexia.myshopify.com");
+    expect(result).toMatchObject({ ok: false, error: "no app id" });
+    expect(mocks.setShopMetafield).not.toHaveBeenCalled();
   });
 
   it("never throws — a failed write leaves the previous allow-list in place", async () => {
@@ -348,21 +512,24 @@ describe("plan_groups metafield", () => {
       { id: "cfg_1", shopifyGroupId: "gid://shopify/SellingPlanGroup/77", shopifyPlanIds: null },
     ]);
     mocks.getSellingPlanGroupPlanIds.mockRejectedValue(new Error("throttled"));
+    // The group cannot be read back live either: no set can be attested.
+    mocks.getSellingPlanGroupOwnershipStates.mockResolvedValue(new Map());
 
     const result = await publishOwnGroupsMetafield("cellexia.myshopify.com");
     expect(result.ok).toBe(true);
     expect(result.value).toEqual({
-      v: 1,
+      v: 2,
       groupIds: ["77"],
       planIds: [],
-      appId: "cellexia",
+      planSets: [],
+      appId: OUR_APP_ID,
     });
   });
 
   it("omits groups that were never synced", async () => {
     mocks.planConfigFindMany.mockResolvedValue([]);
     await expect(buildPlanGroupsValue("shop_1")).resolves.toEqual({
-      v: 1,
+      v: 2,
       groupIds: [],
       planIds: [],
     });

@@ -1,33 +1,49 @@
 {%- comment -%} cx-buybox-core — the ENTIRE buy-box widget, rendered verbatim by both thin block wrappers. MINIFIED ON PURPOSE (total-Liquid deploy budget): full exposition of THE LIQUID RULES (RULE 1 never capture, assign or echo a render; RULE 2 t returns already-escaped HTML, RAW/SAFE string spaces), params, group ownership and history live in README "Core snippet internals". Editor note: comments here carry NO Liquid delimiters and no pipe characters (harness fidelity lint). {%- endcomment -%}
 {%- if product != blank and product.selling_plan_groups.size > 0 -%}
 {%- liquid
-# OWNERSHIP: render OUR allow-listed group or render NOTHING; no allow-list means no widget. TWO factors, BOTH mandatory: (a) the group's app_id equals cx_allow.appId; (b) one of the group's OWN selling plan ids is in cx_allow.planIds, exact string equality, never a joined list. App ids and plan ids read the same way from the Admin API and Storefront Liquid, unlike a SellingPlanGroup's own id (a different, opaque per-shop id in each), so app_id replaces the old group-id compare as the real second factor. A metafield published before appId existed fails closed until the next sync republishes it. Full essay: README "Core snippet internals"; proof: tests/liquid/two-apps.test.ts.
+# OWNERSHIP: render OUR allow-listed group or render NOTHING; no allow-list means no widget. TWO factors, BOTH mandatory: (a) the group's app_id equals cx_allow.appId — the app id this app stamps onto its own groups and publishes about itself; app ids read the same from the Admin API and from Liquid, and app_id is nil unless the owning app stamped it. It is NOT secret (any app can stamp any string onto its own groups), so it never decides alone. (b) the group's LIVE selling plan ids EXACTLY equal one entry of cx_allow.planSets — same members, same count, exact string equality entry by entry, never a joined list, never any-member. Exact set equality is the load-bearing choice: an any-member rule lets ONE corrupted planIds entry render a competitor's single-plan group whose owner copied our public app id; under set equality any tamper of an existing set darkens the widget (fails closed) and rendering a foreign group requires authoring its complete set. Selling PLAN ids are numeric and identical in both APIs; GROUP ids are not (opaque storefront identifiers vs numeric admin ids — the v1.6.6 outage), so cx_allow.groupIds and the legacy any-member cx_allow.planIds still travel in the metafield for the Preview Doctor and the pre-v1.6.9 extension but this gate never reads them. Missing either factor renders nothing, fails closed. Full essay: README "Core snippet internals"; proof: tests/liquid/two-apps.test.ts.
 assign cx_allow = shop.metafields.cellexia.plan_groups.value
-assign cx_allow_plan_ids = cx_allow.planIds
-assign cx_allow_plan_count = cx_allow_plan_ids | size
+assign cx_allow_plan_count = cx_allow.planIds | size
+assign cx_allow_sets = cx_allow.planSets
+assign cx_allow_set_count = cx_allow_sets | size
 assign cx_allow_app_id = cx_allow.appId | append: ''
 assign cx_group = false
 assign cx_group_found = false
-if cx_allow_plan_count > 0 and cx_allow_app_id != blank
+if cx_allow_set_count > 0 and cx_allow_app_id != blank
 for cx_g in product.selling_plan_groups
 assign cx_own = false
 assign cx_g_app_id = cx_g.app_id | append: ''
 if cx_g_app_id == cx_allow_app_id
+assign cx_g_plan_count = cx_g.selling_plans | size
+if cx_g_plan_count > 0
+for cx_set in cx_allow_sets
+assign cx_set_size = cx_set | size
+if cx_set_size == cx_g_plan_count
+assign cx_all_in = true
 for cx_p in cx_g.selling_plans
 assign cx_p_id = cx_p.id | append: ''
-for cx_allowed_plan in cx_allow_plan_ids
+assign cx_hit = false
+for cx_allowed_plan in cx_set
 assign cx_allowed_plan_id = cx_allowed_plan | append: ''
 if cx_allowed_plan_id == cx_p_id
+assign cx_hit = true
+break
+endif
+endfor
+unless cx_hit
+assign cx_all_in = false
+break
+endunless
+endfor
+if cx_all_in
 assign cx_own = true
 break
 endif
-endfor
-if cx_own
-break
 endif
 endfor
 endif
-# A group matching neither factor is skipped, not fatal: a later group may be genuinely ours. First match wins, in product order.
+endif
+# A group failing either factor is skipped, not fatal: a later group may be genuinely ours. First match wins, in product order.
 if cx_own
 assign cx_group = cx_g
 assign cx_group_found = true
@@ -1077,7 +1093,7 @@ assign a_first_raw = a.price | money | strip_html | replace: '&nbsp;', ' ' | re
 </div>
 {%- else -%}
 {%- liquid
-# NO OWNED GROUP: render NOTHING but this invisible admin-diagnostic marker (three hiding layers; carries none of the widget hooks) — README "Core snippet internals". Its data-cellexia-diag-* attributes say WHY nothing matched: every group on the product with its app id and truncated name, whether an allow-list was published, and how many plan ids it carries.
+# NO OWNED GROUP: render NOTHING but this invisible admin-diagnostic marker (three hiding layers; carries none of the widget hooks) — README "Core snippet internals". Its data-cellexia-diag-* attributes say WHY nothing matched: every group on the product with its app id and truncated name, whether an allow-list was published, how many legacy plan ids and how many plan SETS it carries (plan-count 3 with set-count 0 reads as a pre-v1.6.9 metafield), and which appId it expects ('none' when the field is missing — the group app ids alongside make an unstamped group readable in the same inspector view).
 assign cx_diag_groups = ''
 for cx_dg in product.selling_plan_groups
 assign cx_dg_name = cx_dg.name | slice: 0, 40
@@ -1090,6 +1106,10 @@ assign cx_diag_allow = 'absent'
 if cx_allow
 assign cx_diag_allow = 'present'
 endif
--%}<template class="cx-buybox-nogroup" data-cellexia-no-owned-group hidden style="display:none!important" data-cellexia-diag-group-count="{{ product.selling_plan_groups.size }}" data-cellexia-diag-groups="{{ cx_diag_groups | escape }}" data-cellexia-diag-allowlist="{{ cx_diag_allow }}" data-cellexia-diag-plan-count="{{ cx_allow_plan_count }}" data-cellexia-diag-our-app-id="{{ cx_allow_app_id | escape }}"></template>
+assign cx_diag_allow_app_id = cx_allow_app_id
+if cx_diag_allow_app_id == blank
+assign cx_diag_allow_app_id = 'none'
+endif
+-%}<template class="cx-buybox-nogroup" data-cellexia-no-owned-group hidden style="display:none!important" data-cellexia-diag-group-count="{{ product.selling_plan_groups.size }}" data-cellexia-diag-groups="{{ cx_diag_groups | escape }}" data-cellexia-diag-allowlist="{{ cx_diag_allow }}" data-cellexia-diag-plan-count="{{ cx_allow_plan_count }}" data-cellexia-diag-set-count="{{ cx_allow_set_count }}" data-cellexia-diag-allow-app-id="{{ cx_diag_allow_app_id | escape }}"></template>
 {%- endif -%}
 {%- endif -%}

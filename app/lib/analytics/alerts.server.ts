@@ -4,7 +4,7 @@ import { logEvent } from "~/lib/events/log.server";
 import { getSetting } from "~/lib/settings/settings.server";
 import { shopDayStartUtc } from "~/lib/dates.server";
 import { COUNTABLE_CONTRACT, requireShopById } from "./queries.server";
-import { OURS_ONLY } from "~/lib/ownership/ownership.server";
+import { OURS_ONLY, numericIdFromGid } from "~/lib/ownership/ownership.server";
 import { isKlaviyoConfigured } from "~/lib/klaviyo/client.server";
 
 /**
@@ -666,6 +666,14 @@ const PLAN_DRIFT_CHECK_HOURS = 24;
  * recorded — reliable exact equality, unlike storefront Liquid group ids) and
  * re-uses the same batched verification the post-sync check uses.
  *
+ * Since v1.6.9 the same daily budget also verifies the OWNERSHIP FACTORS the
+ * storefront gate requires (published appId + exact plan sets, and the
+ * group-side app_id stamp) — the other way a SYNCED row hides a dark
+ * storefront, produced by upgrading in the wrong order or a hand-edited
+ * metafield. That half SELF-HEALS first (publishOwnGroupsMetafield stamps
+ * and republishes, never throws) and raises OWNERSHIP_FACTORS only when the
+ * republish did not fix it.
+ *
  * Resilient by construction: one config's failed verification is contained
  * (logged, counted, never blocks the others), the completed sweep is
  * timestamped even when partially failed so a broken store cannot turn this
@@ -737,6 +745,119 @@ async function checkPlanGroupDrift(
     }
   }
 
+  // ── The v1.6.9 ownership factors, on the same daily API budget. ─────────
+  // Attachment drift is only one way a SYNCED plan row can hide a dark
+  // storefront: since v1.6.9 the widget also requires the published appId +
+  // exact plan sets AND the group-side app_id stamp, and a store upgraded in
+  // the wrong order (extension deployed before Sync) or a hand-edited
+  // metafield fails those with every attachment intact. Verified against
+  // the live state, SELF-HEALED by republishing (publishOwnGroupsMetafield
+  // never throws and contains the stamp heal), and alerted only when the
+  // republish did not fix it. Contained: a factor-check failure never
+  // blocks the attachment verdict.
+  let factorProblems: string[] = [];
+  let factorsHealed = false;
+  try {
+    const [{ getShopMetafield }, sellingPlans, ownership] = await Promise.all([
+      import("~/lib/graphql/metafields.server"),
+      import("~/lib/graphql/sellingPlans.server"),
+      import("~/lib/ownership/ownership.server"),
+    ]);
+    const gids = configs
+      .map((c) => c.shopifyGroupId)
+      .filter((id): id is string => id != null);
+    const ourAppId = await sellingPlans.getCurrentAppId(admin);
+    const states = await sellingPlans.getSellingPlanGroupOwnershipStates(
+      admin,
+      gids,
+    );
+    const metafield = await getShopMetafield(
+      admin,
+      ownership.PLAN_GROUPS_METAFIELD_NAMESPACE,
+      ownership.PLAN_GROUPS_METAFIELD_KEY,
+    );
+    const describeProblems = (): string[] => {
+      const problems: string[] = [];
+      let parsed: {
+        planSets?: unknown;
+        appId?: unknown;
+      } | null = null;
+      if (metafield) {
+        try {
+          const raw: unknown = JSON.parse(metafield.value);
+          parsed =
+            typeof raw === "object" && raw !== null
+              ? (raw as { planSets?: unknown; appId?: unknown })
+              : null;
+        } catch {
+          parsed = null;
+        }
+      }
+      if (!parsed) {
+        problems.push("the cellexia.plan_groups allow-list is missing or malformed");
+        return problems;
+      }
+      // Verbatim comparison, like the storefront: never trim.
+      const appId =
+        typeof parsed.appId === "string"
+          ? parsed.appId
+          : typeof parsed.appId === "number"
+            ? String(parsed.appId)
+            : null;
+      if (appId !== ourAppId) {
+        problems.push(
+          appId == null || appId.trim() === ""
+            ? "the allow-list has no appId (published before v1.6.9?)"
+            : `the allow-list appId (${JSON.stringify(appId)}) is not this app's id (${ourAppId})`,
+        );
+      }
+      const planSets = Array.isArray(parsed.planSets)
+        ? parsed.planSets.map((set: unknown) =>
+            Array.isArray(set) ? set.map(String) : [],
+          )
+        : [];
+      if (planSets.length === 0) {
+        problems.push("the allow-list has no planSets (published before v1.6.9?)");
+      }
+      const setKeys = new Set(
+        planSets.map((set: string[]) => [...set].sort().join(",")),
+      );
+      for (const gid of gids) {
+        const state = states.get(gid);
+        const numeric = numericIdFromGid(gid) ?? gid;
+        if (!state) {
+          problems.push(`group ${numeric} cannot be read back from Shopify`);
+          continue;
+        }
+        if (state.appId !== ourAppId) {
+          problems.push(`group ${numeric} is not stamped with this app's id`);
+        }
+        const liveSet = state.planIds
+          .map((id) => numericIdFromGid(id))
+          .filter((id): id is string => id != null);
+        if (liveSet.length === 0 || !setKeys.has([...liveSet].sort().join(","))) {
+          problems.push(
+            `group ${numeric}'s live plan set matches no published planSets entry`,
+          );
+        }
+      }
+      return problems;
+    };
+    factorProblems = describeProblems();
+    if (factorProblems.length > 0) {
+      const republished = await ownership.publishOwnGroupsMetafield(shopDomain);
+      factorsHealed =
+        republished.ok === true &&
+        republished.value != null &&
+        republished.value.appId === ourAppId &&
+        republished.value.planSets.length > 0 &&
+        (republished.heal?.failed ?? []).length === 0;
+    }
+  } catch (err) {
+    checkErrors += 1;
+    console.error("[alerts] ownership factor verification failed", err);
+  }
+
   // Timestamp the sweep BEFORE deciding the verdict, clean or not: the gate
   // exists to bound Admin API traffic, and a sweep that found drift (or
   // partially failed) has still spent that budget for today.
@@ -749,9 +870,27 @@ async function checkPlanGroupDrift(
       configsChecked: configs.length,
       driftedConfigs: drifted.length,
       checkErrors,
+      ownershipFactorProblems: factorProblems.length,
+      ownershipFactorsHealed: factorsHealed,
     },
   });
-  if (drifted.length === 0) return false;
+
+  let raised = false;
+  if (factorProblems.length > 0 && !factorsHealed) {
+    raised =
+      (await raiseAlert({
+        shopId,
+        type: "OWNERSHIP_FACTORS",
+        severity: "WARNING",
+        message: `The storefront buy box is rendering nothing although your plans show SYNCED: ${factorProblems.join("; ")}. An automatic republish did not fix it — press Sync to Shopify on the Plans page, then run the Preview Doctor on Preview & launch.`,
+        context: {
+          problems: factorProblems.slice(0, CONTEXT_SAMPLE),
+          republishAttempted: true,
+        },
+      })) || raised;
+  }
+
+  if (drifted.length === 0) return raised;
 
   // Name the detached products for the merchant; a title lookup failure
   // falls back to the GIDs rather than hiding which products are affected.
@@ -767,7 +906,7 @@ async function checkPlanGroupDrift(
   }
   const names = missingIds.map((id) => titleById.get(id) ?? id);
 
-  return raiseAlert({
+  const driftRaised = await raiseAlert({
     shopId,
     type: "PLAN_GROUP_DRIFT",
     severity: "WARNING",
@@ -782,6 +921,7 @@ async function checkPlanGroupDrift(
       checkErrors,
     },
   });
+  return driftRaised || raised;
 }
 
 /**

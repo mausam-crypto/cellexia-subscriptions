@@ -12,6 +12,7 @@ import type { PresetKey, WidgetDesignConfig } from "~/lib/widget/presets";
 
 import {
   FIXTURE,
+  JOY_GROUP,
   REPO_ROOT,
   attributeValue,
   attributeValues,
@@ -1580,27 +1581,27 @@ describe("selling plan group ownership", () => {
     /* Every assertion above is "Joy's plan is not on the page". They would
        all pass just as well against a fixture whose foreign group Liquid
        cannot render at all — and then the suite would be pinning nothing.
-       Allow-list Joy's group id instead of ours and the widget renders Joy's
-       5% plan at CHF 60.80: the client's reported symptom, reproduced. The
-       ONLY thing standing between that render and a shopper is the
-       allow-list.
+       Forge the FULL allow-list — Joy's plan id AND Joy's app id — and the
+       widget renders Joy's 5% plan at CHF 60.80: the client's reported
+       symptom, reproduced. The ONLY thing standing between that render and
+       a shopper is the allow-list.
 
-       The fields that decide are `planIds` AND `appId` together (the forged
-       groupIds entry is admin-numeric and matches no Liquid group id — it is
-       inert either way), and an allow-list missing either one unlocks
-       nothing. So reaching this render means someone wrote a metafield
-       naming another app's PLAN *and* its app id — nothing this app can
-       produce on its own, since publishOwnGroupsMetafield() only ever emits
-       ids read off our own SellingPlanConfig rows and our own installed
-       app's id. The allow-list cannot make a merchant-writable metafield
-       unforgeable, and forging both fields together is the residual. */
+       Since v1.6.9 TWO fields decide together: `planIds` AND `appId` (the
+       forged groupIds entry is admin-numeric and matches no Liquid group id
+       — inert either way), so reaching this render means someone wrote a
+       metafield naming another app's PLAN and that app's app_id at once —
+       nothing this app can produce, since buildPlanGroupsValue() only ever
+       emits ids read off our own SellingPlanConfig rows and the publish
+       path writes only our own appId. The allow-list cannot make a
+       merchant-writable metafield unforgeable, and that is the residual. */
     const html = await renderWidget({
       foreignGroupFirst: true,
       planGroups: {
         v: 1,
         groupIds: [String(FIXTURE.foreignGroupId)],
         planIds: [FOREIGN_PLAN_ID],
-        appId: "joy-subscriptions",
+        planSets: [[FOREIGN_PLAN_ID]],
+        appId: JOY_GROUP.appId,
       },
       launchStatus: "live",
     });
@@ -1633,7 +1634,12 @@ describe("selling plan group ownership", () => {
     // names a group id this product does not carry.
     const html = await renderWidget({
       foreignGroupOnly: true,
-      planGroups: { v: 1, groupIds: ["9999999999999"], planIds: ["1"] },
+      planGroups: {
+        v: 1,
+        groupIds: ["9999999999999"],
+        planIds: ["1"],
+        appId: FIXTURE.appId,
+      },
       launchStatus: "live",
     });
     expect(html).not.toContain("data-cellexia-buybox");
@@ -1649,6 +1655,8 @@ describe("selling plan group ownership", () => {
         v: 1,
         groupIds: [String(FIXTURE.groupId)],
         planIds: ["424242424242"],
+        planSets: [["424242424242"]],
+        appId: FIXTURE.appId,
       },
       launchStatus: "live",
     });
@@ -1662,7 +1670,8 @@ describe("selling plan group ownership", () => {
         v: 1,
         groupIds: [String(FIXTURE.groupId)],
         planIds: OUR_PLAN_IDS,
-        appId: "cellexia",
+        planSets: [OUR_PLAN_IDS],
+        appId: FIXTURE.appId,
       },
       launchStatus: "live",
     });
@@ -1671,14 +1680,15 @@ describe("selling plan group ownership", () => {
   });
 
   it("accepts a numeric id in the metafield (both sides are normalised)", async () => {
-    // Numbers on BOTH fields: JSON may carry either form and the snippet
-    // normalises each with an empty append before comparing plan ids.
+    // Numbers on ALL fields: JSON may carry either form and the snippet
+    // normalises each with an empty append before comparing.
     const html = await renderWidget({
       planGroups: {
         v: 1,
         groupIds: [FIXTURE.groupId],
         planIds: [...ALL_PLAN_IDS].map(Number),
-        appId: "cellexia",
+        planSets: [[...ALL_PLAN_IDS].map(Number)],
+        appId: Number(FIXTURE.appId),
       },
       launchStatus: "live",
     });
@@ -1722,7 +1732,8 @@ describe("selling plan group ownership", () => {
           v: 1,
           groupIds: [String(FIXTURE.groupId)],
           planIds: OUR_PLAN_IDS,
-          appId: "cellexia",
+          planSets: [OUR_PLAN_IDS],
+          appId: FIXTURE.appId,
         },
         foreignGroupFirst: true,
         launchStatus: "live",
@@ -1773,7 +1784,8 @@ describe("selling plan group ownership", () => {
           v: 1,
           groupIds: String(FIXTURE.groupId),
           planIds: OUR_PLAN_IDS,
-          appId: "cellexia",
+          planSets: [OUR_PLAN_IDS],
+          appId: FIXTURE.appId,
         },
         foreignGroupFirst: true,
         launchStatus: "live",
@@ -1784,18 +1796,16 @@ describe("selling plan group ownership", () => {
     });
   });
 
-  describe("planIds decide ownership (groupIds cannot, by construction)", () => {
+  describe("planIds + appId decide ownership (groupIds cannot, by construction)", () => {
     /**
-     * Ownership requires TWO factors together: the PLAN-id intersection
-     * (plan ids are the one id space storefront Liquid and the Admin API
-     * share, and they name plans THIS APP created through the API) AND the
-     * owning app's id (read straight off `selling_plan_group.app_id`,
-     * which — unlike group ids — is NOT an opaque per-shop identifier, so it
-     * is directly comparable to the app id this app publishes about itself).
-     * The groupIds field still travels in the metafield, but it is
+     * TWO mandatory ownership factors: the PLAN-id intersection (plan ids
+     * are the one id space storefront Liquid and the Admin API share, and
+     * they name plans THIS APP created through the API) AND the appId match
+     * (the group's stamped `app_id` equal to the allow-list's `appId` —
+     * v1.6.9). The groupIds field still travels in the metafield, but it is
      * admin-numeric and Liquid's group ids are opaque, so it can neither
-     * pick a group nor veto one; it is decoration only
-     * (tests/liquid/two-apps.test.ts pins that path).
+     * pick a group nor veto one; the storefront no longer reads it at all
+     * (tests/liquid/two-apps.test.ts pins the removed legacy OR).
      */
     it("refuses a foreign group even when the allow-list names its admin id", async () => {
       // Doubly dead: the admin-numeric id matches no Liquid group id, and
@@ -1805,6 +1815,7 @@ describe("selling plan group ownership", () => {
           v: 1,
           groupIds: [String(FIXTURE.foreignGroupId)],
           planIds: OUR_PLAN_IDS,
+          appId: FIXTURE.appId,
         },
         foreignGroupOnly: true,
         launchStatus: "live",
@@ -1822,7 +1833,8 @@ describe("selling plan group ownership", () => {
           v: 1,
           groupIds: [String(FIXTURE.foreignGroupId), String(FIXTURE.groupId)],
           planIds: OUR_PLAN_IDS,
-          appId: "cellexia",
+          planSets: [OUR_PLAN_IDS],
+          appId: FIXTURE.appId,
         },
         foreignGroupFirst: true,
         launchStatus: "live",
@@ -1832,36 +1844,40 @@ describe("selling plan group ownership", () => {
       expect(html).not.toContain(FOREIGN_PLAN_ID);
     });
 
-    it("planIds alone can no longer render a foreign group — appId must match too", async () => {
-      /* Used to be the honest residual: planIds naming the OTHER app's plan
-         rendered the other app's group outright, whatever groupIds said
-         (groupIds is inert either way). Requiring appId alongside planIds
-         closes that single-field forgery — a metafield naming a foreign
-         plan id but carrying OUR OWN appId (the only appId this app can
-         ever publish) now proves nothing, and the widget stays dark rather
-         than rendering a plan we did not create. */
+    it("a forged planIds entry ALONE no longer renders the foreign group (v1.6.9)", async () => {
+      /* Until v1.6.9 planIds naming the OTHER app's plan rendered the other
+         app's group, whatever groupIds said — ownership rested on the one
+         field, so one forged or corrupted entry was sufficient by itself.
+         The appId second factor closes exactly this: Joy's group fails the
+         app-id comparison (its app_id is Joy's, not ours), ours fails the
+         plan-id comparison, and NOTHING renders. The full forgery — both
+         fields at once — still renders, and two-apps.test.ts pins that as
+         the honest residual of a merchant-writable metafield. */
       const html = await renderWidget({
         planGroups: {
           v: 1,
           groupIds: [String(FIXTURE.groupId)],
           planIds: [FOREIGN_PLAN_ID],
-          appId: "cellexia",
+          appId: FIXTURE.appId,
         },
         foreignGroupFirst: true,
         launchStatus: "live",
       });
       expect(rootTag(html)).toBeNull();
       expect(html).not.toContain(FOREIGN_PLAN_ID);
+      expect(html).not.toContain(String(FIXTURE.planIds.weeks8));
+      expect(visibleText(html)).toBe("");
     });
 
-    it("renders normally in the steady state (both fields ours)", async () => {
+    it("renders normally in the steady state (all fields ours)", async () => {
       // Vacuity guard for the three refusals above.
       const html = await renderWidget({
         planGroups: {
-          v: 1,
+          v: 2,
           groupIds: [String(FIXTURE.groupId)],
           planIds: OUR_PLAN_IDS,
-          appId: "cellexia",
+          planSets: [OUR_PLAN_IDS],
+          appId: FIXTURE.appId,
         },
         foreignGroupFirst: true,
         launchStatus: "live",
@@ -1900,6 +1916,7 @@ describe("selling plan group ownership", () => {
           planGroups: {
             v: 1,
             groupIds: [String(FIXTURE.groupId)],
+            appId: FIXTURE.appId,
             ...(planIds === undefined ? {} : { planIds }),
           },
           foreignGroupFirst: true,
@@ -1915,13 +1932,15 @@ describe("selling plan group ownership", () => {
     );
 
     it("renders again as soon as the plan ids are republished", async () => {
-      // Vacuity guard for the pair above: the ONLY difference is planIds.
+      // Vacuity guard for the pair above: the ONLY difference is the plan
+      // fields being republished in full.
       const html = await renderWidget({
         planGroups: {
-          v: 1,
+          v: 2,
           groupIds: [String(FIXTURE.groupId)],
           planIds: OUR_PLAN_IDS,
-          appId: "cellexia",
+          planSets: [OUR_PLAN_IDS],
+          appId: FIXTURE.appId,
         },
         foreignGroupFirst: true,
         launchStatus: "live",

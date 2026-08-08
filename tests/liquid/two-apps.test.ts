@@ -51,6 +51,22 @@ import type { MakeContextOptions, OtherAppGroupFixture } from "./harness";
  * factor, and the harness models both id spaces so the group-id assumption
  * can never quietly return.
  *
+ * THE HARDENING THIS FILE PINS SINCE v1.6.9 (two factors, exact sets): after
+ * the id-space fix, a single field — one planIds entry — decided ownership
+ * by itself; anything that could write a plan id into the metafield was
+ * sufficient alone. Ownership now requires BOTH: (a) the group's
+ * `selling_plan_group.app_id` equal to the allow-list's `appId` (this app's
+ * own numeric App id, which the app stamps onto its own groups on sync —
+ * Shopify leaves `app_id` nil otherwise; the harness models both the stamped
+ * steady state and the unstamped legacy group; NOT secret — any app can copy
+ * it onto its own groups, so it never decides alone); and (b) the group's
+ * live plan set EXACTLY equal to one `planSets` entry — same members, same
+ * count. Exact equality is what makes single-entry corruption harmless:
+ * appending or altering one entry darkens the widget (fails closed) instead
+ * of unlocking a competitor's single-plan group, and the legacy any-member
+ * `planIds` field is storefront-inert. The never-firing legacy group-id OR
+ * is REMOVED outright rather than left as attack surface.
+ *
  * The prices are fixed by the fixture and worth memorising:
  *
  *   one-time                CHF 64.00
@@ -80,6 +96,8 @@ const JOY_GROUP_ID = String(FIXTURE.foreignGroupId);
 const RECHARGE_PLAN_ID = String(RECHARGE_GROUP.plans![0].id);
 const RECHARGE_GROUP_ID = String(RECHARGE_GROUP.id);
 const OUR_PLAN_IDS = Object.values(FIXTURE.planIds).map(String);
+/** Our own app id — the allow-list's second factor since v1.6.9. */
+const OUR_APP_ID = FIXTURE.appId;
 /** The plan the widget preselects (recommended cadence = 8 weeks). */
 const OUR_DEFAULT_PLAN_ID = String(FIXTURE.planIds.weeks8);
 
@@ -189,7 +207,8 @@ describe("a product carrying three subscription apps' groups", () => {
         v: 1,
         groupIds: [String(FIXTURE.groupId)], // admin-numeric: matches nothing in Liquid
         planIds: OUR_PLAN_IDS,
-        appId: "cellexia",
+        planSets: [OUR_PLAN_IDS],
+        appId: OUR_APP_ID,
       },
     });
     const root = rootTag(html);
@@ -208,7 +227,8 @@ describe("a product carrying three subscription apps' groups", () => {
         v: 1,
         groupIds: ["424242424242"],
         planIds: OUR_PLAN_IDS,
-        appId: "cellexia",
+        planSets: [OUR_PLAN_IDS],
+        appId: OUR_APP_ID,
       },
     });
     expect(cartSellingPlanId(html)).toBe(OUR_DEFAULT_PLAN_ID);
@@ -216,48 +236,56 @@ describe("a product carrying three subscription apps' groups", () => {
     expectNoForeignTrace(html);
   });
 
-  it("the legacy group-id OR is gone — a matching Liquid id alone renders nothing", async () => {
-    /* The old comparison is deleted, not demoted: a group whose Liquid-visible
-       id is named EXACTLY in groupIds no longer renders on its own. Ownership
-       now requires a real plan id AND a matching appId together — a group-id
-       match (even the exact opaque storefront id, hand-written into the
-       metafield) proves neither, so it must not be enough by itself. */
+  it("the legacy group-id OR is GONE — the strongest input it ever matched unlocks NOTHING", async () => {
+    /* Until v1.6.9 the old comparison survived, demoted: a group whose
+       Liquid-visible id was named EXACTLY in groupIds still rendered even
+       when planIds named none of its plans. It could never fire in
+       production (the app publishes admin-numeric ids, which cannot collide
+       with the opaque storefront form), so it was pure attack surface for
+       zero benefit — one hand-written metafield entry away from a render
+       with no plan-id evidence at all. The branch is now REMOVED: the exact
+       opaque id, with a correct appId beside it, renders nothing. */
     const html = await renderWidget({
       ...THREE_APPS,
       planGroups: {
         v: 1,
         groupIds: [storefrontGroupId(FIXTURE.groupId)],
         planIds: ["424242424242"], // names no plan anywhere
-        appId: "cellexia",
+        appId: OUR_APP_ID,
       },
     });
     expect(rootTag(html)).toBeNull();
     expect(cartSellingPlanId(html)).toBeNull();
+    expect(visibleText(html)).toBe("");
     expectNoForeignTrace(html);
   });
 
   it("VACUITY GUARD: this fixture CAN render a competitor's group", async () => {
     /* Every assertion above is a negative — "Joy is not on the page" — and a
        fixture whose foreign groups Liquid simply cannot render would satisfy
-       all of them while pinning nothing. Allow-list JOY's group id AND Joy's
-       plan id instead of ours and the client's reported symptom comes straight
-       back: Joy's plan id in the cart mirror, Joy's 5% on the page. The
-       allow-list is the only thing standing between that render and a shopper.
+       all of them while pinning nothing. Forge the FULL allow-list — Joy's
+       plan id AND Joy's app id — and the client's reported symptom comes
+       straight back: Joy's plan id in the cart mirror, Joy's 5% on the page.
+       The allow-list is the only thing standing between that render and a
+       shopper.
 
-       planIds and appId are the fields that decide (the groupIds entry here
-       is inert — it is Joy's ADMIN id, which matches no Liquid group id).
-       The metafield is written by this app alone, and
-       buildPlanGroupsValue()/publishOwnGroupsMetafield() only ever emit our
-       own plan ids and our own app id, so reaching this render means forging
-       BOTH load-bearing fields together — the honest statement of the
-       residual. */
+       Since v1.6.9 reaching this render means forging BOTH load-bearing
+       fields together (the groupIds entry is inert either way — it is Joy's
+       ADMIN id, which matches no Liquid group id). The metafield is written
+       by this app alone: buildPlanGroupsValue() only ever emits plan ids
+       read off our own SellingPlanConfig rows, and the publish path writes
+       only this app's own appId. A planIds-only forgery — the pre-v1.6.9
+       single point of failure — no longer renders (pinned below in "the
+       appId second factor"); this test is the honest statement of what a
+       COMPLETE forgery still buys. */
     const html = await renderWidget({
       ...THREE_APPS,
       planGroups: {
         v: 1,
         groupIds: [JOY_GROUP_ID],
         planIds: [JOY_PLAN_ID],
-        appId: "joy-subscriptions",
+        planSets: [[JOY_PLAN_ID]],
+        appId: JOY_GROUP.appId,
       },
     });
     expect(cartSellingPlanId(html)).toBe(JOY_PLAN_ID);
@@ -275,7 +303,8 @@ describe("a product carrying three subscription apps' groups", () => {
         v: 1,
         groupIds: [RECHARGE_GROUP_ID],
         planIds: [RECHARGE_PLAN_ID],
-        appId: "recharge",
+        planSets: [[RECHARGE_PLAN_ID]],
+        appId: RECHARGE_GROUP.appId,
       },
     });
     expect(cartSellingPlanId(recharge)).toBe(RECHARGE_PLAN_ID);
@@ -295,22 +324,34 @@ describe("a product carrying three subscription apps' groups", () => {
        legacy group-id OR, and not even for our own group. Briefly absent
        beats briefly wrong. */
     for (const [label, planGroups] of [
-      ["planIds empty", { v: 1, groupIds: [JOY_GROUP_ID], planIds: [] }],
-      ["planIds absent", { v: 1, groupIds: [JOY_GROUP_ID] }],
-      ["planIds null", { v: 1, groupIds: [JOY_GROUP_ID], planIds: null }],
       [
-        // Even the one groupIds form the legacy OR could match — the exact
-        // opaque storefront id — unlocks nothing without plan ids.
+        "planIds empty",
+        { v: 1, groupIds: [JOY_GROUP_ID], planIds: [], appId: OUR_APP_ID },
+      ],
+      ["planIds absent", { v: 1, groupIds: [JOY_GROUP_ID], appId: OUR_APP_ID }],
+      [
+        "planIds null",
+        { v: 1, groupIds: [JOY_GROUP_ID], planIds: null, appId: OUR_APP_ID },
+      ],
+      [
+        // Even the one groupIds form the removed legacy OR used to match —
+        // the exact opaque storefront id — unlocks nothing without plan ids.
         "planIds empty, groupIds the exact opaque Liquid id",
         {
           v: 1,
           groupIds: [storefrontGroupId(FIXTURE.foreignGroupId)],
           planIds: [],
+          appId: OUR_APP_ID,
         },
       ],
       [
         "planIds empty, groupIds OUR admin id",
-        { v: 1, groupIds: [String(FIXTURE.groupId)], planIds: [] },
+        {
+          v: 1,
+          groupIds: [String(FIXTURE.groupId)],
+          planIds: [],
+          appId: OUR_APP_ID,
+        },
       ],
     ] as Array<[string, unknown]>) {
       const html = await renderWidget({ ...THREE_APPS, planGroups });
@@ -333,7 +374,8 @@ describe("a product carrying three subscription apps' groups", () => {
         v: 1,
         groupIds: [JOY_GROUP_ID],
         planIds: OUR_PLAN_IDS,
-        appId: "cellexia",
+        planSets: [OUR_PLAN_IDS],
+        appId: OUR_APP_ID,
       },
     });
     expect(cartSellingPlanId(html)).toBe(OUR_DEFAULT_PLAN_ID);
@@ -394,6 +436,7 @@ describe("a product with no group of ours", () => {
         v: 1,
         groupIds: ["9999999999999"],
         planIds: OUR_PLAN_IDS,
+        appId: OUR_APP_ID,
       },
       launchStatus: "live",
     });
@@ -456,14 +499,45 @@ describe("the no-owned-group marker's diagnostic attributes", () => {
         "recharge:Recharge Refills — 15% off",
     );
     // The allow-list WAS published (it names our plans; this product simply
-    // does not carry our group): "present", with its 3 plan ids counted.
+    // does not carry our group): "present", with its 3 plan ids counted and
+    // the appId it expects — next to the group app ids above, an unstamped
+    // or mismatched group is readable straight off the inspector.
     expect(attributeValue(marker, "data-cellexia-diag-allowlist")).toBe(
       "present",
     );
     expect(attributeValue(marker, "data-cellexia-diag-plan-count")).toBe("3");
+    expect(attributeValue(marker, "data-cellexia-diag-set-count")).toBe("1");
+    expect(attributeValue(marker, "data-cellexia-diag-allow-app-id")).toBe(
+      OUR_APP_ID,
+    );
     // Still invisible and inert.
     expect(visibleText(html)).toBe("");
     expectNoForeignTrace(html);
+  });
+
+  it("reports a pre-appId allow-list (published before v1.6.9) as expecting 'none'", async () => {
+    // The upgrade-window diagnostic: plans are named but the appId field is
+    // missing, so the widget renders nothing — and says why.
+    const html = await renderWidget({
+      otherGroups: [JOY_GROUP],
+      planGroups: {
+        v: 1,
+        groupIds: [String(FIXTURE.groupId)],
+        planIds: OUR_PLAN_IDS,
+      },
+      launchStatus: "live",
+    });
+    const marker = markerTag(html);
+    expect(attributeValue(marker, "data-cellexia-diag-allowlist")).toBe(
+      "present",
+    );
+    expect(attributeValue(marker, "data-cellexia-diag-allow-app-id")).toBe(
+      "none",
+    );
+    // plan-count 3 with set-count 0: the pre-v1.6.9 signature, readable
+    // straight off the inspector.
+    expect(attributeValue(marker, "data-cellexia-diag-plan-count")).toBe("3");
+    expect(attributeValue(marker, "data-cellexia-diag-set-count")).toBe("0");
   });
 
   it("reports an absent allow-list (plans never synced) with a zero plan count", async () => {
@@ -477,6 +551,9 @@ describe("the no-owned-group marker's diagnostic attributes", () => {
       "absent",
     );
     expect(attributeValue(marker, "data-cellexia-diag-plan-count")).toBe("0");
+    expect(attributeValue(marker, "data-cellexia-diag-allow-app-id")).toBe(
+      "none",
+    );
     // Joy's group AND our (unprovable) own group are both listed — the card
     // can say "a Cellexia-named group is here but no allow-list proves it".
     expect(attributeValue(marker, "data-cellexia-diag-group-count")).toBe("2");
@@ -484,7 +561,7 @@ describe("the no-owned-group marker's diagnostic attributes", () => {
       decodeEntitiesOnce(
         attributeValue(marker, "data-cellexia-diag-groups") ?? "",
       ),
-    ).toContain("cellexia:Cellexia Ritual");
+    ).toContain(`${OUR_APP_ID}:Cellexia Ritual`);
   });
 
   it("truncates a long merchant group name to 40 characters", async () => {
@@ -573,10 +650,11 @@ describe("before the first plan sync (no allow-list published yet)", () => {
     const html = await renderWidget({
       groupName: "Cellexia Subscribe & Save",
       planGroups: {
-        v: 1,
+        v: 2,
         groupIds: [String(FIXTURE.groupId)],
         planIds: OUR_PLAN_IDS,
-        appId: "cellexia",
+        planSets: [OUR_PLAN_IDS],
+        appId: OUR_APP_ID,
       },
       launchStatus: "live",
     });
@@ -694,10 +772,11 @@ describe("allow-list plan ids are compared by exact equality", () => {
         },
       ],
       planGroups: {
-        v: 1,
+        v: 2,
         groupIds: [String(FIXTURE.groupId)],
         planIds: OUR_PLAN_IDS,
-        appId: "cellexia",
+        planSets: [OUR_PLAN_IDS],
+        appId: OUR_APP_ID,
       },
       launchStatus: "live",
     });
@@ -722,10 +801,11 @@ describe("allow-list plan ids are compared by exact equality", () => {
         },
       ],
       planGroups: {
-        v: 1,
+        v: 2,
         groupIds: [String(FIXTURE.groupId)],
         planIds: OUR_PLAN_IDS,
-        appId: "cellexia",
+        planSets: [OUR_PLAN_IDS],
+        appId: OUR_APP_ID,
       },
       launchStatus: "live",
     });
@@ -734,22 +814,28 @@ describe("allow-list plan ids are compared by exact equality", () => {
     expect(html).not.toContain("68811000019");
   });
 
-  it("matches a real-length plan id exactly, and near misses not at all", async () => {
+  it("matches the exact plan set, and near misses of one member not at all", async () => {
+    /* One mutated MEMBER of an otherwise-correct set — the closest a
+       corrupted publish can get — must fail the whole set (exact string
+       equality per entry, exact count for the set). And a joined list is
+       not a set. */
     const ours = OUR_DEFAULT_PLAN_ID;
+    const others = OUR_PLAN_IDS.filter((id) => id !== ours);
     for (const entry of [
       ours.slice(0, -1), // a prefix of ours
       ours.slice(1), // a suffix of ours
       `${ours}0`, // an id ours is a prefix of
       ` ${ours}`, // whitespace is not equality
-      OUR_PLAN_IDS.join(","), // a joined list is not a list
+      OUR_PLAN_IDS.join(","), // a joined list is not a set member
     ]) {
       const html = await renderWidget({
         otherGroups: [JOY_GROUP],
         planGroups: {
-          v: 1,
+          v: 2,
           groupIds: [String(FIXTURE.groupId)],
-          planIds: [entry],
-          appId: "cellexia",
+          planIds: [...others, entry],
+          planSets: [[...others, entry]],
+          appId: OUR_APP_ID,
         },
         launchStatus: "live",
       });
@@ -757,37 +843,76 @@ describe("allow-list plan ids are compared by exact equality", () => {
       expect(html, `entry ${JSON.stringify(entry)}`).not.toContain(JOY_PLAN_ID);
     }
 
-    // The exact entry still renders: the loop above is not vacuous. ONE plan
-    // id is enough to prove the group.
+    // The exact set still renders: the loop above is not vacuous. Member
+    // ORDER is irrelevant — it is a set, not a sequence.
     const exact = await renderWidget({
       otherGroups: [JOY_GROUP],
       planGroups: {
-        v: 1,
+        v: 2,
         groupIds: [String(FIXTURE.groupId)],
-        planIds: [ours],
-        appId: "cellexia",
+        planIds: OUR_PLAN_IDS,
+        planSets: [[...OUR_PLAN_IDS].reverse()],
+        appId: OUR_APP_ID,
       },
       launchStatus: "live",
     });
     expect(cartSellingPlanId(exact)).toBe(OUR_DEFAULT_PLAN_ID);
   });
 
-  it("accepts plan ids in either JSON form (string or number)", async () => {
-    for (const planIds of [
+  it("a PARTIAL set — fewer entries than the group's plans — unlocks nothing", async () => {
+    /* THE v1.6.9 SEMANTIC CHANGE, pinned on purpose: under the old
+       any-member rule ONE allow-listed plan id proved a whole group, which
+       is exactly what let a single corrupted entry render a competitor's
+       single-plan group. Now the set must carry the SAME COUNT as the
+       group's live plans: a one-entry set cannot unlock our three-plan
+       group, however correct that entry is. */
+    const html = await renderWidget({
+      otherGroups: [JOY_GROUP],
+      planGroups: {
+        v: 2,
+        groupIds: [String(FIXTURE.groupId)],
+        planIds: [OUR_DEFAULT_PLAN_ID],
+        planSets: [[OUR_DEFAULT_PLAN_ID]],
+        appId: OUR_APP_ID,
+      },
+      launchStatus: "live",
+    });
+    expect(rootTag(html)).toBeNull();
+    expect(html).not.toContain(JOY_PLAN_ID);
+
+    // A SUPERSET fails the same way: count equality is two-sided.
+    const superset = await renderWidget({
+      otherGroups: [JOY_GROUP],
+      planGroups: {
+        v: 2,
+        groupIds: [String(FIXTURE.groupId)],
+        planIds: [...OUR_PLAN_IDS, "424242424242"],
+        planSets: [[...OUR_PLAN_IDS, "424242424242"]],
+        appId: OUR_APP_ID,
+      },
+      launchStatus: "live",
+    });
+    expect(rootTag(superset)).toBeNull();
+    expect(superset).not.toContain(JOY_PLAN_ID);
+  });
+
+  it("accepts set members in either JSON form (string or number)", async () => {
+    for (const set of [
       [...OUR_PLAN_IDS],
       [...OUR_PLAN_IDS].map(Number),
     ] as const) {
       const html = await renderWidget({
         otherGroups: [JOY_GROUP],
         planGroups: {
-          v: 1,
+          v: 2,
           groupIds: [String(FIXTURE.groupId)],
-          planIds,
-          appId: "cellexia",
+          planIds: set,
+          planSets: [set],
+          appId: OUR_APP_ID,
         },
         launchStatus: "live",
       });
-      expect(cartSellingPlanId(html), typeof planIds[0]).toBe(
+      expect(cartSellingPlanId(html), typeof set[0]).toBe(
         OUR_DEFAULT_PLAN_ID,
       );
     }
@@ -804,84 +929,285 @@ describe("allow-list plan ids are compared by exact equality", () => {
         v: 1,
         groupIds: [JOY_GROUP_ID, String(FIXTURE.groupId)],
         planIds: OUR_PLAN_IDS,
-        appId: "cellexia",
+        planSets: [OUR_PLAN_IDS],
+        appId: OUR_APP_ID,
       },
       launchStatus: "live",
     });
     expect(cartSellingPlanId(html)).toBe(OUR_DEFAULT_PLAN_ID);
     expect(html).not.toContain(JOY_PLAN_ID);
   });
+});
 
-  it("groupIds is not consulted at all — the legacy field is decoration only", async () => {
-    // Junk groupIds, a real plan id and the real appId: still renders. The
-    // field is published for backward compatibility with the old metafield
-    // shape but is not read by the ownership decision any more.
-    const html = await renderWidget({
-      otherGroups: [JOY_GROUP],
-      planGroups: {
-        v: 1,
-        groupIds: ["not-even-numeric"],
-        planIds: OUR_PLAN_IDS,
-        appId: "cellexia",
-      },
-      launchStatus: "live",
-    });
-    expect(cartSellingPlanId(html)).toBe(OUR_DEFAULT_PLAN_ID);
-    expect(html).not.toContain(JOY_PLAN_ID);
-  });
+// ── f. The appId second factor (v1.6.9) ──────────────────────────────────────
 
-  it("a correct plan id with the WRONG appId still renders nothing", async () => {
-    // The two-factor guarantee this whole model exists for: a corrupted or
-    // foreign appId must not be rescued by an otherwise-correct planIds list.
+describe("the appId second factor", () => {
+  /**
+   * WHY A SECOND FACTOR. After the id-space fix, ONE field decided ownership
+   * by itself: any planIds entry — a bug, a bad migration, a forged request —
+   * was sufficient alone to render whichever group carried that plan.
+   * Ownership now also requires the group's `selling_plan_group.app_id` to
+   * equal the allow-list's `appId`. The factor's value is not secrecy (any
+   * app can stamp any string onto its OWN groups) but INDEPENDENCE: it lives
+   * on the group, written through the Admin API with our token, while
+   * planIds lives in a shop metafield. Corrupting one no longer unlocks
+   * anything; both halves must agree with the same group, at once.
+   *
+   * Shopify does NOT auto-fill `app_id` — it is nil until the owning app
+   * stamps it (SellingPlanGroupInput.appId on sync). Both degraded upgrade
+   * states are pinned here to fail CLOSED: a pre-v1.6.9 metafield (no appId
+   * field) and a pre-v1.6.9 group (no stamp).
+   */
+  it("the correct plan set with the WRONG appId renders nothing", async () => {
     const html = await renderWidget({
-      otherGroups: [JOY_GROUP],
+      ...THREE_APPS,
       planGroups: {
-        v: 1,
+        v: 2,
         groupIds: [String(FIXTURE.groupId)],
         planIds: OUR_PLAN_IDS,
-        appId: "another-subscription-app",
+        planSets: [OUR_PLAN_IDS],
+        appId: "999999999999",
       },
-      launchStatus: "live",
     });
     expect(rootTag(html)).toBeNull();
+    expect(cartSellingPlanId(html)).toBeNull();
     expect(visibleText(html)).toBe("");
-    expect(html).not.toContain(JOY_PLAN_ID);
+    expectNoForeignTrace(html);
   });
 
-  it("the right appId with the WRONG plan ids still renders nothing", async () => {
-    // The other half of the guarantee: appId alone cannot unlock a group
-    // either. Both factors are mandatory, always.
+  it("the right appId with the WRONG plan sets renders nothing", async () => {
     const html = await renderWidget({
-      otherGroups: [JOY_GROUP],
+      ...THREE_APPS,
+      planGroups: {
+        v: 2,
+        groupIds: [String(FIXTURE.groupId)],
+        planIds: ["424242424242"],
+        planSets: [["424242424242"]],
+        appId: OUR_APP_ID,
+      },
+    });
+    expect(rootTag(html)).toBeNull();
+    expect(cartSellingPlanId(html)).toBeNull();
+    expect(visibleText(html)).toBe("");
+    expectNoForeignTrace(html);
+  });
+
+  it("a metafield published BEFORE the fix (no appId field) renders nothing until republished", async () => {
+    // The intended fail-closed upgrade behaviour: "briefly absent beats
+    // briefly wrong". The next plan sync republishes with the new field.
+    const html = await renderWidget({
+      ...THREE_APPS,
       planGroups: {
         v: 1,
         groupIds: [String(FIXTURE.groupId)],
+        planIds: OUR_PLAN_IDS,
+      },
+    });
+    expect(rootTag(html)).toBeNull();
+    expect(cartSellingPlanId(html)).toBeNull();
+    expect(visibleText(html)).toBe("");
+    expectNoForeignTrace(html);
+  });
+
+  it("an UNSTAMPED group (synced before the fix) renders nothing, however correct the metafield", async () => {
+    /* The other half of the upgrade window: the metafield already carries
+       the new appId, but OUR group on Shopify was created before the app
+       stamped app_id onto its groups — Liquid reads nil. The widget must
+       stay dark until a sync (or the publish-path heal) stamps the group;
+       rendering on the metafield alone would collapse ownership back onto
+       one field. */
+    const html = await renderWidget({
+      ...THREE_APPS,
+      ownGroupAppId: null,
+    });
+    expect(rootTag(html)).toBeNull();
+    expect(cartSellingPlanId(html)).toBeNull();
+    expect(visibleText(html)).toBe("");
+    expectNoForeignTrace(html);
+
+    // Vacuity guard: the SAME context renders once the group is stamped.
+    const stamped = await renderWidget(THREE_APPS);
+    expect(cartSellingPlanId(stamped)).toBe(OUR_DEFAULT_PLAN_ID);
+  });
+
+  it("THE HARDENING ITSELF: single-entry corruption never renders a foreign group — even one that copied our appId", async () => {
+    /* The scenario the exact-set rule exists for. Joy's owner can stamp OUR
+       public app id onto Joy's own group (nothing stops it — appId is not a
+       secret), which neutralises the app-id factor for Joy entirely. Under
+       an any-member plan rule, ONE corrupted planIds entry would then have
+       rendered Joy's single-plan group through our buy box: the pre-v1.6.9
+       single point of failure, resurrected. Under exact sets, both
+       single-entry corruptions fail CLOSED instead. */
+    const joyCopy: OtherAppGroupFixture = { ...JOY_GROUP, appId: OUR_APP_ID };
+
+    // (a) A Joy plan id appended to the legacy planIds union: storefront-
+    // inert since v1.6.9 — OUR group still renders, Joy never does.
+    const legacyCorrupted = await renderWidget({
+      otherGroups: [joyCopy],
+      planGroups: {
+        v: 2,
+        groupIds: [String(FIXTURE.groupId)],
+        planIds: [...OUR_PLAN_IDS, JOY_PLAN_ID],
+        planSets: [OUR_PLAN_IDS],
+        appId: OUR_APP_ID,
+      },
+      launchStatus: "live",
+    });
+    expect(cartSellingPlanId(legacyCorrupted)).toBe(OUR_DEFAULT_PLAN_ID);
+    expect(legacyCorrupted).not.toContain(JOY_PLAN_ID);
+
+    // (b) A Joy plan id appended to OUR set: the set no longer equals any
+    // group's live plans — NOTHING renders, ours included. Briefly absent
+    // beats briefly wrong.
+    const setCorrupted = await renderWidget({
+      otherGroups: [joyCopy],
+      planGroups: {
+        v: 2,
+        groupIds: [String(FIXTURE.groupId)],
+        planIds: OUR_PLAN_IDS,
+        planSets: [[...OUR_PLAN_IDS, JOY_PLAN_ID]],
+        appId: OUR_APP_ID,
+      },
+      launchStatus: "live",
+    });
+    expect(rootTag(setCorrupted)).toBeNull();
+    expect(setCorrupted).not.toContain(JOY_PLAN_ID);
+    expect(visibleText(setCorrupted)).toBe("");
+  });
+
+  it("a foreign group that copies OUR appId still cannot render without a full forged set", async () => {
+    // Any app can stamp any string onto its own groups, including ours. The
+    // copy buys nothing by itself: its plan set matches no published set,
+    // and OUR group still matches first on both factors.
+    const joyCopy: OtherAppGroupFixture = { ...JOY_GROUP, appId: OUR_APP_ID };
+    const html = await renderWidget({
+      otherGroups: [joyCopy],
+      launchStatus: "live",
+    });
+    expect(cartSellingPlanId(html)).toBe(OUR_DEFAULT_PLAN_ID);
+    expect(html).not.toContain(JOY_PLAN_ID);
+
+    // …and with ours absent from the product, the copycat renders nothing.
+    const alone = await renderWidget({
+      omitOwnGroup: true,
+      otherGroups: [joyCopy],
+      launchStatus: "live",
+    });
+    expect(rootTag(alone)).toBeNull();
+    expect(alone).not.toContain(JOY_PLAN_ID);
+    expect(visibleText(alone)).toBe("");
+
+    /* THE HONEST RESIDUAL, pinned: a wholesale forgery — an authored,
+       well-formed set exactly matching the copycat's live plans, inside the
+       one metafield only this app should write — still renders it. No
+       storefront-side rule can distinguish that from ownership, because
+       every input except app_id comes from the same metafield; what v1.6.9
+       guarantees is that it takes the FULL coherent forgery, never one
+       corrupted entry. */
+    const fullForgery = await renderWidget({
+      omitOwnGroup: true,
+      otherGroups: [joyCopy],
+      planGroups: {
+        v: 2,
+        groupIds: [JOY_GROUP_ID],
         planIds: [JOY_PLAN_ID],
-        appId: "cellexia",
+        planSets: [[JOY_PLAN_ID]],
+        appId: OUR_APP_ID,
       },
       launchStatus: "live",
     });
-    expect(rootTag(html)).toBeNull();
-    expect(visibleText(html)).toBe("");
-    expect(html).not.toContain(JOY_PLAN_ID);
+    expect(parseJsonIsland(fullForgery).initialPlan).toBe(JOY_PLAN_ID);
   });
 
-  it("an allow-list published before the appId fix fails closed until republished", async () => {
-    // A metafield written by a pre-fix app version has planIds but no appId
-    // at all. Must render nothing rather than fall back to the old (broken)
-    // group-id check — the whole point of the fix is that path is gone.
-    const html = await renderWidget({
-      otherGroups: [JOY_GROUP],
+  it("appId compares exactly, in either JSON form", async () => {
+    // A JSON number is normalised like the ids (append '') and matches…
+    const numeric = await renderWidget({
+      ...THREE_APPS,
       planGroups: {
-        v: 1,
+        v: 2,
         groupIds: [String(FIXTURE.groupId)],
         planIds: OUR_PLAN_IDS,
-        // appId omitted on purpose.
+        planSets: [OUR_PLAN_IDS],
+        appId: Number(OUR_APP_ID),
       },
-      launchStatus: "live",
     });
-    expect(rootTag(html)).toBeNull();
-    expect(visibleText(html)).toBe("");
+    expect(cartSellingPlanId(numeric)).toBe(OUR_DEFAULT_PLAN_ID);
+
+    // …while near misses of every shape match nothing.
+    for (const appId of [
+      OUR_APP_ID.slice(0, -1),
+      `${OUR_APP_ID}0`,
+      ` ${OUR_APP_ID}`,
+    ]) {
+      const html = await renderWidget({
+        ...THREE_APPS,
+        planGroups: {
+          v: 2,
+          groupIds: [String(FIXTURE.groupId)],
+          planIds: OUR_PLAN_IDS,
+          planSets: [OUR_PLAN_IDS],
+          appId,
+        },
+      });
+      expect(rootTag(html), `appId ${JSON.stringify(appId)}`).toBeNull();
+      expectNoForeignTrace(html);
+    }
+  });
+
+  it("MUTATION KILLER: an EMPTY appId can never open the gate — nil-vs-nil is not a match", async () => {
+    /* The `!= blank` half of the gate guard is security-load-bearing and
+       this test exists to make it un-deletable: with the guard removed, a
+       metafield lacking appId ('' after append) would equal every UNSTAMPED
+       group's nil app_id ('' after append), and ownership would collapse
+       back onto the plan sets alone. Both nil-nil directions are pinned
+       with everything else valid, so ONLY the blank guard separates render
+       from dark. */
+    for (const planGroups of [
+      // pre-v1.6.9 metafield: no appId field at all
+      {
+        v: 2,
+        groupIds: [String(FIXTURE.groupId)],
+        planIds: OUR_PLAN_IDS,
+        planSets: [OUR_PLAN_IDS],
+      },
+      // appId present but empty / whitespace-only (blank in Liquid)
+      {
+        v: 2,
+        groupIds: [String(FIXTURE.groupId)],
+        planIds: OUR_PLAN_IDS,
+        planSets: [OUR_PLAN_IDS],
+        appId: "",
+      },
+      {
+        v: 2,
+        groupIds: [String(FIXTURE.groupId)],
+        planIds: OUR_PLAN_IDS,
+        planSets: [OUR_PLAN_IDS],
+        appId: "   ",
+      },
+    ]) {
+      // Our own group unstamped: nil app_id on the group side too.
+      const own = await renderWidget({
+        ...THREE_APPS,
+        ownGroupAppId: null,
+        planGroups,
+      });
+      expect(rootTag(own), JSON.stringify(planGroups)).toBeNull();
+      expect(visibleText(own)).toBe("");
+
+      // A foreign NIL-app_id group (most real apps never stamp) whose plan
+      // set is forged into the metafield: the strongest thing the missing
+      // guard would unlock.
+      const foreign = await renderWidget({
+        omitOwnGroup: true,
+        otherGroups: [{ ...JOY_GROUP, appId: null }],
+        planGroups: { ...planGroups, planSets: [[JOY_PLAN_ID]] },
+        launchStatus: "live",
+      });
+      expect(rootTag(foreign), JSON.stringify(planGroups)).toBeNull();
+      expect(foreign).not.toContain(JOY_PLAN_ID);
+      expect(visibleText(foreign)).toBe("");
+    }
   });
 });
 

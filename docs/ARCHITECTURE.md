@@ -310,46 +310,70 @@ filter is still present in the source of every gating query. The Subscribers
 list is the one deliberate exception (the merchant must see and claim
 non-ours rows) and is pinned as such.
 
-**Storefront.** `publishOwnGroupsMetafield()` mirrors our group and plan ids
-into the shop metafield `cellexia.plan_groups`
-(`{"v":1,"groupIds":[…],"planIds":[…]}`, numeric ids — Liquid's form) on every
-plan sync and on go-live. `cx-buybox-core.liquid` renders the group whose id is
-on that list and **nothing at all** otherwise — no allow-list, no widget. There
+**Storefront.** `publishOwnGroupsMetafield()` mirrors this app's own App id
+and each owned group's LIVE plan set into the shop metafield
+`cellexia.plan_groups`
+(`{"v":2,"groupIds":[…],"planIds":[…],"planSets":[[…]],"appId":"…"}`,
+numeric ids — Liquid's form) on every plan sync, go-live and config delete.
+`cx-buybox-core.liquid` renders the group that passes the two ownership
+factors and **nothing at all** otherwise — no allow-list, no widget. There
 is no name heuristic and no "first group on the product" fallback: a group
-renders because its id is allow-listed, or it does not render.
+renders because it is proven ours, or it does not render.
 
-The id is checked against **two** fields, not one: an allow-listed group is
-only rendered if it also contains one of the allow-listed `planIds`. `groupIds`
-alone would make the whole decision rest on a single metafield field — an
-allow-list naming the other app's group id (a hand-edit in Settings → Custom
-data, any app holding `write_metafields`, a bad group id persisted on a
-`SellingPlanConfig`) resolved to *their* group, and everything downstream is
-written on the assumption that the group it was handed is ours, so their
-selling plan id reached the JSON island, the nameless mirror and the cart. The
-plan ids are independent evidence — they name plans this app created — so one
-forged field is not enough.
+**Two mandatory factors, both from that metafield (v1.6.9):**
 
-**Both factors are mandatory.** An allow-list with no `planIds` unlocks
-nothing, on any product. `planIds` was briefly specified as a *veto* — absent
-or empty meant the group id stood alone, so that a shop upgrading from a build
-without `SellingPlanConfig.shopifyPlanIds` would not have its buy box blanked.
-That was a hole rather than a kindness, because empty `planIds` is a state the
-app **emits itself**: `publishOwnGroupsMetafield()` writes
-`{"groupIds":["77"],"planIds":[]}` whenever `refreshOwnPlanIdsFromShopify()`
-cannot read a group back from Shopify. In that state the two factors collapsed
-into one, and a single corrupt or forged `groupIds` entry rendered the other
-app's group in full. Requiring both restores the intended bar — forge one
-field and nothing renders.
+1. **Exact plan-set equality** — the group's live selling plan ids equal one
+   `planSets` entry: same members (entry-by-entry exact string equality)
+   AND same count. Plan ids are the one id space storefront Liquid and the
+   Admin API share (group ids are NOT: Liquid's `selling_plan_group.id` is
+   an opaque per-shop identifier, which is why the original group-id
+   comparison never matched in production — the v1.6.6 outage). The sets
+   are read off Shopify at publish time, never off the append-only DB
+   evidence (which keeps dead plan ids for billing safety and would break
+   the count). `groupIds` and the any-member `planIds` union still travel
+   in the metafield for the Preview Doctor and the pre-v1.6.9 extension,
+   but the storefront reads neither; the inert "legacy OR" was removed
+   outright.
+2. **App-id match** — the group's `selling_plan_group.app_id` equals `appId`.
+   The value exists on the group only because this app **stamps** it there:
+   `SellingPlanGroupInput.appId` on every group create/update
+   (`syncSellingPlanGroupFromConfig`), healed for pre-v1.6.9 groups by
+   `stampSellingPlanGroupAppIds()` on every publish, with the outcome
+   surfaced on `PublishResult.heal` (never a silent failure). Shopify
+   leaves `app_id` nil otherwise, and app ids — unlike group ids — read
+   identically from the Admin API and from Liquid. HONEST LIMIT: the app id
+   is public and any app can stamp any string onto its OWN groups, so this
+   factor forces coherence but never decides alone — which is exactly why
+   factor 1 is set EQUALITY and not any-member: against a competitor that
+   pre-stamped our app id onto its (single-plan) group, an any-member rule
+   would collapse ownership back onto one corruptible field.
 
-The cost is paid in the safe direction: a shop whose plan ids are unrecorded
-shows **no** buy box until the next successful sync, instead of showing the
-wrong one. A missing widget sells nothing; a widget showing a competitor's plan
-sells *their* subscription through our buy box and hands them the contract.
-`publishOwnGroupsMetafield()` still runs `refreshOwnPlanIdsFromShopify()`
-before it writes — that repair is now load-bearing rather than tidy — so the
-window is the first successful sync, and `goLive()` records
-`published but INCOMPLETE` in its audit payload when it publishes an
-allow-list that cannot render anything.
+One corrupted entry is never enough. Anything that can put a plan id into
+the metafield (a hand-edit in Settings → Custom data, any app holding
+`write_metafields`, a bug, a bad migration) breaks an existing set's
+equality and darkens the widget — fail closed — rather than rendering a
+foreign group whose selling plan id would reach the JSON island, the
+nameless mirror and the cart. Rendering a foreign group requires authoring
+its complete, coherent set next to a matching app id: wholesale forgery of
+the single trust anchor, the documented residual.
+
+The cost is paid in the safe direction: a shop whose metafield predates
+v1.6.9, whose group is not yet stamped, or whose published set went stale
+shows **no** buy box until the next successful sync or publish, instead of
+showing the wrong one. A missing widget sells nothing; a widget showing a
+competitor's plan sells *their* subscription through our buy box and hands
+them the contract. Three layers keep that window short: (1)
+`publishOwnGroupsMetafield()` runs `refreshOwnPlanIdsFromShopify()` and the
+appId heal off one live read before it writes, and fails the whole publish
+(previous metafield stays — stale-but-valid beats fresh-but-dark) when the
+live state cannot be read; (2) `goLive()` records
+`published but INCOMPLETE` in its audit payload when the published value
+cannot render (empty sets, failed stamps); (3) the daily alert sweep
+(`OWNERSHIP_FACTORS`, riding the PLAN_GROUP_DRIFT budget) verifies both
+factors against the live state, republishes automatically, and alerts only
+when that did not fix it. The Preview Doctor's `allow_list` step verifies
+every half (published `appId` VERBATIM — the storefront never trims — the
+group-side stamp, and exact set coverage) and names the broken one.
 
 When nothing renders **because** no owned group matched — as opposed to the
 product having no selling plans at all — the snippet leaves one inert marker,
