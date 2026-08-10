@@ -68,7 +68,14 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   const alertsFor = (severity: string) =>
     prisma.alert.findMany({
-      where: { shopId: shop.id, resolvedAt: null, severity },
+      // GDPR_CUSTOMER_REDACT completions are routine compliance receipts —
+      // they stay on /app/alerts but never surface as dashboard banners.
+      where: {
+        shopId: shop.id,
+        resolvedAt: null,
+        severity,
+        type: { not: "GDPR_CUSTOMER_REDACT" },
+      },
       orderBy: { createdAt: "desc" },
       take: TOP_N,
     });

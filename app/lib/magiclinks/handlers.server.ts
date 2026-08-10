@@ -21,6 +21,7 @@ import {
   unskipNextCycle,
 } from "~/lib/contracts/service.server";
 import { OURS_ONLY, isBillableOwnership } from "~/lib/ownership/ownership.server";
+import { resolveLockState } from "~/lib/contracts/lock.server";
 
 /**
  * Magic link execution. `executeMagicAction` is called by the /magic/:token
@@ -54,6 +55,14 @@ export interface MagicActionDescription {
   description: string;
   confirmLabel: string;
   portalUrl: string | null;
+  /**
+   * Set when the plan lock window refuses this verb RIGHT NOW: the GET
+   * confirm page must render this terminal refusal instead of the promise +
+   * auto-submit — otherwise the customer watches "Skip your next order"
+   * confirm itself, burns the token's single use on a refusal, and the link
+   * is dead by the time the window opens.
+   */
+  lockedResult?: MagicActionResult;
 }
 
 type ContractWithLines = Prisma.SubscriptionContractGetPayload<{
@@ -225,6 +234,19 @@ const MUTATING_MAGIC_ACTIONS = new Set<MagicPayload["action"]>([
   "APPLY_WINBACK",
 ]);
 
+/**
+ * Verbs the plan lock window refuses at EXECUTION time (links are minted up
+ * to 14 days ahead and sit in inboxes — mint-time gating would be a hole).
+ * The reducing verbs only: UNSKIP_NEXT / RESUME / ADD_TO_NEXT / APPLY_WINBACK
+ * stay available, matching the portal dispatcher's blocked set.
+ */
+const LOCKED_MAGIC_ACTIONS = new Set<MagicPayload["action"]>([
+  "SKIP_NEXT",
+  "DELAY_NEXT",
+  "PAUSE",
+  "SWAP",
+]);
+
 export async function describeMagicAction(
   payload: MagicPayload,
 ): Promise<MagicActionDescription> {
@@ -245,7 +267,25 @@ export async function describeMagicAction(
       ? "magic.confirm.desc.APPLY_WINBACK_GIFT"
       : `magic.confirm.desc.${payload.action}`;
 
+  // Plan lock window, checked at DESCRIBE time too: the GET page must tell
+  // the truth before the auto-submit fires (see lockedResult's doc). The
+  // execute-time check below stays as the enforcement backstop.
+  let lockedResult: MagicActionResult | undefined;
+  if (contract && LOCKED_MAGIC_ACTIONS.has(payload.action)) {
+    const lock = await resolveLockState(shop.id, contract, shop.ianaTimezone);
+    if (lock.locked) {
+      const date = fmtDate(lock.until, shop, locale);
+      lockedResult = {
+        locale,
+        headline: t(locale, "magic.locked"),
+        sub: date ? t(locale, "magic.locked_sub", { date }) : undefined,
+        portalUrl: (await safePortalUrl(shop.id)) ?? undefined,
+      };
+    }
+  }
+
   return {
+    ...(lockedResult ? { lockedResult } : {}),
     action: payload.action,
     locale,
     title: t(locale, `magic.confirm.title.${payload.action}`),
@@ -306,6 +346,24 @@ export async function executeMagicAction(
         locale,
         headline: t(locale, "magic.error.rate_limited"),
         sub: t(locale, "magic.error.rate_limited_sub"),
+        portalUrl,
+      };
+    }
+  }
+
+  // ── Plan lock window: reducing verbs refuse at execution time ──────────────
+  // Same blocked set as the portal dispatcher. Checked here (not at mint
+  // time) because links live in inboxes for up to 14 days — a link minted
+  // before the lock mattered must still be refused while the window runs,
+  // and one minted during it must work again once the window has passed.
+  if (contract && LOCKED_MAGIC_ACTIONS.has(payload.action)) {
+    const lock = await resolveLockState(shop.id, contract, shop.ianaTimezone);
+    if (lock.locked) {
+      const date = fmtDate(lock.until, shop, locale);
+      return {
+        locale,
+        headline: t(locale, "magic.locked"),
+        sub: date ? t(locale, "magic.locked_sub", { date }) : undefined,
         portalUrl,
       };
     }

@@ -45,6 +45,7 @@ import {
   type Frequency,
 } from "~/lib/frequency";
 import { OURS_ONLY } from "~/lib/ownership/ownership.server";
+import { resolveLockState, type LockState } from "~/lib/contracts/lock.server";
 
 /**
  * Full subscription management: items (swap / quantity / remove), add a
@@ -101,6 +102,8 @@ interface PageContext {
   nextDateMaxDays: number;
   /** settings.portal.maxLineQuantity — same bound the api action validates. */
   maxQuantity: number;
+  /** Plan lock window — the same state the api action enforces. */
+  lock: LockState;
 }
 
 function api(ctx: PageContext, action: string): string {
@@ -118,15 +121,17 @@ function baseFields(ctx: PageContext): Array<[string, string]> {
 // ── Items ────────────────────────────────────────────────────────────────────
 
 function stepperHtml(ctx: PageContext, line: LocalContractLine): string {
+  // Lock window: decreases are blocked (the api action enforces the same
+  // rule), increases stay available.
   const minus =
-    line.quantity <= 1
+    line.quantity <= 1 || ctx.lock.locked
       ? `<button type="button" disabled aria-hidden="true">&minus;</button>`
       : `<form method="post" action="${api(ctx, "quantity")}">${hiddenFields([...baseFields(ctx), ["lineId", line.id], ["quantity", String(line.quantity - 1)]])}<button type="submit" aria-label="${escapeHtml(t(ctx.locale, "portal.items.decrease"))}">&minus;</button></form>`;
   const plus =
     line.quantity >= ctx.maxQuantity
       ? `<button type="button" disabled aria-hidden="true">+</button>`
       : `<form method="post" action="${api(ctx, "quantity")}">${hiddenFields([...baseFields(ctx), ["lineId", line.id], ["quantity", String(line.quantity + 1)]])}<button type="submit" aria-label="${escapeHtml(t(ctx.locale, "portal.items.increase"))}">+</button></form>`;
-  return `<div class="cx-stepper">${minus}<span class="cx-stepper__qty">${line.quantity}</span>${plus}</div>`;
+  return `<div class="cxs-stepper">${minus}<span class="cxs-stepper__qty">${line.quantity}</span>${plus}</div>`;
 }
 
 function swapHtml(
@@ -151,10 +156,10 @@ function swapHtml(
     })
     .join("");
 
-  return `<form method="post" action="${api(ctx, "swap")}" class="cx-row" style="margin-top:10px">
+  return `<form method="post" action="${api(ctx, "swap")}" class="cxs-row" style="margin-top:10px">
     ${hiddenFields([...baseFields(ctx), ["lineId", line.id]])}
-    <select class="cx-select" name="variantId" style="flex:1" aria-label="${escapeHtml(t(ctx.locale, "portal.items.swap_label"))}">${options}</select>
-    <button type="submit" class="cx-btn cx-btn--ghost cx-btn--small">${escapeHtml(t(ctx.locale, "portal.items.swap"))}</button>
+    <select class="cxs-select" name="variantId" style="flex:1" aria-label="${escapeHtml(t(ctx.locale, "portal.items.swap_label"))}">${options}</select>
+    <button type="submit" class="cxs-btn cxs-btn--ghost cxs-btn--small">${escapeHtml(t(ctx.locale, "portal.items.swap"))}</button>
   </form>`;
 }
 
@@ -172,8 +177,8 @@ function itemsCardHtml(
   const rows = contract.lines
     .map((line) => {
       const thumb = line.imageUrl
-        ? `<img class="cx-thumb" src="${escapeHtml(line.imageUrl)}" alt="" loading="lazy">`
-        : `<div class="cx-thumb cx-thumb--placeholder">C</div>`;
+        ? `<img class="cxs-thumb" src="${escapeHtml(line.imageUrl)}" alt="" loading="lazy">`
+        : `<div class="cxs-thumb cxs-thumb--placeholder">C</div>`;
 
       const badges: string[] = [];
       if (line.isGift) badges.push(t(locale, "portal.item.gift"));
@@ -190,7 +195,7 @@ function itemsCardHtml(
       const compare =
         line.compareAtPriceCents != null &&
         line.compareAtPriceCents > line.currentPriceCents
-          ? `<span class="cx-compare">${escapeHtml(formatMoney(line.compareAtPriceCents * line.quantity, contract.currencyCode, locale))}</span>`
+          ? `<span class="cxs-compare">${escapeHtml(formatMoney(line.compareAtPriceCents * line.quantity, contract.currencyCode, locale))}</span>`
           : "";
       const price = line.isGift
         ? escapeHtml(t(locale, "portal.item.free"))
@@ -198,23 +203,27 @@ function itemsCardHtml(
 
       let controls = "";
       if (editable && !line.isGift) {
-        const canRemove = line.isOneTimeAddon || recurringCount > 1;
+        // Lock window: recurring lines cannot be removed or swapped while it
+        // runs (one-time addons stay removable — undoing an addition).
+        const canRemove =
+          line.isOneTimeAddon || (recurringCount > 1 && !ctx.lock.locked);
         const removeForm = canRemove
-          ? `<form method="post" action="${api(ctx, "remove_line")}" data-cellexia-confirm="${escapeHtml(t(locale, "portal.items.remove_confirm", { title: line.title }))}">${hiddenFields([...baseFields(ctx), ["lineId", line.id]])}<button type="submit" class="cx-btn cx-btn--danger cx-btn--small">${escapeHtml(t(locale, "portal.items.remove"))}</button></form>`
+          ? `<form method="post" action="${api(ctx, "remove_line")}" data-cellexia-confirm="${escapeHtml(t(locale, "portal.items.remove_confirm", { title: line.title }))}">${hiddenFields([...baseFields(ctx), ["lineId", line.id]])}<button type="submit" class="cxs-btn cxs-btn--danger cxs-btn--small">${escapeHtml(t(locale, "portal.items.remove"))}</button></form>`
           : "";
         const stepper = line.isOneTimeAddon ? "" : stepperHtml(ctx, line);
-        const swap = line.isOneTimeAddon
-          ? ""
-          : swapHtml(
-              ctx,
-              line,
-              catalogProduct(catalog, line.productId),
-              discountByProduct.get(line.productId) ?? 0,
-            );
-        controls = `<div class="cx-row cx-row--between" style="margin-top:10px">${stepper}${removeForm}</div>${swap}`;
+        const swap =
+          line.isOneTimeAddon || ctx.lock.locked
+            ? ""
+            : swapHtml(
+                ctx,
+                line,
+                catalogProduct(catalog, line.productId),
+                discountByProduct.get(line.productId) ?? 0,
+              );
+        controls = `<div class="cxs-row cxs-row--between" style="margin-top:10px">${stepper}${removeForm}</div>${swap}`;
       }
 
-      return `<div class="cx-item">${thumb}<div class="cx-item__body"><p class="cx-item__title">${escapeHtml(line.title)}</p>${meta ? `<p class="cx-item__meta">${escapeHtml(meta)}</p>` : ""}${controls}</div><span class="cx-price">${price}</span></div>`;
+      return `<div class="cxs-item">${thumb}<div class="cxs-item__body"><p class="cxs-item__title">${escapeHtml(line.title)}</p>${meta ? `<p class="cxs-item__meta">${escapeHtml(meta)}</p>` : ""}${controls}</div><span class="cxs-price">${price}</span></div>`;
     })
     .join("");
 
@@ -225,15 +234,15 @@ function itemsCardHtml(
     ) + contract.deliveryPriceCents;
   const delivery =
     contract.deliveryPriceCents > 0
-      ? `<div class="cx-row cx-row--between cx-small cx-muted" style="margin-top:8px"><span>${escapeHtml(t(locale, "portal.detail.delivery"))}</span><span>${escapeHtml(formatMoney(contract.deliveryPriceCents, contract.currencyCode, locale))}</span></div>`
+      ? `<div class="cxs-row cxs-row--between cxs-small cxs-muted" style="margin-top:8px"><span>${escapeHtml(t(locale, "portal.detail.delivery"))}</span><span>${escapeHtml(formatMoney(contract.deliveryPriceCents, contract.currencyCode, locale))}</span></div>`
       : "";
 
-  return `<section class="cx-card">
+  return `<section class="cxs-card">
   <h2 style="font-size:18px;margin:0 0 14px">${escapeHtml(t(locale, "portal.detail.items_title"))}</h2>
   ${rows}
   ${delivery}
-  <hr class="cx-divider">
-  <div class="cx-row cx-row--between"><strong>${escapeHtml(t(locale, "portal.index.order_total"))}</strong><strong class="cx-price">${escapeHtml(formatMoney(totalCents, contract.currencyCode, locale))}</strong></div>
+  <hr class="cxs-divider">
+  <div class="cxs-row cxs-row--between"><strong>${escapeHtml(t(locale, "portal.index.order_total"))}</strong><strong class="cxs-price">${escapeHtml(formatMoney(totalCents, contract.currencyCode, locale))}</strong></div>
 </section>`;
 }
 
@@ -268,13 +277,13 @@ function addProductHtml(
       const first = variants[0];
       const priceHtml =
         pct > 0
-          ? `<span class="cx-compare">${escapeHtml(formatMoney(first.priceCents, contract.currencyCode, locale))}</span>${escapeHtml(formatMoney(discountedCents(first.priceCents, pct), contract.currencyCode, locale))}`
+          ? `<span class="cxs-compare">${escapeHtml(formatMoney(first.priceCents, contract.currencyCode, locale))}</span>${escapeHtml(formatMoney(discountedCents(first.priceCents, pct), contract.currencyCode, locale))}`
           : escapeHtml(formatMoney(first.priceCents, contract.currencyCode, locale));
 
       const variantField =
         variants.length === 1
           ? `<input type="hidden" name="variantId" value="${escapeHtml(first.id)}">`
-          : `<select class="cx-select" name="variantId" aria-label="${escapeHtml(t(locale, "portal.add.variant_label"))}">${variants
+          : `<select class="cxs-select" name="variantId" aria-label="${escapeHtml(t(locale, "portal.add.variant_label"))}">${variants
               .map((v) => {
                 const price = formatMoney(
                   discountedCents(v.priceCents, pct),
@@ -286,17 +295,17 @@ function addProductHtml(
               .join("")}</select>`;
 
       const thumb = product.imageUrl
-        ? `<img class="cx-thumb" src="${escapeHtml(product.imageUrl)}" alt="" loading="lazy">`
-        : `<div class="cx-thumb cx-thumb--placeholder">C</div>`;
+        ? `<img class="cxs-thumb" src="${escapeHtml(product.imageUrl)}" alt="" loading="lazy">`
+        : `<div class="cxs-thumb cxs-thumb--placeholder">C</div>`;
 
-      return `<form method="post" action="${api(ctx, "add_line")}" class="cx-card">
+      return `<form method="post" action="${api(ctx, "add_line")}" class="cxs-card">
         ${hiddenFields([...baseFields(ctx), ["quantity", "1"]])}
         ${thumb}
-        <p class="cx-item__title" style="margin:0">${escapeHtml(product.title)}</p>
-        <p class="cx-price cx-small" style="margin:0">${priceHtml}</p>
+        <p class="cxs-item__title" style="margin:0">${escapeHtml(product.title)}</p>
+        <p class="cxs-price cxs-small" style="margin:0">${priceHtml}</p>
         ${variantField}
-        <button type="submit" class="cx-btn cx-btn--small cx-btn--full">${escapeHtml(t(locale, "portal.add.recurring"))}</button>
-        <button type="submit" class="cx-btn cx-btn--ghost cx-btn--small cx-btn--full" formaction="${api(ctx, "addon")}">${escapeHtml(t(locale, "portal.add.one_time"))}</button>
+        <button type="submit" class="cxs-btn cxs-btn--small cxs-btn--full">${escapeHtml(t(locale, "portal.add.recurring"))}</button>
+        <button type="submit" class="cxs-btn cxs-btn--ghost cxs-btn--small cxs-btn--full" formaction="${api(ctx, "addon")}">${escapeHtml(t(locale, "portal.add.one_time"))}</button>
       </form>`;
     })
     .filter(Boolean)
@@ -304,11 +313,11 @@ function addProductHtml(
 
   if (!cards) return { html: "", offered: [] };
 
-  const html = `<details class="cx-acc">
+  const html = `<details class="cxs-acc">
   <summary>${escapeHtml(t(locale, "portal.add.title"))}</summary>
-  <div class="cx-acc__body">
-    <p class="cx-muted cx-small" style="margin:0 0 14px">${escapeHtml(t(locale, "portal.add.intro"))}</p>
-    <div class="cx-grid">${cards}</div>
+  <div class="cxs-acc__body">
+    <p class="cxs-muted cxs-small" style="margin:0 0 14px">${escapeHtml(t(locale, "portal.add.intro"))}</p>
+    <div class="cxs-grid">${cards}</div>
   </div>
 </details>`;
   return { html, offered };
@@ -390,12 +399,12 @@ function scheduleHtml(
     ? dateInputValue(contract.nextBillingDate, tz)
     : minDate;
 
-  const nextDateForm = `<div class="cx-field">
-    <label class="cx-label" for="cx-next-date">${escapeHtml(t(locale, "portal.schedule.next_date_label"))}</label>
-    <form method="post" action="${api(ctx, "next_date")}" class="cx-row">
+  const nextDateForm = `<div class="cxs-field">
+    <label class="cxs-label" for="cxs-next-date">${escapeHtml(t(locale, "portal.schedule.next_date_label"))}</label>
+    <form method="post" action="${api(ctx, "next_date")}" class="cxs-row">
       ${hiddenFields(baseFields(ctx))}
-      <input class="cx-input" style="flex:1" id="cx-next-date" type="date" name="date" required value="${currentDate}" min="${minDate}" max="${maxDate}">
-      <button type="submit" class="cx-btn cx-btn--ghost cx-btn--small">${escapeHtml(t(locale, "common.save"))}</button>
+      <input class="cxs-input" style="flex:1" id="cxs-next-date" type="date" name="date" required value="${currentDate}" min="${minDate}" max="${maxDate}">
+      <button type="submit" class="cxs-btn cxs-btn--ghost cxs-btn--small">${escapeHtml(t(locale, "common.save"))}</button>
     </form>
   </div>`;
 
@@ -403,18 +412,18 @@ function scheduleHtml(
   // only emit tokens that round-trip parseFrequencyToken, never display text.
   const currentFrequency = contractFrequency(contract);
   const frequencyForm = allowFrequencyChoice
-    ? `<div class="cx-field">
-    <label class="cx-label" for="cx-frequency">${escapeHtml(t(locale, "portal.schedule.frequency_label"))}</label>
-    <form method="post" action="${api(ctx, "frequency")}" class="cx-row">
+    ? `<div class="cxs-field">
+    <label class="cxs-label" for="cxs-frequency">${escapeHtml(t(locale, "portal.schedule.frequency_label"))}</label>
+    <form method="post" action="${api(ctx, "frequency")}" class="cxs-row">
       ${hiddenFields(baseFields(ctx))}
-      <select class="cx-select" style="flex:1" id="cx-frequency" name="frequency">${frequencies
+      <select class="cxs-select" style="flex:1" id="cxs-frequency" name="frequency">${frequencies
         .filter((f) => parseFrequencyToken(frequencyToken(f)) !== null)
         .map(
           (f) =>
             `<option value="${escapeHtml(frequencyToken(f))}"${sameFrequency(f, currentFrequency) ? " selected" : ""}>${escapeHtml(formatFrequency(tr, "option", f))}</option>`,
         )
         .join("")}</select>
-      <button type="submit" class="cx-btn cx-btn--ghost cx-btn--small">${escapeHtml(t(locale, "common.save"))}</button>
+      <button type="submit" class="cxs-btn cxs-btn--ghost cxs-btn--small">${escapeHtml(t(locale, "common.save"))}</button>
     </form>
   </div>`
     : "";
@@ -424,22 +433,22 @@ function scheduleHtml(
   const expectedNext: Array<[string, string]> = [
     ["expected_next", contract.nextBillingDate?.toISOString() ?? ""],
   ];
-  const skipForm = `<form method="post" action="${api(ctx, "skip")}">${hiddenFields([...baseFields(ctx), ...expectedNext])}<button type="submit" class="cx-btn cx-btn--quiet cx-btn--small">${escapeHtml(t(locale, "portal.actions.skip"))}</button></form>`;
-  const delayForm = `<form method="post" action="${api(ctx, "delay")}" class="cx-row cx-row--wrap">${hiddenFields([...baseFields(ctx), ...expectedNext])}
-    <button type="submit" class="cx-btn cx-btn--quiet cx-btn--small" name="weeks" value="1">${escapeHtml(t(locale, "portal.schedule.delay_weeks", { weeks: 1 }))}</button>
-    <button type="submit" class="cx-btn cx-btn--quiet cx-btn--small" name="weeks" value="2">${escapeHtml(t(locale, "portal.schedule.delay_weeks", { weeks: 2 }))}</button>
-    <button type="submit" class="cx-btn cx-btn--quiet cx-btn--small" name="weeks" value="3">${escapeHtml(t(locale, "portal.schedule.delay_weeks", { weeks: 3 }))}</button>
+  const skipForm = `<form method="post" action="${api(ctx, "skip")}">${hiddenFields([...baseFields(ctx), ...expectedNext])}<button type="submit" class="cxs-btn cxs-btn--quiet cxs-btn--small">${escapeHtml(t(locale, "portal.actions.skip"))}</button></form>`;
+  const delayForm = `<form method="post" action="${api(ctx, "delay")}" class="cxs-row cxs-row--wrap">${hiddenFields([...baseFields(ctx), ...expectedNext])}
+    <button type="submit" class="cxs-btn cxs-btn--quiet cxs-btn--small" name="weeks" value="1">${escapeHtml(t(locale, "portal.schedule.delay_weeks", { weeks: 1 }))}</button>
+    <button type="submit" class="cxs-btn cxs-btn--quiet cxs-btn--small" name="weeks" value="2">${escapeHtml(t(locale, "portal.schedule.delay_weeks", { weeks: 2 }))}</button>
+    <button type="submit" class="cxs-btn cxs-btn--quiet cxs-btn--small" name="weeks" value="3">${escapeHtml(t(locale, "portal.schedule.delay_weeks", { weeks: 3 }))}</button>
   </form>`;
 
-  return `<details class="cx-acc" open>
+  return `<details class="cxs-acc" open>
   <summary>${escapeHtml(t(locale, "portal.schedule.title"))}</summary>
-  <div class="cx-acc__body cx-stack">
+  <div class="cxs-acc__body cxs-stack">
     ${nextDateForm}
     ${frequencyForm}
     <div>
-      <span class="cx-label">${escapeHtml(t(locale, "portal.schedule.quick_label"))}</span>
-      <div class="cx-actions" style="margin-top:4px">${skipForm}${delayForm}</div>
-      <p class="cx-muted cx-small" style="margin:10px 0 0">${escapeHtml(t(locale, "portal.schedule.skip_hint"))}</p>
+      <span class="cxs-label">${escapeHtml(t(locale, "portal.schedule.quick_label"))}</span>
+      <div class="cxs-actions" style="margin-top:4px">${skipForm}${delayForm}</div>
+      <p class="cxs-muted cxs-small" style="margin:10px 0 0">${escapeHtml(t(locale, "portal.schedule.skip_hint"))}</p>
     </div>
   </div>
 </details>`;
@@ -457,14 +466,14 @@ function pauseHtml(ctx: PageContext, maxMonths: number): string {
         tz,
         locale,
       );
-      return `<form method="post" action="${api(ctx, "pause")}">${hiddenFields([...baseFields(ctx), ["months", String(m)]])}<button type="submit" class="cx-btn cx-btn--quiet cx-btn--full" style="justify-content:space-between"><span>${escapeHtml(t(locale, "portal.pause.months", { months: m }))}</span><span class="cx-muted cx-small">${escapeHtml(t(locale, "portal.pause.until", { date: resumeDate }))}</span></button></form>`;
+      return `<form method="post" action="${api(ctx, "pause")}">${hiddenFields([...baseFields(ctx), ["months", String(m)]])}<button type="submit" class="cxs-btn cxs-btn--quiet cxs-btn--full" style="justify-content:space-between"><span>${escapeHtml(t(locale, "portal.pause.months", { months: m }))}</span><span class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.pause.until", { date: resumeDate }))}</span></button></form>`;
     })
     .join("");
 
-  return `<details class="cx-acc">
+  return `<details class="cxs-acc">
   <summary>${escapeHtml(t(locale, "portal.pause.title"))}</summary>
-  <div class="cx-acc__body cx-stack">
-    <p class="cx-muted cx-small" style="margin:0">${escapeHtml(t(locale, "portal.pause.intro"))}</p>
+  <div class="cxs-acc__body cxs-stack">
+    <p class="cxs-muted cxs-small" style="margin:0">${escapeHtml(t(locale, "portal.pause.intro"))}</p>
     ${buttons}
   </div>
 </details>`;
@@ -487,17 +496,17 @@ function addressHtml(ctx: PageContext): string {
     labelKey: string,
     opts?: { half?: boolean; required?: boolean; autocomplete?: string; maxlength?: number },
   ) =>
-    `<div class="cx-field${opts?.half ? "" : " cx-field--full"}">
-      <label class="cx-label" for="cx-addr-${name}">${escapeHtml(t(locale, labelKey))}</label>
-      <input class="cx-input" id="cx-addr-${name}" type="text" name="${name}" value="${escapeHtml(a[name] ?? "")}"${opts?.required ? " required" : ""}${opts?.autocomplete ? ` autocomplete="${opts.autocomplete}"` : ""}${opts?.maxlength ? ` maxlength="${opts.maxlength}"` : ""}>
+    `<div class="cxs-field${opts?.half ? "" : " cxs-field--full"}">
+      <label class="cxs-label" for="cxs-addr-${name}">${escapeHtml(t(locale, labelKey))}</label>
+      <input class="cxs-input" id="cxs-addr-${name}" type="text" name="${name}" value="${escapeHtml(a[name] ?? "")}"${opts?.required ? " required" : ""}${opts?.autocomplete ? ` autocomplete="${opts.autocomplete}"` : ""}${opts?.maxlength ? ` maxlength="${opts.maxlength}"` : ""}>
     </div>`;
 
-  return `<details class="cx-acc">
+  return `<details class="cxs-acc">
   <summary>${escapeHtml(t(locale, "portal.address.title"))}</summary>
-  <div class="cx-acc__body">
+  <div class="cxs-acc__body">
     <form method="post" action="${api(ctx, "address")}">
       ${hiddenFields(baseFields(ctx))}
-      <div class="cx-form-grid">
+      <div class="cxs-form-grid">
         ${field("firstName", "portal.address.first_name", { half: true, autocomplete: "given-name" })}
         ${field("lastName", "portal.address.last_name", { half: true, autocomplete: "family-name" })}
         ${field("address1", "portal.address.address1", { required: true, autocomplete: "address-line1" })}
@@ -508,8 +517,8 @@ function addressHtml(ctx: PageContext): string {
         ${field("countryCode", "portal.address.country", { half: true, required: true, autocomplete: "country", maxlength: 2 })}
         ${field("phone", "portal.address.phone", { autocomplete: "tel" })}
       </div>
-      <p class="cx-muted cx-small" style="margin:0 0 14px">${escapeHtml(t(locale, "portal.address.country_hint"))}</p>
-      <button type="submit" class="cx-btn cx-btn--full">${escapeHtml(t(locale, "portal.address.save"))}</button>
+      <p class="cxs-muted cxs-small" style="margin:0 0 14px">${escapeHtml(t(locale, "portal.address.country_hint"))}</p>
+      <button type="submit" class="cxs-btn cxs-btn--full">${escapeHtml(t(locale, "portal.address.save"))}</button>
     </form>
   </div>
 </details>`;
@@ -531,17 +540,17 @@ function paymentHtml(ctx: PageContext): string {
           brand: contract.cardBrand ?? t(locale, "portal.payment.card_generic"),
           last4: contract.cardLast4 ?? "····",
         }),
-      )}</p>${expiry ? `<p class="cx-muted cx-small" style="margin:4px 0 0">${escapeHtml(t(locale, "portal.payment.expires", { expiry }))}</p>` : ""}`
-    : `<p class="cx-muted" style="margin:0">${escapeHtml(t(locale, "portal.payment.none"))}</p>`;
+      )}</p>${expiry ? `<p class="cxs-muted cxs-small" style="margin:4px 0 0">${escapeHtml(t(locale, "portal.payment.expires", { expiry }))}</p>` : ""}`
+    : `<p class="cxs-muted" style="margin:0">${escapeHtml(t(locale, "portal.payment.none"))}</p>`;
 
   const updateForm = contract.paymentMethodId
-    ? `<form method="post" action="${api(ctx, "payment_update")}" style="margin-top:14px">${hiddenFields(baseFields(ctx))}<button type="submit" class="cx-btn cx-btn--ghost cx-btn--full">${escapeHtml(t(locale, "portal.payment.update"))}</button></form>
-      <p class="cx-muted cx-small" style="margin:10px 0 0">${escapeHtml(t(locale, "portal.payment.secure_note"))}</p>`
+    ? `<form method="post" action="${api(ctx, "payment_update")}" style="margin-top:14px">${hiddenFields(baseFields(ctx))}<button type="submit" class="cxs-btn cxs-btn--ghost cxs-btn--full">${escapeHtml(t(locale, "portal.payment.update"))}</button></form>
+      <p class="cxs-muted cxs-small" style="margin:10px 0 0">${escapeHtml(t(locale, "portal.payment.secure_note"))}</p>`
     : "";
 
-  return `<details class="cx-acc">
+  return `<details class="cxs-acc">
   <summary>${escapeHtml(t(locale, "portal.payment.title"))}</summary>
-  <div class="cx-acc__body">${summary}${updateForm}</div>
+  <div class="cxs-acc__body">${summary}${updateForm}</div>
 </details>`;
 }
 
@@ -595,10 +604,11 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     );
   }
 
-  const [portalSettings, pauseSettings, frequency] = await Promise.all([
+  const [portalSettings, pauseSettings, frequency, lock] = await Promise.all([
     getSetting(shop.id, "portal"),
     getSetting(shop.id, "pause"),
     frequencyOptionsForContract(shop.id, contract),
+    resolveLockState(shop.id, contract, shop.ianaTimezone),
   ]);
 
   // Catalog + discount map (cached, degrade-to-empty) for swap/add sections.
@@ -627,6 +637,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     preview: portalSession.previewToken,
     nextDateMaxDays: portalSettings.nextDateMaxDays,
     maxQuantity: portalSettings.maxLineQuantity,
+    lock,
   };
 
   const isActive = contract.status === "ACTIVE";
@@ -644,16 +655,27 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
           date: formatShopDate(contract.resumeAt, ctx.tz, locale),
         })
       : t(locale, "portal.detail.paused");
-    body += `<div class="cx-banner"><p>${escapeHtml(resumeCopy)}</p><form method="post" action="${api(ctx, "resume")}">${hiddenFields(baseFields(ctx))}<button type="submit" class="cx-btn cx-btn--small">${escapeHtml(t(locale, "portal.actions.resume"))}</button></form></div>`;
+    body += `<div class="cxs-banner"><p>${escapeHtml(resumeCopy)}</p><form method="post" action="${api(ctx, "resume")}">${hiddenFields(baseFields(ctx))}<button type="submit" class="cxs-btn cxs-btn--small">${escapeHtml(t(locale, "portal.actions.resume"))}</button></form></div>`;
   } else if (isCancelled) {
     // Never a dead end: a returning customer restarts in one tap, through the
     // win-back reactivation service (no discount unless a win-back grant
     // already exists). Waiting for the win-back email is a pure LTGP leak.
-    body += `<div class="cx-banner"><p>${escapeHtml(t(locale, "portal.detail.status_note.cancelled"))}</p><form method="post" action="${api(ctx, "reactivate")}">${hiddenFields(baseFields(ctx))}<button type="submit" class="cx-btn cx-btn--small">${escapeHtml(t(locale, "portal.actions.restart"))}</button></form></div>`;
+    body += `<div class="cxs-banner"><p>${escapeHtml(t(locale, "portal.detail.status_note.cancelled"))}</p><form method="post" action="${api(ctx, "reactivate")}">${hiddenFields(baseFields(ctx))}<button type="submit" class="cxs-btn cxs-btn--small">${escapeHtml(t(locale, "portal.actions.restart"))}</button></form></div>`;
   } else if (!isActive) {
-    body += `<div class="cx-note" style="margin:0 0 16px">${escapeHtml(t(locale, `portal.detail.status_note.${contract.status.toLowerCase()}`))}</div>`;
+    body += `<div class="cxs-note" style="margin:0 0 16px">${escapeHtml(t(locale, `portal.detail.status_note.${contract.status.toLowerCase()}`))}</div>`;
   } else if (contract.nextBillingDate) {
-    body += `<div class="cx-card cx-row cx-row--between"><div><span class="cx-label">${escapeHtml(t(locale, "portal.index.next_order"))}</span><strong>${escapeHtml(formatShopDate(contract.nextBillingDate, ctx.tz, locale))}</strong></div><span class="cx-chip cx-chip--active">${escapeHtml(t(locale, "portal.status.active"))}</span></div>`;
+    body += `<div class="cxs-card cxs-row cxs-row--between"><div><span class="cxs-label">${escapeHtml(t(locale, "portal.index.next_order"))}</span><strong>${escapeHtml(formatShopDate(contract.nextBillingDate, ctx.tz, locale))}</strong></div><span class="cxs-chip cxs-chip--active">${escapeHtml(t(locale, "portal.status.active"))}</span></div>`;
+  }
+
+  // Plan lock window notice: shown while the window runs, with the exact
+  // unlock date — the controls it disables are hidden below, and the api
+  // action refuses them server-side regardless of what a stale page posts.
+  if (lock.locked && lock.until && (isActive || isPaused)) {
+    body += `<div class="cxs-note" style="margin:0 0 16px">${escapeHtml(
+      t(locale, "portal.locked.notice", {
+        date: formatShopDate(lock.until, ctx.tz, locale),
+      }),
+    )}</div>`;
   }
 
   body += itemsCardHtml(ctx, catalog, discountByProduct, isActive);
@@ -667,7 +689,9 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       await logAddonOfferImpressions(ctx, addSection.offered);
     }
   }
-  if (isActive) {
+  if (isActive && !lock.locked) {
+    // The schedule and pause cards hold only locked controls (next date,
+    // frequency, skip, delay, pause) — hidden wholesale during the window.
     body += scheduleHtml(ctx, frequency.options, frequency.allowChoice);
     body += pauseHtml(ctx, pauseSettings.maxMonths);
   }
@@ -679,9 +703,11 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     // the customer to update their card, so the button must be on this page.
     body += paymentHtml(ctx);
   }
-  if (editable) {
+  if (editable && !lock.locked) {
     // Cancel flow entry — the cancel-flow module owns everything past here.
-    body += `<p style="text-align:center;margin:24px 0 0"><a href="${withLocale(`${PORTAL_BASE_PATH}/cancel/${contract.id}`, locale, ctx.preview)}" class="cx-muted cx-small" style="color:var(--cx-muted)">${escapeHtml(t(locale, "portal.detail.cancel_link"))}</a></p>`;
+    // Hidden during the lock window; requireCancelContext turns a direct
+    // /cancel/:id visit away with the same toast either way.
+    body += `<p style="text-align:center;margin:24px 0 0"><a href="${withLocale(`${PORTAL_BASE_PATH}/cancel/${contract.id}`, locale, ctx.preview)}" class="cxs-muted cxs-small" style="color:var(--cxs-muted)">${escapeHtml(t(locale, "portal.detail.cancel_link"))}</a></p>`;
   }
 
   const toast = resolveToast(request, locale)?.toast ?? null;

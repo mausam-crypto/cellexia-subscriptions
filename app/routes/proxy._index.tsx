@@ -29,6 +29,7 @@ import {
 import type { LocalContractWithLines } from "~/lib/contracts/shared.server";
 import { contractFrequency, formatFrequency } from "~/lib/frequency";
 import { OURS_ONLY } from "~/lib/ownership/ownership.server";
+import { getLockRules, lockStateFor } from "~/lib/contracts/lock.server";
 
 /**
  * Portal home: every subscription the signed-in customer has, with one-tap
@@ -50,11 +51,11 @@ const STATUS_ORDER: Record<ContractStatus, number> = {
 };
 
 const STATUS_CHIP_CLASS: Record<ContractStatus, string> = {
-  ACTIVE: "cx-chip--active",
-  PAUSED: "cx-chip--paused",
-  FAILED: "cx-chip--failed",
-  CANCELLED: "cx-chip--cancelled",
-  EXPIRED: "cx-chip--expired",
+  ACTIVE: "cxs-chip--active",
+  PAUSED: "cxs-chip--paused",
+  FAILED: "cxs-chip--failed",
+  CANCELLED: "cxs-chip--cancelled",
+  EXPIRED: "cxs-chip--expired",
 };
 
 function contractTotalCents(contract: LocalContractWithLines): number {
@@ -82,7 +83,7 @@ function postForm(
   actionUrl: string,
   fields: FormField[],
   buttonLabel: string,
-  buttonClass = "cx-btn cx-btn--ghost cx-btn--small",
+  buttonClass = "cxs-btn cxs-btn--ghost cxs-btn--small",
 ): string {
   const hidden = fields
     .map(
@@ -97,8 +98,8 @@ function itemsHtml(contract: LocalContractWithLines, locale: string): string {
   return contract.lines
     .map((line) => {
       const thumb = line.imageUrl
-        ? `<img class="cx-thumb" src="${escapeHtml(line.imageUrl)}" alt="" loading="lazy">`
-        : `<div class="cx-thumb cx-thumb--placeholder">C</div>`;
+        ? `<img class="cxs-thumb" src="${escapeHtml(line.imageUrl)}" alt="" loading="lazy">`
+        : `<div class="cxs-thumb cxs-thumb--placeholder">C</div>`;
       const badges: string[] = [];
       if (line.isGift) badges.push(t(locale, "portal.item.gift"));
       if (line.isOneTimeAddon) badges.push(t(locale, "portal.item.one_time"));
@@ -120,7 +121,7 @@ function itemsHtml(contract: LocalContractWithLines, locale: string): string {
               locale,
             ),
           );
-      return `<div class="cx-item">${thumb}<div class="cx-item__body"><p class="cx-item__title">${escapeHtml(line.title)}</p><p class="cx-item__meta">${escapeHtml(meta)}</p></div><span class="cx-price">${price}</span></div>`;
+      return `<div class="cxs-item">${thumb}<div class="cxs-item__body"><p class="cxs-item__title">${escapeHtml(line.title)}</p><p class="cxs-item__meta">${escapeHtml(meta)}</p></div><span class="cxs-price">${price}</span></div>`;
     })
     .join("");
 }
@@ -137,6 +138,8 @@ function contractCardHtml(params: {
   promptBufferDays: number;
   /** Weeks the contextual one-tap delay pushes the next order back. */
   promptDelayWeeks: number;
+  /** Plan lock window — hides the one-tap skip/delay while it runs. */
+  locked: boolean;
 }): string {
   const { contract, locale, tz, csrf, preview } = params;
   const api = (action: string) => apiPath(locale, action, preview);
@@ -161,16 +164,17 @@ function contractCardHtml(params: {
 
   let scheduleHtml = "";
   if (contract.status === "ACTIVE" && contract.nextBillingDate) {
-    scheduleHtml = `<div><span class="cx-label">${escapeHtml(t(locale, "portal.index.next_order"))}</span><strong>${escapeHtml(formatShopDate(contract.nextBillingDate, tz, locale))}</strong></div>`;
+    scheduleHtml = `<div><span class="cxs-label">${escapeHtml(t(locale, "portal.index.next_order"))}</span><strong>${escapeHtml(formatShopDate(contract.nextBillingDate, tz, locale))}</strong></div>`;
   } else if (contract.status === "PAUSED" && contract.resumeAt) {
-    scheduleHtml = `<div><span class="cx-label">${escapeHtml(t(locale, "portal.index.resumes"))}</span><strong>${escapeHtml(formatShopDate(contract.resumeAt, tz, locale))}</strong></div>`;
+    scheduleHtml = `<div><span class="cxs-label">${escapeHtml(t(locale, "portal.index.resumes"))}</span><strong>${escapeHtml(formatShopDate(contract.resumeAt, tz, locale))}</strong></div>`;
   } else {
-    scheduleHtml = `<div><span class="cx-label">${escapeHtml(t(locale, "portal.index.status_label"))}</span><strong>${escapeHtml(statusLabel)}</strong></div>`;
+    scheduleHtml = `<div><span class="cxs-label">${escapeHtml(t(locale, "portal.index.status_label"))}</span><strong>${escapeHtml(statusLabel)}</strong></div>`;
   }
 
   let promptHtml = "";
   if (
     params.contextualPrompts &&
+    !params.locked &&
     contract.status === "ACTIVE" &&
     contract.nextBillingDate &&
     contract.predictedEmptyDate &&
@@ -178,7 +182,7 @@ function contractCardHtml(params: {
       contract.nextBillingDate.getTime() +
         params.promptBufferDays * 24 * 3600_000
   ) {
-    promptHtml = `<div class="cx-banner"><p>${escapeHtml(t(locale, "portal.index.contextual_prompt"))}</p>${postForm(
+    promptHtml = `<div class="cxs-banner"><p>${escapeHtml(t(locale, "portal.index.contextual_prompt"))}</p>${postForm(
       api("delay"),
       [
         ...baseFields,
@@ -190,7 +194,10 @@ function contractCardHtml(params: {
   }
 
   const actions: string[] = [];
-  if (contract.status === "ACTIVE") {
+  // Lock window: the one-tap skip/delay are hidden while it runs (the api
+  // action refuses them server-side regardless) — the manage link below
+  // stays, and the detail page explains the window with its unlock date.
+  if (contract.status === "ACTIVE" && !params.locked) {
     actions.push(
       postForm(
         api("skip"),
@@ -216,7 +223,7 @@ function contractCardHtml(params: {
         api("resume"),
         baseFields,
         t(locale, "portal.actions.resume"),
-        "cx-btn cx-btn--small",
+        "cxs-btn cxs-btn--small",
       ),
     );
   }
@@ -229,12 +236,12 @@ function contractCardHtml(params: {
         api("reactivate"),
         baseFields,
         t(locale, "portal.actions.restart"),
-        "cx-btn cx-btn--small",
+        "cxs-btn cxs-btn--small",
       ),
     );
   }
   actions.push(
-    `<a class="cx-btn cx-btn--quiet cx-btn--small" href="${manageHref}">${escapeHtml(t(locale, "portal.actions.manage"))}</a>`,
+    `<a class="cxs-btn cxs-btn--quiet cxs-btn--small" href="${manageHref}">${escapeHtml(t(locale, "portal.actions.manage"))}</a>`,
   );
 
   // contractFrequency: exact unit/count mirror when present, else the
@@ -252,19 +259,19 @@ function contractCardHtml(params: {
     locale,
   );
 
-  return `<section class="cx-card">
-  <div class="cx-row cx-row--between" style="margin-bottom:14px">
-    <p class="cx-muted cx-small" style="margin:0">${escapeHtml(frequency)}</p>
-    <span class="cx-chip ${STATUS_CHIP_CLASS[contract.status]}">${escapeHtml(statusLabel)}</span>
+  return `<section class="cxs-card">
+  <div class="cxs-row cxs-row--between" style="margin-bottom:14px">
+    <p class="cxs-muted cxs-small" style="margin:0">${escapeHtml(frequency)}</p>
+    <span class="cxs-chip ${STATUS_CHIP_CLASS[contract.status]}">${escapeHtml(statusLabel)}</span>
   </div>
   ${itemsHtml(contract, locale)}
-  <hr class="cx-divider">
-  <div class="cx-row cx-row--between cx-row--wrap">
+  <hr class="cxs-divider">
+  <div class="cxs-row cxs-row--between cxs-row--wrap">
     ${scheduleHtml}
-    <div><span class="cx-label">${escapeHtml(t(locale, "portal.index.order_total"))}</span><strong class="cx-price">${escapeHtml(total)}</strong></div>
+    <div><span class="cxs-label">${escapeHtml(t(locale, "portal.index.order_total"))}</span><strong class="cxs-price">${escapeHtml(total)}</strong></div>
   </div>
   ${promptHtml}
-  <div class="cx-actions">${actions.join("")}</div>
+  <div class="cxs-actions">${actions.join("")}</div>
 </section>`;
 }
 
@@ -296,8 +303,8 @@ function rewardsStripHtml(params: {
   // the milestone order (and remaining is only rendered when >= 1).
   const ordersRemaining = Math.max(1, milestoneCycle - maxOrders);
   const milestoneCell = milestoneReached
-    ? `<div class="cx-rewards__num">&#10003;</div><div class="cx-muted cx-small">${escapeHtml(t(locale, "portal.rewards.milestone_reached", { orders: milestoneCycle }))}</div>`
-    : `<div class="cx-rewards__num">${maxOrders}&thinsp;/&thinsp;${milestoneCycle}</div><div class="cx-muted cx-small">${escapeHtml(t(locale, "portal.rewards.milestone_next", { count: ordersRemaining }))}</div><div class="cx-progress"><span style="width:${milestonePct}%"></span></div>`;
+    ? `<div class="cxs-rewards__num">&#10003;</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.rewards.milestone_reached", { orders: milestoneCycle }))}</div>`
+    : `<div class="cxs-rewards__num">${maxOrders}&thinsp;/&thinsp;${milestoneCycle}</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.rewards.milestone_next", { count: ordersRemaining }))}</div><div class="cxs-progress"><span style="width:${milestonePct}%"></span></div>`;
 
   const unlockPct = Math.min(
     100,
@@ -306,15 +313,15 @@ function rewardsStripHtml(params: {
   // rewardsUnlocked uses >= so day 90 exactly reads as unlocked, never "0 more days".
   const daysRemaining = Math.max(1, rewardsUnlockDay - daysSubscribed);
   const rewardsCell = rewardsUnlocked
-    ? `<div class="cx-rewards__num">&#10003;</div><div class="cx-muted cx-small">${escapeHtml(t(locale, "portal.rewards.unlocked"))}</div>`
-    : `<div class="cx-rewards__num">${daysSubscribed}&thinsp;/&thinsp;${rewardsUnlockDay}</div><div class="cx-muted cx-small">${escapeHtml(t(locale, "portal.rewards.unlock_next", { days: daysRemaining }))}</div><div class="cx-progress"><span style="width:${unlockPct}%"></span></div>`;
+    ? `<div class="cxs-rewards__num">&#10003;</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.rewards.unlocked"))}</div>`
+    : `<div class="cxs-rewards__num">${daysSubscribed}&thinsp;/&thinsp;${rewardsUnlockDay}</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.rewards.unlock_next", { days: daysRemaining }))}</div><div class="cxs-progress"><span style="width:${unlockPct}%"></span></div>`;
 
-  return `<section class="cx-rewards">
+  return `<section class="cxs-rewards">
   <h2>${escapeHtml(t(locale, "portal.rewards.title"))}</h2>
-  <div class="cx-rewards__grid">
-    <div class="cx-rewards__cell"><div class="cx-rewards__num">${daysSubscribed}</div><div class="cx-muted cx-small">${escapeHtml(t(locale, "portal.rewards.days_subscribed"))}</div></div>
-    <div class="cx-rewards__cell">${milestoneCell}</div>
-    <div class="cx-rewards__cell">${rewardsCell}</div>
+  <div class="cxs-rewards__grid">
+    <div class="cxs-rewards__cell"><div class="cxs-rewards__num">${daysSubscribed}</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.rewards.days_subscribed"))}</div></div>
+    <div class="cxs-rewards__cell">${milestoneCell}</div>
+    <div class="cxs-rewards__cell">${rewardsCell}</div>
   </div>
 </section>`;
 }
@@ -427,7 +434,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }
   }
 
-  const [contracts, portalSettings, lifecycle] = await Promise.all([
+  const [contracts, portalSettings, lifecycle, lockRules] = await Promise.all([
     prisma.subscriptionContract.findMany({
       // OURS_ONLY: a customer who also subscribes through the store's other
       // subscription app must never see (let alone manage) that contract here.
@@ -441,6 +448,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }),
     getSetting(shop.id, "portal"),
     getSetting(shop.id, "lifecycle"),
+    // Plan lock window rules, fetched once and applied per contract card.
+    getLockRules(shop.id),
   ]);
   contracts.sort((a, b) => STATUS_ORDER[a.status] - STATUS_ORDER[b.status]);
 
@@ -453,7 +462,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   let body = "";
   if (contracts.length === 0) {
-    body = `<div class="cx-card"><p style="margin:0 0 8px">${escapeHtml(t(locale, "portal.index.empty_title"))}</p><p class="cx-muted cx-small" style="margin:0">${escapeHtml(t(locale, "portal.index.empty_body"))}</p></div>`;
+    body = `<div class="cxs-card"><p style="margin:0 0 8px">${escapeHtml(t(locale, "portal.index.empty_title"))}</p><p class="cxs-muted cxs-small" style="margin:0">${escapeHtml(t(locale, "portal.index.empty_body"))}</p></div>`;
   } else {
     // ── Rewards strip: days subscribed, milestone + rewards unlock ─────────
     const startTimes = contracts.map((c) =>
@@ -511,6 +520,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         contextualPrompts: portalSettings.contextualPrompts,
         promptBufferDays: portalSettings.contextualPromptBufferDays,
         promptDelayWeeks: portalSettings.contextualPromptDelayWeeks,
+        locked: lockStateFor(lockRules, contract, shop.ianaTimezone).locked,
       });
     }
   }

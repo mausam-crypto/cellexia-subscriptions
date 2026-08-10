@@ -20,6 +20,7 @@ import {
   type PortalSessionContext,
 } from "~/lib/portal/session.server";
 import type { LocalContractWithLines } from "~/lib/contracts/shared.server";
+import { resolveLockState } from "~/lib/contracts/lock.server";
 
 /**
  * Bridge between the cancel flow and the portal module: app-proxy signature
@@ -87,6 +88,25 @@ export async function requireCancelContext(
     !isBillableOwnership(contract.ownership)
   ) {
     throw new Response("Not found", { status: 404 });
+  }
+
+  // ── Plan lock window: the whole cancel flow is one choke point ─────────────
+  // This context guards EVERY loader and action of both cancel routes, so a
+  // locked contract can neither browse the flow nor land a crafted POST on
+  // /cancel/:id/confirm (which would otherwise mint its own session and
+  // cancel). Redirect to the subscription page, whose lock notice shows the
+  // unlock date. Admin previews pass — they are read-only everywhere anyway
+  // and the merchant must be able to inspect the flow.
+  if (!portalSession.isPreview) {
+    const lock = await resolveLockState(shop.id, contract, shop.ianaTimezone);
+    if (lock.locked) {
+      throw redirect(
+        withLocale(
+          `${PORTAL_BASE_PATH}/subscription/${contract.id}?toast=locked`,
+          locale,
+        ),
+      );
+    }
   }
 
   return {

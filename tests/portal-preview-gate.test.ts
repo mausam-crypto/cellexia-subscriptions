@@ -64,6 +64,11 @@ vi.mock("~/db.server", () => ({
       count: mocks.subscriberEventCount,
     },
     giftGrant: { findFirst: mocks.giftGrantFindFirst },
+    // Plan lock window (v1.13.0): portal loaders resolve lock rules; no plan
+    // sets lockDays in these fixtures.
+    sellingPlanConfig: {
+      findMany: vi.fn(async (): Promise<unknown[]> => []),
+    },
   },
 }));
 
@@ -321,10 +326,10 @@ describe("preview-token continuity script", () => {
 
   it("stores the token only behind a live preview bar, and retries only on the gate", () => {
     const gate = setupGatePage("en");
-    // Saving is gated on .cx-preview-bar (proof the token opened a session);
+    // Saving is gated on .cxs-preview-bar (proof the token opened a session);
     // the retry is gated on the root's data-cellexia-gate attribute and a
     // URL that arrived WITHOUT cx_pp — so a retry URL can never retry again.
-    expect(gate).toContain('root.querySelector(".cx-preview-bar")');
+    expect(gate).toContain('root.querySelector(".cxs-preview-bar")');
     expect(gate).toContain('sessionStorage.setItem("cellexia:cx_pp"');
     expect(gate).toContain('root.hasAttribute("data-cellexia-gate")');
     expect(gate).toContain("window.location.replace");
@@ -353,7 +358,130 @@ describe("preview-token continuity script", () => {
       context: {},
     } as never)) as Response;
     const html = await response.text();
-    expect(html).toContain("cx-preview-bar");
+    expect(html).toContain("cxs-preview-bar");
     expect(html).not.toContain(GATE_COPY);
+  });
+});
+
+// ── 4. The demo preview shows the DEMO SUBSCRIPTION, pre-launch ──────────────
+
+/**
+ * The launch-checklist promise, end-to-end at the loader: while the app is
+ * still in SETUP mode, "Preview with a demo subscription" must open the real
+ * portal home rendering the demo contract — not the setup gate, and not the
+ * empty "no subscriptions" portal. The gate tests above prove a valid token
+ * opens a session; this one proves the session then finds the demo contract:
+ * demo rows are `ownership: OURS` on purpose (demo.server.ts stamps and
+ * repairs it), so the portal's OURS_ONLY filter must keep passing them and
+ * must never grow an `isDemo: false` clause — every OTHER consumer filters
+ * demo rows out, which is exactly how such a clause would sneak in here.
+ */
+describe("demo preview in setup mode", () => {
+  function demoContractRow() {
+    const now = Date.now();
+    return {
+      id: "ctr_demo",
+      shopId: "shop_1",
+      customerId: "gid://cellexia/demo/customer/abc",
+      email: "preview@cellexia-demo.invalid",
+      status: "ACTIVE",
+      isDemo: true,
+      ownership: "OURS",
+      currencyCode: "GBP",
+      intervalWeeks: 8,
+      billingIntervalUnit: "WEEK",
+      billingIntervalCount: 8,
+      createdAt: new Date(now - 70 * 86_400_000),
+      firstChargeAt: new Date(now - 70 * 86_400_000),
+      nextBillingDate: new Date(now + 12 * 86_400_000),
+      resumeAt: null,
+      predictedEmptyDate: null,
+      ordersCount: 2,
+      deliveryPriceCents: 0,
+      lines: [
+        {
+          id: "line_1",
+          title: "Cell Renewal Serum",
+          variantTitle: null,
+          imageUrl: null,
+          quantity: 1,
+          currentPriceCents: 5400,
+          isGift: false,
+          isOneTimeAddon: false,
+        },
+        {
+          id: "line_2",
+          title: "Surprise gift — thank you",
+          variantTitle: null,
+          imageUrl: null,
+          quantity: 1,
+          currentPriceCents: 0,
+          isGift: true,
+          isOneTimeAddon: false,
+        },
+      ],
+    };
+  }
+
+  it("renders the demo subscription behind the preview bar — no gate, no empty state", async () => {
+    mocks.setupMode.value = true; // explicit: the app is NOT live
+    mocks.contractFindMany.mockResolvedValue([demoContractRow()]);
+    const token = mintValidToken();
+
+    const response = (await indexLoader({
+      request: new Request(proxyUrl("/", { cx_pp: token })),
+      params: {},
+      context: {},
+    } as never)) as Response;
+    const html = await response.text();
+
+    // The preview shell…
+    expect(html).toContain("Preview mode");
+    expect(html).toContain("cxs-preview-bar");
+    // …around the actual demo subscription…
+    expect(html).toContain("Cell Renewal Serum");
+    expect(html).toContain("Surprise gift — thank you");
+    // …and neither dead end.
+    expect(html).not.toContain(GATE_COPY);
+    expect(html).not.toContain("There are no subscriptions on this account yet");
+
+    // The contract lookup ran as the token's demo customer, OURS-scoped,
+    // WITHOUT an isDemo exclusion (the clause that would silently turn the
+    // demo preview into the empty portal).
+    const lastCall = mocks.contractFindMany.mock.calls.at(-1) as
+      | unknown[]
+      | undefined;
+    const where = (
+      lastCall?.[0] as { where?: Record<string, unknown> } | undefined
+    )?.where;
+    expect(where).toMatchObject({
+      shopId: "shop_1",
+      customerId: "gid://cellexia/demo/customer/abc",
+      ownership: "OURS",
+    });
+    expect(where).not.toHaveProperty("isDemo");
+  });
+
+  it("bounces /login back to the portal home when the valid token lands there", async () => {
+    // Any redirect that dumps a valid preview link on the login page must
+    // come straight back to the portal — carrying the token — instead of
+    // rendering a sign-in (or, worse, gate) page to the previewing admin.
+    const token = mintValidToken();
+    const { loader: loginLoader } = await import("~/routes/proxy.login");
+
+    const response = await loginLoader({
+      request: new Request(proxyUrl("/login", { cx_pp: token })),
+      params: {},
+      context: {},
+    } as never).then(
+      (r) => r as Response,
+      (thrown) => thrown as Response,
+    );
+
+    expect(response.status).toBe(302);
+    const location = response.headers.get("Location") ?? "";
+    expect(location).toContain(`${PORTAL_PROXY_BASE}/`);
+    expect(location).toContain(`cx_pp=${encodeURIComponent(token)}`);
+    expect(mocks.contractFindMany).not.toHaveBeenCalled();
   });
 });

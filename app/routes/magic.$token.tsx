@@ -280,6 +280,10 @@ export const loader = async ({ params }: LoaderFunctionArgs) => {
 
   try {
     const desc = await describeMagicAction(verified.payload);
+    // Plan lock window: render the honest refusal INSTEAD of the promise +
+    // auto-submit confirm page. Nothing is consumed on GET, so the same link
+    // works normally once the window has passed.
+    if (desc.lockedResult) return html(successPage(desc.lockedResult));
     return html(confirmPage(desc));
   } catch (err) {
     console.error("[magic] confirm page failed", verified.payload.action, err);

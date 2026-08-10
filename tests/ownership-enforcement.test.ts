@@ -89,6 +89,11 @@ vi.mock("~/db.server", () => ({
       findUnique: mocks.contractFindUnique,
       findMany: mocks.contractFindMany,
     },
+    // Plan lock window (v1.13.0): the SMS SKIP/DELAY gate resolves lock
+    // rules; no plan sets lockDays in these fixtures.
+    sellingPlanConfig: {
+      findMany: vi.fn(async (): Promise<unknown[]> => []),
+    },
     shop: {
       findUnique: mocks.shopFindUnique,
       findUniqueOrThrow: mocks.shopFindUniqueOrThrow,
@@ -810,6 +815,7 @@ describe("migration 0003 backfills fail-SAFE and stays additive", () => {
       "0014_challenged_attempt_marker_repair",
       "0015_multi_unit_frequencies",
       "0016_data_collection_audit",
+      "0017_plan_lock_window",
     ]);
   });
 });
@@ -1335,6 +1341,45 @@ describe("migration 0016 (data-collection audit) stays additive and leaves owner
 
   it("never touches the ownership column or its default", () => {
     expect(sql).not.toMatch(/ownership/i);
+    expect(sql).not.toMatch(/SET DEFAULT/i);
+  });
+});
+
+describe("migration 0017 (plan lock window) stays additive and leaves ownership alone", () => {
+  const sql = read("prisma/migrations/0017_plan_lock_window/migration.sql")
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("is additive only — no destructive verb anywhere in it", () => {
+    for (const verb of [
+      /\bDROP\b/i,
+      /\bTRUNCATE\b/i,
+      /\bDELETE\s+FROM\b/i,
+      /\bUPDATE\s+"/i,
+      /\bRENAME\b/i,
+      /\bALTER\s+TYPE\b/i,
+      /\bALTER\s+COLUMN\s+"\w+"\s+TYPE\b/i,
+    ]) {
+      expect(sql, String(verb)).not.toMatch(verb);
+    }
+  });
+
+  it("adds exactly the two lockDays columns — defaults ARE the pre-0017 behavior", () => {
+    const adds = sql.match(/ADD COLUMN [^,;]+/g) ?? [];
+    expect(adds).toHaveLength(2);
+    // The plan setting defaults to 0 (feature off)…
+    expect(adds[0]).toMatch(/"lockDays" INTEGER NOT NULL DEFAULT 0/);
+    // …and the per-contract "terms as subscribed under" stamp is nullable:
+    // null = pre-feature/import/backfill row = exempt, never a fabricated
+    // commitment stamped onto existing subscribers.
+    expect(adds[1]).toMatch(/"lockDays" INTEGER$/);
+  });
+
+  it("never touches the ownership column or its default", () => {
+    expect(sql).not.toMatch(/ownership/i);
+    // The column's own DEFAULT 0 is the feature-off state; no existing
+    // column's default is altered.
     expect(sql).not.toMatch(/SET DEFAULT/i);
   });
 });

@@ -1267,6 +1267,16 @@ describe("attribute namespace", () => {
  * foreign `.cx-portal` on the page would have had its forms broken by us. Same
  * document, same vendor, same class prefix, same failure mode as v1.2.2; only
  * the directory was different, which is why nothing caught it.
+ *
+ * v1.12.1 added the third round of the same lesson, this time in CSS: the
+ * vendor's storefront apps (cellexia-reviews, cellexia-aov-ltv-booster) ship
+ * their own `.cx-preview-bar`, `.cx-btn`, `.cx-card`, `.cx-chip`, `.cx-error`,
+ * `.cx-hp` and `.cx-muted` component styles on every theme page. Their
+ * `.cx-preview-bar` (inset-block-end:0; z-index:2147479999; opaque #0F1111;
+ * flex-centered) merged with ours (top:0) into a full-viewport black overlay:
+ * the admin's portal preview rendered perfectly and showed nothing but the
+ * banner text. Portal DOM classes therefore live in `.cxs-*` (and the cancel
+ * flow's `.cxc-*`); the bare `.cx-` prefix is BANNED in portal markup.
  */
 describe("portal script namespace", () => {
   const PORTAL_LAYOUT = join(REPO_ROOT, "app", "lib", "portal", "layout.server.ts");
@@ -1300,7 +1310,7 @@ describe("portal script namespace", () => {
         continue;
       }
       for (const compound of literal[2].split(",").map((part) => part.trim())) {
-        if (!/\.cx-[\w-]/.test(compound) || !compound.includes("data-cellexia-")) {
+        if (!/\.cxs-[\w-]/.test(compound) || !compound.includes("data-cellexia-")) {
           offenders.push(
             `${PORTAL_LABEL}:${query.line} ${query.receiver}.${query.method}("${compound}")`,
           );
@@ -1360,6 +1370,45 @@ describe("portal script namespace", () => {
     const live = withCommentsBlanked(PORTAL_LABEL, portalSource);
     expect(live).not.toContain("data-cx-");
     expect(live).not.toContain("_cx_design");
+  });
+
+  it("keeps every portal class off the other vendor's `cx-` prefix", () => {
+    /* The vendor's theme-extension CSS loads on every storefront page the
+       portal is injected into, and it styles its own `.cx-*` components with
+       rules aggressive enough (position:fixed; inset; max z-index; !important
+       display:none) to swallow any element of ours that wears the same name —
+       the v1.12.1 black-overlay preview. Query parameters (cx_pp) and cookie
+       names (cx_portal) are not CSS-reachable and stay as they are. */
+    const files = [
+      [PORTAL_LABEL, portalSource] as const,
+      [
+        "app/lib/cancel/pages.server.ts",
+        read(join(REPO_ROOT, "app", "lib", "cancel", "pages.server.ts")),
+      ] as const,
+      ...readdirSync(join(REPO_ROOT, "app", "routes"))
+        .filter((name) => name.startsWith("proxy.") && name.endsWith(".tsx"))
+        .map(
+          (name) =>
+            [
+              `app/routes/${name}`,
+              read(join(REPO_ROOT, "app", "routes", name)),
+            ] as const,
+        ),
+    ];
+    const offenders: string[] = [];
+    for (const [label, source] of files) {
+      const live = withCommentsBlanked(label, source);
+      for (const match of live.matchAll(/\bcx-[\w-]+/g)) {
+        const line = live.slice(0, match.index ?? 0).split("\n").length;
+        offenders.push(`${label}:${line} ${match[0]}`);
+      }
+    }
+    expect(
+      offenders,
+      "the `cx-` class prefix belongs to the other vendor's storefront apps " +
+        "on this store — their CSS will restyle any portal element that " +
+        `carries it (use cxs-/cxc-):\n${offenders.join("\n")}`,
+    ).toEqual([]);
   });
 });
 

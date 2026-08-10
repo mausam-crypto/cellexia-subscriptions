@@ -213,7 +213,7 @@ function stubHealthyFetch() {
     "fetch",
     vi.fn(async () =>
       new Response(
-        '<html><div class="cx-portal" data-cellexia-portal></div></html>',
+        '<html><div class="cxs-portal" data-cellexia-portal></div></html>',
         { status: 200 },
       ),
     ),

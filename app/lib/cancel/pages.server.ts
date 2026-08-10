@@ -20,7 +20,7 @@ import type { PageContent } from "./portal.server";
 
 /**
  * Server-rendered HTML for every cancel-flow step, using the shared portal
- * layout classes (`.cx-*`) plus a small scoped block (`.cxc-*`) for pieces
+ * layout classes (`.cxs-*`) plus a small scoped block (`.cxc-*`) for pieces
  * the layout doesn't have (loss list, radio cards). All copy goes through
  * t() with `cancel.*` keys so operators can tweak and A/B copy straight from
  * the locale catalogs. Mobile-first, no client JS beyond the layout's own.
@@ -28,7 +28,7 @@ import type { PageContent } from "./portal.server";
  * Compliance notes baked into the markup:
  * - "Continue to cancel" / "No thanks, cancel my subscription" controls are
  *   full-size buttons with the same dimensions and typography as the save
- *   CTAs (`.cx-btn--ghost` vs solid differ only in fill) — equal visual
+ *   CTAs (`.cxs-btn--ghost` vs solid differ only in fill) — equal visual
  *   weight, no dark patterns, decline is never a buried text link.
  * - Every mutating form carries the portal session's `_csrf` token.
  * - Forms POST to the store-domain proxy paths (`/apps/cellexia-subs/...`),
@@ -37,13 +37,13 @@ import type { PageContent } from "./portal.server";
 
 const EXTRA_STYLE = `<style>
 .cxc-list{margin:0 0 16px;padding:0;list-style:none}
-.cxc-list li{padding:10px 14px;margin:0 0 8px;border-radius:10px;background:var(--cx-accent-soft,#eef1ee);font-size:15px}
-.cxc-radio{display:flex;gap:10px;align-items:flex-start;padding:12px 14px;border:1px solid var(--cx-line,#ece7df);border-radius:10px;margin:0 0 8px;cursor:pointer;background:var(--cx-card,#fff)}
+.cxc-list li{padding:10px 14px;margin:0 0 8px;border-radius:10px;background:var(--cxs-accent-soft,#eef1ee);font-size:15px}
+.cxc-radio{display:flex;gap:10px;align-items:flex-start;padding:12px 14px;border:1px solid var(--cxs-line,#ece7df);border-radius:10px;margin:0 0 8px;cursor:pointer;background:var(--cxs-card,#fff)}
 .cxc-radio input{margin-top:4px}
-.cxc-textarea{width:100%;min-height:72px;padding:10px 14px;border:1px solid var(--cx-line,#ece7df);border-radius:8px;font:inherit;font-size:16px;margin:6px 0 14px}
-.cxc-center{display:block;text-align:center;margin:10px 0 0;color:var(--cx-muted,#8a837a);text-decoration:underline;font-size:14px;min-height:44px;line-height:44px}
-.cxc-stack .cx-btn{width:100%;margin:0 0 10px}
-.cxc-hint{font-size:13px;color:var(--cx-muted,#8a837a);text-align:center;margin:-4px 0 12px}
+.cxc-textarea{width:100%;min-height:72px;padding:10px 14px;border:1px solid var(--cxs-line,#ece7df);border-radius:8px;font:inherit;font-size:16px;margin:6px 0 14px}
+.cxc-center{display:block;text-align:center;margin:10px 0 0;color:var(--cxs-muted,#8a837a);text-decoration:underline;font-size:14px;min-height:44px;line-height:44px}
+.cxc-stack .cxs-btn{width:100%;margin:0 0 10px}
+.cxc-hint{font-size:13px;color:var(--cxs-muted,#8a837a);text-align:center;margin:-4px 0 12px}
 </style>`;
 
 function postForm(
@@ -58,7 +58,7 @@ function postForm(
         `<input type="hidden" name="${esc(name)}" value="${esc(value)}">`,
     )
     .join("");
-  const cls = primary ? "cx-btn cx-btn--full" : "cx-btn cx-btn--ghost cx-btn--full";
+  const cls = primary ? "cxs-btn cxs-btn--full" : "cxs-btn cxs-btn--ghost cxs-btn--full";
   return `<form method="post" action="${esc(action)}">${inputs}<button type="submit" class="${cls}">${esc(buttonLabel)}</button></form>`;
 }
 
@@ -119,7 +119,7 @@ export function pageIntro(args: {
   );
 
   const nextDateLine = summary.nextBillingDate
-    ? `<p class="cx-muted cx-small">${esc(
+    ? `<p class="cxs-muted cxs-small">${esc(
         t(locale, "cancel.intro.next_delivery", {
           date: formatShopDate(summary.nextBillingDate, tz, locale),
         }),
@@ -128,7 +128,7 @@ export function pageIntro(args: {
 
   const body = `${EXTRA_STYLE}
 ${errorHtml(locale, args.showError)}
-<p class="cx-muted">${esc(t(locale, `cancel.intro.sub.${copyVariant}`))}</p>
+<p class="cxs-muted">${esc(t(locale, `cancel.intro.sub.${copyVariant}`))}</p>
 <ul class="cxc-list">${lossItems.map((li) => `<li>${esc(li)}</li>`).join("")}</ul>
 ${nextDateLine}
 <div class="cxc-stack">
@@ -180,16 +180,16 @@ export function pageReason(args: {
 
   const body = `${EXTRA_STYLE}
 ${errorHtml(locale, args.showError, "cancel.reason.required_error")}
-<p class="cx-muted">${esc(t(locale, "cancel.reason.sub"))}</p>
+<p class="cxs-muted">${esc(t(locale, "cancel.reason.sub"))}</p>
 <form method="post" action="${esc(stepAction(contractId, "reason", locale, preview))}">
 <input type="hidden" name="intent" value="reason_submit">
 <input type="hidden" name="_csrf" value="${esc(args.csrf)}">
 ${radios}
-<label class="cx-label" for="cxc-detail">${esc(t(locale, "cancel.reason.detail_label"))}</label>
+<label class="cxs-label" for="cxc-detail">${esc(t(locale, "cancel.reason.detail_label"))}</label>
 <textarea id="cxc-detail" class="cxc-textarea" name="detail" maxlength="1000">${esc(
     args.detail ?? "",
   )}</textarea>
-<button type="submit" class="cx-btn cx-btn--full">${esc(
+<button type="submit" class="cxs-btn cxs-btn--full">${esc(
     t(locale, "cancel.reason.continue"),
   )}</button>
 </form>
@@ -231,16 +231,16 @@ export function pageSaves(args: {
     .join("");
 
   const finalOptIn = args.finalOfferEligible
-    ? `<a class="cx-btn cx-btn--ghost cx-btn--full" href="${esc(
+    ? `<a class="cxs-btn cxs-btn--ghost cxs-btn--full" href="${esc(
         stepAction(contractId, "final", locale, preview),
       )}" style="margin-bottom:10px">${esc(t(locale, "cancel.final.see_offer"))}</a>`
     : "";
 
   const body = `${EXTRA_STYLE}
 ${errorHtml(locale, args.showError)}
-<p class="cx-muted">${esc(t(locale, "cancel.saves.sub"))}</p>
+<p class="cxs-muted">${esc(t(locale, "cancel.saves.sub"))}</p>
 ${cards}
-<hr class="cx-divider">
+<hr class="cxs-divider">
 ${finalOptIn}${postForm(
   stepAction(contractId, "confirm", locale, preview),
   { intent: "confirm_cancel", _csrf: csrf },
@@ -351,7 +351,7 @@ function offerCard(
     case "SWAP": {
       const options = offer.options
         .map(
-          (o) => `<p>${esc(o.title)} — <span class="cx-price">${esc(
+          (o) => `<p>${esc(o.title)} — <span class="cxs-price">${esc(
             t(locale, "cancel.saves.swap.price_line", {
               price: formatMoney(o.displayPriceCents, currencyCode, locale),
             }),
@@ -380,10 +380,10 @@ ${postForm(
       return card(
         t(locale, "cancel.saves.education.title"),
         t(locale, "cancel.saves.education.desc"),
-        `<a class="cx-btn cx-btn--ghost cx-btn--full" href="${esc(
+        `<a class="cxs-btn cxs-btn--ghost cxs-btn--full" href="${esc(
           t(locale, "cancel.saves.education.guide_url"),
         )}" style="margin-bottom:10px">${esc(t(locale, "cancel.saves.education.guide_cta"))}</a>
-<a class="cx-btn cx-btn--ghost cx-btn--full" href="${esc(
+<a class="cxs-btn cxs-btn--ghost cxs-btn--full" href="${esc(
           t(locale, "cancel.saves.education.consult_url"),
         )}" style="margin-bottom:10px">${esc(t(locale, "cancel.saves.education.consult_cta"))}</a>
 ${postForm(
@@ -397,7 +397,7 @@ ${postForm(
       return card(
         t(locale, "cancel.saves.support.title"),
         t(locale, "cancel.saves.support.desc"),
-        `<a class="cx-btn cx-btn--ghost cx-btn--full" href="${esc(
+        `<a class="cxs-btn cxs-btn--ghost cxs-btn--full" href="${esc(
           t(locale, "cancel.saves.support.contact_url"),
         )}" style="margin-bottom:10px">${esc(t(locale, "cancel.saves.support.contact_cta"))}</a>
 ${postForm(
@@ -414,13 +414,13 @@ ${postForm(
 }
 
 function card(title: string, desc: string, bodyHtml: string): string {
-  return `<div class="cx-card"><h2 style="font-size:17px;margin:0 0 6px">${esc(
+  return `<div class="cxs-card"><h2 style="font-size:17px;margin:0 0 6px">${esc(
     title,
   )}</h2><p style="margin:0 0 12px">${esc(desc)}</p>${bodyHtml}</div>`;
 }
 
 function errorHtml(locale: string, show: boolean, key = "cancel.error.generic"): string {
-  return show ? `<p class="cx-error">${esc(t(locale, key))}</p>` : "";
+  return show ? `<p class="cxs-error">${esc(t(locale, key))}</p>` : "";
 }
 
 // ── Step 4: final chance ─────────────────────────────────────────────────────
@@ -441,7 +441,7 @@ export function pageFinal(args: {
 
   const body = `${EXTRA_STYLE}
 ${errorHtml(locale, args.showError)}
-<p class="cx-muted">${esc(t(locale, "cancel.final.sub", { percent, cycles }))}</p>
+<p class="cxs-muted">${esc(t(locale, "cancel.final.sub", { percent, cycles }))}</p>
 ${card(
   t(locale, "cancel.final.card_title", { percent, cycles }),
   t(locale, "cancel.final.card_desc"),
@@ -493,7 +493,7 @@ export function pageConfirm(args: {
 
   const body = `${EXTRA_STYLE}
 ${errorHtml(locale, args.showError)}
-<p class="cx-muted">${esc(t(locale, "cancel.confirm.what_happens"))}</p>
+<p class="cxs-muted">${esc(t(locale, "cancel.confirm.what_happens"))}</p>
 <ul class="cxc-list">${points}</ul>
 ${postForm(
   stepAction(contractId, "confirm", locale, preview),
@@ -501,7 +501,7 @@ ${postForm(
   t(locale, "cancel.confirm.cta"),
   true,
 )}
-<a class="cx-btn cx-btn--ghost cx-btn--full" href="${esc(
+<a class="cxs-btn cxs-btn--ghost cxs-btn--full" href="${esc(
     withLocale(portalPublicPath(), locale, preview),
   )}">${esc(t(locale, "cancel.confirm.keep"))}</a>
 ${finalOptIn}`;
@@ -530,7 +530,7 @@ export function pageDone(args: {
     args.contractId && args.csrf
       ? `<form method="post" action="${esc(
           withLocale(`${PROXY_PUBLIC_BASE}/api/reactivate`, locale, preview),
-        )}"><input type="hidden" name="contractId" value="${esc(args.contractId)}"><input type="hidden" name="_csrf" value="${esc(args.csrf)}"><input type="hidden" name="return_to" value="/"><button type="submit" class="cx-btn cx-btn--ghost cx-btn--full" style="margin-top:10px">${esc(
+        )}"><input type="hidden" name="contractId" value="${esc(args.contractId)}"><input type="hidden" name="_csrf" value="${esc(args.csrf)}"><input type="hidden" name="return_to" value="/"><button type="submit" class="cxs-btn cxs-btn--ghost cxs-btn--full" style="margin-top:10px">${esc(
           t(locale, "cancel.done.restart_cta"),
         )}</button></form>`
       : "";
@@ -538,8 +538,8 @@ export function pageDone(args: {
   const body = `${EXTRA_STYLE}
 <p>${esc(t(locale, "cancel.done.no_charges"))}</p>
 <p>${esc(t(locale, "cancel.done.resume"))}</p>
-<p class="cx-muted cx-small">${esc(t(locale, "cancel.done.winback_seed"))}</p>
-<a class="cx-btn cx-btn--full" href="${esc(withLocale(portalPublicPath(), locale, preview))}">${esc(
+<p class="cxs-muted cxs-small">${esc(t(locale, "cancel.done.winback_seed"))}</p>
+<a class="cxs-btn cxs-btn--full" href="${esc(withLocale(portalPublicPath(), locale, preview))}">${esc(
     t(locale, "cancel.done.portal_cta"),
   )}</a>
 ${restart}`;
@@ -563,14 +563,14 @@ export function pageSaved(args: {
 
   let extras = "";
   if (args.showEducationLinks) {
-    extras = `<a class="cx-btn cx-btn--ghost cx-btn--full" href="${esc(
+    extras = `<a class="cxs-btn cxs-btn--ghost cxs-btn--full" href="${esc(
       t(locale, "cancel.saves.education.guide_url"),
     )}" style="margin-bottom:10px">${esc(t(locale, "cancel.saves.education.guide_cta"))}</a>
-<a class="cx-btn cx-btn--ghost cx-btn--full" href="${esc(
+<a class="cxs-btn cxs-btn--ghost cxs-btn--full" href="${esc(
       t(locale, "cancel.saves.education.consult_url"),
     )}" style="margin-bottom:10px">${esc(t(locale, "cancel.saves.education.consult_cta"))}</a>`;
   } else if (args.showSupportLink) {
-    extras = `<a class="cx-btn cx-btn--ghost cx-btn--full" href="${esc(
+    extras = `<a class="cxs-btn cxs-btn--ghost cxs-btn--full" href="${esc(
       t(locale, "cancel.saves.support.contact_url"),
     )}" style="margin-bottom:10px">${esc(t(locale, "cancel.saves.support.contact_cta"))}</a>`;
   }
@@ -578,7 +578,7 @@ export function pageSaved(args: {
   const body = `${EXTRA_STYLE}
 <p>${esc(t(locale, args.messageKey, args.messageVars))}</p>
 ${extras}
-<a class="cx-btn cx-btn--full" href="${esc(withLocale(portalPublicPath(), locale, preview))}">${esc(
+<a class="cxs-btn cxs-btn--full" href="${esc(withLocale(portalPublicPath(), locale, preview))}">${esc(
     t(locale, "cancel.saved.portal_cta"),
   )}</a>
 <a class="cxc-center" href="${esc(withLocale(cancelPublicPath(contractId), locale, preview))}">${esc(

@@ -4,6 +4,132 @@ All notable changes to Cellexia Subscriptions. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [SemVer](https://semver.org) as contracted in [docs/UPDATE.md](docs/UPDATE.md).
 
+## [1.13.0] — 2026-08-10
+
+**New per-plan option: "Block skip, pause, change or cancel for the first X
+days"** — a commitment window that stops discount-grab-and-cancel. One
+additive migration (`0017_plan_lock_window`, `prisma migrate deploy`); no new
+env vars, no scope, webhook or theme changes (`npm run deploy` not needed).
+
+### Added
+
+- **Commitment window per plan** (Plans → edit plan → "Commitment window",
+  `SellingPlanConfig.lockDays`, 0–365, default 0 = off). While a contract is
+  inside the window — counted from checkout (`firstChargeAt`, falling back to
+  the mirror's `createdAt`, whichever is EARLIER) — every customer-initiated
+  schedule reduction is refused: skip, delay, frequency change, next-date
+  change, pause, variant swap, recurring-line removal, quantity decrease, and
+  cancellation. Additions and recoveries stay available (add product, one-time
+  add-on, quantity increase, addon removal, unskip, resume, reactivate,
+  address, payment update), and admin, dunning, stockout and system flows are
+  never blocked. Set it to roughly delivery time plus first use.
+- **Terms as subscribed under, never retroactive**: the covering plan's
+  lockDays is stamped onto the contract once, at mirror creation
+  (`SubscriptionContract.lockDays`); the effective window is the SMALLER of
+  that stamp and the plan's current setting. Enabling or raising the value
+  never locks anyone who checked out before it existed (they subscribed under
+  "cancel anytime"); lowering or clearing it — or deleting the plan —
+  releases everyone immediately. Every pre-upgrade, imported and
+  install-backfilled contract carries no stamp and is permanently exempt.
+- **The promised date is exactly true**: the window ends at shop-timezone
+  MIDNIGHT of the displayed unlock date (`dates.server.ts` calendar math, DST
+  safe) — a customer told "available on 12 March" is never refused on
+  12 March.
+- **Enforced at every customer surface, not just hidden in the UI**: the
+  portal action dispatcher, the whole cancel flow through one choke point
+  (`requireCancelContext` — a crafted POST to `/cancel/:id/confirm` cannot
+  mint its own session past it) plus a `completeCancel` engine backstop for
+  non-admin channels, magic-link verbs SKIP_NEXT/DELAY_NEXT/PAUSE/SWAP at
+  execution time (links sit in inboxes up to 14 days — a pre-lock link is
+  refused mid-window and works again after), and SMS SKIP/DELAY with a
+  localized reply naming the unlock date.
+- **Honest locked-state UX**: the subscription page shows the exact unlock
+  date (`portal.locked.notice`), the controls the window disables disappear
+  (schedule + pause cards, cancel link, minus/remove/swap on recurring
+  lines), portal-home one-tap skip/delay hide, refused attempts land a
+  localized toast, and a locked magic link renders the refusal on the GET
+  page itself — before the auto-submit — without consuming the token, so the
+  same emailed link works normally once the window has passed. 5 new keys in
+  all 22 locale catalogs. The admin subscriber page shows a "Locked until …"
+  badge so support sees why a customer "can't cancel"; the plan form warns
+  the merchant to disclose the commitment in their terms AND to edit the buy
+  box's default "Skip, pause or cancel anytime" reassurance/benefit copy,
+  which would otherwise promise exactly what the window blocks.
+- **Deliberately exempt**: imported and demo contracts (their lines carry no
+  selling-plan id — a migrated long-tenured subscriber must not re-lock at
+  import day). Plan resolution matches line selling-plan ids against each
+  config's append-only plan-id union (both GID and numeric forms; strictest
+  matching plan wins), so it survives frequency changes and plan-frequency
+  deletions. Note: the merchant demo preview renders unlocked (the demo
+  fixture is 70 days old by design).
+
+### Migration notes
+
+- `0017_plan_lock_window` — two additive columns: `SellingPlanConfig.lockDays
+  INTEGER NOT NULL DEFAULT 0` (the merchant setting; 0 = exactly the
+  pre-upgrade behavior) and `SubscriptionContract.lockDays INTEGER` nullable
+  (the subscribed-under stamp; null = every existing row = permanently
+  exempt). No backfill, no destructive statement.
+
+## [1.12.1] — 2026-08-10
+
+**The customer-portal preview no longer opens on a full-screen black page.**
+No migration, no new env vars, no scope or theme changes (`npm run deploy`
+not needed) — app-server restart only.
+
+### Fixed
+
+- **Portal preview = black screen on the live store.** The portal's preview
+  banner carried the class `cx-preview-bar` — a name the other "cellexia"
+  vendor's storefront apps (cellexia-reviews, cellexia-aov-ltv-booster) also
+  use for THEIR preview-bar component. Their theme-extension CSS loads on
+  every theme page, the theme-wrapped portal included; their
+  `.cx-preview-bar` rules (`inset-block-end:0`, opaque `#0F1111`,
+  `z-index:2147479999`, flex-centered) merged with ours (`top:0`) and
+  stretched the 42px banner into a full-viewport opaque black overlay. The
+  preview page rendered perfectly underneath and showed nothing but the
+  banner text. Verified live on cellexialabs.com by reproducing the exact
+  DOM: the same injection now renders a slim top bar with the fix applied.
+  Same vendor, same namespace, same failure mode as the v1.2.2 buy-box
+  wrapper adoption and the v1.2.3 portal-script sweep — this was round
+  three, in CSS.
+- **Every portal DOM class moved off the vendor's `cx-` namespace**, `.cx-*`
+  → `.cxs-*` (cancel-flow's scoped `.cxc-*` block already complied): the
+  vendor's sheets also ship their own `.cx-btn`, `.cx-card`, `.cx-chip`,
+  `.cx-error`, `.cx-hp` and `.cx-muted`, so any of those could be restyled
+  out from under the portal by their next app update. A class the vendor
+  styles aggressively enough (`display:none !important` appears in one
+  deployed variant of their CSS) cannot be defended with specificity — the
+  element must simply never carry the name. Query parameters (`cx_pp`,
+  `cx_preview`) and the `cx_portal` cookie are not CSS-reachable and keep
+  their names, so outstanding preview links and sessions survive the update.
+- **The preview banner was invisible even without the collision**: the live
+  theme fixes its header wrapper at `z-index:99999`, and the banner's old
+  `z-index:100` rendered behind it. It now pins a near-max `z-index`
+  (2147483200) — above the theme header and the vendor's overlays; a 42px
+  strip cannot meaningfully occlude a page the way the accidental
+  full-screen layer did.
+
+### Added
+
+- **Lint rule (tests/liquid/lint.test.ts §5e): the bare `cx-` class prefix
+  is banned in portal markup** — layout, every `proxy.*` route and the
+  cancel-flow pages, comments blanked first. The rule that would have caught
+  this before it shipped; portal classes live in `cxs-`/`cxc-` from now on.
+- **The pre-launch demo preview is pinned end-to-end**
+  (tests/portal-preview-gate.test.ts §4): with the app still in SETUP mode, a
+  valid demo `?cx_pp=` link renders the portal home with the demo
+  subscription's own line items behind the preview bar — never the
+  "finishing touches" setup gate and never the empty "no subscriptions"
+  portal — and the portal's contract lookup is asserted to stay
+  `ownership: OURS` **without** an `isDemo` exclusion (every other consumer
+  filters demo rows out, which is exactly how such a clause could sneak into
+  the one query that must keep them). A valid token landing on `/login` is
+  pinned to bounce straight back to the portal home, token intact. The gate
+  page itself remains public-only copy: an admin whose link went stale gets
+  the named "preview link has expired — reopen it from the admin" page
+  instead, on every portal route (v1.9.0 behaviour, still covered).
+
 ## [1.12.0] — 2026-08-10
 
 **SMTP and Klaviyo are now configurable from the admin — Settings → Email

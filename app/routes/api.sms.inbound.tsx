@@ -8,6 +8,7 @@ import { logEvent } from "~/lib/events/log.server";
 import { sha256 } from "~/lib/crypto/tokens.server";
 import { getPrimaryShop } from "~/lib/shop/install.server";
 import { delayNextCycle, skipNextCycle } from "~/lib/contracts/service.server";
+import { resolveLockState } from "~/lib/contracts/lock.server";
 import { OURS_ONLY } from "~/lib/ownership/ownership.server";
 
 /**
@@ -163,7 +164,7 @@ async function auditInboundSms(entry: {
   contract: MatchedContract | null;
   phone: string;
   keyword: string;
-  outcome: "ok" | "unknown_phone" | "unknown_keyword" | "error";
+  outcome: "ok" | "unknown_phone" | "unknown_keyword" | "locked" | "error";
 }): Promise<void> {
   try {
     const shopId =
@@ -327,6 +328,34 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   const { locale } = contract;
   const opts = { source: "MAGIC_LINK" as const, actor: "sms" };
+
+  // ── Plan lock window: SKIP and DELAY are reducing verbs ────────────────────
+  // Same blocked set as the portal dispatcher and magic links. The phone
+  // match carries no lock inputs, so they are fetched here — only for the
+  // two verbs the lock can refuse.
+  if (verb === "SKIP" || verb === "DELAY") {
+    const lockable = await prisma.subscriptionContract.findUnique({
+      where: { id: contract.id },
+      select: {
+        lockDays: true,
+        firstChargeAt: true,
+        createdAt: true,
+        lines: { select: { sellingPlanId: true } },
+      },
+    });
+    const lock = lockable
+      ? await resolveLockState(contract.shopId, lockable, contract.ianaTimezone)
+      : null;
+    if (lock?.locked && lock.until) {
+      await auditInboundSms({ contract, phone, keyword, outcome: "locked" });
+      return json({
+        ok: false,
+        message: t(locale, "magic.sms.locked", {
+          date: formatShopDate(lock.until, contract.ianaTimezone, locale),
+        }),
+      });
+    }
+  }
 
   try {
     switch (verb) {

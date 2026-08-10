@@ -34,6 +34,11 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("~/db.server", () => ({
   default: {
+    // Plan lock window (v1.13.0): completeCancel's customer-channel backstop
+    // resolves lock rules; no plan sets lockDays in these fixtures.
+    sellingPlanConfig: {
+      findMany: vi.fn(async (): Promise<unknown[]> => []),
+    },
     cancelSession: {
       findUnique: vi.fn(async (): Promise<unknown> => store.session),
       findUniqueOrThrow: vi.fn(async (): Promise<unknown> => store.session),

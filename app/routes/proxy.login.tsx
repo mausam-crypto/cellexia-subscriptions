@@ -60,38 +60,38 @@ function loginPath(locale: string, step?: string): string {
  */
 function storefrontSigninHtml(locale: string, signinExpired: boolean): string {
   const error = signinExpired
-    ? `<p class="cx-error" role="alert">${escapeHtml(t(locale, "portal.login.signin_expired"))}</p>`
+    ? `<p class="cxs-error" role="alert">${escapeHtml(t(locale, "portal.login.signin_expired"))}</p>`
     : "";
   const returnUrl = encodeURIComponent(withLocale(`${PORTAL_BASE_PATH}/`, locale));
   return `
-<div class="cx-card">
+<div class="cxs-card">
   ${error}
-  <p class="cx-muted" style="margin:0 0 18px">${escapeHtml(t(locale, "portal.login.storefront_intro"))}</p>
-  <a class="cx-btn cx-btn--full" href="/account/login?return_url=${returnUrl}">${escapeHtml(t(locale, "portal.login.storefront_cta"))}</a>
+  <p class="cxs-muted" style="margin:0 0 18px">${escapeHtml(t(locale, "portal.login.storefront_intro"))}</p>
+  <a class="cxs-btn cxs-btn--full" href="/account/login?return_url=${returnUrl}">${escapeHtml(t(locale, "portal.login.storefront_cta"))}</a>
 </div>`;
 }
 
 function emailFormHtml(locale: string, errorKey?: string): string {
   const error = errorKey
-    ? `<p class="cx-error" role="alert">${escapeHtml(t(locale, errorKey))}</p>`
+    ? `<p class="cxs-error" role="alert">${escapeHtml(t(locale, errorKey))}</p>`
     : "";
   return `
-<div class="cx-card">
+<div class="cxs-card">
   ${error}
-  <p class="cx-muted" style="margin:0 0 18px">${escapeHtml(t(locale, "portal.login.intro"))}</p>
+  <p class="cxs-muted" style="margin:0 0 18px">${escapeHtml(t(locale, "portal.login.intro"))}</p>
   <form method="post" action="${loginPath(locale)}">
     <input type="hidden" name="_step" value="request">
-    <div class="cx-hp" aria-hidden="true">
+    <div class="cxs-hp" aria-hidden="true">
       <label>Website<input type="text" name="website" tabindex="-1" autocomplete="off"></label>
     </div>
-    <div class="cx-field">
-      <label class="cx-label" for="cx-email">${escapeHtml(t(locale, "portal.login.email_label"))}</label>
-      <input class="cx-input" id="cx-email" type="email" name="email" required autocomplete="email" inputmode="email" maxlength="320">
+    <div class="cxs-field">
+      <label class="cxs-label" for="cxs-email">${escapeHtml(t(locale, "portal.login.email_label"))}</label>
+      <input class="cxs-input" id="cxs-email" type="email" name="email" required autocomplete="email" inputmode="email" maxlength="320">
     </div>
-    <button class="cx-btn cx-btn--full" type="submit">${escapeHtml(t(locale, "portal.login.send_code"))}</button>
+    <button class="cxs-btn cxs-btn--full" type="submit">${escapeHtml(t(locale, "portal.login.send_code"))}</button>
   </form>
 </div>
-<p class="cx-small cx-muted" style="text-align:center">${escapeHtml(t(locale, "portal.login.help"))}</p>`;
+<p class="cxs-small cxs-muted" style="text-align:center">${escapeHtml(t(locale, "portal.login.help"))}</p>`;
 }
 
 function codeFormHtml(
@@ -101,22 +101,22 @@ function codeFormHtml(
   errorKey?: string,
 ): string {
   const error = errorKey
-    ? `<p class="cx-error" role="alert">${escapeHtml(t(locale, errorKey))}</p>`
+    ? `<p class="cxs-error" role="alert">${escapeHtml(t(locale, errorKey))}</p>`
     : "";
   return `
-<div class="cx-card">
+<div class="cxs-card">
   ${error}
   <p style="margin:0 0 6px">${escapeHtml(t(locale, "portal.login.code_sent_to", { email }))}</p>
-  <p class="cx-muted cx-small" style="margin:0 0 18px">${escapeHtml(t(locale, "portal.login.code_sent", { minutes: ttlMinutes }))}</p>
+  <p class="cxs-muted cxs-small" style="margin:0 0 18px">${escapeHtml(t(locale, "portal.login.code_sent", { minutes: ttlMinutes }))}</p>
   <form method="post" action="${loginPath(locale)}">
     <input type="hidden" name="_step" value="verify">
-    <div class="cx-field">
-      <label class="cx-label" for="cx-code">${escapeHtml(t(locale, "portal.login.code_label"))}</label>
-      <input class="cx-input" id="cx-code" type="text" name="code" required inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" style="letter-spacing:0.35em;font-size:22px;text-align:center" autofocus>
+    <div class="cxs-field">
+      <label class="cxs-label" for="cxs-code">${escapeHtml(t(locale, "portal.login.code_label"))}</label>
+      <input class="cxs-input" id="cxs-code" type="text" name="code" required inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" style="letter-spacing:0.35em;font-size:22px;text-align:center" autofocus>
     </div>
-    <button class="cx-btn cx-btn--full" type="submit">${escapeHtml(t(locale, "portal.login.verify"))}</button>
+    <button class="cxs-btn cxs-btn--full" type="submit">${escapeHtml(t(locale, "portal.login.verify"))}</button>
   </form>
-  <p class="cx-small" style="margin:16px 0 0;text-align:center"><a href="${loginPath(locale)}" style="color:var(--cx-accent)">${escapeHtml(t(locale, "portal.login.resend"))}</a></p>
+  <p class="cxs-small" style="margin:16px 0 0;text-align:center"><a href="${loginPath(locale)}" style="color:var(--cxs-accent)">${escapeHtml(t(locale, "portal.login.resend"))}</a></p>
 </div>`;
 }
 

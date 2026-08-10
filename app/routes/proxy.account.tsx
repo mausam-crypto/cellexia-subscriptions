@@ -65,7 +65,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         c.lines.map((l) => l.title).join(", ") ||
         t(locale, "portal.account.subscription_fallback");
       const status = t(locale, `portal.status.${c.status.toLowerCase()}`);
-      return `<a class="cx-item" style="text-decoration:none;color:inherit" href="${withLocale(`${PORTAL_BASE_PATH}/subscription/${c.id}`, locale, portalSession.previewToken)}"><div class="cx-item__body"><p class="cx-item__title">${escapeHtml(label)}</p><p class="cx-item__meta">${escapeHtml(status)}</p></div><span class="cx-muted">&rsaquo;</span></a>`;
+      return `<a class="cxs-item" style="text-decoration:none;color:inherit" href="${withLocale(`${PORTAL_BASE_PATH}/subscription/${c.id}`, locale, portalSession.previewToken)}"><div class="cxs-item__body"><p class="cxs-item__title">${escapeHtml(label)}</p><p class="cxs-item__meta">${escapeHtml(status)}</p></div><span class="cxs-muted">&rsaquo;</span></a>`;
     })
     .join("");
 
@@ -76,18 +76,18 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   // honest sign-out is Shopify's own /account/logout; cookie and preview
   // sessions keep the app's POST /logout.
   const signOutHtml = portalSession.viaStorefrontLogin
-    ? `<a class="cx-btn cx-btn--quiet cx-btn--full" href="/account/logout">${escapeHtml(t(locale, "portal.account.sign_out"))}</a>`
+    ? `<a class="cxs-btn cxs-btn--quiet cxs-btn--full" href="/account/logout">${escapeHtml(t(locale, "portal.account.sign_out"))}</a>`
     : `<form method="post" action="${withLocale(`${PORTAL_BASE_PATH}/logout`, locale)}">
-    <button type="submit" class="cx-btn cx-btn--quiet cx-btn--full">${escapeHtml(t(locale, "portal.account.sign_out"))}</button>
+    <button type="submit" class="cxs-btn cxs-btn--quiet cxs-btn--full">${escapeHtml(t(locale, "portal.account.sign_out"))}</button>
   </form>`;
 
   const body = `
-<div class="cx-card">
-  <span class="cx-label">${escapeHtml(t(locale, "portal.account.signed_in_as"))}</span>
+<div class="cxs-card">
+  <span class="cxs-label">${escapeHtml(t(locale, "portal.account.signed_in_as"))}</span>
   <p style="margin:0;font-weight:500">${escapeHtml(portalSession.email)}</p>
   ${
     memberSince
-      ? `<p class="cx-muted cx-small" style="margin:6px 0 0">${escapeHtml(
+      ? `<p class="cxs-muted cxs-small" style="margin:6px 0 0">${escapeHtml(
           t(locale, "portal.account.member_since", {
             date: formatShopDate(memberSince, shop.ianaTimezone, locale),
           }),
@@ -97,11 +97,11 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 </div>
 ${
   subscriptionLinks
-    ? `<div class="cx-card"><span class="cx-label">${escapeHtml(t(locale, "portal.account.your_subscriptions"))}</span>${subscriptionLinks}</div>`
+    ? `<div class="cxs-card"><span class="cxs-label">${escapeHtml(t(locale, "portal.account.your_subscriptions"))}</span>${subscriptionLinks}</div>`
     : ""
 }
-<div class="cx-card">
-  <p class="cx-muted cx-small" style="margin:0 0 14px">${escapeHtml(t(locale, "portal.account.help"))}</p>
+<div class="cxs-card">
+  <p class="cxs-muted cxs-small" style="margin:0 0 14px">${escapeHtml(t(locale, "portal.account.help"))}</p>
   ${signOutHtml}
 </div>`;
 

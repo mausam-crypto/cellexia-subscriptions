@@ -27,6 +27,7 @@ import {
   type ContractOwnership,
 } from "~/lib/ownership/ownership.server";
 import { releaseHeldCycleAttempts } from "~/lib/billing/release.server";
+import { getLockRules, maxLockDaysForPlanIds } from "./lock.server";
 import type { LocalContractWithLines, ServiceOptions } from "./shared.server";
 import { reloadContract, resolveActor } from "./shared.server";
 
@@ -649,6 +650,24 @@ export async function syncContractFromShopify(
   if (existingRow) {
     contractRow = await updateExistingRow(existingRow);
   } else {
+    // Lock window "terms as subscribed under" (v1.13.0): stamp the covering
+    // plan's CURRENT lockDays once, at mirror birth — CREATE only, never the
+    // update path, so later plan edits cannot rewrite what this subscriber
+    // agreed to. Backfill mirrors (install; a contract we are only now
+    // meeting) stay null: their subscribe-time terms are unknowable and null
+    // is exempt, exactly like the transition dates above. Contained: a
+    // failed rule read must never lose the mirror row itself.
+    let lockDaysAtCreation: number | null = null;
+    if (!backfillCreate) {
+      try {
+        lockDaysAtCreation = maxLockDaysForPlanIds(
+          await getLockRules(shop.id),
+          sc.lines.map((l) => l.sellingPlanId),
+        );
+      } catch (err) {
+        console.error("[sync] lockDays stamp failed", shopifyContractGid, err);
+      }
+    }
     try {
       contractRow = await prisma.subscriptionContract.create({
         data: {
@@ -658,6 +677,7 @@ export async function syncContractFromShopify(
           // A brand-new mirror has no explicit verdict to protect — the
           // resolved value (UNKNOWN included) rides the create directly.
           ownership,
+          lockDays: lockDaysAtCreation,
           ...shared,
           // First prepaid mirror: seed the deliveries-remaining counter with
           // the full per-charge allotment (see the update-path guard).

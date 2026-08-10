@@ -27,6 +27,7 @@ import {
   swapLineVariant,
 } from "~/lib/contracts/service.server";
 import type { LocalContractWithLines } from "~/lib/contracts/shared.server";
+import { resolveLockState } from "~/lib/contracts/lock.server";
 import {
   FINAL_DISCOUNT,
   MAX_SWAP_OPTIONS,
@@ -1384,6 +1385,23 @@ export async function completeCancel(
   }
   reason = reason ?? "OTHER";
   const source = channelSource(session.channel);
+
+  // ── Plan lock window backstop ──────────────────────────────────────────────
+  // requireCancelContext already turns locked contracts away at the route, so
+  // this is unreachable through today's flow — it exists for any future
+  // caller built on the engine directly. Customer channels only: an ADMIN
+  // channel cancel keeps working (support must always be able to release a
+  // subscriber). Placed BEFORE the atomic session claim, matching the
+  // engine's refuse-early pattern, so a refusal never leaves a claimed
+  // session to revert.
+  if (source !== "ADMIN") {
+    const lock = await resolveLockState(shop.id, contract, shop.ianaTimezone);
+    if (lock.locked) {
+      throw new Error(
+        `Contract ${contract.id} is inside its plan lock window until ${lock.until?.toISOString()}`,
+      );
+    }
+  }
 
   // ── Claim the session BEFORE the Shopify mutation ──────────────────────────
   // Same race as acceptSave/acceptFinalOffer: the confirm page in one tab and

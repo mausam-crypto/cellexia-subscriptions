@@ -94,6 +94,7 @@ interface PlanView {
   prepaidEnabled: boolean;
   prepaidDeliveriesPerCharge: number;
   prepaidDiscountPct: number;
+  lockDays: number;
   badgeText: string | null;
   showBadge: boolean;
   preselectSubscription: boolean;
@@ -189,6 +190,7 @@ const planSchema = z
       .min(2, "2–6 deliveries per charge")
       .max(6, "2–6 deliveries per charge"),
     prepaidDiscountPct: z.number().int().min(0, "0–90%").max(90, "0–90%"),
+    lockDays: z.number().int("Whole days only").min(0, "0–365 days").max(365, "0–365 days"),
     badgeText: z.string().trim().max(40, "Keep badges under 40 characters").nullable(),
     showBadge: z.boolean(),
     preselectSubscription: z.boolean(),
@@ -308,6 +310,7 @@ function parsePlanForm(formData: FormData): {
     prepaidEnabled: boolFrom(formData, "prepaidEnabled"),
     prepaidDeliveriesPerCharge: intFrom(formData, "prepaidDeliveriesPerCharge"),
     prepaidDiscountPct: intFrom(formData, "prepaidDiscountPct"),
+    lockDays: intFrom(formData, "lockDays"),
     badgeText: badgeRaw === "" ? null : badgeRaw,
     showBadge: boolFrom(formData, "showBadge"),
     preselectSubscription: boolFrom(formData, "preselectSubscription"),
@@ -426,6 +429,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     prepaidEnabled: config.prepaidEnabled,
     prepaidDeliveriesPerCharge: config.prepaidDeliveriesPerCharge,
     prepaidDiscountPct: config.prepaidDiscountPct,
+    lockDays: config.lockDays,
     badgeText: config.badgeText,
     showBadge: config.showBadge,
     preselectSubscription: config.preselectSubscription,
@@ -587,6 +591,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       prepaidEnabled: values.prepaidEnabled,
       prepaidDeliveriesPerCharge: values.prepaidDeliveriesPerCharge,
       prepaidDiscountPct: values.prepaidDiscountPct,
+      lockDays: values.lockDays,
       badgeText: values.badgeText,
       showBadge: values.showBadge,
       preselectSubscription: values.preselectSubscription,
@@ -634,6 +639,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         firstOrderDiscountPct: values.firstOrderDiscountPct,
         ongoingDiscountPct: values.ongoingDiscountPct,
         prepaidEnabled: values.prepaidEnabled,
+        lockDays: values.lockDays,
       },
     });
 
@@ -1272,6 +1278,7 @@ function PlanFormModal({
   const [prepaidPct, setPrepaidPct] = useState(
     String(plan?.prepaidDiscountPct ?? 15),
   );
+  const [lockDays, setLockDays] = useState(String(plan?.lockDays ?? 0));
   const [badgeText, setBadgeText] = useState(plan?.badgeText ?? "Most popular");
   const [showBadge, setShowBadge] = useState(plan?.showBadge ?? true);
   const [preselect, setPreselect] = useState(
@@ -1316,6 +1323,7 @@ function PlanFormModal({
     fd.set("prepaidEnabled", String(prepaidEnabled));
     fd.set("prepaidDeliveriesPerCharge", prepaidDeliveries);
     fd.set("prepaidDiscountPct", prepaidPct);
+    fd.set("lockDays", lockDays);
     fd.set("badgeText", badgeText);
     fd.set("showBadge", String(showBadge));
     fd.set("preselectSubscription", String(preselect));
@@ -1493,6 +1501,46 @@ function PlanFormModal({
                 />
               </Box>
             </InlineStack>
+          ) : null}
+          <Divider />
+          <Text as="h3" variant="headingSm">
+            Commitment window
+          </Text>
+          <Box minWidth="200px">
+            <TextField
+              label="Block skip, pause, change or cancel for the first X days"
+              autoComplete="off"
+              type="number"
+              min={0}
+              max={365}
+              value={lockDays}
+              onChange={setLockDays}
+              suffix="days"
+              error={errors.lockDays}
+              helpText="0 disables. Set it to roughly delivery time plus first use, so the discounted first order can't be grabbed and cancelled straight away. Applies only to subscriptions STARTED while the value is set (counted from checkout) — enabling or raising it never locks existing subscribers, lowering or clearing it releases everyone immediately. Customers can still add products, update address and payment, resume and unskip. Admin actions are never blocked."
+            />
+          </Box>
+          {Number(lockDays) > 0 ? (
+            <Banner tone="warning">
+              <BlockStack gap="150">
+                <Text as="p">
+                  The customer portal shows the exact unlock date. Mention any
+                  minimum commitment in your subscription terms — several
+                  jurisdictions require it to be disclosed before checkout.
+                </Text>
+                <Text as="p">
+                  The buy box's default reassurance line and benefit say
+                  &ldquo;Skip, pause or cancel anytime&rdquo; — edit or disable
+                  them in the Buy box designer for products on this plan, or
+                  the storefront promises what this window blocks.
+                </Text>
+                <Text as="p">
+                  Note: the portal demo preview always renders unlocked — the
+                  locked notice appears only on real subscriptions inside
+                  their window.
+                </Text>
+              </BlockStack>
+            </Banner>
           ) : null}
           <Divider />
           <Text as="h3" variant="headingSm">

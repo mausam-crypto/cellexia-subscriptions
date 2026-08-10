@@ -34,6 +34,7 @@ import {
   formatMoney,
 } from "~/lib/money";
 import { shopDayStartUtc } from "~/lib/dates.server";
+import { resolveLockState } from "~/lib/contracts/lock.server";
 import {
   approxWeeks,
   contractFrequency,
@@ -170,6 +171,10 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
 
   const pauseSettings = await getSetting(shop.id, "pause");
 
+  // Plan lock window (support context): tells the agent why the customer
+  // says they "can't cancel". Admin actions on this page are never blocked.
+  const lock = await resolveLockState(shop.id, contract, shop.ianaTimezone);
+
   const configs = await prisma.sellingPlanConfig.findMany({
     where: { shopId: shop.id, active: true },
   });
@@ -249,6 +254,9 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
           ? `${String(contract.cardExpiryMonth).padStart(2, "0")}/${contract.cardExpiryYear}`
           : null,
       createdAt: contract.createdAt.toISOString(),
+      // Plan lock window: set while SellingPlanConfig.lockDays covers this
+      // contract — the portal is refusing skip/pause/change/cancel until then.
+      lockedUntil: lock.locked ? (lock.until?.toISOString() ?? null) : null,
     },
     // Acquisition card (data foundation — docs/DATA_FOUNDATION.md). Captured
     // from the origin order at contract creation / by the daily backfill;
@@ -1311,6 +1319,9 @@ export default function SubscriberDetailPage() {
             <Badge tone="info">{`Prepaid${c.prepaidDeliveriesRemaining != null ? ` (${c.prepaidDeliveriesRemaining} left)` : ""}`}</Badge>
           ) : null}
           {c.grandfathered ? <Badge tone="attention">Grandfathered</Badge> : null}
+          {c.lockedUntil ? (
+            <Badge tone="info">{`Locked until ${new Date(c.lockedUntil).toLocaleDateString("en-US", { month: "short", day: "numeric" })}`}</Badge>
+          ) : null}
           {c.merged ? <Badge tone="new">Merged box</Badge> : null}
           {c.ownership === OWNERSHIP_FOREIGN ? (
             <Badge tone="warning">Another app</Badge>

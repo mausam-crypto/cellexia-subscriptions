@@ -67,6 +67,11 @@ vi.mock("~/db.server", () => ({
       count: mocks.subscriberEventCount,
     },
     giftGrant: { findFirst: mocks.giftGrantFindFirst },
+    // Plan lock window (v1.13.0): portal loaders resolve lock rules; no plan
+    // sets lockDays in these fixtures.
+    sellingPlanConfig: {
+      findMany: vi.fn(async (): Promise<unknown[]> => []),
+    },
   },
 }));
 

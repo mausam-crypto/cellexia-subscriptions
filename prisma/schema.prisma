@@ -103,6 +103,13 @@ model SellingPlanConfig {
   prepaidEnabled             Boolean  @default(false)
   prepaidDeliveriesPerCharge Int      @default(3)
   prepaidDiscountPct         Int      @default(15)
+  // Lock window (v1.13.0): block skip / pause / schedule changes / content
+  // reductions / cancel from CUSTOMER surfaces (portal, cancel flow, magic
+  // links, SMS) for the first N days after subscribing, so the discounted
+  // first order cannot be grabbed and instantly cancelled. 0 = no lock.
+  // Admin, dunning and system paths are never blocked. Resolution and anchor
+  // rules live in app/lib/contracts/lock.server.ts.
+  lockDays                   Int      @default(0)
   // Buy-box presentation
   badgeText                  String?  @default("Most popular")
   showBadge                  Boolean  @default(true)
@@ -211,6 +218,15 @@ model SubscriptionContract {
   deliveryAddress                 Json?
   deliveryPriceCents              Int       @default(0)
   deliveryMethodTitle             String?
+  // Lock window commitment as SUBSCRIBED UNDER (v1.13.0): the covering
+  // plan's lockDays at mirror creation, stamped once on the webhook-create
+  // path and never rewritten. Null = row predates the feature, was imported,
+  // or is an install backfill (subscribe-time terms unknowable) — all exempt.
+  // The effective window is min(this, the covering config's CURRENT
+  // lockDays): raising the plan's value never retro-locks an existing
+  // subscriber, lowering or disabling releases them immediately. Resolution
+  // lives in app/lib/contracts/lock.server.ts.
+  lockDays                        Int?
   // Origin + lifecycle
   originOrderId                   String?
   originOrderName                 String?

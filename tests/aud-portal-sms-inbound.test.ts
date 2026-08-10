@@ -45,7 +45,13 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("~/db.server", () => ({
   default: {
+    // Plan lock window (v1.13.0): the SKIP/DELAY gate reads the contract's
+    // lock inputs and the shop's lock rules; nothing is locked here.
+    sellingPlanConfig: {
+      findMany: vi.fn(async (): Promise<unknown[]> => []),
+    },
     subscriptionContract: {
+      findUnique: vi.fn(async (): Promise<unknown> => null),
       findMany: vi.fn(
         async (args: {
           where: Record<string, unknown>;

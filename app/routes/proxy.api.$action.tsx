@@ -47,6 +47,7 @@ import {
   type Frequency,
 } from "~/lib/frequency";
 import { OURS_ONLY } from "~/lib/ownership/ownership.server";
+import { resolveLockState, type LockState } from "~/lib/contracts/lock.server";
 
 /**
  * Single POST dispatcher for every portal mutation:
@@ -123,7 +124,7 @@ function rateLimitedHtml(locale: string, preview: string | null): string {
   return portalPage({
     locale,
     title: t(locale, "portal.rate_limited.title"),
-    body: `<div class="cx-card"><p style="margin:0 0 8px">${escapeHtml(t(locale, "portal.rate_limited.body"))}</p><a class="cx-btn cx-btn--quiet cx-btn--small" href="${withLocale(`${PORTAL_BASE_PATH}/`, locale, preview)}">${escapeHtml(t(locale, "portal.rate_limited.back"))}</a></div>`,
+    body: `<div class="cxs-card"><p style="margin:0 0 8px">${escapeHtml(t(locale, "portal.rate_limited.body"))}</p><a class="cxs-btn cxs-btn--quiet cxs-btn--small" href="${withLocale(`${PORTAL_BASE_PATH}/`, locale, preview)}">${escapeHtml(t(locale, "portal.rate_limited.back"))}</a></div>`,
     activeNav: "subscriptions",
     previewToken: preview,
   });
@@ -282,6 +283,34 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     return back("error");
   }
 
+  // ── Plan lock window (SellingPlanConfig.lockDays) ──────────────────────────
+  // Inside the window every schedule reduction is refused; additions
+  // (add_line/addon/quantity increase) and recoveries (unskip, resume,
+  // reactivate, address, payment_update) stay available. "quantity" and
+  // "remove_line" are shape-dependent (an increase is additive; removing a
+  // self-added one-time addon just undoes an addition), so their case bodies
+  // re-check against this state. The lock is resolved only for actions it
+  // can affect — everything else skips the extra query.
+  const LOCK_BLOCKED = new Set([
+    "skip",
+    "delay",
+    "frequency",
+    "next_date",
+    "pause",
+    "swap",
+  ]);
+  let lock: LockState = { locked: false, until: null, lockDays: 0 };
+  if (
+    LOCK_BLOCKED.has(actionName) ||
+    actionName === "quantity" ||
+    actionName === "remove_line"
+  ) {
+    lock = await resolveLockState(shop.id, contract, shop.ianaTimezone);
+  }
+  if (lock.locked && LOCK_BLOCKED.has(actionName)) {
+    return back("locked");
+  }
+
   const ownedLine = (lineId: string) =>
     contract.lines.find((l) => l.id === lineId) ?? null;
 
@@ -367,6 +396,11 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         if (!line || line.isGift || line.isOneTimeAddon || !quantity.success) {
           return back("error");
         }
+        // Lock window blocks only the reducing direction — an increase is
+        // additive and stays available.
+        if (lock.locked && quantity.data < line.quantity) {
+          return back("locked");
+        }
         await changeLineQuantity(
           shopDomain,
           contract.id,
@@ -396,6 +430,11 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       case "remove_line": {
         const line = ownedLine(str(form, "lineId"));
         if (!line || line.isGift) return back("error");
+        // Lock window blocks removing recurring lines (a plan reduction);
+        // removing a one-time addon undoes an addition and stays available.
+        if (lock.locked && !line.isOneTimeAddon) {
+          return back("locked");
+        }
         if (!line.isOneTimeAddon) {
           const recurring = contract.lines.filter(
             (l) => !l.isGift && !l.isOneTimeAddon,

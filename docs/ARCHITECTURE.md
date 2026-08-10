@@ -36,6 +36,7 @@ flows, win-back, analytics.
 |---|---|---|
 | GraphQL layer | `app/lib/graphql/` | All Admin API calls: selling plans, contracts, drafts, billing cycles/attempts, payment methods, products, orders, customers, markets (`markets.server.ts`, read-only — powers the designer's per-market card). Throws `ShopifyUserError` on userErrors. |
 | Contract services | `app/lib/contracts/` | Skip/unskip, delay, frequency, swap, quantity, add/remove line, one-time add-on, pause/resume, cancel, address, next-date, price propagation vs grandfather, consolidation (merge), stockout evaluation, sync-from-webhook. |
+| Plan lock window | `app/lib/contracts/lock.server.ts` | Per-plan `SellingPlanConfig.lockDays` (v1.13.0): blocks every CUSTOMER-initiated schedule reduction — skip, delay, frequency, next-date, pause, swap, recurring-line removal, quantity decrease, cancel — for the first N days after subscribing. Terms as subscribed under: the sync CREATE path stamps the covering plan's lockDays onto `SubscriptionContract.lockDays` once at mirror birth; the effective window is min(stamp, current setting) — raising never retro-locks, lowering/disabling releases immediately, null stamp (pre-feature/import/backfill) is permanently exempt. Resolution = line `sellingPlanId` membership in a config's append-only `shopifyPlanIds` (both id forms; NO product fallback); anchor = earliest of `firstChargeAt`/`createdAt`, window ends at shop-tz MIDNIGHT of the displayed unlock date (`addDaysTz`/`shopDayStartUtc` — golden rule 5). Enforced in the portal dispatcher, the cancel-flow choke point (`requireCancelContext`) + `completeCancel` backstop, magic-link GET describe + POST execution, and SMS keywords; additions/recoveries (add, addon, quantity increase, unskip, resume, reactivate, address, payment) and ADMIN/SYSTEM/DUNNING paths are never blocked. The guard lives in customer-facing surfaces — never in the contracts service. |
 | Billing | `app/lib/billing/` | Scheduler (due contracts → pre-charge pipeline → attempt), prepaid handling, stale-attempt sweep. |
 | Jobs | `app/lib/jobs/` | Registry + runner with `JobLock` leases and `JobRun` logs; `POST /api/jobs/run` for external cron. |
 | Dunning | `app/lib/dunning/` | Decline-code taxonomy, retry ladder (payday-aligned), backup payment fallback, 3DS challenge links, pre-expiry notices, recovery, exhaustion. |
@@ -223,7 +224,7 @@ storefront page. **The customer portal is served through the app proxy**, so
 `portalPage()` output is injected into the *merchant's theme*: the theme's own
 markup and every storefront app — including that `cx` vendor — share the
 portal's document too. §5e applies the same rule there. Its script now makes
-exactly **one** document-level query, `.cx-portal[data-cellexia-portal]`
+exactly **one** document-level query, `.cxs-portal[data-cellexia-portal]`
 (class **and** attribute), and roots everything else at that node. Before the
 1.2.3 sweep it used `document.querySelector('.cx-toast')` and
 `document.querySelectorAll('.cx-portal form')` — class-only, unqualified — and
@@ -233,6 +234,23 @@ v1.2.2, in a different directory, which is exactly why the extension-scoped
 rules never saw it. §5e also pins the selector↔markup pairing across files: the
 confirm forms are rendered by `app/routes/proxy.*.tsx`, so renaming one side
 would silently unbind the handler rather than raise anything.
+
+**Portal CSS namespace (`.cxs-*`, v1.12.1).** The third round of the same
+lesson arrived in CSS, needing no JS at all: the `cx` vendor's storefront
+apps (cellexia-reviews, cellexia-aov-ltv-booster) load their theme-extension
+stylesheets on **every** theme page — the theme-wrapped portal included —
+and those sheets style their own `.cx-preview-bar`, `.cx-btn`, `.cx-card`,
+`.cx-chip`, `.cx-error`, `.cx-hp` and `.cx-muted` components. Their
+`.cx-preview-bar` (`inset-block-end:0`, opaque `#0F1111`, `z-index`
+2147479999, flex-centered) merged with the portal banner's `top:0` into a
+full-viewport black overlay: the admin's portal preview rendered perfectly
+and showed nothing but the banner text. Portal DOM classes therefore live in
+`.cxs-*` (cancel flow: `.cxc-*`); the bare `.cx-` prefix is banned in portal
+markup and §5e enforces the ban with comments blanked. Query parameters
+(`cx_pp`, `cx_preview`) and the `cx_portal` cookie are not CSS-reachable and
+keep their names. The preview banner also pins a near-max `z-index`
+(2147483200): the live theme fixes its own header at `z-index` 99999, which
+occluded the banner entirely at the old `z:100`.
 
 **Storefront preview (PREVIEW token).** Magic-token action `PREVIEW`,
 signature-verified but **never consumed** (TTL 7 days, generous max-use for
