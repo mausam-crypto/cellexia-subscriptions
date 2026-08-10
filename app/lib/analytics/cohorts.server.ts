@@ -8,6 +8,7 @@ import {
 } from "./queries.server";
 import {
   loadCostContext,
+  parseChargeCostSnapshot,
   paymentFeeCents,
   perCycleLineCosts,
   perShipmentCostCents,
@@ -85,9 +86,15 @@ function monthStartUtc(index: number, tz: string): Date {
  * - activeRemaining: cohort contracts not churned before the end of the
  *   offset's calendar month. "Churned" means cancelledAt, OR — for contracts
  *   sitting in status FAILED with no cancelledAt (dunning exhausted under the
- *   default PAUSE action) — failedAt. Without the failedAt leg, payment-churned
- *   contracts would read as retained forever. (EXPIRED contracts carry no
- *   terminal timestamp and are still counted as retained — a documented gap.)
+ *   default PAUSE action) — failedAt, OR — for completed bounded plans
+ *   (status EXPIRED, billingMaxCycles ran out) — expiredAt (stamped since
+ *   migration 0016). Without the failedAt leg, payment-churned contracts
+ *   would read as retained forever; without the expiredAt leg, expired ones
+ *   did. All three retention surfaces (this, the rollup churn columns, the
+ *   survival curves) classify EXPIRED as VOLUNTARY churn — a scheduled end
+ *   the subscriber signed up for, not a payment failure. Contracts that
+ *   expired before 0016 carry no expiredAt and still count as retained: the
+ *   instant was never recorded and cannot be reconstructed.
  * - revenueCents: Σ successful BillingAttempt.amountCents completed in that
  *   calendar month for cohort contracts, NET of refundedCents (actual money
  *   kept), PLUS the cohort contracts' origin (checkout) payments
@@ -102,11 +109,15 @@ function monthStartUtc(index: number, tz: string): Date {
  *   — the documented origin-lines ≈ current-lines approximation.
  * - discountCents: per billed cycle, Σ non-gift lines max(0, compareAt − current) × qty
  *   (informational; not subtracted from gross profit since revenue is already net).
- * - cogsCents: per billed cycle via the shared cost model (Shopify cost →
- *   merchant override → percentage estimate), gift lines EXCLUDED — gift COGS
- *   is added from GiftGrant rows (rule cost, falling back to the variant's
- *   override), the same per-grant source the daily rollup uses, so a gift's
- *   cost is booked once in the month it was granted and survives line removal.
+ * - cogsCents: per billed cycle, PREFERRING the cost basis frozen into
+ *   BillingAttempt.costSnapshot at settlement (migration 0016) so the nightly
+ *   full recompute stops repricing history with today's cost settings;
+ *   attempts with no parseable snapshot (pre-0016) keep the live shared cost
+ *   model (Shopify cost → merchant override → percentage estimate). Gift
+ *   lines EXCLUDED either way — gift COGS is added from GiftGrant rows (rule
+ *   cost, falling back to the variant's override), the same per-grant source
+ *   the daily rollup uses, so a gift's cost is booked once in the month it
+ *   was granted and survives line removal.
  *   Prepaid charges multiply line COGS by deliveries-per-charge.
  *   estimatedCogsCents stores the estimated share (COGS-coverage stat).
  * - shippingCostCents: merchant-side fulfillment + carrier cost per shipment
@@ -139,6 +150,7 @@ export async function runCohortComputation(
         cancelledAt: true,
         status: true,
         failedAt: true,
+        expiredAt: true,
         deliveryPriceCents: true,
         isPrepaid: true,
         prepaidDeliveriesPerCharge: true,
@@ -174,15 +186,24 @@ export async function runCohortComputation(
         refundedCents: true,
         currencyCode: true,
         completedAt: true,
+        costSnapshot: true,
       },
     }),
     // Gift COGS source — per grant, like the rollup, so it cannot be
     // re-counted per billed cycle nor vanish when the gift line is removed.
+    // Status is transient (ADDED → SHIPPED at settlement → REMOVED by daily
+    // mirror hygiene), so the filter keys on the durable facts: attached
+    // (addedAt), and either not yet cleared or provably shipped (shippedAt
+    // survives the REMOVED flip). Supersede-retired grants (REMOVED, never
+    // shipped) stay excluded.
     prisma.giftGrant.findMany({
       where: {
         contract: { shopId, ...COUNTABLE_CONTRACT },
-        status: { in: ["ADDED", "SHIPPED"] },
         addedAt: { not: null },
+        OR: [
+          { status: { in: ["ADDED", "SHIPPED"] } },
+          { shippedAt: { not: null } },
+        ],
       },
       select: {
         contractId: true,
@@ -251,22 +272,34 @@ export async function runCohortComputation(
     const offset = Math.max(0, ymIndex(ymKey(attempt.completedAt, tz)) - cohortIdx);
     const amount = attempt.amountCents ?? 0;
     const refunded = Math.min(attempt.refundedCents, Math.max(amount, 0));
-    const deliveries = contract.isPrepaid
-      ? Math.max(1, contract.prepaidDeliveriesPerCharge ?? 1)
-      : 1;
     const cell = cellFor(cohortIdx, offset);
     cell.revenueCents += amount - refunded;
     cell.refundedCents += refunded;
     cell.discountCents += perCycleDiscountCents(contract.lines);
-    // Gift lines excluded — gift COGS is booked per grant below.
-    const costs = perCycleLineCosts(contract.lines, costCtx, {
-      includeGifts: false,
-    });
-    cell.cogsCents += costs.cogsCents * deliveries;
-    cell.estimatedCogsCents += costs.estimatedCogsCents * deliveries;
-    cell.shippingCostCents +=
-      perShipmentCostCents(costCtx.costModel, contract.deliveryPriceCents) *
-      deliveries;
+    // Cost basis: the settlement-frozen snapshot when present (the full
+    // recompute must not reprice history with today's cost settings); live
+    // cost model for pre-0016 attempts. Fees always compute on the charged
+    // amount at read time. Gift lines excluded either way — gift COGS is
+    // booked per grant below.
+    const snapshot = parseChargeCostSnapshot(attempt.costSnapshot);
+    if (snapshot) {
+      cell.cogsCents += snapshot.cogsCents;
+      cell.estimatedCogsCents += snapshot.estimatedCogsCents;
+      cell.shippingCostCents +=
+        snapshot.shippingCostCents + snapshot.fulfillmentCostCents;
+    } else {
+      const deliveries = contract.isPrepaid
+        ? Math.max(1, contract.prepaidDeliveriesPerCharge ?? 1)
+        : 1;
+      const costs = perCycleLineCosts(contract.lines, costCtx, {
+        includeGifts: false,
+      });
+      cell.cogsCents += costs.cogsCents * deliveries;
+      cell.estimatedCogsCents += costs.estimatedCogsCents * deliveries;
+      cell.shippingCostCents +=
+        perShipmentCostCents(costCtx.costModel, contract.deliveryPriceCents) *
+        deliveries;
+    }
     cell.feesCents += paymentFeeCents(amount, costCtx.costModel);
     cell.billedCycles += 1;
   }
@@ -354,13 +387,22 @@ export async function runCohortComputation(
 
   // When did this contract stop being a live subscriber? cancelledAt when
   // cancelled; failedAt for dunning-exhausted contracts stuck in FAILED with
-  // no cancel timestamp. Null = still considered retained.
+  // no cancel timestamp; expiredAt for completed bounded plans (EXPIRED —
+  // voluntary churn, the shared classification, see activeRemaining doc).
+  // Null = still considered retained, including pre-0016 expiries whose
+  // instant was never recorded.
   const churnEndOf = (m: {
     cancelledAt: Date | null;
     status: string;
     failedAt: Date | null;
+    expiredAt: Date | null;
   }): Date | null =>
-    m.cancelledAt ?? (m.status === "FAILED" ? m.failedAt : null);
+    m.cancelledAt ??
+    (m.status === "FAILED"
+      ? m.failedAt
+      : m.status === "EXPIRED"
+        ? m.expiredAt
+        : null);
 
   const cohortIndexes = [...cohortMembers.keys()].sort((a, b) => a - b);
   for (const cohortIdx of cohortIndexes) {

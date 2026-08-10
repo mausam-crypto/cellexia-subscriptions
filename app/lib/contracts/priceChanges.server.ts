@@ -71,6 +71,64 @@ function affectedContractsWhere(shopId: string, variantIds: string[]) {
   };
 }
 
+// ── Per-contract outcome ledger (migration 0016) ─────────────────────────────
+
+type OutcomeStatus =
+  | "APPLIED"
+  | "FAILED"
+  | "SKIPPED_NULL_LINE"
+  | "NOTICE_SENT"
+  | "NOTICE_FAILED";
+
+/** Notice-phase vs apply-phase rows — each phase retries off its own set. */
+const NOTICE_STATUSES: OutcomeStatus[] = ["NOTICE_SENT", "NOTICE_FAILED"];
+const APPLY_STATUSES: OutcomeStatus[] = ["APPLIED", "FAILED", "SKIPPED_NULL_LINE"];
+
+/**
+ * Append one per-contract outcome row. Best-effort: the ledger documents the
+ * engine run, it must never abort it — a failed write costs one retry (the
+ * contract looks unprocessed next run and its idempotent path re-verifies).
+ */
+async function recordOutcome(
+  batchId: string,
+  contractId: string,
+  status: OutcomeStatus,
+  error?: string,
+): Promise<void> {
+  try {
+    await prisma.priceChangeContractOutcome.create({
+      data: { batchId, contractId, status, error: error ?? null },
+    });
+  } catch (err) {
+    console.error(
+      "[contracts] price change outcome write failed",
+      batchId,
+      contractId,
+      status,
+      err,
+    );
+  }
+}
+
+/**
+ * Latest outcome per contract for one batch phase. Rows are append-only
+ * (each retry adds one), so "latest wins" is the per-contract verdict.
+ */
+async function latestOutcomeByContract(
+  batchId: string,
+  statuses: OutcomeStatus[],
+): Promise<Map<string, string>> {
+  const rows = await prisma.priceChangeContractOutcome.findMany({
+    where: { batchId, status: { in: statuses } },
+    // id (cuid) breaks same-millisecond createdAt ties in insert order.
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+    select: { contractId: true, status: true },
+  });
+  const latest = new Map<string, string>();
+  for (const row of rows) latest.set(row.contractId, row.status);
+  return latest;
+}
+
 // ── Create ───────────────────────────────────────────────────────────────────
 
 /**
@@ -114,6 +172,12 @@ export async function createPriceChangeBatch(
     where: affectedContractsWhere(shopId, variantIds),
   });
 
+  // The items' old/new prices come from the admin catalog UI, i.e. they are
+  // shop-currency cents. Stamped on the batch at creation (migration 0016)
+  // so notice/apply can refuse contracts billed in another currency instead
+  // of writing cross-currency cents onto them.
+  const shop = await prisma.shop.findUniqueOrThrow({ where: { id: shopId } });
+
   const batch = await prisma.priceChangeBatch.create({
     data: {
       shopId,
@@ -123,6 +187,7 @@ export async function createPriceChangeBatch(
       status: "DRAFT",
       items: validItems as object,
       contractsAffected,
+      currencyCode: shop.currencyCode,
     },
   });
 
@@ -138,6 +203,7 @@ export async function createPriceChangeBatch(
       noticeDays: resolvedNoticeDays,
       itemCount: validItems.length,
       contractsAffected,
+      currencyCode: shop.currencyCode,
     },
   });
 
@@ -155,8 +221,12 @@ export interface SendNoticesResult {
 /**
  * Send the advance notice to every affected ACTIVE, non-grandfathered
  * contract, stamp noticeSentAt / effectiveAt (= now + noticeDays in the shop
- * timezone) and move the batch to NOTICE_SENT. Idempotent: a batch already
- * past DRAFT is returned unchanged.
+ * timezone) and move the batch to NOTICE_SENT. Every contract's verdict is
+ * recorded in PriceChangeContractOutcome (NOTICE_SENT / NOTICE_FAILED), and
+ * a call on a batch already NOTICE_SENT retries ONLY the NOTICE_FAILED
+ * contracts — same-run re-clicks can never double-send, and a failed send is
+ * no longer a number in a log line that nothing ever retries. An APPLIED
+ * batch is returned unchanged.
  */
 export async function sendPriceChangeNotices(
   batchId: string,
@@ -165,10 +235,11 @@ export async function sendPriceChangeNotices(
   const batch = await prisma.priceChangeBatch.findUniqueOrThrow({
     where: { id: batchId },
   });
-  if (batch.status === "NOTICE_SENT" || batch.status === "APPLIED") {
-    return { batch, contractsNotified: 0, failures: 0 }; // already sent
+  if (batch.status === "APPLIED") {
+    return { batch, contractsNotified: 0, failures: 0 }; // nothing left to notice
   }
-  if (batch.status !== "DRAFT") {
+  const retryRun = batch.status === "NOTICE_SENT";
+  if (!retryRun && batch.status !== "DRAFT") {
     throw new Error(
       `PriceChangeBatch ${batch.id} is ${batch.status} — cannot send notices`,
     );
@@ -183,7 +254,16 @@ export async function sendPriceChangeNotices(
   });
   const tz = shop.ianaTimezone;
   const now = new Date();
-  const effectiveAt = addDaysTz(now, batch.noticeDays, tz);
+  // The notice window anchors at the FIRST send: a retry reuses the stored
+  // effectiveAt so retried subscribers get the exact date everyone else was
+  // promised — recomputing would silently extend the batch per retry.
+  const effectiveAt =
+    retryRun && batch.effectiveAt
+      ? batch.effectiveAt
+      : addDaysTz(now, batch.noticeDays, tz);
+  // Batch prices are shop-currency cents (stamped at creation; a pre-0016
+  // batch predates the stamp and meant the shop currency).
+  const batchCurrency = batch.currencyCode ?? shop.currencyCode;
 
   const contracts = await prisma.subscriptionContract.findMany({
     where: {
@@ -193,10 +273,21 @@ export async function sendPriceChangeNotices(
     include: { lines: true },
   });
 
+  const noticeOutcomes = retryRun
+    ? await latestOutcomeByContract(batch.id, NOTICE_STATUSES)
+    : new Map<string, string>();
+
   let contractsNotified = 0;
   let failures = 0;
 
   for (const contract of contracts) {
+    // Retry runs touch exactly the contracts whose last send failed; anyone
+    // already NOTICE_SENT (or newly affected since the first run — their
+    // window never started) is left alone.
+    if (retryRun && noticeOutcomes.get(contract.id) !== "NOTICE_FAILED") {
+      continue;
+    }
+
     const changes = contract.lines
       .filter((l) => !l.isGift && itemByVariant.has(l.variantId))
       .map((l) => {
@@ -209,6 +300,17 @@ export async function sendPriceChangeNotices(
         };
       });
     if (changes.length === 0) continue;
+
+    // Currency guard: the batch's cents mean nothing on a contract billed in
+    // another currency — never format them into its notice (a "£12.00 →
+    // £14.00" email to a CHF-billed subscriber misstates both prices).
+    // Recorded, not silently skipped, so the exclusion is visible per
+    // contract; apply enforces the same guard on the write side.
+    if (contract.currencyCode !== batchCurrency) {
+      failures += 1;
+      await recordOutcome(batch.id, contract.id, "NOTICE_FAILED", "currency_mismatch");
+      continue;
+    }
 
     const first = changes[0]!;
     try {
@@ -233,41 +335,54 @@ export async function sendPriceChangeNotices(
         },
       });
       contractsNotified += 1;
+      await recordOutcome(batch.id, contract.id, "NOTICE_SENT");
+      // The scheduled-propagation event ONLY on a successful send: it is the
+      // compliance record that this subscriber actually received advance
+      // notice — logging it for a failed send fabricated the notice trail.
+      await logEvent({
+        shopId: batch.shopId,
+        contractId: contract.id,
+        customerId: contract.customerId,
+        email: contract.email,
+        type: "contract.price_propagated",
+        source: resolveSource(options),
+        actor: resolveActor(options),
+        payload: {
+          batchId: batch.id,
+          scheduled: true,
+          effectiveAt: effectiveAt.toISOString(),
+          changes,
+        },
+      });
     } catch (err) {
       failures += 1;
+      await recordOutcome(
+        batch.id,
+        contract.id,
+        "NOTICE_FAILED",
+        err instanceof Error ? err.message : String(err),
+      );
       console.error(
         "[contracts] price change notice failed",
         contract.id,
         err,
       );
     }
-
-    await logEvent({
-      shopId: batch.shopId,
-      contractId: contract.id,
-      customerId: contract.customerId,
-      email: contract.email,
-      type: "contract.price_propagated",
-      source: resolveSource(options),
-      actor: resolveActor(options),
-      payload: {
-        batchId: batch.id,
-        scheduled: true,
-        effectiveAt: effectiveAt.toISOString(),
-        changes,
-      },
-    });
   }
 
-  const updated = await prisma.priceChangeBatch.update({
-    where: { id: batch.id },
-    data: {
-      noticeSentAt: now,
-      effectiveAt,
-      status: "NOTICE_SENT",
-      contractsAffected: contracts.length,
-    },
-  });
+  // A retry run leaves the batch row untouched — its window and count were
+  // fixed by the first send.
+  const updated = retryRun
+    ? batch
+    : await prisma.priceChangeBatch.update({
+        where: { id: batch.id },
+        data: {
+          noticeSentAt: now,
+          effectiveAt,
+          status: "NOTICE_SENT",
+          contractsAffected: contracts.length,
+        },
+      });
 
   return { batch: updated, contractsNotified, failures };
 }
@@ -285,8 +400,14 @@ export interface ApplyBatchResult {
  * Apply the batch. GRANDFATHER: mark every affected ACTIVE contract
  * grandfatheredPricing and never touch its prices. PROPAGATE_WITH_NOTICE:
  * only after effectiveAt, move each affected non-grandfathered contract's
- * matching lines to the new price minus its ongoing subscription discount.
- * Idempotent: an APPLIED batch is returned unchanged.
+ * matching lines to the new price minus its ongoing subscription discount,
+ * recording every contract's verdict in PriceChangeContractOutcome (APPLIED
+ * / FAILED+error / SKIPPED_NULL_LINE). The batch is stamped APPLIED only
+ * when a run ends with nothing failing — a half-applied batch stays
+ * NOTICE_SENT and the next "Apply now" retries exactly the non-APPLIED
+ * contracts (stamping early froze the batch APPLIED around failures that
+ * only a log line ever saw). Idempotent: an APPLIED batch is returned
+ * unchanged.
  */
 export async function applyPriceChangeBatch(
   batchId: string,
@@ -354,9 +475,30 @@ export async function applyPriceChangeBatch(
     }
   } else {
     const admin = await adminClientForShop(shop.domain);
+    // Batch prices are shop-currency cents (stamped at creation; a pre-0016
+    // batch predates the stamp and meant the shop currency).
+    const batchCurrency = batch.currencyCode ?? shop.currencyCode;
+    // Contracts that already landed in an earlier run are skipped; everything
+    // else (FAILED, SKIPPED_NULL_LINE, never attempted) is retried.
+    const applyOutcomes = await latestOutcomeByContract(
+      batch.id,
+      APPLY_STATUSES,
+    );
 
     for (const contract of contracts) {
       if (contract.grandfatheredPricing) continue; // grandfathered elsewhere
+      if (applyOutcomes.get(contract.id) === "APPLIED") continue; // done earlier
+
+      // Currency guard: the batch's cents are meaningless on a contract
+      // billed in another currency — writing them would smuggle cross-
+      // currency amounts past every "same currency only" analytics guard.
+      // Recorded, never silently skipped; the mismatch also blocks the
+      // APPLIED stamp below, so the exclusion stays visible on the batch.
+      if (contract.currencyCode !== batchCurrency) {
+        failures += 1;
+        await recordOutcome(batch.id, contract.id, "FAILED", "currency_mismatch");
+        continue;
+      }
 
       // Target price per line: new catalog price minus the ongoing discount.
       const lineTargets: Array<{
@@ -367,6 +509,9 @@ export async function applyPriceChangeBatch(
         newPriceCents: number;
         targetPriceCents: number;
       }> = [];
+      // Matching lines that CANNOT be written because the mirror has no
+      // Shopify line id (imports, failed post-add stamps) — resync required.
+      let nullLineSkips = 0;
       for (const line of contract.lines) {
         if (line.isGift || line.isOneTimeAddon) continue;
         const item = itemByVariant.get(line.variantId);
@@ -383,6 +528,7 @@ export async function applyPriceChangeBatch(
         if (line.currentPriceCents === target) continue; // already applied
 
         if (!line.shopifyLineId) {
+          nullLineSkips += 1;
           console.error(
             "[contracts] applyPriceChangeBatch: line has no Shopify line id — price not propagated; resync required",
             contract.id,
@@ -399,7 +545,21 @@ export async function applyPriceChangeBatch(
           targetPriceCents: target,
         });
       }
-      if (lineTargets.length === 0) continue;
+      if (lineTargets.length === 0) {
+        if (nullLineSkips > 0) {
+          // Nothing writable on this contract: recorded so the batch is
+          // never silently "applied around" it, and a later re-run (after a
+          // resync restores the line ids) retries it.
+          failures += 1;
+          await recordOutcome(batch.id, contract.id, "SKIPPED_NULL_LINE");
+        } else {
+          // Every matching line already sits at its target price — applied
+          // in effect (e.g. an earlier run whose outcome write failed).
+          // Recording APPLIED keeps re-runs convergent.
+          await recordOutcome(batch.id, contract.id, "APPLIED");
+        }
+        continue;
+      }
 
       try {
         await withContractDraft(
@@ -424,6 +584,7 @@ export async function applyPriceChangeBatch(
           });
         }
         contractsUpdated += 1;
+        await recordOutcome(batch.id, contract.id, "APPLIED");
 
         await logEvent({
           shopId: batch.shopId,
@@ -445,6 +606,12 @@ export async function applyPriceChangeBatch(
         });
       } catch (err) {
         failures += 1;
+        await recordOutcome(
+          batch.id,
+          contract.id,
+          "FAILED",
+          err instanceof Error ? err.message : String(err),
+        );
         console.error(
           "[contracts] applyPriceChangeBatch: contract update failed",
           contract.id,
@@ -454,10 +621,17 @@ export async function applyPriceChangeBatch(
     }
   }
 
-  const updated = await prisma.priceChangeBatch.update({
-    where: { id: batch.id },
-    data: { appliedAt: now, status: "APPLIED" },
-  });
+  // GRANDFATHER always stamps: its per-contract writes throw on error, so
+  // reaching here means every contract was flagged. PROPAGATE stamps only
+  // when nothing failed this run — otherwise the batch stays NOTICE_SENT and
+  // "Apply now" remains available to retry the non-APPLIED contracts.
+  const complete = batch.mode === "GRANDFATHER" || failures === 0;
+  const updated = complete
+    ? await prisma.priceChangeBatch.update({
+        where: { id: batch.id },
+        data: { appliedAt: now, status: "APPLIED" },
+      })
+    : batch;
 
   return {
     batch: updated,

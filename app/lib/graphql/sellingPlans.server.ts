@@ -1,6 +1,12 @@
 import { z } from "zod";
 import type { SellingPlanConfig } from "@prisma/client";
 import {
+  type Frequency,
+  parseConfigDefaultFrequency,
+  parseConfigFrequencies,
+  planOptionValue,
+} from "~/lib/frequency";
+import {
   type AdminClient,
   type UserError,
   ensureNoUserErrors,
@@ -21,20 +27,10 @@ import {
 // ── Config parsing (Prisma Json fields, defensively) ─────────────────────────
 
 const stringArraySchema = z.array(z.string());
-const weeksArraySchema = z.array(z.number().int().positive());
 
 function parseProductIds(config: SellingPlanConfig): string[] {
   const parsed = stringArraySchema.safeParse(config.productIds);
   return parsed.success ? parsed.data : [];
-}
-
-function parseFrequenciesWeeks(config: SellingPlanConfig): number[] {
-  const parsed = weeksArraySchema.safeParse(config.frequenciesWeeks);
-  const weeks =
-    parsed.success && parsed.data.length > 0
-      ? parsed.data
-      : [config.defaultFrequencyWeeks];
-  return [...new Set(weeks)].sort((a, b) => a - b);
 }
 
 // ── Desired plan construction ────────────────────────────────────────────────
@@ -47,10 +43,14 @@ interface DesiredSellingPlan {
 
 function frequencyPlan(
   config: SellingPlanConfig,
-  weeks: number,
+  freq: Frequency,
   position: number,
 ): DesiredSellingPlan {
-  const key = `Every ${weeks} weeks`;
+  // The option value doubles as the reconcile key. planOptionValue() keeps
+  // the exact pre-v1.8.0 format for WEEK cadences ("Every N weeks"), so a
+  // re-sync of an existing week-only group updates its plans in place — GIDs
+  // stable, no allow-list churn on a live storefront.
+  const key = planOptionValue(freq);
   return {
     key,
     input: {
@@ -59,10 +59,10 @@ function frequencyPlan(
       options: [key],
       position,
       billingPolicy: {
-        recurring: { interval: "WEEK", intervalCount: weeks },
+        recurring: { interval: freq.unit, intervalCount: freq.count },
       },
       deliveryPolicy: {
-        recurring: { interval: "WEEK", intervalCount: weeks },
+        recurring: { interval: freq.unit, intervalCount: freq.count },
       },
       pricingPolicies: [
         {
@@ -89,9 +89,12 @@ function prepaidPlan(
   config: SellingPlanConfig,
   position: number,
 ): DesiredSellingPlan {
-  const shipEveryWeeks = config.defaultFrequencyWeeks;
+  const shipEvery = parseConfigDefaultFrequency(config);
   const deliveries = Math.max(1, config.prepaidDeliveriesPerCharge);
-  const key = `Every ${shipEveryWeeks} weeks, prepay ${deliveries} deliveries`;
+  // Same key-stability contract as frequencyPlan: for a WEEK default this is
+  // byte-identical to the pre-v1.8.0 key, so existing prepaid plans survive
+  // a re-sync with their GIDs intact.
+  const key = `${planOptionValue(shipEvery)}, prepay ${deliveries} deliveries`;
   return {
     key,
     input: {
@@ -102,12 +105,12 @@ function prepaidPlan(
       // Bill once per {deliveries} shipments; ship on the normal cadence.
       billingPolicy: {
         recurring: {
-          interval: "WEEK",
-          intervalCount: shipEveryWeeks * deliveries,
+          interval: shipEvery.unit,
+          intervalCount: shipEvery.count * deliveries,
         },
       },
       deliveryPolicy: {
-        recurring: { interval: "WEEK", intervalCount: shipEveryWeeks },
+        recurring: { interval: shipEvery.unit, intervalCount: shipEvery.count },
       },
       pricingPolicies: [
         {
@@ -123,8 +126,8 @@ function prepaidPlan(
 }
 
 function buildDesiredPlans(config: SellingPlanConfig): DesiredSellingPlan[] {
-  const plans = parseFrequenciesWeeks(config).map((weeks, i) =>
-    frequencyPlan(config, weeks, i + 1),
+  const plans = parseConfigFrequencies(config).map((freq, i) =>
+    frequencyPlan(config, freq, i + 1),
   );
   if (config.prepaidEnabled) {
     plans.push(prepaidPlan(config, plans.length + 1));
@@ -392,6 +395,19 @@ interface GroupSetAppIdResponse {
 export interface SellingPlanSyncResult {
   groupId: string;
   planIds: string[];
+  /**
+   * Product add/remove reconciliation failed AFTER the plan mutation
+   * succeeded. Deliberately a field, not a throw: by this point the group's
+   * live plan set has already changed (a unit conversion replaces every plan
+   * GID), and aborting here would leave the published allow-list describing
+   * plans that no longer exist — the exact-set storefront gate would then
+   * render NOTHING on every product of the group, with no self-heal (the
+   * daily factor sweep skips non-SYNCED configs). The caller persists the
+   * sync, republishes the allow-list against the LIVE plans, and surfaces
+   * this through the ATTACH_FAILED path its post-sync verification already
+   * owns.
+   */
+  productReconcileError?: string;
 }
 
 /**
@@ -528,7 +544,8 @@ export async function stampSellingPlanGroupAppIds(
  *
  * - No `shopifyGroupId` (or the group was deleted on Shopify): create the
  *   group with all plans and attach `productIds` via `resources`.
- * - Existing group: match plans by their option value ("Every N weeks"),
+ * - Existing group: match plans by their option value ("Every N weeks" /
+ *   "Every N days" / "Every N months"),
  *   update matches in place (keeps plan GIDs stable for live contracts),
  *   create missing, delete removed, then add/remove products to match.
  *
@@ -719,9 +736,27 @@ async function updateGroup(
     throw new Error("sellingPlanGroupUpdate returned no selling plan group");
   }
 
-  await reconcileProducts(admin, group.id, existing, productIds);
+  // The plan set is now live — from here on, failures are REPORTED, never
+  // thrown (see SellingPlanSyncResult.productReconcileError). A dead product
+  // GID left in the config, or another app's sync interfering, must not
+  // strand the allow-list on the pre-mutation plan set.
+  let productReconcileError: string | undefined;
+  try {
+    await reconcileProducts(admin, group.id, existing, productIds);
+  } catch (err) {
+    productReconcileError = err instanceof Error ? err.message : String(err);
+    console.error(
+      "[sellingPlans] product reconcile failed after plan update for group",
+      group.id,
+      err,
+    );
+  }
 
-  return { groupId: group.id, planIds: planIdsOf(group) };
+  return {
+    groupId: group.id,
+    planIds: planIdsOf(group),
+    ...(productReconcileError ? { productReconcileError } : {}),
+  };
 }
 
 async function reconcileProducts(

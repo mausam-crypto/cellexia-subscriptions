@@ -66,7 +66,10 @@ vi.mock("~/lib/shop/install.server", () => ({
   requireShop: mocks.requireShop,
 }));
 
-vi.mock("~/lib/events/log.server", () => ({ logEvent: mocks.logEvent }));
+vi.mock("~/lib/events/log.server", () => ({
+  logEvent: mocks.logEvent,
+  logEventOrThrow: mocks.logEvent,
+}));
 
 vi.mock("~/lib/settings/settings.server", () => ({
   getSetting: vi.fn(async (): Promise<unknown> => ({})),

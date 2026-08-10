@@ -653,7 +653,7 @@ export default function CancelFlowPage() {
                   </Box>
                   <Box minWidth="160px">
                     <TextField
-                      label="Frequency suggestion (+weeks)"
+                      label="Frequency suggestion (+weeks equivalent)"
                       autoComplete="off"
                       type="number"
                       min={1}
@@ -661,7 +661,7 @@ export default function CancelFlowPage() {
                       value={freqDelta}
                       onChange={setFreqDelta}
                       error={errors.frequencySuggestDeltaWeeks}
-                      helpText="The slower cadence the FREQUENCY save suggests."
+                      helpText="How much slower the FREQUENCY save suggests. Weekly cadences add this many weeks; day cadences add ×7 days, month cadences ≈ this ÷ 4 months (min 1)."
                     />
                   </Box>
                   <Box minWidth="160px">

@@ -25,6 +25,18 @@ import { authenticate } from "~/shopify.server";
 import { getPrimaryShop } from "~/lib/shop/install.server";
 import { logEvent } from "~/lib/events/log.server";
 import { getSetting } from "~/lib/settings/settings.server";
+import type { Frequency } from "~/lib/frequency";
+import {
+  approxDays,
+  approxWeeks,
+  contractFrequency,
+  frequencyLabelEn,
+  frequencyToken,
+  normalizeFrequencies,
+  parseConfigFrequencies,
+  parseFrequencyToken,
+  sameFrequency,
+} from "~/lib/frequency";
 import { centsFromDecimalString, formatMoney } from "~/lib/money";
 import { searchProducts } from "~/lib/graphql/index.server";
 import {
@@ -82,7 +94,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const policy = await getSetting(shop.id, "priceChangePolicy");
 
   const freqDist = await prisma.subscriptionContract.groupBy({
-    by: ["intervalWeeks"],
+    by: ["billingIntervalUnit", "billingIntervalCount", "intervalWeeks"],
     // OURS_ONLY + isDemo: the distribution drives the plan-migration picker
     // below, which then MUTATES every matching contract — offering another
     // app's cadences here would put its subscribers one click from being
@@ -91,13 +103,41 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     where: { shopId: shop.id, status: "ACTIVE", ...OURS_ONLY, isDemo: false },
     _count: { _all: true },
   });
+  // Canonicalize every group through contractFrequency (NULL unit — a row
+  // predating the exact mirror — reads as WEEK/intervalWeeks) and merge the
+  // groups that canonicalize identically, e.g. {WEEK,8} and {NULL,8w}.
+  const distribution = new Map<string, { freq: Frequency; contracts: number }>();
+  for (const group of freqDist) {
+    const freq = contractFrequency(group);
+    const token = frequencyToken(freq);
+    const entry = distribution.get(token);
+    if (entry) entry.contracts += group._count._all;
+    else distribution.set(token, { freq, contracts: group._count._all });
+  }
+
+  const configs = await prisma.sellingPlanConfig.findMany({
+    where: { shopId: shop.id, active: true },
+  });
 
   return json({
     currencyCode: shop.currencyCode,
     policy,
-    frequencies: freqDist
-      .map((f) => ({ weeks: f.intervalWeeks, count: f._count._all }))
-      .sort((a, b) => a.weeks - b.weeks),
+    frequencies: [...distribution.values()]
+      .sort(
+        (a, b) =>
+          approxDays(a.freq.unit, a.freq.count) -
+          approxDays(b.freq.unit, b.freq.count),
+      )
+      .map(({ freq, contracts }) => ({
+        unit: freq.unit,
+        count: freq.count,
+        contracts,
+      })),
+    // Every cadence the active plan configs offer — merged client-side with
+    // the observed distribution into the migration target choices.
+    planFrequencies: normalizeFrequencies(
+      configs.flatMap((config) => parseConfigFrequencies(config)),
+    ).map((f) => ({ unit: f.unit, count: f.count })),
     batches: batches.map((b) => {
       const items = priceItemsSchema.safeParse(b.items);
       const effectiveAtMs = b.effectiveAt?.getTime() ?? null;
@@ -327,20 +367,28 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
       // ── (b) Plan migration ──────────────────────────────────────────────
       case "migrate": {
-        const sourceWeeks = parseInt(str(formData, "sourceWeeks"), 10);
-        const targetWeeks = parseInt(str(formData, "targetWeeks"), 10);
-        if (
-          !Number.isInteger(sourceWeeks) ||
-          !Number.isInteger(targetWeeks) ||
-          sourceWeeks === targetWeeks
-        ) {
+        // Token fields ("8:WEEK") from the current UI; bare week integers
+        // keep a stale pre-v1.8.0 tab working (bare weeks = WEEK unit).
+        const legacyWeeks = (key: string): Frequency | null => {
+          const weeks = parseInt(str(formData, key), 10);
+          return Number.isInteger(weeks) && weeks >= 1
+            ? { unit: "WEEK", count: weeks }
+            : null;
+        };
+        const source =
+          parseFrequencyToken(str(formData, "sourceFrequency")) ??
+          legacyWeeks("sourceWeeks");
+        const target =
+          parseFrequencyToken(str(formData, "targetFrequency")) ??
+          legacyWeeks("targetWeeks");
+        if (!source || !target || sameFrequency(source, target)) {
           return json<ActionResponse>({
             ok: false,
             intent,
             error: "Pick two different frequencies",
           });
         }
-        const where = {
+        const where: Prisma.SubscriptionContractWhereInput = {
           shopId: shop.id,
           // OURS_ONLY: this changes the billing cadence on Shopify. Another
           // subscription app's contract is not ours to reschedule.
@@ -351,7 +399,32 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           // run again" arithmetic forever.
           isDemo: false,
           status: "ACTIVE" as const,
-          intervalWeeks: sourceWeeks,
+          // A WEEK source must also match every row contractFrequency
+          // canonicalizes to that week cadence — the same shapes the loader's
+          // distribution merges into one picker entry: rows predating the
+          // exact mirror (NULL unit) AND rows whose mirrored unit is not
+          // plan-offerable (a YEAR contract imported from a previous app),
+          // both of which fall back to intervalWeeks.
+          ...(source.unit === "WEEK"
+            ? {
+                OR: [
+                  {
+                    billingIntervalUnit: "WEEK",
+                    billingIntervalCount: source.count,
+                  },
+                  { billingIntervalUnit: null, intervalWeeks: source.count },
+                  {
+                    billingIntervalUnit: {
+                      notIn: ["DAY", "WEEK", "MONTH"],
+                    },
+                    intervalWeeks: source.count,
+                  },
+                ],
+              }
+            : {
+                billingIntervalUnit: source.unit,
+                billingIntervalCount: source.count,
+              }),
         };
         const total = await prisma.subscriptionContract.count({ where });
         const contracts = await prisma.subscriptionContract.findMany({
@@ -361,27 +434,38 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           select: { id: true },
         });
         let processed = 0;
-        let failures = 0;
-        let firstError: string | null = null;
+        const failed: Array<{ contractId: string; error: string }> = [];
         for (const contract of contracts) {
           try {
-            await changeFrequency(shop.domain, contract.id, targetWeeks, opts);
+            await changeFrequency(shop.domain, contract.id, target, opts);
             processed += 1;
           } catch (err) {
-            failures += 1;
-            if (!firstError) firstError = errMessage(err);
+            failed.push({ contractId: contract.id, error: errMessage(err) });
             console.error("[admin] plan migration failed", contract.id, err);
           }
         }
+        const failures = failed.length;
+        const firstError = failed[0]?.error ?? null;
         const remaining = Math.max(0, total - contracts.length);
         await adminLog(
-          `Plan migration ${sourceWeeks}w → ${targetWeeks}w: ${processed} migrated, ${failures} failed, ${remaining} remaining`,
+          `Plan migration ${frequencyLabelEn(source)} → ${frequencyLabelEn(target)}: ${processed} migrated, ${failures} failed, ${remaining} remaining`,
           {
             action: "plan_migration",
-            sourceWeeks,
-            targetWeeks,
+            // Week approximations stay first for anything built on them.
+            sourceWeeks: approxWeeks(source.unit, source.count),
+            targetWeeks: approxWeeks(target.unit, target.count),
+            sourceUnit: source.unit,
+            sourceCount: source.count,
+            targetUnit: target.unit,
+            targetCount: target.count,
             processed,
             failures,
+            // Every failure by contract: a count plus first-error could not
+            // answer "which contracts, and why" once the run scrolled out of
+            // the server logs — and these are the exact contracts an operator
+            // must chase before the migration is really done. Bounded by
+            // BULK_LIMIT per run.
+            ...(failed.length > 0 ? { failedContracts: failed } : {}),
             remaining,
             batchLimit: BULK_LIMIT,
           },
@@ -392,7 +476,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           processed,
           failures,
           remaining,
-          message: `Migrated ${processed} contract(s) to every ${targetWeeks} weeks${failures ? `, ${failures} failed` : ""}${remaining ? `. ${remaining} remaining — run again to continue.` : ""}`,
+          message: `Migrated ${processed} contract(s) to ${frequencyLabelEn(target).toLowerCase()}${failures ? `, ${failures} failed` : ""}${remaining ? `. ${remaining} remaining — run again to continue.` : ""}`,
           ...(failures && firstError ? { error: firstError } : {}),
         });
       }
@@ -435,18 +519,26 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           select: { id: true },
         });
         let processed = 0;
-        let failures = 0;
-        let firstError: string | null = null;
+        const failed: Array<{ contractId: string; error: string }> = [];
         for (const contract of contracts) {
           try {
-            await skipNextCycle(shop.domain, contract.id, opts);
+            // ADMIN initiator: a stockout-tool skip is the merchant's call,
+            // not the customer's — it lands in merchantSkipCount so a bulk
+            // run can never make loyal subscribers look disengaged to the
+            // risk/win-back models (see skipNextCycle).
+            await skipNextCycle(shop.domain, contract.id, {
+              ...opts,
+              initiator: "ADMIN",
+              reason: "stockout_tool",
+            });
             processed += 1;
           } catch (err) {
-            failures += 1;
-            if (!firstError) firstError = errMessage(err);
+            failed.push({ contractId: contract.id, error: errMessage(err) });
             console.error("[admin] mass skip failed", contract.id, err);
           }
         }
+        const failures = failed.length;
+        const firstError = failed[0]?.error ?? null;
         const remaining = Math.max(0, total - contracts.length);
         await adminLog(
           `Mass skip for variant ${variantId}: ${processed} contracts skipped, ${failures} failed, ${remaining} remaining`,
@@ -455,6 +547,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             variantId,
             processed,
             failures,
+            // Per-contract failures, same rationale as plan_migration.
+            ...(failed.length > 0 ? { failedContracts: failed } : {}),
             remaining,
             batchLimit: BULK_LIMIT,
           },
@@ -515,6 +609,12 @@ function formatDate(iso: string | null): string {
   });
 }
 
+/** "8:WEEK" → "every 8 weeks" for mid-sentence migration copy. */
+function tokenLabelLower(token: string): string {
+  const freq = parseFrequencyToken(token);
+  return freq ? frequencyLabelEn(freq).toLowerCase() : "?";
+}
+
 export default function BulkOpsPage() {
   const data = useLoaderData<typeof loader>();
   const actionFetcher = useFetcher<typeof action>();
@@ -536,18 +636,36 @@ export default function BulkOpsPage() {
 
   // (b) Plan migration
   const sourceOptions = data.frequencies;
-  const [sourceWeeks, setSourceWeeks] = useState(
-    sourceOptions.length ? String(sourceOptions[0].weeks) : "",
+  const [sourceFrequency, setSourceFrequency] = useState(
+    sourceOptions.length ? frequencyToken(sourceOptions[0]) : "",
   );
   const targetChoices = useMemo(() => {
-    const set = new Set<number>([2, 3, 4, 6, 8, 10, 12]);
-    data.frequencies.forEach((f) => set.add(f.weeks));
-    return [...set].sort((a, b) => a - b);
-  }, [data.frequencies]);
-  const [targetWeeks, setTargetWeeks] = useState("8");
+    // Union of what the active plan configs offer and what contracts are
+    // actually on; the legacy week ladder only when both are empty.
+    const union = normalizeFrequencies([
+      ...data.planFrequencies,
+      ...data.frequencies,
+    ]);
+    const list = union.length
+      ? union
+      : [2, 3, 4, 6, 8, 10, 12].map((count) => ({
+          unit: "WEEK" as const,
+          count,
+        }));
+    return list.map((f) => ({
+      token: frequencyToken(f),
+      label: frequencyLabelEn(f),
+    }));
+  }, [data.planFrequencies, data.frequencies]);
+  const [targetFrequency, setTargetFrequency] = useState(
+    targetChoices.some((c) => c.token === "8:WEEK")
+      ? "8:WEEK"
+      : (targetChoices[0]?.token ?? ""),
+  );
   const [migrateOpen, setMigrateOpen] = useState(false);
   const affectedBySource =
-    data.frequencies.find((f) => String(f.weeks) === sourceWeeks)?.count ?? 0;
+    sourceOptions.find((f) => frequencyToken(f) === sourceFrequency)
+      ?.contracts ?? 0;
 
   // (c) Mass skip
   const [skipQuery, setSkipQuery] = useState("");
@@ -706,30 +824,30 @@ export default function BulkOpsPage() {
                 options={
                   sourceOptions.length
                     ? sourceOptions.map((f) => ({
-                        label: `Every ${f.weeks} weeks (${f.count} active)`,
-                        value: String(f.weeks),
+                        label: `${frequencyLabelEn(f)} (${f.contracts} active)`,
+                        value: frequencyToken(f),
                       }))
                     : [{ label: "No active contracts", value: "" }]
                 }
-                value={sourceWeeks}
-                onChange={setSourceWeeks}
+                value={sourceFrequency}
+                onChange={setSourceFrequency}
                 disabled={sourceOptions.length === 0}
               />
               <Select
                 label="To frequency"
-                options={targetChoices.map((w) => ({
-                  label: `Every ${w} weeks`,
-                  value: String(w),
+                options={targetChoices.map((c) => ({
+                  label: c.label,
+                  value: c.token,
                 }))}
-                value={targetWeeks}
-                onChange={setTargetWeeks}
+                value={targetFrequency}
+                onChange={setTargetFrequency}
               />
               <Button
                 variant="primary"
                 disabled={
                   busy ||
-                  !sourceWeeks ||
-                  sourceWeeks === targetWeeks ||
+                  !sourceFrequency ||
+                  sourceFrequency === targetFrequency ||
                   affectedBySource === 0
                 }
                 onClick={() => setMigrateOpen(true)}
@@ -1035,7 +1153,7 @@ export default function BulkOpsPage() {
           loading: busy,
           onAction: () => {
             actionFetcher.submit(
-              { intent: "migrate", sourceWeeks, targetWeeks },
+              { intent: "migrate", sourceFrequency, targetFrequency },
               { method: "post" },
             );
             setMigrateOpen(false);
@@ -1045,7 +1163,7 @@ export default function BulkOpsPage() {
       >
         <Modal.Section>
           <Text as="p">
-            {`Moves up to ${Math.min(BULK_LIMIT, affectedBySource)} of ${affectedBySource} ACTIVE contract(s) from every ${sourceWeeks} weeks to every ${targetWeeks} weeks. Each contract's billing and delivery policy is edited on Shopify and the change is logged on its timeline.`}
+            {`Moves up to ${Math.min(BULK_LIMIT, affectedBySource)} of ${affectedBySource} ACTIVE contract(s) from ${tokenLabelLower(sourceFrequency)} to ${tokenLabelLower(targetFrequency)}. Each contract's billing and delivery policy is edited on Shopify and the change is logged on its timeline.`}
           </Text>
         </Modal.Section>
       </Modal>

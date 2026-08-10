@@ -113,6 +113,9 @@ async function writeLog(entry: {
   template: string;
   status: string;
   klaviyoEventName?: string | null;
+  /** Outbox row carrying the delivery — lets the flush flip this row to
+   * FAILED (and log notification.failed) when the row later goes DEAD. */
+  outboxId?: string | null;
   error?: string | null;
   payload?: Record<string, unknown>;
 }): Promise<void> {
@@ -129,6 +132,7 @@ async function writeLog(entry: {
         template: entry.template,
         status: entry.status,
         klaviyoEventName: entry.klaviyoEventName ?? null,
+        outboxId: entry.outboxId ?? null,
         error: entry.error ?? null,
         payload,
       },
@@ -394,26 +398,53 @@ export async function sendNotification(
           ? contractProfileAttrs(contract)
           : {};
 
-        await enqueue(input.shopId, {
+        const outboxRow = await enqueue(input.shopId, {
           eventName: tmpl.klaviyoMetric,
           email,
           phone,
           profileAttrs,
           properties,
         });
-        result.klaviyoEnqueued = true;
-        channelsUsed.push("KLAVIYO_EVENT");
-        await writeLog({
-          shopId: input.shopId,
-          contractId: contract?.id,
-          email,
-          phone,
-          channel: "KLAVIYO_EVENT",
-          template: input.template,
-          status: "SENT",
-          klaviyoEventName: tmpl.klaviyoMetric,
-          payload: { cycleIndex, vars: toTemplateVars(vars) },
-        });
+        if (outboxRow) {
+          result.klaviyoEnqueued = true;
+          channelsUsed.push("KLAVIYO_EVENT");
+          // SENT means "riding a live outbox row" — the row id makes that
+          // claim falsifiable: if the row later goes DEAD, the flush flips
+          // this log row to FAILED and logs notification.failed, so cycle
+          // dedupe and dunning ladders stop trusting a delivery that never
+          // happened (the ARCHITECTURE promise: never logged SENT
+          // undelivered).
+          await writeLog({
+            shopId: input.shopId,
+            contractId: contract?.id,
+            email,
+            phone,
+            channel: "KLAVIYO_EVENT",
+            template: input.template,
+            status: "SENT",
+            klaviyoEventName: tmpl.klaviyoMetric,
+            outboxId: outboxRow.id,
+            payload: { cycleIndex, vars: toTemplateVars(vars) },
+          });
+        } else {
+          // The enqueue itself was dropped (DB error): no row will ever
+          // deliver this, so a SENT log here would be the exact
+          // logged-SENT-but-undelivered lie the outboxId reconciliation
+          // exists to prevent. Log FAILED and let the outcome event below
+          // report notification.failed.
+          await writeLog({
+            shopId: input.shopId,
+            contractId: contract?.id,
+            email,
+            phone,
+            channel: "KLAVIYO_EVENT",
+            template: input.template,
+            status: "FAILED",
+            klaviyoEventName: tmpl.klaviyoMetric,
+            error: "Klaviyo outbox enqueue failed",
+            payload: { cycleIndex },
+          });
+        }
       } else if (!tmpl.critical) {
         // KLAVIYO_PRIVATE_API_KEY is not set. Enqueueing anyway would strand
         // the row PENDING (flushKlaviyoOutbox skips entirely without the key)

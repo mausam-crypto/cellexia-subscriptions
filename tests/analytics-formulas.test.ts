@@ -448,6 +448,8 @@ const GOLDEN_ROLLUP: Row = {
   takeRateNum: 0,
   takeRateDen: 1,
   prepaidActive: 0,
+  excludedForeignCurrencyCents: 0,
+  snapshotFabricated: false,
 };
 
 const cellRow = (over: Row): Row => ({
@@ -534,9 +536,14 @@ describe("runDailyRollup — golden day 2026-08-05", () => {
       }),
     );
     const { rollup } = await computeAll(store);
-    // Identical to the golden row: the EUR attempt adds neither revenue nor
-    // COGS/fees/shipping (the whole attempt is skipped, not just its amount).
-    expect(rollup).toEqual(GOLDEN_ROLLUP);
+    // Identical to the golden row EXCEPT the audit counter: the EUR attempt
+    // adds neither revenue nor COGS/fees/shipping (the whole attempt is
+    // skipped, not just its amount), and the exclusion is no longer silent —
+    // its raw foreign cents land in excludedForeignCurrencyCents.
+    expect(rollup).toEqual({
+      ...GOLDEN_ROLLUP,
+      excludedForeignCurrencyCents: 6000,
+    });
   });
 
   it("produces an all-zero row (no throw) on a shop with no data at all", async () => {

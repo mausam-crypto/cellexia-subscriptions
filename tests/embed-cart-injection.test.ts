@@ -211,7 +211,7 @@ describe("buy-box-embed cart-request injection", () => {
     expect(out.get("items[0][properties][_cellexia_design]")).toBeNull();
   });
 
-  it("never touches an item that already carries a selling_plan", () => {
+  it("never touches an item that already carries another app's selling_plan", () => {
     const original =
       `items%5B0%5D%5Bid%5D=${OUR_VARIANT}&items%5B0%5D%5Bselling_plan%5D=123`;
     expect(post(original)).toBe(original);
@@ -270,6 +270,137 @@ describe("buy-box-embed cart-request injection", () => {
     form.append("id", OUR_VARIANT);
     const out = post(form) as FormData;
     expect(out.get("selling_plan")).toBe(PLAN_ID);
+  });
+
+  // ── A line that already carries OUR plan is completed, never rewritten ─────
+  //
+  // Some theme JS serializes the widget's adopted selling_plan field into a
+  // hand-built payload without copying the properties input: the plan is
+  // already right, only the _cellexia_design attribution is missing. The
+  // patcher stamps exactly that — the plan value itself is untouched, an
+  // attribution that already travelled is never overwritten, and any OTHER
+  // plan id keeps the byte-identical pass-through above.
+
+  it("stamps only the design when a bracket item already carries OUR plan", () => {
+    const original =
+      `items%5B0%5D%5Bid%5D=${OUR_VARIANT}&items%5B0%5D%5Bquantity%5D=1` +
+      `&items%5B0%5D%5Bselling_plan%5D=${PLAN_ID}`;
+    const out = params(post(original));
+
+    expect(out.get("items[0][properties][_cellexia_design]")).toBe("classic");
+    // The theme's own plan value survives, exactly once.
+    expect(out.getAll("items[0][selling_plan]")).toEqual([PLAN_ID]);
+    expect(out.get("items[0][id]")).toBe(OUR_VARIANT);
+    expect(out.get("items[0][quantity]")).toBe("1");
+  });
+
+  it("stamps only the design when the flat urlencoded body carries OUR plan", () => {
+    const out = params(post(`id=${OUR_VARIANT}&quantity=1&selling_plan=${PLAN_ID}`));
+    expect(out.get("properties[_cellexia_design]")).toBe("classic");
+    expect(out.getAll("selling_plan")).toEqual([PLAN_ID]);
+  });
+
+  it("leaves the flat body byte-identical when the existing plan is not ours", () => {
+    const original = `id=${OUR_VARIANT}&quantity=1&selling_plan=123`;
+    expect(post(original)).toBe(original);
+  });
+
+  it("stamps only the design into JSON items[] carrying OUR plan (String-compared)", () => {
+    // The theme carries the plan NUMERIC while the widget state holds a
+    // string — ours-vs-foreign must not hinge on the JSON type.
+    const out = JSON.parse(
+      String(
+        post(
+          JSON.stringify({
+            items: [{ id: Number(OUR_VARIANT), quantity: 1, selling_plan: Number(PLAN_ID) }],
+          }),
+        ),
+      ),
+    ) as { items: Array<Record<string, unknown>> };
+    expect(out.items[0].selling_plan).toBe(Number(PLAN_ID));
+    expect(out.items[0].properties).toEqual({ _cellexia_design: "classic" });
+  });
+
+  it("stamps only the design into flat JSON carrying OUR plan", () => {
+    const out = JSON.parse(
+      String(post(JSON.stringify({ id: OUR_VARIANT, quantity: 1, selling_plan: PLAN_ID }))),
+    ) as Record<string, unknown>;
+    expect(out.selling_plan).toBe(PLAN_ID);
+    expect(out.properties).toEqual({ _cellexia_design: "classic" });
+  });
+
+  it("stamps only the design into a flat FormData carrying OUR plan", () => {
+    const form = new FormData();
+    form.append("id", OUR_VARIANT);
+    form.append("selling_plan", PLAN_ID);
+    const out = post(form) as FormData;
+    expect(out).toBeInstanceOf(FormData);
+    expect(out.get("properties[_cellexia_design]")).toBe("classic");
+    expect(out.getAll("selling_plan")).toEqual([PLAN_ID]);
+    // The caller's own object is never mutated.
+    expect(form.get("properties[_cellexia_design]")).toBeNull();
+  });
+
+  it("stamps only the design into a bracket FormData carrying OUR plan", () => {
+    const form = new FormData();
+    form.append("items[0][id]", OUR_VARIANT);
+    form.append("items[0][selling_plan]", PLAN_ID);
+    const out = post(form) as FormData;
+    expect(out.get("items[0][properties][_cellexia_design]")).toBe("classic");
+    expect(out.getAll("items[0][selling_plan]")).toEqual([PLAN_ID]);
+  });
+
+  it("never overwrites a design attribution that already travelled", () => {
+    const original =
+      `items%5B0%5D%5Bid%5D=${OUR_VARIANT}` +
+      `&items%5B0%5D%5Bselling_plan%5D=${PLAN_ID}` +
+      `&items%5B0%5D%5Bproperties%5D%5B_cellexia_design%5D=tiles`;
+    expect(post(original)).toBe(original);
+
+    const json = JSON.stringify({
+      items: [
+        {
+          id: Number(OUR_VARIANT),
+          selling_plan: Number(PLAN_ID),
+          properties: { _cellexia_design: "tiles" },
+        },
+      ],
+    });
+    expect(post(json)).toBe(json);
+  });
+
+  it("treats an empty design value as missing and fills it", () => {
+    // No design is recorded either way — an empty property attributes
+    // nothing, so completing it loses nobody's data.
+    const out = params(
+      post(`id=${OUR_VARIANT}&selling_plan=${PLAN_ID}&properties%5B_cellexia_design%5D=`),
+    );
+    expect(out.get("properties[_cellexia_design]")).toBe("classic");
+    expect(out.getAll("properties[_cellexia_design]")).toEqual(["classic"]);
+  });
+
+  it("handles a mixed items[] body: completes ours, fills the plan-less, skips foreign", () => {
+    const original =
+      `items%5B0%5D%5Bid%5D=${OUR_VARIANT}&items%5B0%5D%5Bselling_plan%5D=${PLAN_ID}` +
+      `&items%5B1%5D%5Bid%5D=${OTHER_VARIANT}&items%5B1%5D%5Bquantity%5D=1` +
+      `&items%5B2%5D%5Bid%5D=${FOREIGN_VARIANT}&items%5B2%5D%5Bselling_plan%5D=555`;
+    const out = params(post(original));
+
+    expect(out.get("items[0][properties][_cellexia_design]")).toBe("classic");
+    expect(out.getAll("items[0][selling_plan]")).toEqual([PLAN_ID]);
+    expect(out.get("items[1][selling_plan]")).toBe(PLAN_ID);
+    expect(out.get("items[1][properties][_cellexia_design]")).toBe("classic");
+    expect(out.getAll("items[2][selling_plan]")).toEqual(["555"]);
+    expect(out.get("items[2][properties][_cellexia_design]")).toBeNull();
+  });
+
+  it("does not stamp a design while one-time is selected, even over our plan id", () => {
+    // getState() knows no plan or design for a one-time selection, so a
+    // stale plan the theme kept sending is not provably a choice the
+    // visitor made on this page view — and stripping it is not our job.
+    env.setState({ ...subscriptionState(), mode: "one_time", sellingPlanId: null });
+    const original = `id=${OUR_VARIANT}&selling_plan=${PLAN_ID}`;
+    expect(post(original)).toBe(original);
   });
 
   // ── Never act for a selection the visitor cannot see or did not make ───────

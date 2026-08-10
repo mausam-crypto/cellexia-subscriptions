@@ -27,6 +27,7 @@ import prisma from "~/db.server";
 import {
   FORECAST_HISTORY_WEEKS,
   FORECAST_MODELS,
+  HISTORY_WEEKS,
   blendForecasts,
   chooseModel,
   cohortActivesForecast,
@@ -185,6 +186,105 @@ describe("cohortActivesForecast", () => {
       }),
     ).toEqual([5, 10, 15, 20]);
   });
+
+  // ── Heterogeneous per-cycle decay (FR-6a) ──────────────────────────────────
+
+  it("uniform per-cycle ratios reproduce the homogeneous model exactly", () => {
+    const base = {
+      activeBase: 100,
+      avgCycleSurvival: 0.25,
+      avgIntervalWeeks: 2,
+      weeklyNewSubscribers: 0,
+      horizon: 4,
+    };
+    expect(
+      cohortActivesForecast({
+        ...base,
+        perCycleSurvival: [0.25, 0.25, 0.25],
+        cycleDistribution: [50, 30, 20],
+      }),
+    ).toEqual(cohortActivesForecast(base));
+  });
+
+  it("early-cycle-heavy books churn faster than mature books under the same hazard curve", () => {
+    // Hazard curve: cycle 1 survives 50%, later cycles 95% — the shape every
+    // subscription book actually has. The blended average threw this away.
+    const shared = {
+      activeBase: 100,
+      avgCycleSurvival: 0.8,
+      avgIntervalWeeks: 1,
+      weeklyNewSubscribers: 0,
+      horizon: 6,
+      perCycleSurvival: [0.5, 0.95, 0.95],
+    };
+    const young = cohortActivesForecast({
+      ...shared,
+      cycleDistribution: [100, 0, 0],
+    });
+    const mature = cohortActivesForecast({
+      ...shared,
+      cycleDistribution: [0, 0, 100],
+    });
+    for (let i = 0; i < 6; i++) expect(young[i]).toBeLessThan(mature[i]);
+    // Homogeneous decay (blended 0.8) sits between the two — it under-churns
+    // the young book and over-churns the mature one.
+    const blended = cohortActivesForecast({
+      ...shared,
+      perCycleSurvival: undefined,
+      cycleDistribution: undefined,
+    });
+    expect(young[0]).toBeLessThan(blended[0]);
+    expect(mature[0]).toBeGreaterThan(blended[0]);
+  });
+
+  it("buckets advance one cycle in lockstep at each interval boundary (hand-computed)", () => {
+    // interval 2 weeks, cycle-1 survival 0.25 (weekly 0.5), cycle-2+ survival
+    // 1. Weeks 1–2 decay the base at 0.5/week (still cycle 1); the boundary
+    // after week 2 advances it into cycle 2, where nothing churns.
+    expect(
+      cohortActivesForecast({
+        activeBase: 100,
+        avgCycleSurvival: 0.9,
+        avgIntervalWeeks: 2,
+        weeklyNewSubscribers: 0,
+        horizon: 4,
+        perCycleSurvival: [0.25, 1],
+        cycleDistribution: [100, 0],
+      }),
+    ).toEqual([50, 25, 25, 25]);
+  });
+
+  it("inflow joins at cycle 1 and faces the early-cycle hazard", () => {
+    // No base; 10 arrivals/week; cycle-1 weekly retention 0.5. Week 1: 10.
+    // Week 2: the boundary (interval 1) advances survivors to cycle 2
+    // (retention 1), so 10·0.5 + 10 = 15; week 3: 15·(survivors advance) …
+    // steady growth toward the mature plateau, never the naive 10·h line.
+    const out = cohortActivesForecast({
+      activeBase: 0,
+      avgCycleSurvival: 0.9,
+      avgIntervalWeeks: 1,
+      weeklyNewSubscribers: 10,
+      horizon: 3,
+      perCycleSurvival: [0.5, 1],
+      cycleDistribution: [1, 0],
+    });
+    expect(out).toEqual([10, 15, 20]);
+  });
+
+  it("cycles beyond the observed curve reuse its LAST ratio, not the blended average", () => {
+    // Distribution deeper than the curve clamps into the tail bucket; the
+    // tail keeps the last observed (mature) hazard.
+    const out = cohortActivesForecast({
+      activeBase: 100,
+      avgCycleSurvival: 0.5, // blended — must NOT drive the tail
+      avgIntervalWeeks: 1,
+      weeklyNewSubscribers: 0,
+      horizon: 2,
+      perCycleSurvival: [0.5, 1],
+      cycleDistribution: [0, 0, 0, 100],
+    });
+    expect(out).toEqual([100, 100]);
+  });
 });
 
 // ── censoring-corrected survival (the audit fix) ──────────────────────────────
@@ -240,6 +340,57 @@ describe("decidedCycleSurvival", () => {
     ]);
     expect(withCensored.avgCycleSurvival).toBeCloseTo(base.avgCycleSurvival, 10);
     expect(withCensored.perCycle[0].ratio).toBe(0.7);
+  });
+
+  it("FAILED contracts churn at their cycle — payment churn is not censored (audit fix)", () => {
+    // 70 reached cycle 2; 30 cancelled and 20 dunning-exhausted (status
+    // FAILED, no cancelledAt under the default exhaustedAction PAUSE) died at
+    // cycle 1. Counting only CANCELLED read 70/100 = 0.70; the true decided
+    // survival is 70/120 ≈ 0.583 — the bias was exactly the involuntary
+    // share, and it fed both the cohort model and the merchant-visible
+    // per-cycle survival number.
+    const estimate = decidedCycleSurvival([
+      { ordersCount: 2, status: "ACTIVE", count: 70 },
+      { ordersCount: 1, status: "CANCELLED", count: 30 },
+      { ordersCount: 1, status: "FAILED", count: 20 },
+    ]);
+    expect(estimate.decidedTransitions).toBe(120);
+    expect(estimate.avgCycleSurvival).toBeCloseTo(70 / 120, 6);
+    expect(estimate.perCycle[0]).toEqual({
+      cycle: 1,
+      survivors: 70,
+      churned: 50,
+      atRisk: 120,
+      ratio: 0.5833,
+    });
+  });
+
+  it("EXPIRED contracts churn too — a completed bounded plan leaves the base", () => {
+    // Same terminal set as survival.server.ts: EXPIRED is voluntary by the
+    // shared classification, but for decay purposes it is a death.
+    const withExpired = decidedCycleSurvival([
+      { ordersCount: 2, status: "ACTIVE", count: 90 },
+      { ordersCount: 1, status: "EXPIRED", count: 30 },
+    ]);
+    expect(withExpired.decidedTransitions).toBe(120);
+    expect(withExpired.avgCycleSurvival).toBeCloseTo(90 / 120, 6);
+  });
+
+  it("a FAILED contract's own history still counts it as a survivor of earlier cycles", () => {
+    // Failed at cycle 3: it reached cycles 1–3 (survivor of 1→2 and 2→3) and
+    // churned the 3→4 transition.
+    const estimate = decidedCycleSurvival(
+      [
+        { ordersCount: 4, status: "ACTIVE", count: 10 },
+        { ordersCount: 3, status: "FAILED", count: 10 },
+      ],
+      { minDecided: 5 },
+    );
+    expect(estimate.perCycle).toEqual([
+      { cycle: 1, survivors: 20, churned: 0, atRisk: 20, ratio: 1 },
+      { cycle: 2, survivors: 20, churned: 0, atRisk: 20, ratio: 1 },
+      { cycle: 3, survivors: 10, churned: 10, atRisk: 20, ratio: 0.5 },
+    ]);
   });
 
   it("honours the minDecided override", () => {
@@ -585,6 +736,46 @@ describe("materializeWeeklyGrid", () => {
     expect(grid.activeSubscribers).toEqual([10, 10, 13]);
     expect(grid.newSubscribers).toEqual([5, 5, 8]);
   });
+
+  it("exposes the churn split and paused snapshot for future models (FR-6c)", () => {
+    // No model consumes these yet — the grid carries them so a future
+    // outflow/pause model starts with history from day one.
+    const grid = materializeWeeklyGrid(
+      new Map([
+        [
+          "2026-06-01",
+          {
+            ...week(100, 10, 500, 5),
+            churnedVoluntary: 2,
+            churnedInvoluntary: 1,
+            pausedSubscribers: 4,
+          },
+        ],
+        ["2026-06-08", week(110, 11)],
+      ]),
+    );
+    expect(grid.churnedVoluntary).toEqual([2, 0]);
+    expect(grid.churnedInvoluntary).toEqual([1, 0]);
+    expect(grid.pausedSubscribers).toEqual([4, 0]);
+  });
+
+  it("a snapshotFabricated week keeps its real flows, carries snapshots forward and is annotated", () => {
+    const grid = materializeWeeklyGrid(
+      new Map([
+        ["2026-06-01", week(100, 10, 500, 5)],
+        [
+          "2026-06-08",
+          { ...week(0, 0, 700, 7), snapshotFabricated: true },
+        ],
+        ["2026-06-15", week(130, 13, 800, 8)],
+      ]),
+    );
+    expect(grid.filledWeeks).toEqual(["2026-06-08"]);
+    expect(grid.mrrCents).toEqual([100, 100, 130]); // snapshot carried, not 0
+    expect(grid.activeSubscribers).toEqual([10, 10, 13]);
+    expect(grid.netRevenueCents).toEqual([500, 700, 800]); // flows stay real
+    expect(grid.newSubscribers).toEqual([5, 7, 8]);
+  });
 });
 
 // ── getForecast (mocked prisma) ───────────────────────────────────────────────
@@ -595,6 +786,13 @@ function rollupRow(
   activeSubscribers: number,
   chargedCents = 0,
   newSubscribers = 5,
+  extra?: Partial<{
+    refundedCents: number;
+    churnedVoluntary: number;
+    churnedInvoluntary: number;
+    pausedSubscribers: number;
+    snapshotFabricated: boolean;
+  }>,
 ) {
   return {
     date: new Date(`${dayKey}T00:00:00.000Z`),
@@ -602,6 +800,12 @@ function rollupRow(
     activeSubscribers,
     chargedCents,
     newSubscribers,
+    refundedCents: 0,
+    churnedVoluntary: 0,
+    churnedInvoluntary: 0,
+    pausedSubscribers: 0,
+    snapshotFabricated: false,
+    ...extra,
   };
 }
 
@@ -855,6 +1059,107 @@ describe("getForecast", () => {
     }
   });
 
+  // ── Net revenue is NET of refunds (FR-2/SM-01): the analytics page labels
+  //    this exact series "payments collected (net of refunds)" ──────────────
+  it("subtracts refundedCents from the weekly collected-revenue series", async () => {
+    mockShop({
+      rollups: [
+        rollupRow("2026-06-01", 100_000, 100, 20_000),
+        // Two rollup days in one week: 22 000 charged, 5 000 refunded.
+        rollupRow("2026-06-08", 110_000, 110, 12_000, 5, { refundedCents: 3_000 }),
+        rollupRow("2026-06-10", 110_000, 110, 10_000, 0, { refundedCents: 2_000 }),
+        rollupRow("2026-06-15", 120_000, 120, 24_000),
+        rollupRow("2026-06-22", 130_000, 130, 26_000),
+        rollupRow("2026-06-29", 140_000, 140, 28_000),
+        rollupRow("2026-07-06", 150_000, 240, 30_000),
+      ],
+    });
+    const result = await getForecast("shop1", { model: "naive", now: NOW });
+    expect(result.series.netRevenueCents.history[1]).toEqual({
+      weekStartIso: "2026-06-08",
+      value: 17_000, // 22 000 charged − 5 000 refunded, NOT gross 22 000
+    });
+    // Un-refunded weeks are untouched.
+    expect(result.series.netRevenueCents.history[0].value).toBe(20_000);
+  });
+
+  it("a refund-heavier-than-charges week clamps at 0 instead of going negative", async () => {
+    mockShop({
+      rollups: [
+        rollupRow("2026-06-22", 130_000, 130, 26_000),
+        // Refunds recorded this week exceed its charges (they net charges of
+        // PRIOR weeks — refunds book on their recorded day).
+        rollupRow("2026-06-29", 140_000, 140, 1_000, 5, { refundedCents: 9_000 }),
+        rollupRow("2026-07-06", 150_000, 240, 30_000),
+      ],
+    });
+    const result = await getForecast("shop1", { model: "naive", now: NOW });
+    const clamped = result.series.netRevenueCents.history.find(
+      (p) => p.weekStartIso === "2026-06-29",
+    )!;
+    expect(clamped.value).toBe(0);
+    for (const p of result.series.netRevenueCents.history) {
+      expect(p.value).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  // ── Gap-backfilled weeks (FR-3 / I1): snapshotFabricated rows carry real
+  //    flows but zeroed snapshots — never observed history ───────────────────
+  it("a week of backfilled rollups is annotated and its snapshots carried forward", async () => {
+    mockShop({
+      rollups: [
+        rollupRow("2026-06-01", 100_000, 100, 20_000),
+        rollupRow("2026-06-08", 110_000, 110, 22_000),
+        // The whole 06-15 week was gap-backfilled: flow columns recomputed
+        // from source, snapshot columns left at 0 (I1).
+        rollupRow("2026-06-15", 0, 0, 24_000, 5, { snapshotFabricated: true }),
+        rollupRow("2026-06-29", 140_000, 140, 28_000),
+        rollupRow("2026-07-06", 150_000, 240, 30_000),
+      ],
+    });
+    const result = await getForecast("shop1", { model: "naive", now: NOW });
+
+    // Annotated exactly like a missing week (the honesty reason fires for
+    // both); the wholly-absent 06-22 week is annotated alongside.
+    expect(result.series.mrrCents.filledWeeks).toEqual([
+      "2026-06-15",
+      "2026-06-22",
+    ]);
+    expect(result.accuracy.reasons.join(" ")).toContain("2 missing weeks");
+
+    // Snapshots carried forward — the backfill's zeros never chart as a
+    // collapse — while the week's REAL flow total stays its own.
+    expect(result.series.mrrCents.history[2]).toEqual({
+      weekStartIso: "2026-06-15",
+      value: 110_000,
+    });
+    expect(result.series.activeSubscribers.history[2].value).toBe(110);
+    expect(result.series.netRevenueCents.history[2].value).toBe(24_000);
+  });
+
+  it("a week with a real rollup next to backfilled ones keeps the real snapshot and is NOT annotated", async () => {
+    mockShop({
+      rollups: [
+        rollupRow("2026-06-01", 100_000, 100, 20_000),
+        // Mixed week: Monday backfilled, Wednesday real — the real row is
+        // the week's snapshot and the week counts as observed.
+        rollupRow("2026-06-08", 0, 0, 10_000, 5, { snapshotFabricated: true }),
+        rollupRow("2026-06-10", 112_000, 112, 12_000, 0),
+        rollupRow("2026-06-15", 120_000, 120, 24_000),
+        rollupRow("2026-06-22", 130_000, 130, 26_000),
+        rollupRow("2026-06-29", 140_000, 140, 28_000),
+        rollupRow("2026-07-06", 150_000, 240, 30_000),
+      ],
+    });
+    const result = await getForecast("shop1", { model: "naive", now: NOW });
+    expect(result.series.mrrCents.filledWeeks).toEqual([]);
+    expect(result.series.mrrCents.history[1]).toEqual({
+      weekStartIso: "2026-06-08",
+      value: 112_000,
+    });
+    expect(result.series.netRevenueCents.history[1].value).toBe(22_000);
+  });
+
   it("is deterministic within a week — Tuesday and Saturday agree given the same data", async () => {
     mockShop();
     const tuesday = await getForecast("shop1", {
@@ -874,12 +1179,13 @@ describe("getForecast", () => {
   });
 
   it("drops the leading week truncated by the mid-week history cutoff", async () => {
-    // subWeeks(2026-07-08T12:00, 26) = 2026-01-07T12:00 (a Wednesday), so the
-    // 2026-01-05 week's rollups start mid-week — a truncated flow bucket that
-    // must not enter the series (nor drag 20 carried-forward fill weeks in).
+    // subWeeks(2026-07-08T12:00, HISTORY_WEEKS=78) = 2025-01-08T12:00 (a
+    // Wednesday), so the 2025-01-06 week's rollups start mid-week — a
+    // truncated flow bucket that must not enter the series (nor drag 70
+    // carried-forward fill weeks in).
     mockShop({
       rollups: [
-        rollupRow("2026-01-08", 90_000, 90, 4_000),
+        rollupRow("2025-01-09", 90_000, 90, 4_000),
         rollupRow("2026-06-01", 100_000, 100, 20_000),
         rollupRow("2026-06-08", 110_000, 110, 22_000),
         rollupRow("2026-06-15", 120_000, 120, 24_000),
@@ -891,6 +1197,14 @@ describe("getForecast", () => {
     expect(result.historyWeeks[0]).toBe("2026-06-01");
     expect(result.historyWeeks).toHaveLength(5);
     expect(result.series.mrrCents.filledWeeks).toEqual([]);
+  });
+
+  it("HISTORY_WEEKS spans at least a full year — collected annual seasonality is readable (FR-6)", () => {
+    // 26 weeks made every rollup beyond six months structurally unreadable:
+    // two years of collected history could never inform any model. The
+    // constant is pinned ≥ 52 so a future annual-seasonal model has a full
+    // year plus margin in view.
+    expect(HISTORY_WEEKS).toBeGreaterThanOrEqual(52);
   });
 
   // ── Shop-timezone label space (regression): DailyRollup rows are labeled by
@@ -983,36 +1297,67 @@ describe("getForecast", () => {
 // ── Self-improvement (v1.5.0): weighted history, blend, persisted accuracy ────
 
 describe("exponentiallyWeightedError", () => {
+  /** Contiguous Monday keys starting 2026-06-01 — errors[i] is week i. */
+  const weekly = (errors: Array<number | null | undefined>) =>
+    errors.map((error, i) => ({
+      weekStartIso: new Date(Date.UTC(2026, 5, 1) + i * 7 * 86_400_000)
+        .toISOString()
+        .slice(0, 10),
+      error,
+    }));
+
   it("null on empty or all-null history — the caller falls back to the backtest", () => {
     expect(exponentiallyWeightedError([])).toBeNull();
-    expect(exponentiallyWeightedError([null, undefined, null])).toBeNull();
+    expect(exponentiallyWeightedError(weekly([null, undefined, null]))).toBeNull();
   });
 
   it("a single measured week is returned verbatim", () => {
-    expect(exponentiallyWeightedError([0.25])).toBe(0.25);
+    expect(exponentiallyWeightedError(weekly([0.25]))).toBe(0.25);
   });
 
   it("recent weeks weigh more than old ones (hand-computed, decay 0.85)", () => {
     // [old 0.5, new 0.1]: (0.85·0.5 + 1·0.1) / 1.85 = 0.28378…
-    expect(exponentiallyWeightedError([0.5, 0.1])).toBeCloseTo(0.525 / 1.85, 10);
+    expect(exponentiallyWeightedError(weekly([0.5, 0.1]))).toBeCloseTo(
+      0.525 / 1.85,
+      10,
+    );
     // The plain mean would be 0.3 — the EW mean leans toward the newer 0.1.
-    expect(exponentiallyWeightedError([0.5, 0.1])!).toBeLessThan(0.3);
+    expect(exponentiallyWeightedError(weekly([0.5, 0.1]))!).toBeLessThan(0.3);
     // Order matters: the mirrored series leans the other way.
-    expect(exponentiallyWeightedError([0.1, 0.5])!).toBeGreaterThan(0.3);
+    expect(exponentiallyWeightedError(weekly([0.1, 0.5]))!).toBeGreaterThan(0.3);
   });
 
-  it("null gaps carry no weight but keep their position in the decay", () => {
-    // [0.4, null, 0.2]: weights 0.85², —, 1 → (0.7225·0.4 + 0.2) / 1.7225.
-    expect(exponentiallyWeightedError([0.4, null, 0.2])).toBeCloseTo(
+  it("null gaps carry no weight but their weeks still count toward the decay", () => {
+    // [0.4, null, 0.2] on contiguous weeks: weights 0.85², —, 1.
+    expect(exponentiallyWeightedError(weekly([0.4, null, 0.2]))).toBeCloseTo(
       (0.7225 * 0.4 + 0.2) / 1.7225,
       10,
     );
   });
 
+  it("decays by CALENDAR distance, not array position — history holes cannot compress time", () => {
+    // Two entries, but the older one is 10 calendar weeks before the newer
+    // (a 9-week recording outage between them). Positional decay would give
+    // it weight 0.85¹ as if it were last week's error; calendar decay gives
+    // 0.85¹⁰ — stale performance barely counts.
+    const holey = [
+      { weekStartIso: "2026-03-23", error: 0.5 },
+      { weekStartIso: "2026-06-01", error: 0.1 },
+    ];
+    const d10 = Math.pow(0.85, 10);
+    expect(exponentiallyWeightedError(holey)).toBeCloseTo(
+      (d10 * 0.5 + 0.1) / (d10 + 1),
+      10,
+    );
+    // …and therefore sits far closer to the recent error than the positional
+    // weighting's 0.284 would.
+    expect(exponentiallyWeightedError(holey)!).toBeLessThan(0.19);
+  });
+
   it("a recently-better model beats a formerly-better one — the learning signal", () => {
     // Model A was bad, got good. Model B was good, got bad. Same plain mean.
-    const recentlyGood = exponentiallyWeightedError([0.4, 0.3, 0.1, 0.05])!;
-    const recentlyBad = exponentiallyWeightedError([0.05, 0.1, 0.3, 0.4])!;
+    const recentlyGood = exponentiallyWeightedError(weekly([0.4, 0.3, 0.1, 0.05]))!;
+    const recentlyBad = exponentiallyWeightedError(weekly([0.05, 0.1, 0.3, 0.4]))!;
     expect(recentlyGood).toBeLessThan(recentlyBad);
   });
 });

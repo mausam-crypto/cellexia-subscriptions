@@ -608,6 +608,14 @@ export interface ProductFixtureOptions {
   requiresSellingPlan?: boolean;
   /** 1 collapses the group to a single cadence (no selector in any version). */
   planCount?: 1 | 2 | 3;
+  /**
+   * Replace the default week-only plan set entirely — the v1.8.0 multi-unit
+   * fixture ("Every 10 days" / "Every 2 weeks" / "Every 1 month" in the
+   * app's own planOptionValue vocabulary, or any adversarial shape a test
+   * needs). Supersedes `planCount`; the published allow-list planSet follows
+   * these ids exactly, like a real publish following the live plan set.
+   */
+  planSpecs?: Array<{ id: number; name: string; optionValue: string }>;
   /** Renames the group so the "contains cellexia" pick is exercised. */
   groupName?: string;
   /** A product with no selling plan groups at all: the block must render nothing. */
@@ -684,8 +692,16 @@ const PLAN_SPECS: Array<{ id: number; weeks: number }> = [
   { id: FIXTURE.planIds.weeks8, weeks: 8 },
 ];
 
-function makePlans(count: number): SellingPlanFixture[] {
-  return PLAN_SPECS.slice(0, count).map((spec) => ({
+function makePlans(options: ProductFixtureOptions): SellingPlanFixture[] {
+  if (options.planSpecs) {
+    return options.planSpecs.map((spec) => ({
+      id: spec.id,
+      name: spec.name,
+      options: [{ name: "Delivery frequency", value: spec.optionValue }],
+      recurring_deliveries: true,
+    }));
+  }
+  return PLAN_SPECS.slice(0, options.planCount ?? 3).map((spec) => ({
     id: spec.id,
     name: `Delivery every ${spec.weeks} weeks`,
     options: [{ name: "Delivery every", value: `${spec.weeks} weeks` }],
@@ -786,7 +802,7 @@ function otherGroupSpecs(
 
 /** A product shaped exactly like the storefront `product` drop the block reads. */
 export function makeProduct(options: ProductFixtureOptions = {}) {
-  const plans = makePlans(options.planCount ?? 3);
+  const plans = makePlans(options);
   const variants: VariantFixture[] = options.jarVariants
     ? [
         {
@@ -1008,9 +1024,9 @@ export function makeContext(options: MakeContextOptions = {}): RenderContext {
   // makeProduct built. The default allow-list must follow them: a real
   // publish reads the LIVE plan set off Shopify, so a planCount:1 shop
   // publishes a one-plan set, not the full catalogue.
-  const ownPlanIds = PLAN_SPECS.slice(0, options.planCount ?? 3).map((spec) =>
-    String(spec.id),
-  );
+  const ownPlanIds = (
+    options.planSpecs ?? PLAN_SPECS.slice(0, options.planCount ?? 3)
+  ).map((spec) => String(spec.id));
   const planGroups =
     options.planGroups === undefined
       ? {

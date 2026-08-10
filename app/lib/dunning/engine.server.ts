@@ -40,6 +40,7 @@ import {
 } from "~/lib/billing/mit-evidence.server";
 import {
   categorizeDeclineCode,
+  structuredUserErrorCode,
   type DeclineCodeInfo,
 } from "./decline-codes.server";
 import { selectNextRetryOffsetDays } from "./ladder.server";
@@ -235,6 +236,24 @@ function assertOurContract(
   return false;
 }
 
+/**
+ * The 3DS resolution already recorded in an attempt's mitEvidence blob, or
+ * null. Defensive over shape (legacy/imported attempts carry null or
+ * malformed blobs) — the success path uses it to fold SUCCEEDED exactly once
+ * instead of restamping resolvedAt on every settlement redrive.
+ */
+function threeDsResolution(evidence: Prisma.JsonValue | null): string | null {
+  if (evidence == null || typeof evidence !== "object" || Array.isArray(evidence)) {
+    return null;
+  }
+  const threeDS = (evidence as Record<string, unknown>).threeDS;
+  if (threeDS == null || typeof threeDS !== "object" || Array.isArray(threeDS)) {
+    return null;
+  }
+  const resolution = (threeDS as Record<string, unknown>).resolution;
+  return typeof resolution === "string" ? resolution : null;
+}
+
 function findOpenCase(contractId: string): Promise<DunningCase | null> {
   return prisma.dunningCase.findFirst({
     where: { contractId, state: { in: OPEN_CASE_STATES } },
@@ -356,6 +375,13 @@ async function ensureOpenCase(
   // invocation (or another failing attempt of this contract) opened the case
   // between our find and our create — reuse it instead of duplicating the
   // ladder, the failure counter and the customer's "payment failed" emails.
+  // The money at stake, frozen at case-open (an estimate, never rewritten —
+  // recoveredCents later holds the actual): failed attempts carry no
+  // amountCents (Shopify only prices an attempt on success), and once the
+  // case resolves the contract's lines may have changed, so this is the only
+  // moment the at-risk amount is knowable. Priced from the contract's lines
+  // + delivery, hence the contract's own currency.
+  const amountAtRiskCents = estimateContractAmountCents(attempt.contract);
   let kase: DunningCase;
   try {
     kase = await prisma.dunningCase.create({
@@ -364,6 +390,15 @@ async function ensureOpenCase(
         triggerAttemptId: attempt.id,
         declineCode: attempt.errorCode ?? null,
         declineCategory,
+        amountAtRiskCents,
+        amountAtRiskCurrencyCode:
+          amountAtRiskCents != null ? attempt.contract.currencyCode : null,
+        // The instrument on file when the trouble started. Recovery
+        // analytics compare it with the method at resolution, and the
+        // backup-card revert reads it as the durable copy of the original
+        // id — the dunning.backup_used event payload alone rides logEvent's
+        // never-throw contract, i.e. a lossy channel.
+        originalPaymentMethodId: attempt.contract.paymentMethodId,
       },
     });
   } catch (err) {
@@ -387,6 +422,8 @@ async function ensureOpenCase(
       attemptNumber: attempt.attemptNumber,
       declineCode: attempt.errorCode ?? null,
       declineCategory,
+      amountAtRiskCents: kase.amountAtRiskCents,
+      currencyCode: kase.amountAtRiskCurrencyCode,
     },
   });
   return kase;
@@ -591,6 +628,11 @@ export async function onBillingAttemptFailed(
         attemptId: attempt.id,
         cycleIndex: attempt.cycleIndex,
         attemptNumber: attempt.attemptNumber,
+        // outcome/superseded discriminate the overloaded event type: this is
+        // a REAL decline, but for a cycle that already PAID — event-derived
+        // failure features must be able to skip it (the webhook handler
+        // already logged the raw failure for the attempt itself).
+        outcome: "FAILED",
         superseded: true,
         reason: "cycle_already_succeeded",
       },
@@ -600,26 +642,36 @@ export async function onBillingAttemptFailed(
 
   const kase = await ensureOpenCase(attempt, info.category, "WEBHOOK");
 
-  await prisma.subscriptionContract.update({
-    where: { id: contract.id },
-    data: { consecutiveFailures: { increment: 1 } },
-  });
-
   if (attempt.attemptNumber > 1) {
-    await logEvent({
-      ...eventBase(contract),
-      type: "dunning.retry_failed",
-      source: "WEBHOOK",
-      payload: {
-        dunningCaseId: kase.id,
-        attemptId: attempt.id,
-        cycleIndex: attempt.cycleIndex,
-        attemptNumber: attempt.attemptNumber,
-        declineCode: attempt.errorCode ?? null,
-        declineCategory: info.category,
-        usedBackupPayment: attempt.usedBackupPayment,
+    // attemptId-keyed dedupe, the mirror of retry_succeeded's: the engine is
+    // deliberately re-driven after a crash (webhook redelivery / settlement
+    // redrive once the lease expires) and the event log is immutable —
+    // without the check every re-drive would append another retry_failed for
+    // the same attempt and permanently skew event-derived retry features.
+    const alreadyLogged = await prisma.subscriberEvent.findFirst({
+      where: {
+        contractId: contract.id,
+        type: "dunning.retry_failed",
+        payload: { path: ["attemptId"], equals: attempt.id },
       },
+      select: { id: true },
     });
+    if (!alreadyLogged) {
+      await logEvent({
+        ...eventBase(contract),
+        type: "dunning.retry_failed",
+        source: "WEBHOOK",
+        payload: {
+          dunningCaseId: kase.id,
+          attemptId: attempt.id,
+          cycleIndex: attempt.cycleIndex,
+          attemptNumber: attempt.attemptNumber,
+          declineCode: attempt.errorCode ?? null,
+          declineCategory: info.category,
+          usedBackupPayment: attempt.usedBackupPayment,
+        },
+      });
+    }
   }
 
   if (info.category === "SOFT") {
@@ -630,10 +682,25 @@ export async function onBillingAttemptFailed(
     await handleHardFailure(attempt, kase, info, now);
   }
 
-  // Processing-complete marker — written last (see JSDoc).
-  await prisma.billingAttempt.update({
-    where: { id: attempt.id },
-    data: { declineCategory: info.category },
+  // Processing-complete marker — written last (see JSDoc) — with the failure
+  // counter committing in the SAME transaction, gated on the marker still
+  // being null. Every step above is re-drivable after a crash, but only the
+  // run that actually stamps declineCategory moves consecutiveFailures: the
+  // entry lease closed the CONCURRENT double-increment (see schema.prisma on
+  // dunningClaimedAt); this closes the crash-redrive variant, where an
+  // unguarded increment ahead of the marker counted the same failure twice
+  // whenever the engine died between the two writes.
+  await prisma.$transaction(async (tx) => {
+    const marked = await tx.billingAttempt.updateMany({
+      where: { id: attempt.id, declineCategory: null },
+      data: { declineCategory: info.category },
+    });
+    if (marked.count === 1) {
+      await tx.subscriptionContract.update({
+        where: { id: contract.id },
+        data: { consecutiveFailures: { increment: 1 } },
+      });
+    }
   });
 }
 
@@ -714,6 +781,19 @@ async function handleSoftFailure(
       })) > 0;
     if (!backupTried) {
       try {
+        // The id being replaced must survive somewhere durable BEFORE the
+        // switch: both contract pointers are equal afterwards ("on backup"),
+        // so the case column is what the revert reads. Cases opened before
+        // the column existed (null) get it stamped here with the precise
+        // pre-switch instrument; newer cases already carry their case-open
+        // snapshot from ensureOpenCase.
+        if (kase.originalPaymentMethodId == null && contract.paymentMethodId) {
+          await prisma.dunningCase.update({
+            where: { id: kase.id },
+            data: { originalPaymentMethodId: contract.paymentMethodId },
+          });
+          kase.originalPaymentMethodId = contract.paymentMethodId;
+        }
         await changePaymentMethodToBackup(contract);
         viaBackup = true;
         await logEvent({
@@ -788,11 +868,15 @@ async function handleSoftFailure(
 
 /**
  * Restore the original payment method after the backup card ALSO failed. The
- * original id comes from the case's dunning.backup_used event
- * (previousPaymentMethodId) — the switch keeps both pointers equal
- * (paymentMethodId = backupPaymentMethodId marks "on backup"), so the event
- * payload is the only place the original id survives. Best-effort: a failure
- * here leaves the ladder on the backup card, which is the old behavior.
+ * switch keeps both pointers equal (paymentMethodId = backupPaymentMethodId
+ * marks "on backup"), so the original id must come from elsewhere: the case's
+ * originalPaymentMethodId column first (stamped at case-open and refreshed at
+ * switch time for pre-column cases — a real column, durable by construction),
+ * then the dunning.backup_used event payload for legacy cases predating the
+ * column. The event alone used to be the ONLY copy, and it rides logEvent's
+ * never-throw contract — one swallowed insert stranded every remaining ladder
+ * rung on the dead backup card. Best-effort: a failure here leaves the ladder
+ * on the backup card, which is the old behavior.
  */
 async function revertToOriginalPaymentMethod(
   contract: ContractWithShop,
@@ -803,20 +887,26 @@ async function revertToOriginalPaymentMethod(
     if (contract.paymentMethodId !== contract.backupPaymentMethodId) {
       return; // not on the backup — nothing to revert
     }
-    const switchEvent = await prisma.subscriberEvent.findFirst({
-      where: {
-        contractId: contract.id,
-        type: "dunning.backup_used",
-        createdAt: { gte: kase.openedAt },
-      },
-      orderBy: { createdAt: "desc" },
-      select: { payload: true },
-    });
-    const payload = (switchEvent?.payload ?? {}) as Record<string, unknown>;
-    const originalId =
-      typeof payload.previousPaymentMethodId === "string"
-        ? payload.previousPaymentMethodId
+    let originalId =
+      kase.originalPaymentMethodId !== contract.paymentMethodId
+        ? kase.originalPaymentMethodId
         : null;
+    if (!originalId) {
+      const switchEvent = await prisma.subscriberEvent.findFirst({
+        where: {
+          contractId: contract.id,
+          type: "dunning.backup_used",
+          createdAt: { gte: kase.openedAt },
+        },
+        orderBy: { createdAt: "desc" },
+        select: { payload: true },
+      });
+      const payload = (switchEvent?.payload ?? {}) as Record<string, unknown>;
+      originalId =
+        typeof payload.previousPaymentMethodId === "string"
+          ? payload.previousPaymentMethodId
+          : null;
+    }
     if (!originalId || originalId === contract.paymentMethodId) return;
 
     const admin = await adminClientForShop(contract.shop.domain);
@@ -940,6 +1030,54 @@ async function sendCaseNotificationOnce(
 }
 
 /**
+ * Commit the case-side bookkeeping of a webhook-path notification.
+ *
+ * ladderCursor is the notification-ladder RUNG CURSOR (migration 0016) and
+ * emailsSent is a TRUE sent-count. The two used to be one column: emailsSent
+ * doubled as the cursor via Math.max(1, …) writes, which silently dropped
+ * every challenge email beyond the first from the count while the
+ * dunning.exhausted payload and the failed-payments queue presented it as
+ * "emails sent". Pre-0016 cases carry ladderCursor null: the cursor READ
+ * falls back to emailsSent (its historical meaning) and the first write here
+ * initializes the column.
+ *
+ * Every webhook-path notice consumes rung 0 — the day-0 "payment failed"
+ * slot — so the sweep ladder continues from rung 1, exactly the old
+ * Math.max behavior. Counting is exactly-once via an optimistic pin on
+ * (ladderCursor, emailsSent) as read:
+ *  - SENT always counts (a fresh email really went out — including a second
+ *    challenge email later in the case, the send the old write dropped);
+ *  - DUPLICATE with rung 0 unconsumed is the crash-replay whose counter
+ *    increment died with the cursor write — counted now;
+ *  - DUPLICATE after the cursor moved was already counted by whichever path
+ *    sent it, and a concurrent writer that advanced the pin first turns
+ *    this write into a no-op instead of a double count;
+ *  - SUPPRESSED consumes the rung without counting (nothing was sent).
+ * NotificationLog remains the ground truth a drifted counter can be audited
+ * against.
+ */
+async function commitCaseNotificationCursor(
+  kase: DunningCase,
+  status: "SENT" | "SUPPRESSED" | "DUPLICATE",
+  now: Date,
+): Promise<void> {
+  const cursor = kase.ladderCursor ?? kase.emailsSent;
+  const counted = status === "SENT" || (status === "DUPLICATE" && cursor === 0);
+  await prisma.dunningCase.updateMany({
+    where: {
+      id: kase.id,
+      ladderCursor: kase.ladderCursor,
+      emailsSent: kase.emailsSent,
+    },
+    data: {
+      ladderCursor: Math.max(1, cursor),
+      ...(counted ? { emailsSent: { increment: 1 } } : {}),
+      lastNotifiedAt: now,
+    },
+  });
+}
+
+/**
  * HARD: no automatic retry can succeed. Park the case on the customer
  * (AWAITING_CUSTOMER) and — when there is something they can actually fix —
  * notify immediately with a one-tap update-card link. Manual-review declines
@@ -995,10 +1133,7 @@ async function handleHardFailure(
     },
   );
   if (status !== "FAILED") {
-    await prisma.dunningCase.update({
-      where: { id: kase.id },
-      data: { emailsSent: Math.max(1, kase.emailsSent), lastNotifiedAt: now },
-    });
+    await commitCaseNotificationCursor(kase, status, now);
   }
 }
 
@@ -1042,10 +1177,7 @@ async function handleAuthRequiredFailure(
     },
   );
   if (status !== "FAILED") {
-    await prisma.dunningCase.update({
-      where: { id: kase.id },
-      data: { emailsSent: Math.max(1, kase.emailsSent), lastNotifiedAt: now },
-    });
+    await commitCaseNotificationCursor(kase, status, now);
   }
   await logEvent({
     ...eventBase(contract),
@@ -1183,10 +1315,10 @@ export async function onBillingAttemptChallenged(
     },
   );
   if (status !== "FAILED") {
-    await prisma.dunningCase.update({
-      where: { id: kase.id },
-      data: { emailsSent: Math.max(1, kase.emailsSent), lastNotifiedAt: now },
-    });
+    // Attempt-keyed dedupe means a SECOND challenge later in the case sends
+    // a real fresh email — the count-every-SENT rule in the commit helper is
+    // what finally counts it.
+    await commitCaseNotificationCursor(kase, status, now);
   }
 
   await logEvent({
@@ -1238,26 +1370,41 @@ export async function onBillingAttemptSucceeded(
   if (!assertOurContract(contract, "attempt-succeeded")) return;
   const now = new Date();
 
+  // A CHALLENGED attempt succeeding means the customer passed 3DS — fold the
+  // outcome into the stored evidence blob REGARDLESS of the attempt's current
+  // status: every live call path reaches this hook only AFTER a claim
+  // transaction already stamped SUCCESS (finishSuccessSettlement runs
+  // post-claim, and neither claim writer touches mitEvidence), so a fold
+  // gated on status !== "SUCCESS" would never run and every passed challenge
+  // stayed frozen at PENDING_CUSTOMER_ACTION — breaking the mit-evidence
+  // contract ("the challenge/resolution path folds the 3DS outcome back into
+  // it") on exactly the charges that DID authenticate. An already-SUCCEEDED
+  // resolution is left untouched so settlement redrives never restamp
+  // resolvedAt; a recorded FAILED is overwritten — the settled SUCCESS is
+  // Shopify's final answer for the attempt.
+  const wasChallenged =
+    attempt.status === "CHALLENGED" || hasThreeDsEvidence(attempt.mitEvidence);
+  const foldedEvidence =
+    wasChallenged && threeDsResolution(attempt.mitEvidence) !== "SUCCEEDED"
+      ? withThreeDsOutcome(attempt.mitEvidence, {
+          challenged: true,
+          resolution: "SUCCEEDED",
+          resolvedAt: now.toISOString(),
+        })
+      : null;
   if (attempt.status !== "SUCCESS") {
-    // A CHALLENGED attempt succeeding means the customer passed 3DS — fold
-    // the outcome into the stored evidence blob.
-    const wasChallenged =
-      attempt.status === "CHALLENGED" || hasThreeDsEvidence(attempt.mitEvidence);
     await prisma.billingAttempt.update({
       where: { id: attempt.id },
       data: {
         status: "SUCCESS",
         completedAt: attempt.completedAt ?? now,
-        ...(wasChallenged
-          ? {
-              mitEvidence: withThreeDsOutcome(attempt.mitEvidence, {
-                challenged: true,
-                resolution: "SUCCEEDED",
-                resolvedAt: now.toISOString(),
-              }),
-            }
-          : {}),
+        ...(foldedEvidence ? { mitEvidence: foldedEvidence } : {}),
       },
+    });
+  } else if (foldedEvidence) {
+    await prisma.billingAttempt.update({
+      where: { id: attempt.id },
+      data: { mitEvidence: foldedEvidence },
     });
   }
 
@@ -1353,6 +1500,7 @@ export async function onBillingAttemptSucceeded(
         resolution,
         recoveredAttemptId: attempt.id,
         recoveredCents: attempt.amountCents,
+        currencyCode: attempt.currencyCode ?? contract.currencyCode,
         cycleIndex: attempt.cycleIndex,
         attemptNumber: attempt.attemptNumber,
         usedBackupPayment: attempt.usedBackupPayment,
@@ -1520,8 +1668,16 @@ export async function exhaustCase(
       declineCode: kase.declineCode,
       declineCategory: kase.declineCategory,
       ladderStep: kase.ladderStep,
+      // emailsSent is the TRUE sent-count and ladderCursor the notification
+      // rung position (they used to be one conflated column — see
+      // commitCaseNotificationCursor). ladderCursor null = pre-0016 case
+      // whose emailsSent still carries the old cursor meaning.
       emailsSent: kase.emailsSent,
+      ladderCursor: kase.ladderCursor,
       smsSent: kase.smsSent,
+      // The money this exhaustion walks away from (case-open estimate).
+      amountAtRiskCents: kase.amountAtRiskCents,
+      currencyCode: kase.amountAtRiskCurrencyCode,
       openedAt: kase.openedAt.toISOString(),
       daysOpen: Math.floor((now.getTime() - kase.openedAt.getTime()) / DAY_MS),
     },
@@ -1626,6 +1782,23 @@ export async function runDunningSweep(
         (now.getTime() - kase.openedAt.getTime()) / DAY_MS,
       );
       if (daysOpen < settings.cancelAfterFailedDays) continue;
+      if (kase.state === "AWAITING_3DS") {
+        // A 3DS outcome only ever arrives by webhook (the CONFIRM_3DS magic
+        // link just redirects to the bank), so a lost SUCCESS webhook would
+        // leave this case to time out here — failing or cancelling a
+        // contract whose charge actually went through, with the paid cycle
+        // never recorded. One last Shopify re-check before the irreversible
+        // step: a resolved outcome re-enters the engine through the normal
+        // hooks (a success settles the attempt and closes the case as
+        // recovered; a failure reschedules or exhausts it with the REAL
+        // decline code), so either way this sweep pass no longer owns the
+        // case. Only an unresolved re-check falls through to the timeout.
+        const outcome = await recheckAwaiting3ds(kase);
+        if (outcome === "SUCCESS" || outcome === "FAILED") {
+          closed.add(kase.id);
+          continue;
+        }
+      }
       await exhaustCase(kase, kase.contract, "SCHEDULER");
       closed.add(kase.id);
       stats.exhausted += 1;
@@ -1651,9 +1824,13 @@ export async function runDunningSweep(
         (now.getTime() - kase.openedAt.getTime()) / DAY_MS,
       );
 
-      // Email rung N is due when daysSinceOpen >= emailLadderDays[N] and
-      // exactly N emails have gone out (emailsSent is the cursor).
-      const rung = kase.emailsSent;
+      // Email rung N is due when daysSinceOpen >= emailLadderDays[N] and the
+      // rung cursor sits at N. ladderCursor is that cursor (migration 0016);
+      // pre-0016 cases carry null and fall back to emailsSent, which WAS the
+      // cursor before it became a true sent-count — the advance below
+      // initializes the column. (Cursor/count split: see
+      // commitCaseNotificationCursor.)
+      const rung = kase.ladderCursor ?? kase.emailsSent;
       const dueDay = settings.emailLadderDays.at(rung);
       if (dueDay !== undefined && daysSinceOpen >= dueDay) {
         const status = await sendLadderNotification(
@@ -1667,9 +1844,24 @@ export async function runDunningSweep(
         if (status !== "FAILED") {
           // SENT advances; SUPPRESSED (channel off) also advances so a
           // disabled channel doesn't spam retries; FAILED retries next sweep.
-          await prisma.dunningCase.update({
-            where: { id: kase.id },
-            data: { emailsSent: rung + 1, lastNotifiedAt: now },
+          // The sent-count increments exactly-once via the same optimistic
+          // pin the webhook paths use: only the writer that moves the cursor
+          // off rung N counts rung N's email (a DUPLICATE here is the
+          // crash-replay whose count died with the cursor write; SUPPRESSED
+          // sent nothing).
+          await prisma.dunningCase.updateMany({
+            where: {
+              id: kase.id,
+              ladderCursor: kase.ladderCursor,
+              emailsSent: kase.emailsSent,
+            },
+            data: {
+              ladderCursor: rung + 1,
+              ...(status !== "SUPPRESSED"
+                ? { emailsSent: { increment: 1 } }
+                : {}),
+              lastNotifiedAt: now,
+            },
           });
         }
       }
@@ -1701,6 +1893,45 @@ export async function runDunningSweep(
   }
 
   return stats;
+}
+
+/**
+ * Pre-exhaustion Shopify re-check for an AWAITING_3DS case (sweep phase (c)):
+ * find the case's newest in-flight CHALLENGED attempt and resolve it through
+ * the billing module's status-guarded re-query lane. Returns what the
+ * re-check ESTABLISHED — "SUCCESS"/"FAILED" mean the attempt was settled and
+ * the corresponding engine hook has already run; null means nothing new
+ * (no challenged attempt left, Shopify had no outcome, or the re-check
+ * itself failed) and the caller's timeout stands. Contained: a re-check
+ * failure must never block the exhaust sweep.
+ */
+async function recheckAwaiting3ds(
+  kase: CaseWithContract,
+): Promise<"SUCCESS" | "FAILED" | null> {
+  try {
+    const cycleIndex = await caseCycleIndex(kase);
+    const challenged = await prisma.billingAttempt.findFirst({
+      where: {
+        contractId: kase.contractId,
+        status: "CHALLENGED",
+        shopifyAttemptId: { not: null },
+        ...(cycleIndex != null ? { cycleIndex } : {}),
+      },
+      orderBy: [{ cycleIndex: "desc" }, { attemptNumber: "desc" }],
+      select: { id: true },
+    });
+    if (!challenged) return null;
+    // Lazy import: the billing module lazy-imports this engine everywhere —
+    // same seam, opposite direction, keeps the module graphs acyclic.
+    const { recheckAttemptOutcome } = await import(
+      "~/lib/billing/scheduler.server"
+    );
+    const outcome = await recheckAttemptOutcome(challenged.id);
+    return outcome === "SUCCESS" || outcome === "FAILED" ? outcome : null;
+  } catch (err) {
+    console.error("[dunning] pre-exhaustion 3DS re-check failed", kase.id, err);
+    return null;
+  }
 }
 
 /**
@@ -1831,14 +2062,27 @@ async function fireRetry(
           ],
         },
       });
+      const refusalCode =
+        err instanceof ShopifyUserError
+          ? structuredUserErrorCode(err.errors)
+          : null;
       const permanent =
         err instanceof ShopifyUserError ||
         priorCreateFailures + 1 >= CREATE_FAILURE_MAX;
 
       if (permanent) {
+        // The refusal reason must survive on the terminal row itself, not
+        // only in the event payload below: a bare EXPIRED row reads as an
+        // unknown outcome in every analytics surface, and
+        // categorizeDeclineCode(null) files it under UNKNOWN/SOFT.
         await prisma.billingAttempt.updateMany({
           where: { id: row.id, shopifyAttemptId: null, startedAt: null },
-          data: { status: "EXPIRED", completedAt: now },
+          data: {
+            status: "EXPIRED",
+            completedAt: now,
+            errorCode: refusalCode,
+            errorMessage: err instanceof Error ? err.message : String(err),
+          },
         });
         await prisma.dunningCase.update({
           where: { id: kase.id },
@@ -1853,6 +2097,7 @@ async function fireRetry(
             cycleIndex,
             reason: "attempt_create_failed_permanently",
             createFailures: priorCreateFailures + 1,
+            errorCode: refusalCode,
             error: err instanceof Error ? err.message : String(err),
           },
         });

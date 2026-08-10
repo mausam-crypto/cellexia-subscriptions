@@ -405,6 +405,9 @@ export const SNAPSHOT_EVENT_TYPES = [
   "dunning.exhausted",
   "contract.paused",
   "contract.resumed",
+  // Reactivation after a dunning-exhausted FAILED episode (dunning engine /
+  // win-back) — closes the historical dead span the exhausted event opened.
+  "contract.activated",
 ] as const;
 
 /**
@@ -422,6 +425,19 @@ export const SNAPSHOT_EVENT_TYPES = [
  *   post-T events only to subtract, never to signal.
  * - The label reads cancelledAt/failedAt strictly inside (T, T+60d];
  *   contracts already churned at T produce no snapshot at T.
+ * - INVOLUNTARY EPISODES SURVIVE RECOVERY: failedAt is a LIVE-state column —
+ *   every recovery path (dunning reactivation, admin resume, win-back)
+ *   nulls it, so a won-back contract's historical FAILED span would read
+ *   label 0 and even yield feature rows sampled while it was dead
+ *   (teaching the model that dunning-heavy profiles end well whenever the
+ *   win-back succeeded, and disagreeing forever with the rollup, which
+ *   counted the contract churnedInvoluntary on its failedAt day). The
+ *   episode is therefore reconstructed from the event log, which recovery
+ *   never rewrites: a dunning.exhausted event inside (T, T+60d] labels 1
+ *   exactly like a live failedAt, and grid times between an exhaustion and
+ *   the next recovery signal (billing.attempt_succeeded, contract.resumed,
+ *   contract.activated — all ≤ T) produce no snapshot, mirroring the
+ *   failedMs skip for the still-failed case.
  *
  * IMPORT BOUNDARY (the other load-bearing part): a contract produces
  * snapshots only at grid times ≥ its mirror row's createdAt — the moment this
@@ -516,6 +532,12 @@ export function buildRiskSnapshots(input: {
 
   for (const contract of contracts) {
     const events = byContract.get(contract.id) ?? [];
+    // Involuntary-churn episodes, reconstructed from the log because recovery
+    // clears failedAt (see doc block). Times, oldest first, of every
+    // dunning.exhausted this contract logged.
+    const exhaustedTimes = events
+      .filter((event) => event.type === "dunning.exhausted")
+      .map((event) => event.createdAt.getTime());
     const arrivalMs = (contract.firstChargeAt ?? contract.createdAt).getTime();
     // Observation starts when the mirror row was born (see IMPORT BOUNDARY in
     // the doc block): before that instant no event log and no counters exist,
@@ -539,6 +561,10 @@ export function buildRiskSnapshots(input: {
       let unskipsAfter = 0;
       let failureStreak = 0;
       let dunningOpen = false;
+      // Inside a historical FAILED span at T? Set by dunning.exhausted,
+      // cleared by any recovery signal — the event-log stand-in for the
+      // failedMs skip once recovery has nulled the column.
+      let involuntaryDead = false;
       let lastSkipMs: number | null = null;
       let lastContractLoginMs: number | null = null;
       for (const event of events) {
@@ -552,6 +578,7 @@ export function buildRiskSnapshots(input: {
         switch (event.type) {
           case "billing.attempt_succeeded":
             failureStreak = 0;
+            involuntaryDead = false;
             break;
           case "billing.attempt_failed":
             failureStreak += 1;
@@ -560,14 +587,21 @@ export function buildRiskSnapshots(input: {
             dunningOpen = true;
             break;
           case "dunning.recovered":
+            dunningOpen = false;
+            break;
           case "dunning.exhausted":
             dunningOpen = false;
+            involuntaryDead = true;
             break;
           case "contract.paused":
             paused = true;
             break;
           case "contract.resumed":
             paused = false;
+            involuntaryDead = false;
+            break;
+          case "contract.activated":
+            involuntaryDead = false;
             break;
           case "cycle.skipped":
             lastSkipMs = eMs;
@@ -580,6 +614,9 @@ export function buildRiskSnapshots(input: {
         }
       }
       if (paused) continue;
+      // Dead at T (exhausted, not yet recovered): no feature row — exactly as
+      // the failedMs skip above treats a contract whose failedAt is still set.
+      if (involuntaryDead) continue;
 
       const ordersAtT = Math.max(0, contract.ordersCount - successesAfter);
       const skipsAtT = Math.max(
@@ -606,11 +643,15 @@ export function buildRiskSnapshots(input: {
       const windowEnd = t + OUTCOME_WINDOW_DAYS * DAY_MS;
       const inWindow = (v: number | null): boolean =>
         v != null && v > t && v <= windowEnd;
-      // Voluntary churn = a cancel inside the window (consolidation merges are
-      // not churn — the customer stayed); involuntary churn = entered FAILED.
+      // Voluntary churn = a cancel inside the window (consolidation merges
+      // are not churn — the customer stayed); involuntary churn = entered
+      // FAILED, read from BOTH the live column and the dunning.exhausted
+      // events: recovery nulls failedAt, and without the event leg every
+      // won-back contract's churn window would silently read label 0.
       const voluntaryOrInvoluntary =
         (inWindow(cancelledMs) && contract.cancelReason !== "MERGED") ||
-        inWindow(failedMs);
+        inWindow(failedMs) ||
+        exhaustedTimes.some((exhaustedMs) => inWindow(exhaustedMs));
 
       snapshots.push({
         contractId: contract.id,

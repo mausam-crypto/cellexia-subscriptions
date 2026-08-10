@@ -3,9 +3,21 @@ import prisma from "~/db.server";
 import { logEvent, type EventSource } from "~/lib/events/log.server";
 import { getSetting } from "~/lib/settings/settings.server";
 import { clampGrantPercentForContract } from "~/lib/billing/stacking.server";
-import { addDaysTz, addWeeksTz } from "~/lib/dates.server";
+import { addDaysTz, addIntervalTz } from "~/lib/dates.server";
+import {
+  approxWeeks,
+  contractFrequency,
+  FREQUENCY_COUNT_LIMITS,
+  type Frequency,
+  type FrequencyUnit,
+  sameFrequency,
+} from "~/lib/frequency";
 import { adminClientForShop } from "~/shopify.server";
 import { gql, type AdminClient } from "~/lib/graphql/client.server";
+import {
+  getBillingCycleByDate,
+  getBillingCycleByIndex,
+} from "~/lib/graphql/billingCycles.server";
 import {
   applyDiscountGrant,
   cancelContract,
@@ -69,6 +81,12 @@ export type SaveOffer =
       kind: "FREQUENCY";
       currentWeeks: number;
       suggestedWeeks: number;
+      /** Exact cadence (v1.8.0) — absent on offers persisted before it; the
+       * week fields above stay populated as approximations either way. */
+      currentUnit?: FrequencyUnit;
+      currentCount?: number;
+      suggestedUnit?: FrequencyUnit;
+      suggestedCount?: number;
       estNextDate: string | null;
     }
   | { kind: "PAUSE"; months: number; resumeDate: string }
@@ -100,7 +118,9 @@ export interface SaveConfirmation {
   resumeAt?: string | null;
   /** SKIP / FREQUENCY */
   nextBillingDate?: string | null;
+  /** Week approximation of `frequency` — kept for existing consumers. */
   weeks?: number;
+  frequency?: Frequency;
   /** SWAP */
   swappedTitle?: string;
 }
@@ -511,30 +531,90 @@ export async function getSavesForReason(
     switch (kind) {
       case "SKIP": {
         if (!isActive || !contract.nextBillingDate) break;
+        // The card promises an exact date, so preview what accepting actually
+        // does: skipNextCycle prefers Shopify's own post-skip date, and for a
+        // MONTH cadence anchored on the 29th–31st a local calendar step
+        // clamps (Feb 28 + 1 month = Mar 28) where Shopify keeps the anchor
+        // (Mar 31). Ask Shopify for the cycle after the current one; the
+        // local unit advance stays as the contained fallback (a preview must
+        // never break the cancel flow).
+        const f = contractFrequency(contract);
+        let newNextDate = addIntervalTz(
+          contract.nextBillingDate,
+          f.unit,
+          f.count,
+          tz,
+        );
+        try {
+          const admin = await adminClientForShop(shop.domain);
+          const current = await getBillingCycleByDate(
+            admin,
+            contract.shopifyContractId,
+            contract.nextBillingDate,
+          );
+          const following = current
+            ? await getBillingCycleByIndex(
+                admin,
+                contract.shopifyContractId,
+                current.cycleIndex + 1,
+              )
+            : null;
+          if (following?.billingAttemptExpectedDate) {
+            newNextDate = following.billingAttemptExpectedDate;
+          }
+        } catch (err) {
+          console.error(
+            "[cancel] SKIP preview cycle read failed, using local estimate",
+            contract.id,
+            err,
+          );
+        }
         offers.push({
           kind: "SKIP",
           currentNextDate: contract.nextBillingDate.toISOString(),
-          newNextDate: addWeeksTz(
-            contract.nextBillingDate,
-            contract.intervalWeeks,
-            tz,
-          ).toISOString(),
+          newNextDate: newNextDate.toISOString(),
         });
         break;
       }
       case "FREQUENCY": {
         if (!isActive) break;
-        const suggestedWeeks =
-          contract.intervalWeeks + cancelFlow.frequencySuggestDeltaWeeks;
-        if (suggestedWeeks > 52) break;
+        // The settings knob stays "+weeks" and applies to WEEK cadences
+        // directly; DAY/MONTH cadences translate it (×7 days, ≈÷4 months,
+        // min 1) so the suggestion stays in the contract's own unit. Past
+        // the unit ceiling (WEEK keeps the 52 service ceiling) the card is
+        // dropped, as the 52-week cap always did.
+        const current = contractFrequency(contract);
+        const delta = cancelFlow.frequencySuggestDeltaWeeks;
+        const addedCount =
+          current.unit === "WEEK"
+            ? delta
+            : current.unit === "DAY"
+              ? delta * 7
+              : Math.max(1, Math.round(delta / 4));
+        const suggested: Frequency = {
+          unit: current.unit,
+          count: current.count + addedCount,
+        };
+        const ceiling =
+          current.unit === "WEEK"
+            ? 52
+            : FREQUENCY_COUNT_LIMITS[current.unit].max;
+        if (suggested.count > ceiling) break;
         offers.push({
           kind: "FREQUENCY",
-          currentWeeks: contract.intervalWeeks,
-          suggestedWeeks,
+          currentWeeks: approxWeeks(current.unit, current.count),
+          suggestedWeeks: approxWeeks(suggested.unit, suggested.count),
+          currentUnit: current.unit,
+          currentCount: current.count,
+          suggestedUnit: suggested.unit,
+          suggestedCount: suggested.count,
+          // Advanced by the ADDED slack only — the next order still arrives,
+          // just later; the full new cadence starts after it.
           estNextDate: contract.nextBillingDate
-            ? addWeeksTz(
+            ? addIntervalTz(
                 contract.nextBillingDate,
-                cancelFlow.frequencySuggestDeltaWeeks,
+                suggested.unit,
+                addedCount,
                 tz,
               ).toISOString()
             : null,
@@ -684,7 +764,16 @@ function offerSummary(offer: SaveOffer): Record<string, unknown> {
     case "FINAL_DISCOUNT":
       return { kind: offer.kind, percent: offer.percent, cycles: offer.cycles };
     case "FREQUENCY":
-      return { kind: offer.kind, suggestedWeeks: offer.suggestedWeeks };
+      return {
+        kind: offer.kind,
+        suggestedWeeks: offer.suggestedWeeks,
+        ...(offer.suggestedUnit != null
+          ? {
+              suggestedUnit: offer.suggestedUnit,
+              suggestedCount: offer.suggestedCount,
+            }
+          : {}),
+      };
     case "PAUSE":
       return { kind: offer.kind, months: offer.months };
     default:
@@ -744,7 +833,9 @@ export function hasSeenFinalOffer(session: CancelSession): boolean {
 // ── Accepting saves ──────────────────────────────────────────────────────────
 
 export interface AcceptSaveParams {
-  /** FREQUENCY: new interval in weeks. */
+  /** FREQUENCY: exact new cadence — preferred over `weeks`. */
+  frequency?: Frequency;
+  /** FREQUENCY: new interval in weeks (legacy form field, mapped to WEEK). */
   weeks?: number;
   /** PAUSE: months to pause. */
   months?: number;
@@ -863,11 +954,37 @@ export async function acceptSave(
       break;
     }
     case "FREQUENCY": {
-      const weeks = params.weeks;
-      if (!weeks || !Number.isInteger(weeks) || weeks < 1 || weeks > 52) {
-        throw new Error(`Invalid frequency weeks: ${String(params.weeks)}`);
+      // Exact cadence preferred; bare weeks (already-rendered pages in the
+      // transition window) map to WEEK.
+      const freq: Frequency | null =
+        params.frequency ??
+        (params.weeks != null ? { unit: "WEEK", count: params.weeks } : null);
+      // Offer-gating extends to the VALUE, not just the kind: the accepted
+      // cadence must equal the suggestion this session actually showed
+      // (savesShown is the record). Otherwise a crafted POST could pick any
+      // in-limits cadence — including 1-day billing — through a card that
+      // offered "slow down", which is neither the offer nor a choice the
+      // portal's own frequency action would allow.
+      const shownFrequency = savesShownArray(session).find(
+        (s): s is Extract<SaveOffer, { kind: "FREQUENCY" }> =>
+          s.kind === "FREQUENCY",
+      );
+      const offered: Frequency | null = shownFrequency
+        ? shownFrequency.suggestedUnit != null &&
+          shownFrequency.suggestedCount != null
+          ? {
+              unit: shownFrequency.suggestedUnit,
+              count: shownFrequency.suggestedCount,
+            }
+          : // Offers persisted before v1.8.0 recorded only the week count.
+            { unit: "WEEK", count: shownFrequency.suggestedWeeks }
+        : null;
+      if (!freq || !offered || !sameFrequency(freq, offered)) {
+        throw new Error(
+          `Frequency ${JSON.stringify(params.frequency ?? params.weeks ?? null)} was not the offered cadence in cancel session ${session.id}`,
+        );
       }
-      updated = await changeFrequency(shop.domain, contract.id, weeks, opts);
+      updated = await changeFrequency(shop.domain, contract.id, freq, opts);
       break;
     }
     case "PAUSE": {
@@ -970,6 +1087,15 @@ export async function acceptSave(
         reason: session.reason,
         saveKind,
         ...(params.weeks ? { weeks: params.weeks } : {}),
+        // Exact cadence rides alongside — `weeks` stays the approximation
+        // (Klaviyo flows key on it).
+        ...(params.frequency
+          ? {
+              weeks: approxWeeks(params.frequency.unit, params.frequency.count),
+              unit: params.frequency.unit,
+              count: params.frequency.count,
+            }
+          : {}),
         ...(params.months ? { months: params.months } : {}),
         ...(params.variantId ? { variantId: params.variantId } : {}),
       },
@@ -994,6 +1120,13 @@ function buildConfirmation(
     swappedTitle?: string;
   } = {},
 ): SaveConfirmation {
+  // Exact cadence for the confirmation page's localized phrase; `weeks`
+  // stays populated as its approximation for existing consumers.
+  const frequency =
+    extras.frequency ??
+    (extras.weeks != null
+      ? { unit: "WEEK" as const, count: extras.weeks }
+      : contractFrequency(contract));
   return {
     kind,
     contract,
@@ -1002,7 +1135,8 @@ function buildConfirmation(
     months: extras.months,
     resumeAt: contract.resumeAt?.toISOString() ?? null,
     nextBillingDate: contract.nextBillingDate?.toISOString() ?? null,
-    weeks: extras.weeks ?? contract.intervalWeeks,
+    weeks: approxWeeks(frequency.unit, frequency.count),
+    frequency,
     swappedTitle: extras.swappedTitle,
   };
 }
@@ -1264,9 +1398,14 @@ export async function completeCancel(
   // safe.
   const claimedHere = session.outcome == null;
   if (claimedHere) {
+    // The resolved reason rides the claim: the cancel-flow analytics read
+    // reasons from CancelSession rows, and a fallback reason that reached
+    // only the cancel.completed event left exactly the decided cancellers
+    // (re-entry sessions, deep links) with a null-reason row the loader's
+    // histogram drops. One write keeps row and event telling the same story.
     const claimed = await prisma.cancelSession.updateMany({
       where: { id: session.id, outcome: null },
-      data: { outcome: "CANCELLED", completedAt: new Date() },
+      data: { outcome: "CANCELLED", completedAt: new Date(), reason },
     });
     if (claimed.count === 0) {
       const settled = await prisma.cancelSession.findUniqueOrThrow({
@@ -1300,11 +1439,13 @@ export async function completeCancel(
     if (claimedHere) {
       // Revert the claim (only this call can have set it) so the session
       // stays open for a retry instead of recording a cancel that never
-      // reached Shopify.
+      // reached Shopify. The reason reverts to its pre-claim value too — a
+      // fallback written by the claim must not masquerade as customer-stated
+      // on a session that is open again.
       await prisma.cancelSession
         .update({
           where: { id: session.id },
-          data: { outcome: null, completedAt: null },
+          data: { outcome: null, completedAt: null, reason: session.reason },
         })
         .catch((revertErr) => {
           console.error(

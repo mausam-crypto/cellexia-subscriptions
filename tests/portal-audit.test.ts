@@ -61,7 +61,7 @@ const mocks = vi.hoisted(() => {
     otpCodeCreate: vi.fn(async (args: unknown): Promise<unknown> => args),
     otpCodeFindMany: vi.fn(async (): Promise<unknown[]> => []),
     otpCodeUpdateMany: vi.fn(async (): Promise<unknown> => ({ count: 0 })),
-    logEvent: vi.fn(async (): Promise<void> => {}),
+    logEvent: vi.fn(async (_e: unknown): Promise<void> => {}),
     getSetting: vi.fn(async (_shopId: string, key: string): Promise<unknown> => {
       if (key === "winback") {
         return {
@@ -177,7 +177,7 @@ vi.mock("~/lib/notifications/send.server", () => ({
 import { executeMagicAction } from "~/lib/magiclinks/handlers.server";
 import { exchangeLoginHandoff } from "~/lib/portal/session.server";
 import { isRtlLocale, portalPage } from "~/lib/portal/layout.server";
-import { requestOtp } from "~/lib/portal/otp.server";
+import { requestOtp, verifyOtp } from "~/lib/portal/otp.server";
 
 function payload(
   action: string,
@@ -391,6 +391,70 @@ describe("requestOtp anti-enumeration timing", () => {
   });
 });
 
+// ── OTP telemetry (data-collection audit) ────────────────────────────────────
+// Rate-limited requests and wrong-code attempts used to leave zero trace —
+// abuse patterns and login friction were unmeasurable. Both now log an
+// event, WITHOUT changing the anti-enumeration responses: same neutral
+// shapes, same timing floor, and never any code material.
+
+describe("requestOtp throttle telemetry", () => {
+  it("logs portal.otp_throttled while keeping the neutral response", async () => {
+    mocks.contractFindFirst.mockResolvedValueOnce(mocks.contract);
+    mocks.otpCodeCount.mockResolvedValueOnce(3); // at the otpRequestsPerHour cap
+
+    const result = await requestOtp("sub@example.com");
+
+    // Byte-identical outcome to every other requestOtp path.
+    expect(result.ok).toBe(true);
+    expect(mocks.otpCodeCreate).not.toHaveBeenCalled();
+    expect(mocks.sendNotification).not.toHaveBeenCalled();
+
+    const throttled = mocks.logEvent.mock.calls
+      .map((c) => c[0] as { type: string; payload: Record<string, unknown> })
+      .filter((e) => e.type === "portal.otp_throttled");
+    expect(throttled).toHaveLength(1);
+    expect(throttled[0].payload).toMatchObject({
+      recentRequests: 3,
+      limit: 3,
+    });
+  });
+});
+
+describe("verifyOtp wrong-code telemetry", () => {
+  it("logs portal.login_failed — email-keyed, never code material", async () => {
+    mocks.contractFindFirst.mockResolvedValueOnce(mocks.contract);
+    mocks.otpCodeFindMany.mockResolvedValueOnce([
+      { id: "otp_1", codeHash: "not-the-submitted-hash", attempts: 0 },
+    ]);
+
+    const result = await verifyOtp("sub@example.com", "123456");
+
+    expect(result).toEqual({ ok: false });
+    // The guessing budget still burns on every live code.
+    expect(mocks.otpCodeUpdateMany).toHaveBeenCalledTimes(1);
+
+    const failed = mocks.logEvent.mock.calls
+      .map((c) => c[0] as { type: string })
+      .filter((e) => e.type === "portal.login_failed");
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({
+      email: "sub@example.com",
+      payload: { reason: "code_mismatch", liveCodes: 1 },
+    });
+    // Neither the guessed code nor its hash enters the event stream.
+    expect(JSON.stringify(failed[0])).not.toContain("123456");
+  });
+
+  it("stays silent for unknown emails (no shop to log against, no enumeration surface)", async () => {
+    mocks.contractFindFirst.mockResolvedValueOnce(null);
+
+    const result = await verifyOtp("stranger@example.com", "123456");
+
+    expect(result).toEqual({ ok: false });
+    expect(mocks.logEvent).not.toHaveBeenCalled();
+  });
+});
+
 // ── 5. Static pins ───────────────────────────────────────────────────────────
 
 describe("static source pins", () => {
@@ -426,5 +490,22 @@ describe("static source pins", () => {
     expect(read("app/routes/proxy.subscription.$id.tsx")).toContain(
       'api(ctx, "reactivate")',
     );
+  });
+
+  it("the portal home logs a daily-throttled portal.visit (never for previews)", () => {
+    const source = read("app/routes/proxy._index.tsx");
+    expect(source).toContain('type: "portal.visit"');
+    // Throttle key: one event per session per shop-day.
+    expect(source).toContain('payload: { path: ["sessionId"]');
+    expect(source).toContain("if (!portalSession.isPreview) {");
+  });
+
+  it("the detail page logs deduped cycle.addon_offer_shown impressions", () => {
+    const source = read("app/routes/proxy.subscription.$id.tsx");
+    expect(source).toContain('type: "cycle.addon_offer_shown"');
+    // Once per (contract, upcoming order, variant) — the dedupe reads events
+    // for the orderNumber before logging, and previews/demo never count.
+    expect(source).toContain('payload: { path: ["orderNumber"]');
+    expect(source).toContain("!portalSession.isPreview && !contract.isDemo");
   });
 });

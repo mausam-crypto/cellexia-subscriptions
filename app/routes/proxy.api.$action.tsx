@@ -31,15 +31,21 @@ import {
   escapeHtml,
   localeFromRequest,
   portalPage,
-  setupGatePage,
+  closedPortalPage,
   withLocale,
 } from "~/lib/portal/layout.server";
 import {
   PORTAL_BASE_PATH,
   getPortalSession,
+  loginRedirectUrl,
   verifyCsrf,
 } from "~/lib/portal/session.server";
 import { frequencyOptionsForContract } from "~/lib/portal/catalog.server";
+import {
+  parseFrequencyToken,
+  sameFrequency,
+  type Frequency,
+} from "~/lib/frequency";
 import { OURS_ONLY } from "~/lib/ownership/ownership.server";
 
 /**
@@ -101,23 +107,25 @@ function backRedirect(
   locale: string,
   returnTo: string,
   toast: string,
+  preview: string | null,
   extra?: Record<string, string>,
 ) {
   const path = returnTo === "/" ? `${PORTAL_BASE_PATH}/` : `${PORTAL_BASE_PATH}${returnTo}`;
   const params = new URLSearchParams({ toast, ...(extra ?? {}) });
-  return redirect(withLocale(`${path}?${params.toString()}`, locale));
+  return redirect(withLocale(`${path}?${params.toString()}`, locale, preview));
 }
 
 function str(form: FormData, name: string): string {
   return String(form.get(name) ?? "");
 }
 
-function rateLimitedHtml(locale: string): string {
+function rateLimitedHtml(locale: string, preview: string | null): string {
   return portalPage({
     locale,
     title: t(locale, "portal.rate_limited.title"),
-    body: `<div class="cx-card"><p style="margin:0 0 8px">${escapeHtml(t(locale, "portal.rate_limited.body"))}</p><a class="cx-btn cx-btn--quiet cx-btn--small" href="${withLocale(`${PORTAL_BASE_PATH}/`, locale)}">${escapeHtml(t(locale, "portal.rate_limited.back"))}</a></div>`,
+    body: `<div class="cx-card"><p style="margin:0 0 8px">${escapeHtml(t(locale, "portal.rate_limited.body"))}</p><a class="cx-btn cx-btn--quiet cx-btn--small" href="${withLocale(`${PORTAL_BASE_PATH}/`, locale, preview)}">${escapeHtml(t(locale, "portal.rate_limited.back"))}</a></div>`,
     activeNav: "subscriptions",
+    previewToken: preview,
   });
 }
 
@@ -134,7 +142,10 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   }
 
   const locale = localeFromRequest(request);
-  const loginUrl = withLocale(`${PORTAL_BASE_PATH}/login`, locale);
+  // loginRedirectUrl (not a bare /login) so a POST whose cx_pp expired
+  // mid-preview carries the token to the login page, which then names the
+  // expired preview instead of showing the generic gate.
+  const loginUrl = loginRedirectUrl(request);
 
   const portalSession = await getPortalSession(request);
   if (!portalSession) throw redirect(loginUrl);
@@ -148,17 +159,21 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   if (portalSession.shopId !== shop.id) throw redirect(loginUrl);
 
   // ── Preview sessions are read-only: nothing executes, no Shopify calls ─────
+  // The redirect carries the cx_pp token (backRedirect's preview parameter):
+  // the proxy strips cookies, so dropping it here would sign the admin out of
+  // their own preview on the very first blocked click.
   if (portalSession.isPreview) {
     return backRedirect(
       locale,
       sanitizeReturnTo(form.get("return_to")),
       "preview_blocked",
+      portalSession.previewToken,
     );
   }
 
   // ── Launch gate: a closed portal takes no mutations (stale sessions) ───────
   if (await isSetupMode(shop.id)) {
-    return liquid(setupGatePage(locale), {
+    return liquid(closedPortalPage(request, locale), {
       headers: { "X-Robots-Tag": "noindex" },
     });
   }
@@ -192,12 +207,12 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   });
   // Strictly greater: the count includes the attempt just inserted.
   if (recentAttempts > portalSettings.mutationsPerHour) {
-    return liquid(rateLimitedHtml(locale), 429);
+    return liquid(rateLimitedHtml(locale, portalSession.previewToken), 429);
   }
 
   const returnTo = sanitizeReturnTo(form.get("return_to"));
   const back = (toast: string, extra?: Record<string, string>) =>
-    backRedirect(locale, returnTo, toast, extra);
+    backRedirect(locale, returnTo, toast, portalSession.previewToken, extra);
 
   // Bounds come from settings so the form (subscription page) and this
   // validator share ONE source and cannot silently drift apart.
@@ -217,7 +232,9 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     },
     include: { lines: true },
   });
-  if (!contract) return backRedirect(locale, "/", "not_found");
+  if (!contract) {
+    return backRedirect(locale, "/", "not_found", portalSession.previewToken);
+  }
 
   const actionName = params.action ?? "";
   const shopDomain = session.shop;
@@ -304,14 +321,29 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       }
 
       case "frequency": {
-        const weeks = frequencyWeeksSchema.safeParse(form.get("weeks"));
-        if (!weeks.success) return back("error");
+        // v1.8.0 forms post a "frequency" token ("2:WEEK", "10:DAY"); the
+        // bare "weeks" int keeps in-flight pages rendered before the deploy
+        // working. A present-but-malformed token is an error, never a
+        // fallback.
+        const token = str(form, "frequency");
+        const legacyWeeks = frequencyWeeksSchema.safeParse(form.get("weeks"));
+        const freq: Frequency | null = token
+          ? parseFrequencyToken(token)
+          : legacyWeeks.success
+            ? { unit: "WEEK", count: legacyWeeks.data }
+            : null;
+        if (!freq) return back("error");
         const { options, allowChoice } = await frequencyOptionsForContract(
           shop.id,
           contract,
         );
-        if (!allowChoice || !options.includes(weeks.data)) return back("error");
-        await changeFrequency(shopDomain, contract.id, weeks.data, opts);
+        // Exact {unit, count} membership — a cadence outside the offered set
+        // (stale form, tampering) is rejected, as is any post when the
+        // config disallows choice.
+        if (!allowChoice || !options.some((o) => sameFrequency(o, freq))) {
+          return back("error");
+        }
+        await changeFrequency(shopDomain, contract.id, freq, opts);
         return back("frequency_changed");
       }
 

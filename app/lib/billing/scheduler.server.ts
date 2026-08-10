@@ -1,14 +1,16 @@
-import type { BillingAttempt, SubscriptionContract } from "@prisma/client";
+import type { BillingAttempt, Prisma, SubscriptionContract } from "@prisma/client";
 import prisma from "~/db.server";
 import { adminClientForShop } from "~/shopify.server";
 import { getPrimaryShop } from "~/lib/shop/install.server";
 import { logEvent } from "~/lib/events/log.server";
+import { getSetting } from "~/lib/settings/settings.server";
 import {
   addDaysTz,
-  addWeeksTz,
+  addIntervalTz,
   isDueNow,
   shopDayStartUtc,
 } from "~/lib/dates.server";
+import { contractFrequency } from "~/lib/frequency";
 import {
   gql,
   ShopifyUserError,
@@ -19,13 +21,23 @@ import {
   getBillingCycleByDate,
 } from "~/lib/graphql/billingCycles.server";
 import { getOrderSummary } from "~/lib/graphql/orders.server";
+import { fetchNextBillingDate } from "~/lib/contracts/shared.server";
+import {
+  computeChargeCostSnapshot,
+  loadCostContext,
+  type ChargeCostSnapshot,
+} from "~/lib/analytics/costs.server";
+import { structuredUserErrorCode } from "~/lib/dunning/decline-codes.server";
 import {
   applyGrantToCycle,
   getActiveDiscountForCycle,
   type ContractWithLines,
 } from "./discounts.server";
 import { buildMitEvidence, withThreeDsOutcome } from "./mit-evidence.server";
-import { OURS_ONLY } from "~/lib/ownership/ownership.server";
+import {
+  OURS_ONLY,
+  isBillableOwnership,
+} from "~/lib/ownership/ownership.server";
 
 /**
  * Billing scheduler — the heart of the app.
@@ -50,10 +62,11 @@ import { OURS_ONLY } from "~/lib/ownership/ownership.server";
  * companion `sweepStalePendingAttempts` resolves rows whose webhook never came.
  *
  * PREPAID contracts are charged exactly the same way: their selling plan's
- * billing interval already spans N deliveries (e.g. bill every 24 weeks,
- * deliver every 8), so one billing attempt pays for the whole prepaid block
- * and Shopify's delivery policy splits it into N scheduled fulfillment orders.
- * Nothing special to do here beyond charging on the billing cadence.
+ * billing interval already spans N deliveries (the billing interval is N
+ * delivery intervals long, whatever unit the plan uses), so one billing
+ * attempt pays for the whole prepaid block and Shopify's delivery policy
+ * splits it into N scheduled fulfillment orders. Nothing special to do here
+ * beyond charging on the billing cadence.
  */
 
 const BATCH_SIZE = 25;
@@ -64,6 +77,16 @@ const STALE_EXPIRE_HOURS = 24;
  * recompute window — see the same constant in webhooks/handlers.server.ts.
  */
 const MAX_CHARGE_BACKDATE_MS = 86_400_000;
+/**
+ * How long past settings.dunning.cancelAfterFailedDays a CHALLENGED attempt
+ * keeps its Shopify re-query lane in the stale sweep. The dunning case
+ * chasing the challenge exhausts on that setting (measured from case open, ≈
+ * attempt start for the trigger scenario) — beyond it plus this grace, a
+ * still-CHALLENGED row is a closed case's residue, not worth a Shopify round
+ * trip every sweep. Operational bound, not policy: the policy window itself
+ * comes from the settings registry.
+ */
+const CHALLENGED_RECHECK_GRACE_DAYS = 7;
 
 // ── Cross-module seams (lazy imports so module graphs stay acyclic) ──────────
 
@@ -228,13 +251,22 @@ async function processDueContract(
 
   if (cycle.skipped || cycle.status === "BILLED") {
     // Customer skipped this cycle (or a missed webhook left the mirror behind
-    // an already-billed cycle): advance the local pointer and let webhooks /
-    // sync correct any drift.
-    const newNext = addWeeksTz(
-      nextBillingDate,
-      Math.max(1, contract.intervalWeeks),
-      shop.tz,
+    // an already-billed cycle): advance the local pointer. Shopify's own
+    // nextBillingDate is preferred — for MONTH cadences the local calendar
+    // step clamps month-ends (Feb 28 + 1 month = Mar 28) while Shopify keeps
+    // the contract's anchor (Mar 31), and a clamped pointer would resolve the
+    // wrong cycle on the next sweep. The local unit step is the fallback when
+    // the read fails or has not advanced past the stale pointer.
+    const freq = contractFrequency(contract);
+    const shopifyNext = await fetchNextBillingDate(
+      admin,
+      contract.shopifyContractId,
+      null,
     );
+    const newNext =
+      shopifyNext && shopifyNext.getTime() > nextBillingDate.getTime()
+        ? shopifyNext
+        : addIntervalTz(nextBillingDate, freq.unit, freq.count, shop.tz);
     await prisma.subscriptionContract.update({
       where: { id: contract.id },
       data: { nextBillingDate: newNext },
@@ -439,11 +471,8 @@ async function processDueContract(
     // Optimistically advance the local schedule pointer so the next sweep
     // doesn't re-process this contract; the CONTRACTS_UPDATE / billing-attempt
     // webhooks correct it whenever Shopify lands on a different date.
-    const newNext = addWeeksTz(
-      scheduledFor,
-      Math.max(1, contract.intervalWeeks),
-      shop.tz,
-    );
+    const freq = contractFrequency(contract);
+    const newNext = addIntervalTz(scheduledFor, freq.unit, freq.count, shop.tz);
     await prisma.subscriptionContract.update({
       where: { id: contract.id },
       data: { nextBillingDate: newNext },
@@ -496,11 +525,18 @@ async function processDueContract(
     //    the cycle is unbilled and dunning may still recover it — and the
     //    FAILED row we write below is exactly what the cycle-history guard
     //    (b2) keys on, so the next tick can never re-attempt this cycle.
+    //    The structured refusal code is persisted alongside the message:
+    //    errorCode null reads as an unknown SOFT decline downstream
+    //    (categorizeDeclineCode), scheduling a retry ladder for refusals a
+    //    retry can never fix. Read structurally — non-null once the GraphQL
+    //    layer's userErrors selection carries `code`.
+    const refusalCode = structuredUserErrorCode(err.errors);
     await prisma.billingAttempt.update({
       where: { id: attempt.id },
       data: {
         status: "FAILED",
         completedAt: new Date(),
+        errorCode: refusalCode,
         errorMessage: message,
       },
     });
@@ -516,8 +552,14 @@ async function processDueContract(
         attemptId: attempt.id,
         cycleIndex,
         attemptNumber,
+        errorCode: refusalCode,
         error: message,
         stage: "attempt_create",
+        // outcome/superseded discriminate the overloaded event type for
+        // event-derived features: a create refusal is a REAL failure of the
+        // cycle's charge, unlike the stale sweep's EXPIRED_UNKNOWN rows.
+        outcome: "FAILED",
+        superseded: false,
       },
     });
 
@@ -574,10 +616,18 @@ export interface StaleSweepStats {
 type StaleAttempt = BillingAttempt & { contract: SubscriptionContract };
 
 /**
- * Resolve local attempts stuck PENDING because their outcome webhook never
- * arrived (delivery failure, downtime during the delivery window). Re-queries
- * Shopify for the truth; anything unresolvable after 24h is marked EXPIRED
- * and raises an admin alert.
+ * Resolve local attempts stuck in a non-terminal state because their outcome
+ * webhook never arrived (delivery failure, downtime during the delivery
+ * window). Re-queries Shopify for the truth. Two lanes:
+ *  - PENDING rows: anything unresolvable after 24h is marked EXPIRED and
+ *    raises an admin alert;
+ *  - CHALLENGED rows: the 3DS outcome is webhook-ONLY (the CONFIRM_3DS magic
+ *    link just redirects to the bank), so a lost SUCCESS webhook would leave
+ *    a PAID charge permanently unrecorded while the dunning case times out
+ *    and fails/cancels the paying customer. They get the same re-query lane
+ *    within the window where the outcome still matters
+ *    (cancelAfterFailedDays + grace), and are never expired here — the
+ *    dunning sweep's timeout owns their case's lifetime.
  */
 export async function sweepStalePendingAttempts(
   olderThanHours = 2,
@@ -599,16 +649,49 @@ export async function sweepStalePendingAttempts(
 
   const now = new Date();
   const cutoff = new Date(now.getTime() - olderThanHours * 3_600_000);
+
+  // The CHALLENGED lane's floor: past cancelAfterFailedDays (+ grace) a
+  // still-CHALLENGED row is an exhausted case's residue and stops being worth
+  // a Shopify round trip every sweep. A settings failure downgrades to the
+  // PENDING-only sweep rather than aborting it.
+  let challengedFloor: Date | null = null;
+  try {
+    const dunning = await getSetting(shop.id, "dunning");
+    challengedFloor = new Date(
+      now.getTime() -
+        (dunning.cancelAfterFailedDays + CHALLENGED_RECHECK_GRACE_DAYS) *
+          86_400_000,
+    );
+  } catch (err) {
+    console.error("[billing] stale sweep: dunning settings unavailable", err);
+  }
+
+  const staleAge: Prisma.BillingAttemptWhereInput[] = [
+    { startedAt: { lte: cutoff } },
+    { startedAt: null, scheduledFor: { lte: cutoff } },
+  ];
   const stale = (await prisma.billingAttempt.findMany({
     where: {
-      status: "PENDING",
       // Another app's contracts can never have one of our attempts, but the
       // sweep resolves them against Shopify and can FAIL/EXPIRE them — keep it
       // strictly on our own book.
       contract: { shopId: shop.id, isDemo: false, ...OURS_ONLY },
       OR: [
-        { startedAt: { lte: cutoff } },
-        { startedAt: null, scheduledFor: { lte: cutoff } },
+        { status: "PENDING", OR: staleAge },
+        ...(challengedFloor
+          ? [
+              {
+                status: "CHALLENGED",
+                OR: [
+                  { startedAt: { lte: cutoff, gte: challengedFloor } },
+                  {
+                    startedAt: null,
+                    scheduledFor: { lte: cutoff, gte: challengedFloor },
+                  },
+                ],
+              } satisfies Prisma.BillingAttemptWhereInput,
+            ]
+          : []),
       ],
     },
     include: { contract: true },
@@ -698,12 +781,30 @@ async function resolveStaleAttempt(
     // recompute window would strand the charge in a closed rollup row that
     // is never recomputed.
     let chargedAt = now;
+    // The renewal order's money breakdown (discount/tax/shipping/subtotal +
+    // processedAt) rides the settlement onto the attempt row, so rollup and
+    // cohort math report net-of-tax revenue and real discount spend instead
+    // of estimating them — same capture the webhook settlement performs.
+    let orderBreakdown: {
+      discountCents: number;
+      taxCents: number;
+      shippingCents: number;
+      subtotalCents: number;
+      orderProcessedAt: Date | null;
+    } | null = null;
     if (admin) {
       try {
         const summary = await getOrderSummary(admin, info.order.id);
         amountCents = summary.totalCents;
         orderCurrency = summary.currencyCode;
         orderName = summary.name || orderName;
+        orderBreakdown = {
+          discountCents: summary.discountsCents,
+          taxCents: summary.taxCents,
+          shippingCents: summary.shippingCents,
+          subtotalCents: summary.subtotalCents,
+          orderProcessedAt: summary.processedAt,
+        };
         if (
           summary.createdAt != null &&
           now.getTime() - summary.createdAt.getTime() <= MAX_CHARGE_BACKDATE_MS
@@ -717,6 +818,39 @@ async function resolveStaleAttempt(
           err,
         );
       }
+    }
+
+    // The charge's cost basis, frozen at settlement (BillingAttempt.
+    // costSnapshot): rollup/cohorts PREFER the stored snapshot so
+    // gross-profit history stops being repriced by later cost-setting edits,
+    // and fall back to live resolution when it is absent. Strictly contained
+    // — a cost-model failure must never block recording a real charge.
+    let costSnapshot: ChargeCostSnapshot | null = null;
+    try {
+      const [costCtx, lines] = await Promise.all([
+        loadCostContext(shop.id),
+        prisma.contractLine.findMany({ where: { contractId: contract.id } }),
+      ]);
+      // Add-ons staged for OTHER cycles are excluded with the exact
+      // cycle-scope rule consumeCycleOnSuccess applies below — the same
+      // filter the webhook path's snapshot uses. Without it, a future-cycle
+      // add-on mirror still staged during the stale window would book its
+      // COGS into THIS charge's frozen basis and then book AGAIN when its
+      // own cycle settles.
+      const billedLines = lines.filter(
+        (l) =>
+          !l.isOneTimeAddon ||
+          l.addonCycleIndex == null ||
+          l.addonCycleIndex === attempt.cycleIndex,
+      );
+      costSnapshot = computeChargeCostSnapshot(costCtx, {
+        deliveryPriceCents: contract.deliveryPriceCents,
+        isPrepaid: contract.isPrepaid,
+        prepaidDeliveriesPerCharge: contract.prepaidDeliveriesPerCharge,
+        lines: billedLines,
+      });
+    } catch (err) {
+      console.error("[billing] stale sweep cost snapshot failed", attempt.id, err);
     }
 
     // The settlement machinery is SHARED with handleBillingAttemptSuccess:
@@ -750,6 +884,10 @@ async function resolveStaleAttempt(
                 currencyCode: orderCurrency ?? contract.currencyCode,
               }
             : {}),
+          ...(orderBreakdown ?? {}),
+          ...(costSnapshot
+            ? { costSnapshot: costSnapshot as unknown as Prisma.InputJsonObject }
+            : {}),
         },
       });
       if (claim.count === 0) return null;
@@ -771,7 +909,26 @@ async function resolveStaleAttempt(
         data: {
           ordersCount: { increment: 1 },
           lifetimeRevenueCents: { increment: amountCents ?? 0 },
+          // Renewals-only, mirroring lifetimeRevenueCents: origin (checkout)
+          // discount is booked on the contract at sync, never here.
+          ...(orderBreakdown
+            ? {
+                lifetimeDiscountCents: {
+                  increment: orderBreakdown.discountCents,
+                },
+              }
+            : {}),
           ...(contractRow.firstChargeAt ? {} : { firstChargeAt: chargedAt }),
+          // Prepaid delivery countdown re-arm — the sweep is a claim winner
+          // like the webhook path and must not hand-roll a subset of its
+          // bookkeeping: a successful prepaid charge pays for a fresh
+          // per-charge allotment (see the webhook claim's comment).
+          ...(contract.isPrepaid && contract.prepaidDeliveriesPerCharge != null
+            ? {
+                prepaidDeliveriesRemaining:
+                  contract.prepaidDeliveriesPerCharge,
+              }
+            : {}),
         },
       });
       return consumed;
@@ -891,8 +1048,12 @@ async function resolveStaleAttempt(
     // Claimed like the branches above: if the FAILED webhook settled the
     // attempt during the sweep's window, its handler already drove dunning —
     // a second unguarded write + hand-off here would only re-drive it.
+    // CHALLENGED claims too: a challenged attempt whose customer failed or
+    // abandoned 3DS lands here when the FAILURE webhook was lost — exactly
+    // what the FAILURE webhook handler itself would have settled — while a
+    // concurrently-settled SUCCESS still loses the claim.
     const claimed = await prisma.billingAttempt.updateMany({
-      where: { id: attempt.id, status: "PENDING" },
+      where: { id: attempt.id, status: { in: ["PENDING", "CHALLENGED"] } },
       data: {
         status: "FAILED",
         completedAt: now,
@@ -914,6 +1075,11 @@ async function resolveStaleAttempt(
         cycleIndex: attempt.cycleIndex,
         errorCode: info.errorCode,
         error: info.errorMessage,
+        // outcome/superseded discriminate the overloaded event type: this
+        // is a REAL decline Shopify reported, unlike the EXPIRED_UNKNOWN
+        // rows below whose charge outcome was never learned.
+        outcome: "FAILED",
+        superseded: false,
         resolvedBy: "stale_sweep",
       },
     });
@@ -930,6 +1096,15 @@ async function resolveStaleAttempt(
   }
 
   // ── Still unresolved: expire after 24h and alert, otherwise wait ───────────
+  // Never a CHALLENGED row: the customer may legitimately take days to
+  // complete the challenge (the CONFIRM_3DS link lives for 3), and its
+  // lifetime belongs to the dunning case's cancelAfterFailedDays timeout —
+  // which re-checks Shopify one last time before exhausting (runDunningSweep
+  // phase (c)). Expiring it here would stomp an in-flight authentication.
+  if (attempt.status === "CHALLENGED") {
+    stats.unresolved += 1;
+    return;
+  }
   const ageBasis = attempt.startedAt ?? attempt.scheduledFor;
   const expireBefore = new Date(now.getTime() - STALE_EXPIRE_HOURS * 3_600_000);
   if (ageBasis > expireBefore) {
@@ -960,6 +1135,10 @@ async function resolveStaleAttempt(
       attemptId: attempt.id,
       cycleIndex: attempt.cycleIndex,
       reason: "expired_unresolved",
+      // The charge OUTCOME was never learned — event-derived failure
+      // features must not count this as a decline.
+      outcome: "EXPIRED_UNKNOWN",
+      superseded: false,
       shopifyAttemptId: attempt.shopifyAttemptId,
     },
   });
@@ -993,6 +1172,79 @@ async function resolveStaleAttempt(
   stats.expired += 1;
 }
 
+/** What a one-off Shopify re-check of a single attempt established. */
+export type AttemptRecheckOutcome =
+  | "SUCCESS"
+  | "FAILED"
+  | "CHALLENGED"
+  | "EXPIRED"
+  | "UNRESOLVED";
+
+/**
+ * Re-check ONE attempt against Shopify and settle it through the stale
+ * sweep's status-guarded resolution branches (same claims, same settlement
+ * tail, same dunning hand-offs). The dunning sweep calls this before
+ * exhausting an AWAITING_3DS case: the 3DS outcome only ever arrives by
+ * webhook, so with that webhook lost the case would otherwise time out and
+ * fail/cancel a contract whose charge may have SUCCEEDED. Returns what the
+ * re-check ESTABLISHED — "UNRESOLVED" covers a missing shop/admin client, a
+ * foreign or demo contract, Shopify having nothing new, and re-check
+ * failures (all logged, never thrown: the caller is deciding whether to
+ * exhaust, and an error here must read as "nothing new", not abort it).
+ */
+export async function recheckAttemptOutcome(
+  attemptLocalId: string,
+): Promise<AttemptRecheckOutcome> {
+  const shop = await getPrimaryShop();
+  if (!shop) return "UNRESOLVED";
+  const attempt = (await prisma.billingAttempt.findUnique({
+    where: { id: attemptLocalId },
+    include: { contract: true },
+  })) as StaleAttempt | null;
+  if (
+    !attempt ||
+    attempt.contract.shopId !== shop.id ||
+    attempt.contract.isDemo ||
+    !isBillableOwnership(attempt.contract.ownership)
+  ) {
+    return "UNRESOLVED";
+  }
+
+  let admin: AdminClient;
+  try {
+    admin = await adminClientForShop(shop.domain);
+  } catch (err) {
+    console.error("[billing] attempt re-check: no admin client", err);
+    return "UNRESOLVED";
+  }
+
+  const stats: StaleSweepStats = {
+    checked: 0,
+    succeeded: 0,
+    failed: 0,
+    challenged: 0,
+    expired: 0,
+    unresolved: 0,
+  };
+  try {
+    await resolveStaleAttempt(
+      admin,
+      { id: shop.id, domain: shop.domain },
+      attempt,
+      new Date(),
+      stats,
+    );
+  } catch (err) {
+    console.error("[billing] attempt re-check failed", attemptLocalId, err);
+    return "UNRESOLVED";
+  }
+  if (stats.succeeded > 0) return "SUCCESS";
+  if (stats.failed > 0) return "FAILED";
+  if (stats.challenged > 0) return "CHALLENGED";
+  if (stats.expired > 0) return "EXPIRED";
+  return "UNRESOLVED";
+}
+
 // ── Settlement redrive sweep ─────────────────────────────────────────────────
 
 /**
@@ -1023,6 +1275,8 @@ const REDRIVE_LOOKBACK_MS = 7 * 86_400_000;
 export interface SettlementRedriveStats {
   successRedriven: number;
   failureRedriven: number;
+  /** SUCCESS rows whose null amount was re-read from the order (third arm). */
+  amountsTruedUp: number;
   errors: number;
   skipped?: string;
 }
@@ -1050,10 +1304,15 @@ export interface SettlementRedriveStats {
  *    billing. → onBillingAttemptFailed(id): its atomic entry claim
  *    (dunningClaimedAt lease) makes the re-invocation single-flight, exactly
  *    like a webhook redelivery would have been.
+ *  - status SUCCESS + amountCents NULL: the order-summary fetch failed at
+ *    claim time and the charge settled worth 0 in every revenue surface —
+ *    with no other repair lane, since the replay path deliberately never
+ *    re-reads a SETTLED attempt's amount. → the third arm below re-fetches
+ *    the order and trues the money up exactly once.
  *
  * Belt-and-braces by design: the WEBHOOK_FAILURES alert (FAILED-residue arm)
  * tells the merchant, this sweep repairs the attempt-shaped subset without
- * anyone reading the alert. Both arms are scoped to OURS + non-demo, like
+ * anyone reading the alert. All arms are scoped to OURS + non-demo, like
  * every other sweep on this book.
  */
 export async function sweepUnsettledAttempts(
@@ -1062,6 +1321,7 @@ export async function sweepUnsettledAttempts(
   const stats: SettlementRedriveStats = {
     successRedriven: 0,
     failureRedriven: 0,
+    amountsTruedUp: 0,
     errors: 0,
   };
 
@@ -1145,6 +1405,97 @@ export async function sweepUnsettledAttempts(
         attempt.id,
         err,
       );
+    }
+  }
+
+  // ── Null-amount SUCCESS true-up ────────────────────────────────────────────
+  // A transient order-summary failure at claim time commits a SUCCESS with
+  // amountCents NULL — a real charge booked as 0 in rollup chargedCents,
+  // cohorts, lifetimeRevenueCents and a recovered case's recoveredCents. The
+  // webhook replay path deliberately never re-reads a SETTLED amount (a
+  // post-refund current total would double-count the refund), but NULL is
+  // proof no amount was ever read, so re-fetching here is the one safe
+  // moment — and the amountCents-still-NULL claim makes every true-up (and
+  // its counter increments) exactly-once even against a rival sweep run.
+  const nullAmount = await prisma.billingAttempt.findMany({
+    where: {
+      status: "SUCCESS",
+      amountCents: null,
+      orderId: { not: null },
+      contract: { shopId: shop.id, isDemo: false, ...OURS_ONLY },
+      completedAt: { gte: lookbackFloor },
+    },
+    orderBy: { completedAt: "asc" },
+    take: 50,
+    include: { contract: true },
+  });
+  if (nullAmount.length > 0) {
+    let admin: AdminClient | null = null;
+    try {
+      admin = await adminClientForShop(shop.domain);
+    } catch (err) {
+      console.error("[billing] amount true-up: no admin client", err);
+    }
+    for (const attempt of admin ? nullAmount : []) {
+      try {
+        const summary = await getOrderSummary(admin!, attempt.orderId!);
+        // The order's CURRENT total is already reduced by any refund that
+        // landed before this repair ran; refundedCents (webhook-tracked)
+        // restores the amount AS CHARGED, keeping the same
+        // net-of-refunds-at-read-time semantics as claim-time settlements.
+        const chargedCents = summary.totalCents + attempt.refundedCents;
+        const currencyCode =
+          summary.currencyCode ?? attempt.contract.currencyCode;
+        const claimed = await prisma.billingAttempt.updateMany({
+          where: { id: attempt.id, status: "SUCCESS", amountCents: null },
+          data: {
+            amountCents: chargedCents,
+            currencyCode,
+            // The order money breakdown the claim would have captured.
+            discountCents: summary.discountsCents,
+            taxCents: summary.taxCents,
+            shippingCents: summary.shippingCents,
+            subtotalCents: summary.subtotalCents,
+            orderProcessedAt: summary.processedAt,
+          },
+        });
+        if (claimed.count === 0) continue; // a rival run trued it up first
+        await prisma.subscriptionContract.update({
+          where: { id: attempt.contractId },
+          data: {
+            lifetimeRevenueCents: { increment: chargedCents },
+            lifetimeDiscountCents: { increment: summary.discountsCents },
+          },
+        });
+        // A case this attempt recovered inherited the NULL — its recovered
+        // money is this same charge.
+        await prisma.dunningCase.updateMany({
+          where: { recoveredAttemptId: attempt.id, recoveredCents: null },
+          data: { recoveredCents: chargedCents },
+        });
+        await logEvent({
+          shopId: shop.id,
+          contractId: attempt.contractId,
+          customerId: attempt.contract.customerId,
+          email: attempt.contract.email,
+          type: "billing.attempt_amount_backfilled",
+          source: "SCHEDULER",
+          actor: "system",
+          payload: {
+            attemptId: attempt.id,
+            orderId: attempt.orderId,
+            cycleIndex: attempt.cycleIndex,
+            amountCents: chargedCents,
+            currencyCode,
+            refundedCentsIncluded: attempt.refundedCents,
+            resolvedBy: "settlement_redrive",
+          },
+        });
+        stats.amountsTruedUp += 1;
+      } catch (err) {
+        stats.errors += 1;
+        console.error("[billing] amount true-up failed", attempt.id, err);
+      }
     }
   }
 

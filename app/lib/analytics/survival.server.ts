@@ -26,7 +26,12 @@ import { COUNTABLE_CONTRACT } from "./queries.server";
  *   (dunning ladder exhausted under the default PAUSE action — no cancelledAt
  *   ever exists, which previously made payment churn invisible here).
  * - voluntary: every other terminal state (CANCELLED with CUSTOMER / ADMIN /
- *   SYSTEM / unknown source, and EXPIRED).
+ *   SYSTEM / unknown source, and EXPIRED). EXPIRED-as-voluntary is THE shared
+ *   rule all three retention surfaces apply (rollup churnedVoluntary counts
+ *   expiredAt-in-day, cohort activeRemaining churns at expiredAt): a bounded
+ *   plan completing its billingMaxCycles is a scheduled end the subscriber
+ *   signed up for, not a payment failure — the three surfaces must never feed
+ *   their consumers contradictory retention for the same book again.
  * The cause-specific curves treat only their own cause as death (standard
  * cause-specific hazard, same at-risk sets), so the gap each curve leaves
  * below 100% is that cause's cumulative damage.

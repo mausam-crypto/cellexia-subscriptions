@@ -7,7 +7,8 @@ import { getSetting } from "~/lib/settings/settings.server";
 import { clampGrantPercentForContract } from "~/lib/billing/stacking.server";
 import { releaseHeldCycleAttempts } from "~/lib/billing/release.server";
 import type { SettingsValue } from "~/lib/settings/registry.server";
-import { addDaysTz } from "~/lib/dates.server";
+import { addDaysTz, addIntervalTz } from "~/lib/dates.server";
+import { contractFrequency } from "~/lib/frequency";
 import { buildMagicUrl } from "~/lib/magiclinks/builder.server";
 import { sendNotification } from "~/lib/notifications/index.server";
 import {
@@ -21,9 +22,11 @@ import { OURS_ONLY, isBillableOwnership } from "~/lib/ownership/ownership.server
 
 /**
  * Win-back engine — staged re-acquisition of cancelled subscribers, timed to
- * the PREDICTED EMPTY DATE of their last delivery (analytics keeps
- * predictedEmptyDate fresh), not to the cancel date. Touching someone the week
- * their jar runs out converts; touching them the day they cancel annoys.
+ * the PREDICTED EMPTY DATE of their last delivery (analytics keeps the
+ * CONTRACT's predictedEmptyDate fresh for 180 days after cancel, and each due
+ * touch re-anchors to it when it moved materially — see processDueTouch),
+ * not to the cancel date. Touching someone the week their jar runs out
+ * converts; touching them the day they cancel annoys.
  *
  * Stages (offsets are days relative to predicted empty, from settings.winback):
  *   0 soft touch  — no offer; education / results framing        (winback_soft)
@@ -35,9 +38,10 @@ import { OURS_ONLY, isBillableOwnership } from "~/lib/ownership/ownership.server
  * them through reactivateFromWinback below. Customers who resubscribe
  * naturally (a new ACTIVE contract for the same email) are flipped to
  * WON_BACK by the sweep and never touched again. OPTED_OUT is always
- * respected. When a touch's moment has already passed (downtime backlog), the
- * sweep skips ahead to the stage that is relevant NOW instead of bursting
- * every stale offer in sequence.
+ * respected — the SMS STOP handler (api.sms.inbound.tsx) writes it and logs
+ * winback.opted_out. When a touch's moment has already passed (downtime
+ * backlog), the sweep skips ahead to the stage that is relevant NOW instead
+ * of bursting every stale offer in sequence.
  *
  * Idempotency: one WinbackState per contract (unique contractId); each touch
  * is deduped by event existence since the state's cancelledAt, so a crash
@@ -51,6 +55,27 @@ type ContractWithLines = SubscriptionContract & { lines: ContractLine[] };
 // Timing knobs live in settings.winback (reactivationBillDelayDays,
 // linkGraceDays) — promoted from constants so the operator can tune them
 // without a deploy; the registry defaults equal the old constants.
+
+/**
+ * Minimum drift (days) between the state's stored anchor and the contract's
+ * CURRENT predictedEmptyDate before a due touch re-anchors the remaining
+ * schedule. Below it the drift is recompute noise (the nightly prediction
+ * refresh already suppresses writes under 6h — risk.server.ts — and touch
+ * offsets are whole days, so sub-2-day wobble never changes which week a
+ * touch lands); at or above it a cadence edit or late settlement genuinely
+ * moved the run-out moment and the campaign must re-time. Overridable via
+ * the settings registry key `winback.reanchorThresholdDays` once registered;
+ * until then this default applies.
+ */
+const REANCHOR_THRESHOLD_DEFAULT_DAYS = 2;
+
+function reanchorThresholdDays(settings: WinbackSettings): number {
+  const v = (settings as { reanchorThresholdDays?: unknown })
+    .reanchorThresholdDays;
+  return typeof v === "number" && Number.isFinite(v) && v >= 0
+    ? v
+    : REANCHOR_THRESHOLD_DEFAULT_DAYS;
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -138,9 +163,11 @@ export async function scheduleWinback(
   const tz = shop.ianaTimezone;
 
   const cancelledAt = contract.cancelledAt ?? new Date();
+  // No prediction → assume the last delivery lasts one billing interval.
+  const freq = contractFrequency(contract);
   const predictedEmptyDate =
     contract.predictedEmptyDate ??
-    addDaysTz(cancelledAt, Math.max(1, contract.intervalWeeks) * 7, tz);
+    addIntervalTz(cancelledAt, freq.unit, freq.count, tz);
   const nextTouchAt = addDaysTz(
     predictedEmptyDate,
     settings.softTouchOffsetDays,
@@ -268,6 +295,22 @@ export async function runWinbackSweep(now: Date): Promise<WinbackSweepStats> {
           where: { id: state.id },
           data: { status: "SUNSET", nextTouchAt: null },
         });
+        // Terminate the funnel in the event stream too (rule: every mutation
+        // logs an event). contractId stays null — the FK row is gone, so an
+        // event pointing at it would fail the insert; the purged id lives in
+        // the payload instead.
+        await logEvent({
+          shopId: state.shopId,
+          type: "winback.sunset",
+          source: "SYSTEM",
+          actor: "winback_engine",
+          payload: {
+            stateId: state.id,
+            purgedContractId: state.contractId,
+            stage: state.stage,
+            reason: "contract_purged",
+          },
+        });
         stats.errors += 1;
         console.error("[winback] state without contract sunset", state.id);
         continue;
@@ -283,6 +326,19 @@ export async function runWinbackSweep(now: Date): Promise<WinbackSweepStats> {
         await prisma.winbackState.update({
           where: { id: state.id },
           data: { status: "SUNSET", nextTouchAt: null },
+        });
+        // Local audit only: the Klaviyo map refuses demo/foreign contracts,
+        // so this sunset never reaches the suppression feed — by design.
+        await logEvent({
+          ...contractEventBase(contract),
+          type: "winback.sunset",
+          source: "SYSTEM",
+          actor: "winback_engine",
+          payload: {
+            stateId: state.id,
+            stage: state.stage,
+            reason: contract.isDemo ? "demo_contract" : "foreign_ownership",
+          },
         });
         continue;
       }
@@ -350,7 +406,23 @@ async function processDueTouch(
   now: Date,
   stats: WinbackSweepStats,
 ): Promise<void> {
-  const predictedEmpty = state.predictedEmptyDate;
+  // The state's anchor is a snapshot from cancel time. Analytics keeps the
+  // CONTRACT's predictedEmptyDate fresh for 180 days after cancel
+  // (risk.server.ts) precisely so these touches can re-time when a cadence
+  // edit or a late settlement moves the run-out moment — prefer the live
+  // value whenever it drifted materially (threshold above; smaller drift is
+  // recompute noise and the stored anchor stands).
+  const storedAnchor = state.predictedEmptyDate;
+  let predictedEmpty = storedAnchor;
+  const live = contract.predictedEmptyDate;
+  if (
+    live &&
+    Math.abs(live.getTime() - storedAnchor.getTime()) >=
+      reanchorThresholdDays(settings) * 86_400_000
+  ) {
+    predictedEmpty = live;
+  }
+  const reanchored = predictedEmpty.getTime() !== storedAnchor.getTime();
 
   // Skip ahead past touches whose moment has already gone: a subscriber whose
   // whole window elapsed during downtime gets the offer that is relevant NOW
@@ -366,6 +438,42 @@ async function processDueTouch(
 
   const eventBase = contractEventBase(contract);
   const since = state.cancelledAt;
+
+  if (reanchored) {
+    const dueAt =
+      stage < 3 ? touchAtForStage(predictedEmpty, stage, settings, tz) : null;
+    if (dueAt && dueAt.getTime() > now.getTime()) {
+      // The fresh prediction pushed the pending touch back into the future —
+      // re-time it instead of firing on the stale anchor, and log the
+      // re-schedule (the touch that would otherwise record the new date is
+      // exactly the one being deferred).
+      await prisma.winbackState.update({
+        where: { id: state.id },
+        data: { predictedEmptyDate: predictedEmpty, stage, nextTouchAt: dueAt },
+      });
+      await logEvent({
+        ...eventBase,
+        type: "winback.scheduled",
+        source: "SYSTEM",
+        actor: "winback_engine",
+        payload: {
+          stateId: state.id,
+          reanchored: true,
+          previousPredictedEmptyDate: storedAnchor.toISOString(),
+          predictedEmptyDate: predictedEmpty.toISOString(),
+          nextTouchAt: dueAt.toISOString(),
+          stage,
+        },
+      });
+      return;
+    }
+    // Still due under the fresh anchor — persist it so the state row matches
+    // the predictedEmptyDate the touch/sunset events below record.
+    await prisma.winbackState.update({
+      where: { id: state.id },
+      data: { predictedEmptyDate: predictedEmpty },
+    });
+  }
 
   if (stage >= 3) {
     // ── Sunset: stop touching; Klaviyo suppression keys off the event. ──────
@@ -530,6 +638,33 @@ async function processDueTouch(
         },
       });
       stats.discountsOffered += 1;
+    } else {
+      // Zero headroom: the stage still advances to sunset timing below, and
+      // without a trace the funnel reads "discount never offered" with no
+      // recorded cause. A plumbing event (deliberately unmapped in the
+      // Klaviyo event map — a "discount" metric for an offer that was NOT
+      // made would fire the discount flow) records the skip and why. Deduped
+      // like the touches: a crash between this log and the stage advance
+      // must not double-record the skip.
+      const skipLogged = await hasEventSince(
+        contract.id,
+        "winback.discount_skipped",
+        since,
+      );
+      if (!skipLogged) {
+        await logEvent({
+          ...eventBase,
+          type: "winback.discount_skipped",
+          source: "SYSTEM",
+          actor: "winback_engine",
+          payload: {
+            stateId: state.id,
+            reason: "no_discount_headroom",
+            requestedPercent: settings.discountPct,
+            predictedEmptyDate: predictedEmpty.toISOString(),
+          },
+        });
+      }
     }
   }
   await prisma.winbackState.update({
@@ -598,13 +733,15 @@ export async function reactivateFromWinback(
     const state = await prisma.winbackState.findUnique({
       where: { contractId: contract.id },
     });
+    let flipped = false;
     if (state && state.status !== "WON_BACK") {
       await prisma.winbackState.update({
         where: { id: state.id },
         data: { status: "WON_BACK", wonBackAt: new Date(), nextTouchAt: null },
       });
+      flipped = true;
     }
-    return state;
+    return { state, flipped };
   };
 
   if (contract.status === "ACTIVE") {
@@ -619,11 +756,17 @@ export async function reactivateFromWinback(
     // self-healing path). On a pure replay the release finds nothing
     // (supersededAt already stamped) and stays silent.
     const releasedAttempts = await releaseHeldCycleAttempts(contract.id);
-    const replayState = await settleWonBack();
-    if (releasedAttempts > 0) {
-      // The first pass never got to its bookkeeping — this replay is the one
-      // that made the reactivation billable, so the release must be
-      // auditable (and drive the same downstream consumers).
+    const { state: replayState, flipped } = await settleWonBack();
+    if (releasedAttempts > 0 || flipped) {
+      // Two auditable outcomes share this event. releasedAttempts > 0: the
+      // first pass never got to its bookkeeping — this replay is the one
+      // that made the reactivation billable. flipped alone: a Shopify-side
+      // reactivation was mirrored ACTIVE by webhook before the customer's
+      // click, so THIS call performs the ACTIVE→WON_BACK settle — and the
+      // sweep, which only scans ACTIVE states, will never log it. Without
+      // the event that conversion vanishes from winback.reactivated counts
+      // and the Klaviyo metric. A pure replay (already WON_BACK, nothing
+      // released) stays silent.
       await logEvent({
         ...contractEventBase(contract),
         type: "winback.reactivated",
@@ -632,7 +775,10 @@ export async function reactivateFromWinback(
         payload: {
           stateId: replayState?.id ?? null,
           natural: false,
-          replayRelease: true,
+          ...(releasedAttempts > 0 ? { replayRelease: true } : {}),
+          ...(flipped && releasedAttempts === 0
+            ? { settledFromMirror: true }
+            : {}),
           releasedFailedAttempts: releasedAttempts,
         },
       });
@@ -694,9 +840,17 @@ export async function reactivateFromWinback(
   // and onPaymentMethodUpdated only reopens EXHAUSTED cases while the
   // contract is FAILED. Reactivated, the contract is ACTIVE — so if
   // effectiveNext lands back inside the still-unbilled failed cycle (the
-  // normal case: reactivationBillDelayDays is days, the cycle interval
-  // weeks), NO code path would ever create another attempt: the customer is
-  // told they resubscribed but is never billed and never shipped. This
+  // normal case whenever the billing interval outlasts
+  // reactivationBillDelayDays (1–14 days): every WEEK/MONTH cadence and any
+  // DAY cadence counting past the delay), NO code path would ever create
+  // another attempt: the customer is told they resubscribed but is never
+  // billed and never shipped. A DAY cadence SHORTER than the delay is the
+  // one case where effectiveNext can land in a LATER cycle instead —
+  // verified safe: the b2 guard keys on the attempt history of the cycle
+  // nextBillingDate resolves to, a later cycle has no attempts, so the
+  // sweep opens its first attempt normally; the contract-scoped release
+  // below is then inert (superseded rows on a cycle the pointer never
+  // resolves are never inspected — see releaseHeldCycleAttempts). This
   // reactivation closes that churn episode, so its terminal attempts are
   // stamped superseded — the append-only history keeps every row and
   // outcome; the rows just stop counting as their cycle's live verdict,
@@ -783,7 +937,7 @@ export async function reactivateFromWinback(
   }
 
   // ── 3. Bookkeeping + events. ───────────────────────────────────────────────
-  const state = await settleWonBack();
+  const { state } = await settleWonBack();
 
   await logEvent({
     ...contractEventBase(contract),

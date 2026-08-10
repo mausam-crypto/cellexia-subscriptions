@@ -265,15 +265,23 @@ function expectPurchaseOptions(html: string, preset: PresetKey): void {
       break;
 
     case "subscription_max":
+    case "subscription_ultra_max":
       // The subscription card IS the buy box; one-time is a quiet underlined
       // link below it — but still a REAL radio in the same group, with its
       // price visible in the link before selection (compliance guardrail;
-      // tests/liquid/subscription-max.test.ts owns the full contract).
+      // tests/liquid/subscription-max.test.ts and
+      // tests/liquid/subscription-ultra-max.test.ts own the full contracts).
       expect(html).toContain('data-cellexia-option="subscription"');
       expect(html).toContain('data-cellexia-option="one_time"');
       expect(html).toContain("cx-buybox__submax-link");
       expect(html).toContain("data-cellexia-onetime-price");
       expect(text).toMatch(/or buy once for CHF \d/);
+      if (preset === "subscription_ultra_max") {
+        // The quiet line doubles as the relocatable satellite.
+        expect(html).toContain("cx-buybox-satellite");
+        expect(html).toContain("data-cellexia-satellite");
+        expect(html).toContain("data-cellexia-for");
+      }
       break;
 
     default:
@@ -572,6 +580,8 @@ describe("widget root attribute list", () => {
         "data-cellexia-money-sub",
         "data-cellexia-price-sync",
         "data-cellexia-price-selector",
+        "data-cellexia-price-sync-main",
+        "data-cellexia-main-selector",
       ]) {
         expect(startsOwnLine(attr), `${attr} on its own line`).toBe(true);
       }
@@ -1208,11 +1218,18 @@ describe("Liquid ⇄ JS DOM contract", () => {
   });
 
   it("renders every data-cellexia-* hook assets/buy-box-embed.js looks up", async () => {
-    const [embed, widget] = await Promise.all([
+    const [embed, widget, ultra] = await Promise.all([
       renderEmbed({ config: designConfig("classic"), launchStatus: "live" }),
       renderWidget({ config: designConfig("classic"), launchStatus: "live" }),
+      // The subscription_ultra_max satellite (.cx-buybox-satellite
+      // [data-cellexia-satellite]) is markup the embed's variant scan must
+      // SKIP as "ours" — its hooks render only in that preset.
+      renderWidget({
+        config: designConfig("subscription_ultra_max"),
+        launchStatus: "live",
+      }),
     ]);
-    const markup = `${embed}\n${widget}`;
+    const markup = `${embed}\n${widget}\n${ultra}`;
     const tokens = domContractTokens(readAsset("buy-box-embed.js"));
 
     const missing = tokens.filter((token) => {

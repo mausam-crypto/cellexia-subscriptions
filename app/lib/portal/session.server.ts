@@ -10,10 +10,34 @@ import { PORTAL_PROXY_BASE } from "~/lib/portal/proxy-path";
  * Portal authentication on top of the app proxy.
  *
  * The proxy signature (`authenticate.public.appProxy`) proves the request came
- * through Shopify; this module proves WHICH customer is browsing. After an OTP
- * login we set an HMAC-signed cookie `cx_portal` on the store domain (scoped
- * to /apps/cellexia-subs). The cookie carries the raw session token; the database
- * stores only its SHA-256, so a leaked database cannot mint valid cookies.
+ * through Shopify; this module proves WHICH customer is browsing, through one
+ * of three identity paths (in order):
+ *
+ *  1. A signed, 1-hour, view-only admin preview token in the ?cx_pp= query
+ *    parameter (previewToken.server.ts) — the cookie-less identity for the
+ *    admin "Preview the portal" flow on a live store. A VALID token outranks
+ *    the cookie: it is explicit, admin-minted intent, and in the dev harness
+ *    a stale non-preview cookie shadowing it dead-ended every preview click
+ *    at the setup gate. An invalid one falls through to the other paths.
+ *  2. The HMAC-signed HttpOnly cookie `cx_portal`, set after an OTP login and
+ *    scoped to /apps/cellexia-subs. The cookie carries the raw session token;
+ *    the database stores only its SHA-256, so a leaked database cannot mint
+ *    valid cookies. NOTE: on a live store Shopify's app proxy STRIPS the
+ *    Cookie request header and the Set-Cookie response header in both
+ *    directions, so this path only works in environments that reach the app
+ *    host directly (the local dev harness — see PORTAL_COOKIE_DEV).
+ *  3. Shopify's own storefront login: the proxy appends
+ *    ?logged_in_customer_id=<numeric id> to every proxied request, filled in
+ *    ONLY when the visitor is signed into their store account. That value is
+ *    covered by the proxy request signature, so it is Shopify's sanctioned,
+ *    unforgeable customer identity for app-proxy requests — no app cookie
+ *    needed.
+ *
+ * Paths 2 and 3 are safe ONLY because every proxy route verifies the request
+ * HMAC via authenticate.public.appProxy BEFORE calling into this module — the
+ * exact trust contract the cookie path already places on its callers. A
+ * request that skipped that verification could fabricate both parameters;
+ * one that passed it cannot (Shopify signs the full query string).
  *
  * CSRF: every mutating portal form carries a token derived from the session
  * (HMAC of the stored token hash). It is embedded in the rendered HTML, never
@@ -23,6 +47,10 @@ import { PORTAL_PROXY_BASE } from "~/lib/portal/proxy-path";
 const COOKIE_NAME = "cx_portal";
 const PENDING_COOKIE_NAME = "cx_otp_pending";
 const PENDING_TTL_SECONDS = 15 * 60;
+// Literal duplicated from previewToken.server.ts (PREVIEW_TOKEN_PARAM):
+// that module imports signValue/verifySignedValue from THIS one, so a static
+// import back would be circular. Its tests pin the two values equal.
+const PREVIEW_TOKEN_PARAM = "cx_pp";
 
 /** Portal base path on the storefront domain (app proxy prefix + subpath) —
  * single source of truth in app/lib/portal/proxy-path.ts. */
@@ -110,6 +138,22 @@ export interface PortalSessionContext {
   isPreview: boolean;
   /** Derived per-session CSRF token — embed in forms, verify with verifyCsrf. */
   csrfToken: string;
+  /**
+   * Raw ?cx_pp= preview token this session came from, so links and redirects
+   * can re-embed it (withLocale's third parameter) — the app proxy strips
+   * cookies, so the token in the URL IS the session. Null for cookie and
+   * logged_in_customer_id sessions.
+   */
+  previewToken: string | null;
+  /**
+   * Identity came from Shopify's ?logged_in_customer_id= (storefront login) —
+   * the primary path on a live store. These sessions hold NO app credential
+   * to destroy: Shopify re-appends the parameter to every proxied request,
+   * so the portal's own POST /logout deletes nothing and the very next
+   * request signs the customer straight back in. "Sign out" for them must go
+   * through Shopify's /account/logout (the store account IS the session).
+   */
+  viaStorefrontLogin: boolean;
 }
 
 function csrfTokenForHash(tokenHash: string): string {
@@ -173,31 +217,152 @@ function sessionTokenFromRequest(request: Request): string | null {
   return verifySignedValue(signed);
 }
 
-/** Validated portal session for the request, or null. */
+/** TTL of a logged_in_customer_id session context. Advisory only — the
+ * identity is re-proven by Shopify's signed query on every request. */
+const LICID_SESSION_TTL_MS = 15 * 60 * 1000;
+
+/**
+ * The Shop row id for the ?shop= domain Shopify appends to every proxied
+ * request. Only consulted for the cookie-less identity paths; the parameter
+ * is covered by the proxy signature the calling route has already verified.
+ */
+async function shopIdFromProxyRequest(request: Request): Promise<string | null> {
+  const domain = new URL(request.url).searchParams.get("shop");
+  if (!domain) return null;
+  const shop = await prisma.shop.findUnique({
+    where: { domain },
+    select: { id: true },
+  });
+  return shop?.id ?? null;
+}
+
+/**
+ * Validated portal session for the request, or null.
+ *
+ * Identity paths, in order (see the module doc comment): a VALID ?cx_pp=
+ * admin preview token, then the cx_portal cookie, then Shopify's
+ * ?logged_in_customer_id=. The cookie-less paths exist because the app proxy
+ * strips cookies on a live store; BOTH are trustworthy only behind
+ * authenticate.public.appProxy, which every proxy route runs first.
+ */
 export async function getPortalSession(
   request: Request,
 ): Promise<PortalSessionContext | null> {
+  const params = new URL(request.url).searchParams;
+  const rawPreview = params.get(PREVIEW_TOKEN_PARAM);
+
+  // (a) Admin preview token — signed, 1h, shop-bound, view-only (isPreview
+  // sessions have every mutation intercepted). Stateless: the CSRF token is
+  // derived from the token hash, so it is stable across the token's clicks.
+  // Checked FIRST: clicking a freshly minted preview link is the clearest
+  // intent a request can carry, and in the cookie-preserving dev harness a
+  // stale non-preview cx_portal cookie would otherwise shadow it and land
+  // the admin on the setup gate. On a live store the proxy strips cookies,
+  // so this ordering changes nothing there.
+  if (rawPreview) {
+    const previewShopId = await shopIdFromProxyRequest(request);
+    if (previewShopId) {
+      const { verifyPreviewToken } = await import(
+        "~/lib/portal/previewToken.server"
+      );
+      const payload = verifyPreviewToken(rawPreview, previewShopId);
+      if (payload) {
+        const previewHash = sha256(rawPreview);
+        return {
+          id: `preview:${previewHash.slice(0, 12)}`,
+          shopId: payload.shopId,
+          customerId: payload.customerId,
+          email: payload.email,
+          expiresAt: new Date(payload.exp * 1000),
+          isPreview: true,
+          csrfToken: csrfTokenForHash(previewHash),
+          previewToken: rawPreview,
+          viaStorefrontLogin: false,
+        };
+      }
+    }
+    // Invalid/expired preview token: fall through — a cookie session or a
+    // storefront-logged-in customer on a stale link still gets their own
+    // portal; anyone else gets null and the closed-portal pages name the
+    // expired preview (closedPortalPage) instead of silently gating.
+  }
+
   const token = sessionTokenFromRequest(request);
-  if (!token) return null;
+  if (token) {
+    const tokenHash = sha256(token);
+    const row = await prisma.portalSession.findUnique({ where: { tokenHash } });
+    if (row && row.expiresAt.getTime() > Date.now()) {
+      return {
+        id: row.id,
+        shopId: row.shopId,
+        customerId: row.customerId,
+        email: row.email,
+        expiresAt: row.expiresAt,
+        isPreview: row.isPreview,
+        csrfToken: csrfTokenForHash(tokenHash),
+        previewToken: null,
+        viaStorefrontLogin: false,
+      };
+    }
+  }
 
-  const tokenHash = sha256(token);
-  const row = await prisma.portalSession.findUnique({ where: { tokenHash } });
-  if (!row || row.expiresAt.getTime() <= Date.now()) return null;
+  // ── Storefront login (proxy strips cookies on a live store) ────────────────
+  const loggedInCustomerId = params.get("logged_in_customer_id");
+  if (!loggedInCustomerId) return null;
 
-  return {
-    id: row.id,
-    shopId: row.shopId,
-    customerId: row.customerId,
-    email: row.email,
-    expiresAt: row.expiresAt,
-    isPreview: row.isPreview,
-    csrfToken: csrfTokenForHash(tokenHash),
-  };
+  const shopId = await shopIdFromProxyRequest(request);
+  if (!shopId) return null;
+
+  // (b) Shopify storefront login. logged_in_customer_id is numeric; contracts
+  // store the customer gid (gid://shopify/Customer/<id>) — match both forms,
+  // and anchor the context on the stored form so every later query hits.
+  if (loggedInCustomerId && /^\d+$/.test(loggedInCustomerId)) {
+    const customerGid = `gid://shopify/Customer/${loggedInCustomerId}`;
+    const contract = await prisma.subscriptionContract.findFirst({
+      where: {
+        shopId,
+        customerId: { in: [customerGid, loggedInCustomerId] },
+      },
+      orderBy: { createdAt: "desc" },
+      select: { customerId: true, email: true },
+    });
+    const customerId = contract?.customerId ?? customerGid;
+    return {
+      id: `licid:${loggedInCustomerId}`,
+      shopId,
+      customerId,
+      email: contract?.email ?? "",
+      expiresAt: new Date(Date.now() + LICID_SESSION_TTL_MS),
+      isPreview: false,
+      csrfToken: csrfTokenForHash(sha256(`licid:${shopId}:${customerId}`)),
+      previewToken: null,
+      viaStorefrontLogin: true,
+    };
+  }
+
+  return null;
 }
 
-function loginRedirectUrl(request: Request): string {
-  const locale = new URL(request.url).searchParams.get("locale");
-  const suffix = locale ? `?locale=${encodeURIComponent(locale)}` : "";
+/**
+ * Login-page URL for a request that turned out to be sessionless, carrying
+ * ?locale= and — crucially — the request's (invalid) ?cx_pp= preview token,
+ * so the login page can say "this preview link has expired" instead of the
+ * generic gate. Every sessionless bounce to /login MUST go through this
+ * helper (requireCustomer does; routes that call getPortalSession directly
+ * use it by hand): a hand-rolled redirect that drops cx_pp recreates the
+ * exact dead-end this token exists to name — the portal home IS the URL the
+ * admin preview mints, so an expired token most often lands right there.
+ */
+export function loginRedirectUrl(request: Request): string {
+  const params = new URL(request.url).searchParams;
+  const carried = new URLSearchParams();
+  const locale = params.get("locale");
+  if (locale) carried.set("locale", locale);
+  // Carry an (invalid) preview token to the login page so it can say "this
+  // preview link has expired" instead of the generic gate.
+  const preview = params.get(PREVIEW_TOKEN_PARAM);
+  if (preview) carried.set(PREVIEW_TOKEN_PARAM, preview);
+  const suffix = carried.size > 0 ? `?${carried.toString()}` : "";
   return `${PORTAL_BASE_PATH}/login${suffix}`;
 }
 

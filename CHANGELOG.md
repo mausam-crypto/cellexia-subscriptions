@@ -4,7 +4,430 @@ All notable changes to Cellexia Subscriptions. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [SemVer](https://semver.org) as contracted in [docs/UPDATE.md](docs/UPDATE.md).
 
-## [1.6.10] — 2026-08-08
+## [1.11.0] — 2026-08-10
+
+**Buy box: the one-click-behind variant defect fixed at the root, the
+theme's main price kept honest, and a new `subscription_ultra_max` preset.**
+Theme-extension release: run `npm run deploy` after updating — nothing
+reaches the storefront until the extension is redeployed. No migrations, no
+env changes.
+
+### Fixed
+
+- **Widget permanently one variant behind the pills (live, preview and
+  future-live).** The store's PDP no longer carries any `input[name="id"]`:
+  the size pills expose the variant id only as a `data-val-id` attribute
+  (one pill's value padded with trailing whitespace), the theme paints the
+  selection by moving an `active` class, and a bystander widget's
+  recommendation rows (`data-variant-id`) track the current variant on
+  their own schedule. The embed's picker didn't know `data-val-id`, and its
+  one-shot 60ms DOM re-read raced the bystander's update — pushing the
+  PREVIOUS variant after every click ("select 1 jar, see the 2-jar
+  subscription price"), with no `[name="id"]` field left for the 600ms poll
+  to correct from. Both storefront assets now read the marker vocabulary
+  (`data-variant-id` / `data-val-id` / `data-variant`, trimmed) and rank
+  evidence — bound form, changed-since-last-read, `[name=id]` fields
+  (own-section tiebreak), the theme's own active-selection paint, passive
+  bystander markers last; an unpicked swatch is never evidence, only a real
+  field can park the widget on an un-synced variant, and the embed's
+  re-read is staggered (60/350/900ms) with the poll underneath. Pinned by
+  the new marker-theme suites in `tests/buybox-variant-tracking.test.ts`
+  and the refreshed live-PDP fixture in
+  `tests/embed-hostile-neighbour.test.ts`, each with mutation checks that
+  put the defect back. This also un-froze the theme add-to-cart price swap,
+  which had stopped matching the button's string because the widget was
+  quoting the wrong variant.
+
+### Added
+
+- **Theme MAIN price sync** (`themeSync.syncMainPrice`, default ON;
+  `themeSync.mainPriceSelector` escape hatch, sanitized like
+  `priceSelector`). The price under the product title now follows the
+  selected purchase option with the same exact-money-string swap as the
+  add-to-cart button (built-in list led by the store's `.pdp__price`);
+  struck-through compare-at and per-unit lines are deliberately untouched.
+  New root attributes `data-cellexia-price-sync-main` /
+  `data-cellexia-main-selector`; a pre-v1.11.0 metafield (missing keys)
+  means ON, per the schema-evolution rule.
+- **`subscription_ultra_max` preset** (eighth preset). `subscription_max`
+  taken to its logical end: the card sheds all offer chrome — no border, no
+  tint, no badge, no savings pill, no reassurance line by default (each
+  re-enableable) — so the subscription price reads as the product's plain,
+  normal price; subscription is preselected; the recurring then-line always
+  stays (recurrence disclosure is not optional). The quiet priced one-time
+  line doubles as a relocatable **satellite** that `buy-box.js` mounts
+  BELOW the theme's whole buy area (quantity, add to cart, guarantees)
+  while the widget is visible — rendered inside the widget root so no-JS
+  and launch-gated pages stay exactly as safe as `subscription_max`, with
+  its own gate mirror, ownership assertion and ghost cleanup. Designer
+  card, preview, per-market support and docs included.
+
+### Changed
+
+- `tests/liquid/size-limits.test.ts`: per-script performance ceiling raised
+  92→112KB for the new tracking/satellite modules (a deliberate,
+  commented decision, not drift). Total shipped Liquid stays within the
+  88KB deploy budget.
+
+## [1.10.0] — 2026-08-09
+
+**Data-collection deep audit: 110 verified findings fixed, one additive
+migration (0016), every ingest path made loss-proof or honest about its
+limits.** A 19-agent adversarially-verified audit swept every data-collection,
+aggregation and forecast-input path; this release implements the fixes. All
+schema changes are additive (`0016_data_collection_audit`: 25 columns across 9
+tables + `PriceChangeContractOutcome` + `AvailabilitySnapshot`).
+
+**Capture-time corruption stopped (unrepairable-later class):**
+
+- The acquisition PII scrubber no longer destroys legitimate data: slug-shaped
+  campaign names (`black-friday-2025-conversion`), date-stamped campaigns and
+  numeric ad-platform ids survive; real emails/tokens are still redacted; a
+  capped unscrubbed `acqRaw.rawUtm` reserve allows future recomputation.
+- CSV imports run acq columns through the same sanitizer (doc parity), compute
+  first-order shape, and accept `subscribed_since` so a migrated book cohorts
+  on its real signup dates instead of import day (docs/MIGRATION.md updated).
+- Price-change batches carry `currencyCode`, reprice only matching-currency
+  contracts, and record per-contract outcomes (`PriceChangeContractOutcome`)
+  instead of stamping APPLIED over erased failures; notice events log only
+  when the notice actually sent.
+
+**Revenue books made true:**
+
+- A successful charge can no longer be booked at 0 cents forever: redelivered
+  success webhooks and the unsettled-attempt sweep true-up null `amountCents`
+  (logging `billing.attempt_amount_backfilled`), and the new
+  `ATTEMPT_AMOUNT_MISSING` alert surfaces any residue.
+- Refund recording is atomic with its replay guard (one transaction), applies
+  the same currency guard as revenue, logs unmatched refunds instead of
+  dropping them, and the new `refund_reconcile` job re-attempts the match.
+- Gift COGS survives the grant lifecycle: `GiftGrant.shippedAt` is stamped at
+  settlement and both gross-profit surfaces count by it — cohort LTGP no
+  longer silently loses every shipped gift's cost.
+- One truthful "recovered" definition shared by rollup and dashboard;
+  dunning cases persist the at-risk amount (`amountAtRiskCents`) at open, so
+  the failed-payments queue finally shows money.
+- CHALLENGED attempts get a lost-webhook recovery lane (Shopify re-query
+  before dunning exhaustion) — a paid 3DS charge can no longer be unrecorded
+  while the customer is wrongly churned.
+- Settlement now persists the renewal order's discount/tax/shipping/subtotal
+  and real processed instant, increments `lifetimeDiscountCents`, and captures
+  a per-charge cost snapshot (`BillingAttempt.costSnapshot`) so gross-profit
+  history stops being rewritten by later cost-setting edits.
+- Foreign-currency exclusions are counted (`excludedForeignCurrencyCents`)
+  instead of silently invisible.
+
+**Forecast & risk honesty:**
+
+- Per-cycle survival counts FAILED/EXPIRED contracts as churned (involuntary
+  churn was censored); the "net of refunds" series actually nets refunds;
+  gap-backfilled rollup days are flagged (`snapshotFabricated`) and treated as
+  filled, not observed; model-error decay keys on calendar weeks; history
+  window extended to 78 weeks; forecast grade wired into insights; learning
+  labels recover involuntary-churn episodes cleared by later recovery;
+  predicted-empty dates blend observed per-contract consumption with the
+  merchant estimate.
+
+**Silent-loss channels closed:**
+
+- `logEvent` supports transactional writes (`{tx}`) + `logEventOrThrow`;
+  swallowed event-write failures are counted and alerted
+  (`EVENT_WRITE_FAILURES`) — take-rate, refund and saves counters were
+  event-sole-source.
+- ORDERS_CREATE replay guards are per-block, so a partial run re-completes on
+  redelivery instead of permanently losing the take-rate denominator or the
+  acquisition stash; test orders are excluded; design attribution uses the
+  same subscribability test as the denominator and the embed stamps
+  `_cellexia_design` even when the theme itself carried the selling plan.
+- `backfillAllContracts` is finally wired (install + daily
+  `full_sync_reconcile`), so pre-install contracts get mirrored and late
+  mirrors stop stamping churn timestamps as "now".
+- GDPR redaction scrubs the Klaviyo outbox (pending rows deleted, sent/dead
+  rows anonymized) — redacted identities can no longer be transmitted
+  outward post-erasure.
+- NotificationLog is truthful: outbox rows that die flip their log row to
+  FAILED via `outboxId` and emit `notification.failed`, so dunning dedupe
+  stops sticking on messages never delivered.
+
+**New collection (additive, consumed later per the data-foundation rule):**
+fulfillment outcomes (`orders/fulfilled` → `fulfilledAt` /
+`originOrderFulfilledAt` + `billing.order_fulfilled`), order cancellations
+(capture-only `billing.order_cancelled`), `shop/update` + `customers/update`
+sync (currency/timezone/identity drift), skip initiator separation
+(`merchantSkipCount` — stockout/admin skips no longer poison churn-risk
+features), pause reasons, portal visit + OTP failure/throttle telemetry,
+add-on offer impressions (`cycle.addon_offer_shown`), daily variant
+`AvailabilitySnapshot` from the alert scan, winback opt-out via SMS STOP
+(`winback.opted_out`), expanded acquisition bundle (discount codes, checkout
+locale, presentment currency, sales channel, marketing consent, order tags),
+`expiredAt` churn stamping, consolidation clustering on exact cadence
+(`unit:count`, never the week approximation).
+
+**Deliberately deferred, documented:** buy-box impression beacons, Klaviyo
+engagement ingest, ad-spend/CAC entry, the `orders/edited` money leg
+(accepted-error entry in docs/DATA_FOUNDATION.md), extra forecast model
+signals gated on backtest wins.
+
+Verified: `npm run verify` green (tsc 0 errors, 2,673+ tests across 138
+files, build clean); migration SQL proven equivalent to
+`prisma migrate diff` output. Deploy notes: run `npm run deploy` so the four
+new webhook topics register; migration 0016 applies on normal deploy;
+`npx prisma generate` after pulling.
+
+## [1.9.0] — 2026-08-09
+
+**Debug tab: continuous live-store self-checks.** A new admin **Debug** page
+(nav, between Audit and Settings) runs 28 read-only checks against the
+DEPLOYED store — the failure modes local debugging cannot see — grouped by
+category: platform (DB, migrations, required env/secrets, SMTP verify, clock
+skew), Shopify connection (Admin API token, granted-vs-requested scope diff,
+webhook delivery evidence, app-proxy identity probe), launch & storefront
+(launch-flag divergence, selling-plan sync, ownership allow-list published +
+appId match, storefront reachability incl. password-page detection), customer
+portal (signing round-trip, a REAL portal fetch through the store domain and
+Shopify's app proxy, demo-fixture health), billing (scheduler heartbeat, stuck
+attempts past the sweeps' windows, forgotten overdue renewals, a
+multiple-successful-charges-per-cycle guard), dunning (sweep heartbeat, zombie
+RETRYING cases, overdue awaiting cases), jobs (per-job freshness against each
+registered cadence), notifications (Klaviyo outbox draining/age-out, failed
+sends, stale setup-mode suppressions after go-live) and data integrity (stored
+settings that silently fell back to defaults, ownership attribution, open
+alerts).
+
+The same suite runs automatically every 30 minutes via the new ungated
+`selfcheck_run` job (it only reads — catching a dead proxy BEFORE go-live is
+its job), persists its report to the machine-written `selfCheck` setting, and
+keeps ONE deduped CRITICAL `SELF_CHECK_FAILED` alert in sync with the verdict:
+raised while broken (emails Settings → alerts → emailTo), auto-resolved when a
+later run comes back clean. Each check carries a plain-language detail and a
+named fix, doctor-style.
+
+**Fixed — portal preview dead-ending at the setup gate.** "Preview with a demo
+subscription" could land on the public "finishing touches" gate page instead
+of the portal, through three separate paths, all closed:
+
+- A **valid `?cx_pp=` preview token now outranks a stale non-preview
+  `cx_portal` cookie** in `getPortalSession` (dev-harness path: an old OTP
+  login shadowed every preview click; on a live store the proxy strips
+  cookies, so ordering there is unchanged). An invalid token still falls
+  through to the other identity paths.
+- **Every gate site now names an expired preview link.** A gated request
+  carrying `?cx_pp=` gets the "preview link has expired" page (new shared
+  `closedPortalPage` in the portal layout) instead of the generic gate —
+  previously only `/login` did this; a storefront-logged-in admin on a stale
+  link fell through to a non-preview session and hit the nameless gate on
+  every other route (portal home, account, subscription, api, cancel flow).
+- **The token now survives dropped query strings** (classically: the
+  storefront password page redirect). A page rendering a live preview stores
+  the token in `sessionStorage`; the setup-gate page — sessionless by
+  construction and only ever rendered while the store is dark — retries once
+  with the stored token when its own URL lost it. No loop is possible: the
+  retry URL carries `cx_pp`, and a page whose URL carries `cx_pp` never
+  retries.
+
+> **Update notes:** no migration, no new env vars, no scope changes.
+> `shopify.app.toml` is unchanged (no `npm run deploy` needed for this
+> release; the new checks read webhook/proxy state, they do not register
+> any). New machine-written settings key `selfCheck`; new alert type
+> `SELF_CHECK_FAILED`; new job `selfcheck_run` (every 30 min, ungated —
+> runs in setup mode by design).
+
+## [1.8.0] — 2026-08-08
+
+**Order frequencies in days, weeks or months — mixable in one plan.** Plans
+were week-only (`frequenciesWeeks` ints); a merchant could not offer
+"every 10 days" or "every month", let alone both next to "every 2 weeks".
+Frequencies are now `{unit: DAY|WEEK|MONTH, count}` pairs, freely mixable
+inside one selling plan group, end to end: admin plan editor (token grammar —
+bare ints stay weeks, `10d` / `1m` add units), Shopify selling-plan sync
+(exact unit+count billing/delivery policies), buy box (localized unit nouns in
+chips/dropdown/microcopy and the JS island, all 22 extension catalogs), portal
+frequency change (token-valued options, all 22 app catalogs via the new
+`freq.{every|option}.{unit}.{one|other}` key family), cancel-flow save offer
+(suggests in the contract's own unit), bulk plan migration, CSV import
+(`interval_unit`+`interval_count` columns; `interval_weeks` stays as the WEEK
+alias), admin subscriber pages and CSV export (additive unit/count columns),
+Klaviyo events and reminder vars (additive `*_unit`/`*_count`/localized
+`frequency` phrase — every existing weeks-named property is retained).
+
+Under the hood: one shared module `app/lib/frequency.ts` owns parsing,
+normalization, tokens, labels and the week approximation; `contractFrequency()`
+resolves a contract's exact cadence (mirror columns, `intervalWeeks`
+fallback); `addIntervalTz()` advances dates calendar-exactly (month-end
+clamping) and now drives the billing scheduler's optimistic advance, skip
+preview/execution, gifts and win-back windows — the 4-weeks-per-month
+approximation no longer drifts monthly schedules. Migration 0015 (additive:
+two nullable Json columns on `SellingPlanConfig`); legacy week columns keep
+being written as approximations for rollback safety.
+
+> **Compatibility notes:**
+> - **Week plans are untouched on Shopify.** The plan option value
+>   "Every N weeks" is byte-frozen as the reconcile key (pinned by test), so
+>   re-syncing an existing week-only group updates plans in place — same
+>   GIDs, no storefront allow-list churn. New-unit plans are new plans.
+> - **External names are additive-only.** `interval_weeks`,
+>   `frequency_weeks`, `oldWeeks`/`newWeeks`, the subscriber-export
+>   `intervalWeeks` column and magic-token `{weeks}` params all still exist
+>   and still carry the whole-week approximation; unit-aware fields ride
+>   alongside. Existing Klaviyo flows keep working unchanged.
+> - i18n: `portal.schedule.every_weeks_option` was removed; four sentence
+>   keys now take a pre-localized `{frequency}` phrase. All 21 translations
+>   updated in this release (parity-tested).
+> - Deliberately unchanged: delay quick-actions (1w/3w links, SMS DELAY's
+>   2 weeks) stay week-denominated — they are duration offsets, valid for
+>   any cadence — and the buy-box designer preview keeps its illustrative
+>   week-only sample data.
+
+Post-implementation adversarial review (7 finders, 3-vote verification per
+finding) confirmed and fixed 8 further defects before packaging: a sticky
+live-widget outage window (product-reconcile failure after a plan-GID-swapping
+sync stranded the published allow-list — reconcile failures now report through
+the ATTACH_FAILED path and the allow-list always tracks the live plans); the
+billing sweep's stale-mirror heal now prefers Shopify's own next date (local
+month steps clamp month-ends and would drift a day-31 monthly schedule); the
+cancel-flow frequency save now accepts ONLY the exact offered cadence (the
+pre-existing any-weeks bypass would have widened to daily billing); anniversary
+gifts are granted once per rule (month-end window overlap could grant twice);
+the cancel SKIP card previews Shopify's real post-skip date; bulk migration
+matches YEAR-mirrored contracts its picker counts; rollback-window plan edits
+now win over the stale multi-unit Json (coherence check between the column
+families); prepaid plans keep their full label instead of colliding with the
+plain plan of the same cadence; and buy-box frequency sentences are composed
+from per-unit `every_*` phrases so gendered/case-marked languages stay
+grammatical (French "toutes les 2 semaines" vs "tous les 10 jours") — all 21
+extension catalogs updated, English output byte-identical. A plan offers at
+most 20 frequencies (Shopify per-group plan cap headroom).
+
+2250 tests (was 2160), `npm run verify` green twice, Liquid total 80,947
+bytes of the 90,112 working ceiling.
+
+## [1.7.0] — 2026-08-08
+
+**The portal works on a real store: cookie-less identity.** Root cause of the
+"Preview with a demo subscription" dead end — and of every portal login
+failing on a live store while all local tests passed: **Shopify's app proxy
+strips the `Cookie` request header and the `Set-Cookie` response header in
+both directions** (shopify.dev, "About app proxies" → Disallowed headers).
+The portal's entire identity model rode that cookie: OTP login set
+`cx_portal`, the magic-link LOGIN hand-off exchanged `?handoff=` for the same
+cookie — and on a live store the browser never received or returned either,
+so every visit arrived sessionless and fell through to the setup gate
+("We're putting the finishing touches…") with zero explanation. The local
+harness reaches the app host directly, so cookies worked there and 2160 tests
+proved a flow production could never run. Identity now rides the signed query
+string, which the proxy HMAC covers end-to-end: **admin previews** use a
+stateless, signed, 1-hour, view-only `?cx_pp=` token (the same trade-off as
+the `?cx_preview=` storefront token — every mutation is already intercepted
+for preview sessions), and **real customers** use Shopify's own
+`logged_in_customer_id`, appended by Shopify to every proxied request when
+the visitor is signed into their store account.
+
+> **Migration notes:**
+> - **Customers now sign in with their store account.** The portal login
+>   page's primary CTA is `/account/login?return_url=…`; after Shopify's
+>   login the portal opens with zero app cookies. The email → OTP-code flow
+>   cannot work through the proxy and is hidden unless
+>   **`PORTAL_COOKIE_DEV=1`** (new in `.env.example`) — set it only for a
+>   local harness that reaches the app host directly.
+> - Admin preview links minted before this release keep working: the magic
+>   LOGIN executor now appends a fresh `?cx_pp=` token alongside the (dead on
+>   live) hand-off.
+> - No schema changes, no migrations, no new scopes.
+
+### Added
+
+- **`app/lib/portal/previewToken.server.ts`** — the stateless `?cx_pp=`
+  admin preview token: `base64url(payload).HMAC` over the same signing
+  primitives the session cookie already used (no new crypto), verified
+  signature-first (timing-safe), then expiry, then **shop binding**. 1-hour
+  TTL, multi-use, nothing stored server-side. The doc comment spells out why
+  a URL token is acceptable *here* (admin-initiated, view-only, short-lived)
+  while customer session tokens in URLs remain banned.
+- **Two cookie-less identity paths in `getPortalSession`** (tried after the
+  cookie, both safe only behind `authenticate.public.appProxy`, which every
+  proxy route already runs first): a verified `cx_pp` token opens an
+  `isPreview` session carrying the raw token; a numeric
+  `logged_in_customer_id` opens a real session, matched against contracts
+  storing either the customer gid or the bare id, email taken from the
+  newest matching contract. `PortalSessionContext` gains
+  `previewToken: string | null`.
+- **Token propagation**: `withLocale(path, locale, preview?)` appends
+  `cx_pp=` to portal-base URLs; every in-portal link, form action and
+  redirect built under a session now passes `session.previewToken` (portal
+  home, subscription page, account, api dispatcher, logout, the whole
+  cancel flow), and the layout nav carries it via the new
+  `PortalPageInput.previewToken`. The layout's client script re-stamps any
+  portal-base link or form that slipped through (belt-and-suspenders — the
+  token in the URL *is* the session).
+- **Honest login screens** (`proxy.login`): an expired/tampered `cx_pp`
+  renders "This preview link has expired — reopen it from the Cellexia
+  admin" *before* the setup gate; a dead LOGIN hand-off redirects with
+  `?signin=expired` and renders "That sign-in link has expired"; the primary
+  CTA is the storefront sign-in. New keys under `portal.preview.expired_*` /
+  `portal.login.*` in all 22 catalogs.
+
+### Changed
+
+- **Admin portal previews are direct links** (`app.preview`,
+  `preview-portal-demo` / `preview-portal-subscriber`): the intents return
+  `https://<store>/apps/cellexia-subs/?cx_pp=…` — opens instantly on the
+  live store, valid 1 hour, multi-use, safe to share with staff — instead of
+  minting a magic LOGIN URL whose cookie hand-off the proxy discarded.
+  Checklist ticking and the `portal_preview_created` audit event are
+  unchanged (payload gains `via: "cx_pp"`).
+- **The magic LOGIN hand-off is kept** (harmless, still works in the local
+  harness), and when the payload carries `preview: true` the redirect also
+  appends a fresh `cx_pp` token so stale pre-1.7.0 preview links keep
+  working on live.
+- The setup-mode gates (`proxy._index`, `proxy.account`,
+  `proxy.subscription.$id`, `proxy.api.$action`, cancel flow) needed no
+  change: they key off `portalSession.isPreview`, which `cx_pp` sessions
+  set — and preview mutation interception blocks every write for them
+  exactly as before.
+- **Sessionless bounces keep the request's `cx_pp`** (`loginRedirectUrl`,
+  now exported from `session.server` and shared by `requireCustomer`,
+  `proxy._index` and the api dispatcher): the portal home is the *exact*
+  URL the admin preview mints, so an expired token lands there first — a
+  redirect to `/login` that dropped the token would recreate the original
+  dead-end (generic setup gate) instead of reaching the expired-preview
+  card.
+- **Sign-out follows the credential** (`proxy.account`, `proxy.logout`): a
+  `logged_in_customer_id` session holds no app credential to destroy —
+  Shopify re-appends the identity to every proxied request, so the app's
+  own POST `/logout` deleted nothing and the `/login` bounce signed the
+  customer straight back in. The account page now links those sessions to
+  Shopify's `/account/logout` (the store account *is* the session), and a
+  stale cached form that still POSTs the app's `/logout` is redirected
+  there too. Cookie (dev-harness) and preview sessions keep the app form.
+  `PortalSessionContext` gains `viaStorefrontLogin`.
+- `verifyPreviewToken` guards a signed non-object payload before the first
+  property access — `JSON.parse("null")` returns without throwing, so the
+  parse's try/catch never saw it and the dereference escaped as a 500.
+  Defense-in-depth only: unreachable without a valid HMAC, and the app
+  never mints such a body.
+
+### Tests
+
+- 2200 tests (40 new): `cx_pp` mint/verify round-trip, expiry boundary,
+  tampered signature/payload, wrong-shop binding; `getPortalSession` cx_pp +
+  logged_in_customer_id paths (gid/numeric normalization pinned on the
+  query), bare and empty-licid requests still null; `withLocale` third
+  parameter (portal paths only — the token never leaks onto
+  `/account/login`); login-page branches (expired preview beats the setup
+  gate, `signin=expired`, OTP hidden by default and back under
+  `PORTAL_COOKIE_DEV=1`); setup-gate bypass for `cx_pp` sessions on the
+  portal home and subscription pages with the token threaded through every
+  rendered action URL; mutation interception bouncing `cx_pp` sessions with
+  the token intact; and the preview intents returning direct, verifiable
+  `cx_pp` URLs with the audit/checklist side effects preserved. Hardening
+  pass: an *expired* `cx_pp` at the portal entry URL (and on a mid-preview
+  POST) redirects to login with the token intact and the followed page
+  names the expiry; the storefront-login account page renders the
+  `/account/logout` link (never the dead POST form, which cookie sessions
+  keep); POST `/logout` with `logged_in_customer_id` hands off to Shopify's
+  logout; a signed non-object token body fails closed instead of throwing.
+
+## [1.6.9] — 2026-08-08
 
 **Ownership hardening: two factors, exact sets.** After the v1.6.6 id-space
 fix, a single field — one `planIds` entry in the `cellexia.plan_groups` shop

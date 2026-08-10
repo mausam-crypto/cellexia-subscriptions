@@ -83,9 +83,17 @@ model SellingPlanConfig {
   shopifyPlanIds             Json? // ["gid://shopify/SellingPlan/...", ...]
   merchantCode               String   @unique @default(cuid())
   productIds                 Json // ["gid://shopify/Product/..."] products this group applies to
-  // Frequency options offered, in weeks: e.g. [4,6,8,10,12]
+  // Frequency options offered, in weeks: e.g. [4,6,8,10,12]. LEGACY as of
+  // v1.8.0 — kept written as a whole-week approximation of `frequencies` so a
+  // rollback still sees a coherent (week-only) view; readers prefer the
+  // multi-unit columns below and fall back here (app/lib/frequency.ts).
   frequenciesWeeks           Json
   defaultFrequencyWeeks      Int      @default(8)
+  // Multi-unit frequency truth (v1.8.0): [{unit: DAY|WEEK|MONTH, count}],
+  // units mixable within one group. Null on rows saved before v1.8.0 until
+  // their next save — consumers fall back to the week columns above.
+  frequencies                Json?
+  defaultFrequency           Json? // {unit, count}
   allowFrequencyChoice       Boolean  @default(true)
   // Offer architecture — discounts are baked into plan pricing policies (never codes)
   firstOrderDiscountPct      Int      @default(20)
@@ -110,15 +118,15 @@ model SellingPlanConfig {
 
 // Per-product cadence intelligence: real empty dates, not arbitrary monthly.
 model ProductCadence {
-  id                  String  @id @default(cuid())
-  shopId              String
-  productId           String // gid
-  variantId           String? // optional per-variant override
-  title               String?
-  estDaysToEmpty      Int     @default(56) // drives recommended frequency + win-back timing
-  recommendedWeeks    Int     @default(8)
-  substituteVariantId String? // used by stockout policy SUBSTITUTE
-  stockoutPolicy      String? // null = shop default; DELAY | SKIP_NOTIFY | SUBSTITUTE
+  id                    String  @id @default(cuid())
+  shopId                String
+  productId             String // gid
+  variantId             String? // optional per-variant override
+  title                 String?
+  estDaysToEmpty        Int     @default(56) // drives recommended frequency + win-back timing
+  recommendedWeeks      Int     @default(8)
+  substituteVariantId   String? // used by stockout policy SUBSTITUTE
+  stockoutPolicy        String? // null = shop default; DELAY | SKIP_NOTIFY | SUBSTITUTE
   // Merchant-entered COGS override (cents). Beats Shopify inventoryItem cost in
   // the analytics cost resolution (see app/lib/analytics/costs.server.ts):
   // ContractLine.unitCostCents → this override → costModel.cogsFallbackPctOfPrice.
@@ -149,44 +157,63 @@ model SubscriptionContract {
   status            ContractStatus @default(ACTIVE)
   locale            String         @default("en")
 
-  currencyCode                String
+  currencyCode                    String
   // Cadence. intervalWeeks is the whole-week APPROXIMATION (MONTH≈4wk,
   // DAY→ceil/7) that scheduling/portal/consolidation surfaces key off; the
   // exact Shopify billing policy is mirrored alongside so money math (MRR)
   // never pays the approximation error. Null on rows mirrored before v1.4.0
   // until their next sync — consumers must fall back to intervalWeeks.
-  intervalWeeks               Int
-  billingIntervalUnit         String? // DAY | WEEK | MONTH | YEAR (Shopify SellingPlanInterval)
-  billingIntervalCount        Int?
-  nextBillingDate             DateTime?
+  intervalWeeks                   Int
+  billingIntervalUnit             String? // DAY | WEEK | MONTH | YEAR (Shopify SellingPlanInterval)
+  billingIntervalCount            Int?
+  // Billing-policy cycle bounds (migration 0016), mirrored from the same
+  // Shopify billing policy as the interval columns: minCycles the contract is
+  // committed to, maxCycles after which Shopify expires it. Read by the portal
+  // (commitment-aware cancel guards) and by expiry analytics alongside
+  // expiredAt. Null = no bound set on the plan (the common case); also null on
+  // rows mirrored before 0016 until their next sync.
+  billingMinCycles                Int?
+  billingMaxCycles                Int?
+  nextBillingDate                 DateTime?
   // Pause state
-  pausedAt                    DateTime?
-  resumeAt                    DateTime? // auto-resume date (pause is 1–3 months)
+  pausedAt                        DateTime?
+  resumeAt                        DateTime? // auto-resume date (pause is 1–3 months)
+  // Why the contract paused (migration 0016), stamped by whichever path pauses
+  // it — the pause analogue of cancelReason: CUSTOMER | ADMIN | SAVE_FLOW |
+  // STOCKOUT_DELAY | SYSTEM. Read by retention analytics and the admin
+  // timeline; null on pauses taken before 0016 ("reason not recorded").
+  pausedReason                    String?
   // Cancel state
-  cancelledAt                 DateTime?
-  cancelReason                String?
-  cancelSource                String? // CUSTOMER | ADMIN | DUNNING | SYSTEM
+  cancelledAt                     DateTime?
+  cancelReason                    String?
+  cancelSource                    String? // CUSTOMER | ADMIN | DUNNING | SYSTEM
+  // Expiry state (migration 0016): stamped when the mirror flips status
+  // EXPIRED (Shopify ends a contract whose billingMaxCycles ran out), so
+  // lifecycle analytics can date the expiry the way cancelledAt dates a
+  // cancel. Null on rows that expired before 0016 — status stays the truth,
+  // this column only adds the WHEN.
+  expiredAt                       DateTime?
   // Failure / dunning
-  failedAt                    DateTime?
-  consecutiveFailures         Int       @default(0)
+  failedAt                        DateTime?
+  consecutiveFailures             Int       @default(0)
   // Prepaid
-  isPrepaid                   Boolean   @default(false)
-  prepaidDeliveriesPerCharge  Int?
-  prepaidDeliveriesRemaining  Int?
+  isPrepaid                       Boolean   @default(false)
+  prepaidDeliveriesPerCharge      Int?
+  prepaidDeliveriesRemaining      Int?
   // Payment
-  paymentMethodId             String? // gid://shopify/CustomerPaymentMethod/...
-  backupPaymentMethodId       String?
-  cardBrand                   String?
-  cardLast4                   String?
-  cardExpiryMonth             Int?
-  cardExpiryYear              Int?
+  paymentMethodId                 String? // gid://shopify/CustomerPaymentMethod/...
+  backupPaymentMethodId           String?
+  cardBrand                       String?
+  cardLast4                       String?
+  cardExpiryMonth                 Int?
+  cardExpiryYear                  Int?
   // Delivery
-  deliveryAddress             Json?
-  deliveryPriceCents          Int       @default(0)
-  deliveryMethodTitle         String?
+  deliveryAddress                 Json?
+  deliveryPriceCents              Int       @default(0)
+  deliveryMethodTitle             String?
   // Origin + lifecycle
-  originOrderId               String?
-  originOrderName             String?
+  originOrderId                   String?
+  originOrderName                 String?
   // Origin (checkout) order money mirror (migration 0006). The first payment
   // never becomes a BillingAttempt, so before these columns cohort/LTGP/rollup
   // revenue was structurally renewals-only. Captured from getOrderSummary when
@@ -204,6 +231,15 @@ model SubscriptionContract {
   originOrderRefundedCents        Int       @default(0)
   originOrderProcessedAt          DateTime?
   originOrderCurrencyCode         String?
+  // Origin money mirror, continued (migration 0016): the tax share of the
+  // origin total (getOrderSummary), so net-of-tax revenue math can stop
+  // treating the checkout payment as tax-free; and the origin order's first
+  // fulfillment timestamp, so delivery-experience analytics can measure the
+  // pay→ship gap for cycle 0 the way BillingAttempt.fulfilledAt does for
+  // renewals. Filled by the same capture-at-mirror / origin_order_backfill
+  // paths as the 0006 columns; null = not captured yet.
+  originOrderTaxCents             Int?
+  originOrderFulfilledAt          DateTime?
   // Terminal marker for the daily origin MONEY capture (migration 0011):
   // stamped by origin_order_backfill when getOrderSummary conclusively
   // reports the origin order unfetchable (order-not-found: deleted,
@@ -221,18 +257,18 @@ model SubscriptionContract {
   // ORDERS_CREATE payload + customer record, SANITIZED before persistence
   // (URLs keep host + path + utm_* only; never raw IP, never the full user
   // agent). All nulled by the CUSTOMERS_REDACT anonymizer.
-  acqReferringSite            String?
-  acqLandingSite              String?
-  acqSourceName               String?
-  acqUtm                      Json? // {source,medium,campaign,term,content}
-  acqCountryCode              String?
-  acqCity                     String?
-  acqProvinceCode             String?
-  acqDeviceType               String? // "mobile" | "desktop" | "tablet" | null
-  acqTimeToPurchaseSeconds    Int? // customer created_at → origin order processed_at
-  acqUnitsFirstOrder          Int?
-  acqOrderValueBand           String? // decile-friendly band label (raw total kept alongside)
-  acqRaw                      Json? // whole sanitized bundle for future mining — additive only, never repurposed
+  acqReferringSite                String?
+  acqLandingSite                  String?
+  acqSourceName                   String?
+  acqUtm                          Json? // {source,medium,campaign,term,content}
+  acqCountryCode                  String?
+  acqCity                         String?
+  acqProvinceCode                 String?
+  acqDeviceType                   String? // "mobile" | "desktop" | "tablet" | null
+  acqTimeToPurchaseSeconds        Int? // customer created_at → origin order processed_at
+  acqUnitsFirstOrder              Int?
+  acqOrderValueBand               String? // decile-friendly band label (raw total kept alongside)
+  acqRaw                          Json? // whole sanitized bundle for future mining — additive only, never repurposed
   // Terminal marker for the daily acquisition stash pickup (migration 0010):
   // stamped by origin_order_backfill once the stash-race horizon has passed
   // and no "acquisition.captured" stash exists for this contract (pre-0006
@@ -241,37 +277,47 @@ model SubscriptionContract {
   // identity). Stamped rows leave the capped acqPending window so unfillable
   // rows cannot starve it. The ORDERS_CREATE direct-persist path deliberately
   // ignores this marker — a genuinely late order webhook still lands its data.
-  acqPickupExhaustedAt        DateTime?
-  firstChargeAt               DateTime?
-  ordersCount                 Int       @default(0) // successful cycles billed
+  acqPickupExhaustedAt            DateTime?
+  firstChargeAt                   DateTime?
+  ordersCount                     Int       @default(0) // successful cycles billed
   // Renewal revenue collected on this contract, NET of recorded refunds since
   // v1.4.0 (REFUNDS_CREATE decrements it, clamped at zero). DELIBERATELY
   // renewals-only ("billed by this app"): the origin (checkout) payment is
   // mirrored separately in originOrderTotalCents below, and cohort/LTGP/rollup
   // aggregates add it from there — this column's meaning never changed.
-  lifetimeRevenueCents        Int       @default(0)
-  lifetimeDiscountCents       Int       @default(0)
+  lifetimeRevenueCents            Int       @default(0)
+  // Discount cents granted across this contract's RENEWAL orders. Gained its
+  // first writer in the 0016 data-collection pass: settlement increments it
+  // with the renewal order's discount total (BillingAttempt.discountCents).
+  // Renewals-only like lifetimeRevenueCents — origin (checkout) discount is
+  // mirrored separately in originOrderDiscountCents. Rows settled before the
+  // writer existed read 0 = "not tracked", not "no discount".
+  lifetimeDiscountCents           Int       @default(0)
   // DEPRECATED (dead column): no code writes it — per-contract gross profit
   // is derived from BillingAttempt rows via the shared cost model instead
   // (app/lib/analytics/costs.server.ts). Kept because migrations are
   // additive-only; do not read.
-  estLifetimeGrossProfitCents Int       @default(0)
+  estLifetimeGrossProfitCents     Int       @default(0)
   // Offer/discount bookkeeping
-  grandfatheredPricing        Boolean   @default(false)
+  grandfatheredPricing            Boolean   @default(false)
   // Consolidation ("routine box"): contracts sharing a mergeGroupId + date bill together
-  mergeGroupId                String?
+  mergeGroupId                    String?
   // Risk & prediction (analytics jobs keep these fresh)
-  churnRiskScore              Float?    @default(0)
-  predictedEmptyDate          DateTime?
-  skipCount                   Int       @default(0)
-  lastSkippedAt               DateTime?
+  churnRiskScore                  Float?    @default(0)
+  predictedEmptyDate              DateTime?
+  skipCount                       Int       @default(0)
+  lastSkippedAt                   DateTime?
+  // Skips initiated by the merchant/admin (migration 0016), counted apart
+  // from skipCount so churn-risk features read CUSTOMER intent only — an
+  // admin skipping a cycle around a stockout is not a disengagement signal.
+  merchantSkipCount               Int       @default(0)
   // Save/win-back bookkeeping
-  savedAt                     DateTime? // last time a cancel was averted
-  winbackEligibleAt           DateTime?
+  savedAt                         DateTime? // last time a cancel was averted
+  winbackEligibleAt               DateTime?
   // Local-only demo contract for the admin portal preview: fake
   // shopifyContractId ("gid://cellexia/demo/..."), never billed, excluded from
   // jobs/analytics/Klaviyo. Portal queries include it on purpose.
-  isDemo                      Boolean   @default(false)
+  isDemo                          Boolean   @default(false)
   // Which app owns this contract. The shop may run another subscription app
   // (e.g. Joy) whose contracts arrive on the same SUBSCRIPTION_CONTRACTS_*
   // webhooks and get mirrored here. Only OURS is billable / emailable /
@@ -289,7 +335,7 @@ model SubscriptionContract {
   // it to UNKNOWN makes the same mistake cost a renewal that waits until
   // reclassifyContracts() decides it. Wrong-and-recoverable beats
   // wrong-and-charged-twice, so the column leans UNKNOWN.
-  ownership                   String    @default("UNKNOWN")
+  ownership                       String    @default("UNKNOWN")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -334,6 +380,13 @@ model ContractLine {
   currentPriceCents   Int
   compareAtPriceCents Int? // undiscounted price, for "you save X" display
   unitCostCents       Int? // COGS from Shopify inventoryItem, for LTGP
+  // Shopify line pricing-policy mirror (migration 0016): the line's
+  // {basePrice, cycleDiscounts[]} exactly as the contract query returns it,
+  // refreshed on each sync. The price-change apply engine reads it to compute
+  // per-line adjustments; a line without one (older syncs, gifts, imports) is
+  // recorded SKIPPED_NULL_LINE in PriceChangeContractOutcome instead of being
+  // guessed at. Null until the next sync touches the line.
+  pricingPolicy       Json?
   isGift              Boolean  @default(false)
   isOneTimeAddon      Boolean  @default(false) // remove after ITS cycle settles (addonCycleIndex)
   // The Shopify billing-cycle index this one-time add-on was staged onto
@@ -414,6 +467,29 @@ model BillingAttempt {
   // amountCents keeps the amount originally charged; analytics report
   // revenue net of this column, so the charge history is never rewritten.
   refundedCents     Int                  @default(0)
+  // Renewal-order money breakdown (migration 0016), captured from the order
+  // at settlement: amountCents keeps the total as charged, these split it
+  // into discount / tax / shipping / pre-discount subtotal so rollup + cohort
+  // math can report net-of-tax revenue and real discount spend instead of
+  // estimating them. Null on attempts settled before 0016 and until the
+  // order summary is fetched.
+  discountCents     Int?
+  taxCents          Int?
+  shippingCents     Int?
+  subtotalCents     Int?
+  // The renewal order's processedAt and first-fulfillment timestamps
+  // (migration 0016), from settlement capture + FULFILLMENTS webhooks, so
+  // charge→ship latency is measurable per cycle (the renewal twin of
+  // originOrderProcessedAt / originOrderFulfilledAt).
+  orderProcessedAt  DateTime?
+  fulfilledAt       DateTime?
+  // Per-charge cost basis (migration 0016): {v:1, cogsCents,
+  // estimatedCogsCents, shippingCostCents, fulfillmentCostCents,
+  // deliveriesPerCharge, lines[]} captured at settlement through the shared
+  // cost model (app/lib/analytics/costs.server.ts), so gross-profit history
+  // survives later cost-setting edits — analytics read the snapshot when
+  // present and only fall back to live cost resolution for pre-0016 rows.
+  costSnapshot      Json?
   // Compliance evidence: stored-credential/MIT flags, 3DS outcome, consent snapshot
   mitEvidence       Json?
   // Churn-episode release marker (migration 0013): stamped on terminal
@@ -445,23 +521,41 @@ enum DunningState {
 }
 
 model DunningCase {
-  id                 String       @id @default(cuid())
-  contractId         String
-  openedAt           DateTime     @default(now())
-  state              DunningState @default(OPEN)
-  triggerAttemptId   String? // the failed attempt that opened the case
-  declineCode        String?
-  declineCategory    String? // SOFT | HARD | AUTH_REQUIRED
-  ladderStep         Int          @default(0) // index into retry schedule
-  nextRetryAt        DateTime?
-  paydayAligned      Boolean      @default(false)
-  emailsSent         Int          @default(0)
-  smsSent            Int          @default(0)
-  lastNotifiedAt     DateTime?
-  resolvedAt         DateTime?
-  resolution         String? // RECOVERED | CUSTOMER_FIXED | CANCELLED | EXHAUSTED
-  recoveredAttemptId String?
-  recoveredCents     Int?
+  id                       String       @id @default(cuid())
+  contractId               String
+  openedAt                 DateTime     @default(now())
+  state                    DunningState @default(OPEN)
+  triggerAttemptId         String? // the failed attempt that opened the case
+  declineCode              String?
+  declineCategory          String? // SOFT | HARD | AUTH_REQUIRED
+  ladderStep               Int          @default(0) // index into retry schedule
+  nextRetryAt              DateTime?
+  paydayAligned            Boolean      @default(false)
+  emailsSent               Int          @default(0)
+  smsSent                  Int          @default(0)
+  lastNotifiedAt           DateTime?
+  resolvedAt               DateTime?
+  resolution               String? // RECOVERED | CUSTOMER_FIXED | CANCELLED | EXHAUSTED
+  recoveredAttemptId       String?
+  recoveredCents           Int?
+  // Amount at risk (migration 0016): the ESTIMATED cycle amount at case-open,
+  // priced from the contract's lines + delivery at that moment — failed
+  // attempts carry no amountCents (Shopify only prices an attempt on
+  // success), so recovery reporting had case COUNTS but no money at stake.
+  // Estimate, never rewritten; recoveredCents holds the actual. Null on
+  // pre-0016 cases.
+  amountAtRiskCents        Int?
+  amountAtRiskCurrencyCode String?
+  // The contract's paymentMethodId at case-open (migration 0016), compared to
+  // the method at recovery so analytics can split "customer fixed the card"
+  // from "retry ladder got lucky". Null on pre-0016 cases.
+  originalPaymentMethodId  String?
+  // Position in the CONFIGURED retry ladder consumed so far (migration 0016).
+  // ladderStep counts retries performed on this case; ladderCursor pins which
+  // schedule entry the next retry reads from, so a mid-case ladder-config
+  // edit cannot replay or skip steps. Null = pre-0016 case; the engine falls
+  // back to ladderStep.
+  ladderCursor             Int?
 
   contract SubscriptionContract @relation(fields: [contractId], references: [id], onDelete: Cascade)
 
@@ -582,6 +676,12 @@ model GiftGrant {
   status     GiftGrantStatus @default(SCHEDULED)
   addedAt    DateTime?
   removedAt  DateTime?
+  // Stamped at the ADDED→SHIPPED settlement flip (migration 0016) so
+  // analytics can count this gift's COGS even after mirror hygiene later
+  // flips the grant REMOVED — the ship fact survives the status machine.
+  // Null on grants that shipped before 0016 (status alone said SHIPPED but
+  // not when, and lost it on REMOVED).
+  shippedAt  DateTime?
   createdAt  DateTime        @default(now())
 
   contract SubscriptionContract @relation(fields: [contractId], references: [id], onDelete: Cascade)
@@ -643,6 +743,11 @@ model WinbackState {
   nextTouchAt        DateTime?
   status             String    @default("ACTIVE") // ACTIVE | WON_BACK | SUNSET | OPTED_OUT
   wonBackAt          DateTime?
+  // Stamped when status flips OPTED_OUT (migration 0016) so the suppression
+  // is datable and auditable — status alone said "opted out" but not when,
+  // which compliance reviews and win-back reporting both need. Null on rows
+  // that opted out before 0016.
+  optedOutAt         DateTime?
   createdAt          DateTime  @default(now())
 
   @@index([status, nextTouchAt])
@@ -660,6 +765,11 @@ model NotificationLog {
   template         String // e.g. "upcoming_order", "payment_failed_1"
   status           String   @default("SENT") // SENT | FAILED | SUPPRESSED
   klaviyoEventName String?
+  // KlaviyoOutbox row that carried this notification (migration 0016), so a
+  // logged SENT can be traced to the delivery attempt that actually left the
+  // building (the outbox retries/fails independently of this log row). Null
+  // for channels that bypass the outbox and for pre-0016 rows.
+  outboxId         String?
   error            String?
   payload          Json?
   createdAt        DateTime @default(now())
@@ -754,43 +864,80 @@ model PriceChangeBatch {
   status            String    @default("DRAFT") // DRAFT | NOTICE_SENT | APPLIED | CANCELLED
   items             Json // [{variantId, oldPriceCents, newPriceCents}]
   contractsAffected Int       @default(0)
+  // Currency the items' old/new prices are denominated in (migration 0016),
+  // stamped from the shop at batch creation so the apply step's currency
+  // guard can refuse contracts billed in another currency instead of writing
+  // cross-currency cents. Null = pre-0016 batch (readers assume the shop
+  // currency, which is what those batches meant).
+  currencyCode      String?
+}
+
+// Per-contract outcome of a price-change batch (migration 0016). The batch
+// used to keep only contractsAffected — an aggregate that could not answer
+// "which contract failed, and why", so a half-applied batch was invisible.
+// One row per (batch, contract) per phase, appended by the notice + apply
+// engines: APPLIED | FAILED | SKIPPED_NULL_LINE (a line had no pricingPolicy
+// mirror to adjust) | NOTICE_SENT | NOTICE_FAILED. error carries the
+// Shopify/user error verbatim on the *_FAILED rows so retries and audits
+// need no log spelunking.
+model PriceChangeContractOutcome {
+  id         String   @id @default(cuid())
+  batchId    String
+  contractId String
+  status     String // APPLIED | FAILED | SKIPPED_NULL_LINE | NOTICE_SENT | NOTICE_FAILED
+  error      String?
+  createdAt  DateTime @default(now())
+
+  @@index([batchId])
+  @@index([contractId])
 }
 
 // ── Analytics ─────────────────────────────────────────────────────────────────
 
 model DailyRollup {
-  id                  String   @id @default(cuid())
-  shopId              String
-  date                DateTime // UTC midnight for the shop-tz day
-  activeSubscribers   Int      @default(0)
-  pausedSubscribers   Int      @default(0)
-  newSubscribers      Int      @default(0)
-  churnedVoluntary    Int      @default(0)
-  churnedInvoluntary  Int      @default(0)
-  mrrCents            Int      @default(0)
-  chargedCents        Int      @default(0)
-  discountCents       Int      @default(0)
-  giftCogsCents       Int      @default(0)
-  estGrossProfitCents Int      @default(0)
-  failedAttempts      Int      @default(0)
-  recoveredCents      Int      @default(0)
-  openDunningCases    Int      @default(0)
-  skips               Int      @default(0)
-  cancels             Int      @default(0)
-  savesOffered        Int      @default(0)
-  savesAccepted       Int      @default(0)
-  addonsAttached      Int      @default(0)
-  takeRateNum         Int      @default(0) // subscription checkouts
-  takeRateDen         Int      @default(0) // total checkouts of subscribable products
-  prepaidActive       Int      @default(0)
+  id                           String   @id @default(cuid())
+  shopId                       String
+  date                         DateTime // UTC midnight for the shop-tz day
+  activeSubscribers            Int      @default(0)
+  pausedSubscribers            Int      @default(0)
+  newSubscribers               Int      @default(0)
+  churnedVoluntary             Int      @default(0)
+  churnedInvoluntary           Int      @default(0)
+  mrrCents                     Int      @default(0)
+  chargedCents                 Int      @default(0)
+  discountCents                Int      @default(0)
+  giftCogsCents                Int      @default(0)
+  estGrossProfitCents          Int      @default(0)
+  failedAttempts               Int      @default(0)
+  recoveredCents               Int      @default(0)
+  openDunningCases             Int      @default(0)
+  skips                        Int      @default(0)
+  cancels                      Int      @default(0)
+  savesOffered                 Int      @default(0)
+  savesAccepted                Int      @default(0)
+  addonsAttached               Int      @default(0)
+  takeRateNum                  Int      @default(0) // new OURS contract mirrors booked on arrival day (not checkouts)
+  takeRateDen                  Int      @default(0) // total checkouts of subscribable products
+  prepaidActive                Int      @default(0)
   // Cost-model era (migration 0004): refunds recorded in the day window,
   // estimated shipping/fulfillment + payment-fee load of the day's charges, and
   // the share of billedCogs that came from the cogsFallbackPctOfPrice estimate
   // (COGS coverage stat — 0 means all COGS was known from Shopify/overrides).
-  refundedCents       Int      @default(0)
-  shippingCostCents   Int      @default(0)
-  feesCents           Int      @default(0)
-  estimatedCogsCents  Int      @default(0)
+  refundedCents                Int      @default(0)
+  shippingCostCents            Int      @default(0)
+  feesCents                    Int      @default(0)
+  estimatedCogsCents           Int      @default(0)
+  // Data-collection audit (migration 0016): money the currency guards
+  // excluded from this row's shop-currency aggregates, made visible instead
+  // of silently dropped — a nonzero value tells the merchant the totals are
+  // incomplete and by how much (in the foreign amounts' own cents).
+  excludedForeignCurrencyCents Int      @default(0)
+  // True on gap-backfilled rollup days whose point-in-time snapshot columns
+  // (activeSubscribers, mrrCents, openDunningCases, ...) could not be
+  // reconstructed after the fact — the flow columns are real, the snapshots
+  // are carried/estimated. Dashboards badge fabricated days instead of
+  // presenting them as measured.
+  snapshotFabricated           Boolean  @default(false)
 
   @@unique([shopId, date])
 }
@@ -818,6 +965,26 @@ model CohortCell {
   estimatedCogsCents  Int      @default(0)
 
   @@unique([shopId, cohortMonth, monthOffset])
+}
+
+// Daily variant-availability snapshot (migration 0016), one row per shop-tz
+// day, written by the availability check that fronts the billing/stockout
+// machinery: which subscribable variants were unavailable that day
+// (unavailableVariantIds, full GIDs) out of checkedVariants looked at.
+// Shopify availability is unqueryable retroactively, so without this record
+// stockout analytics could never say what was actually out of stock on the
+// day a renewal was delayed, skipped or substituted. checkedVariants = 0
+// with an empty list means "ran, nothing to check", distinguishable from a
+// day with no row at all ("never ran").
+model AvailabilitySnapshot {
+  id                    String   @id @default(cuid())
+  shopId                String
+  date                  DateTime // UTC midnight for the shop-tz day (matches DailyRollup.date)
+  unavailableVariantIds Json // ["gid://shopify/ProductVariant/...", ...]
+  checkedVariants       Int      @default(0)
+  createdAt             DateTime @default(now())
+
+  @@unique([shopId, date])
 }
 
 // ── Buy-box designer ─────────────────────────────────────────────────────────

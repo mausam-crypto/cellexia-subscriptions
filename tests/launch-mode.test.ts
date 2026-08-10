@@ -26,7 +26,7 @@ const mocks = vi.hoisted(() => ({
     async (
       _shopId: string,
       _event: { eventName: string; email: string | null },
-    ): Promise<void> => {},
+    ): Promise<{ id: string } | null> => ({ id: "obx_1" }),
   ),
   logEvent: vi.fn(async (): Promise<void> => {}),
   sendEmail: vi.fn(

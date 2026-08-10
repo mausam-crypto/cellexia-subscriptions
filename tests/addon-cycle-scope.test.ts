@@ -125,7 +125,7 @@ describe("consumeCycleOnSuccess is cycle-scoped", () => {
 
     expect(tx.giftGrant.updateMany).toHaveBeenCalledWith({
       where: { contractId: "c_1", cycleIndex: 5, status: "ADDED" },
-      data: { status: "SHIPPED" },
+      data: { status: "SHIPPED", shippedAt: expect.any(Date) },
     });
   });
 });

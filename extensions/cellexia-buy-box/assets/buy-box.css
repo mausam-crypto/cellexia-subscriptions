@@ -1124,6 +1124,158 @@
   }
 }
 
+/* ── Preset: subscription_ultra_max (v1.11.0) ─────────────────────────────
+   subscription_max taken to its logical end. Two moves:
+
+   1. The card is deliberately NOT special. No accent border, no soft fill,
+      no box chrome at all — the subscription price simply reads as the
+      product's price, the way a theme's own buy box would print it. The
+      then-line stays (recurrence disclosure is not optional) and the
+      focus ring stays (a11y is not chrome).
+   2. The quiet one-time line is a SATELLITE: buy-box.js relocates it below
+      the theme's whole buy area (.pdp__grey on the client's PDP). Out
+      there it has NO .cx-buybox ancestor, so its rules below stand alone —
+      selector rooted at .cx-buybox-satellite, brand fallbacks inline
+      because the root's custom properties cannot reach it. Inside the root
+      (gated, no-JS, no anchor) the inherited properties win through the
+      var() fallbacks and the rendering matches subscription_max. */
+
+.cx-buybox--subscription_ultra_max .cx-buybox__ultramax-card,
+.cx-buybox--subscription_ultra_max .cx-buybox__ultramax-card.is-selected {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.cx-buybox--subscription_ultra_max .cx-buybox__ultramax-card .cx-buybox__card {
+  padding: 0;
+}
+
+/* The relocated satellite loses its .cx-buybox ancestor, and with it the
+   visually-hidden clipping of .cx-buybox__sr-input above — without this
+   standalone copy the one-time radio would render as a NAKED NATIVE RADIO
+   CIRCLE next to the quiet link on the storefront. Same declarations,
+   selector rooted at the satellite itself. */
+.cx-buybox-satellite[data-cellexia-satellite] .cx-buybox__sr,
+.cx-buybox-satellite[data-cellexia-satellite] .cx-buybox__sr-input {
+  position: absolute !important;
+  inline-size: 1px;
+  block-size: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+/* The satellite, wherever it lives (inside the root pre-mount, below the
+   theme's buy area after). Font size / colors carry their own fallbacks. */
+.cx-buybox-satellite[data-cellexia-satellite] {
+  box-sizing: border-box;
+  margin: 12px 0 0;
+  text-align: start;
+  font-family: inherit;
+  font-size: calc(13px * var(--cx-font-scale, 1));
+  font-style: normal;
+  font-weight: 300;
+  line-height: 1.4;
+  letter-spacing: normal;
+  text-transform: none;
+}
+
+.cx-buybox-satellite[data-cellexia-satellite] .cx-buybox__submax-choice {
+  display: flex;
+  align-items: center;
+  min-block-size: 44px;
+  padding: 10px 2px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.cx-buybox-satellite[data-cellexia-satellite] .cx-buybox__submax-link {
+  font-weight: 300;
+  color: var(--cx-muted, rgba(29, 29, 27, 0.55));
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.cx-buybox-satellite[data-cellexia-satellite] .cx-buybox__submax-picked {
+  display: none;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-weight: 500;
+  color: var(--cx-text, #1d1d1b);
+}
+
+.cx-buybox-satellite[data-cellexia-satellite]
+  .cx-buybox__submax-picked
+  .cx-buybox__check {
+  align-self: center;
+  margin-block-start: 0;
+}
+
+.cx-buybox-satellite[data-cellexia-satellite] .cx-buybox__submax-picked-price {
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.cx-buybox-satellite[data-cellexia-satellite] .cx-buybox__submax-switchback {
+  display: none;
+  align-items: center;
+  min-block-size: 44px;
+  padding: 10px 2px;
+  font-weight: 300;
+  color: var(--cx-muted, rgba(29, 29, 27, 0.55));
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.cx-buybox-satellite[data-cellexia-satellite].is-selected .cx-buybox__submax-link {
+  display: none;
+}
+
+.cx-buybox-satellite[data-cellexia-satellite].is-selected .cx-buybox__submax-picked {
+  display: flex;
+}
+
+.cx-buybox-satellite[data-cellexia-satellite].is-selected
+  .cx-buybox__submax-switchback {
+  display: inline-flex;
+}
+
+/* No-sub variant: the satellite carries its own copy of the state class
+   (no .cx-buybox--no-sub ancestor once relocated — buy-box.js toggles it
+   on the satellite too), and "Switch back to subscription" is a promise a
+   no-allocation variant cannot honour. Both selection states covered. */
+.cx-buybox-satellite[data-cellexia-satellite].cx-buybox--no-sub
+  .cx-buybox__submax-switchback,
+.cx-buybox-satellite[data-cellexia-satellite].cx-buybox--no-sub.is-selected
+  .cx-buybox__submax-switchback {
+  display: none;
+}
+
+/* Focus ring — matches the in-widget pattern, standalone fallbacks. */
+.cx-buybox-satellite[data-cellexia-satellite]:has(input:focus-visible) {
+  outline: 2px solid var(--cx-accent, #1d1d1b);
+  outline-offset: 2px;
+}
+
+@supports not selector(:has(*)) {
+  .cx-buybox-satellite[data-cellexia-satellite]:focus-within {
+    outline: 2px solid var(--cx-accent, #1d1d1b);
+    outline-offset: 2px;
+  }
+}
+
 /* ── Density (compact) for preset elements ───────────────────────────── */
 
 .cx-buybox--compact .cx-buybox__chip-label {

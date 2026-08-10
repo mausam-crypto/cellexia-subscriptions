@@ -73,6 +73,12 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       take: TOP_N,
     });
 
+  // ONE forecast run per dashboard load: insights reuse this promise's
+  // accuracy grade for rule 7 instead of getInsights self-computing a
+  // duplicate forecast (~5 queries + the full rollup history fetch). A failed
+  // forecast degrades insights to "no grade" (the known-unknown contract) —
+  // the Promise.all still rejects on the forecast element itself, unchanged.
+  const forecastPromise = getForecast(shop.id);
   const [
     launch,
     stats,
@@ -92,7 +98,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     alertsFor("CRITICAL"),
     alertsFor("WARNING"),
     alertsFor("INFO"),
-    getForecast(shop.id),
+    forecastPromise,
     prisma.dailyRollup.findMany({
       where: { shopId: shop.id, date: { gte: trendCutoff } },
       orderBy: { date: "asc" },
@@ -103,7 +109,10 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         openDunningCases: true,
       },
     }),
-    getInsights(shop.id, now),
+    forecastPromise.then(
+      (f) => getInsights(shop.id, now, { forecastGrade: f.accuracy.grade }),
+      () => getInsights(shop.id, now, { forecastGrade: null }),
+    ),
   ]);
 
   const mrrTrend = rollups.map((r) => ({

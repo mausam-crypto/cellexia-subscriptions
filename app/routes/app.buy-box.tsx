@@ -63,7 +63,7 @@ import { BuyBoxPreview } from "~/components/buybox-preview";
 /**
  * Admin — Buy box designer.
  *
- * Configures the PDP subscription buy box: seven design presets with deep
+ * Configures the PDP subscription buy box: eight design presets with deep
  * customization (layout / per-locale text / style / behavior / app-embed
  * placement), per-Shopify-Market preset selection (v1.6.0 — config.markets,
  * keyed by market handle; everything but the preset inherits the main
@@ -332,7 +332,7 @@ const TEXT_FIELDS: { key: TextKey; label: string; templated: boolean }[] = [
   { key: "firstOrderLine", label: "First-order note", templated: true },
   {
     key: "oneTimeLinkLabel",
-    label: "One-time link label (Value stack & Subscription max)",
+    label: "One-time link label (Value stack & Subscription max / ultra max)",
     templated: true,
   },
 ];
@@ -348,8 +348,10 @@ const DEFAULT_BENEFITS = [
 function enDefaultFor(key: TextKey, preset: PresetKey): string {
   switch (key) {
     case "heading":
-      // subscription_max: no "choose your option" framing — empty heading.
-      return preset === "subscription_max" ? "" : "Choose your ritual";
+      // subscription_max family: no "choose your option" framing — empty heading.
+      return preset === "subscription_max" || preset === "subscription_ultra_max"
+        ? ""
+        : "Choose your ritual";
     case "subheading":
       return "";
     case "subscribeLabel":
@@ -385,6 +387,15 @@ function enDefaultFor(key: TextKey, preset: PresetKey): string {
  * design's layout instead (only the preset varies per market); the Liquid
  * additionally defaults both knobs off at render time when the config
  * cannot speak for them.
+ *
+ * subscription_ultra_max (v1.11.0) is quieter still: savings and
+ * reassurance also start off (each re-enableable) — the card must read as
+ * the plain, normal way of buying. The Liquid mirrors the same defaults at
+ * render time, and ALSO preselects the subscription for this preset unless
+ * the config explicitly says one_time — deliberately enforced at render
+ * time rather than written into the draft here, so browsing through the
+ * preset gallery can never leave `behavior.preselect` flipped on a design
+ * that ends up publishing a different preset.
  */
 const PRESET_LAYOUT_PATCH: Partial<
   Record<PresetKey, Partial<WidgetDesignConfig["layout"]>>
@@ -392,6 +403,12 @@ const PRESET_LAYOUT_PATCH: Partial<
   value_stack: { showBenefits: true },
   planner: { frequencyStyle: "chips" },
   subscription_max: { showBadge: false, showFrequency: false },
+  subscription_ultra_max: {
+    showBadge: false,
+    showFrequency: false,
+    showSavings: false,
+    showReassurance: false,
+  },
 };
 
 function applyPresetDefaults(
@@ -727,7 +744,7 @@ export default function BuyBoxDesignerPage() {
   return (
     <Page
       title="Buy box designer"
-      subtitle="Seven conversion-tested presets with deep customization and per-market selection — preview everything, publish safely, restore instantly."
+      subtitle="Eight conversion-tested presets with deep customization and per-market selection — preview everything, publish safely, restore instantly."
       primaryAction={{
         content: "Publish",
         onAction: () => setPublishOpen(true),
@@ -1066,6 +1083,36 @@ export default function BuyBoxDesignerPage() {
                     "Sleepify theme on cellexialabs.com. Test it first with " +
                     "document.querySelector('…') in the browser console on a " +
                     "product page."
+                  }
+                />
+              </Box>
+            ) : null}
+            <Checkbox
+              label="Match the theme's main price display to the selected option"
+              checked={draft.themeSync.syncMainPrice}
+              onChange={(v) => setThemeSync("syncMainPrice", v)}
+              helpText={
+                "The price under the product title keeps quoting the " +
+                "one-time price while the subscription is selected — this " +
+                "swaps that displayed TEXT the same safe way as the button. " +
+                "Struck-through compare-at and per-unit lines are left as " +
+                "the theme printed them."
+              }
+            />
+            {draft.themeSync.syncMainPrice ? (
+              <Box minWidth="280px">
+                <TextField
+                  label="Main price selector (optional)"
+                  autoComplete="off"
+                  value={draft.themeSync.mainPriceSelector}
+                  onChange={(v) => setThemeSync("mainPriceSelector", v)}
+                  placeholder=".pdp__price"
+                  maxLength={PRICE_SELECTOR_MAX_LENGTH}
+                  helpText={
+                    'Leave empty to use the built-in list (".pdp__price" for ' +
+                    "cellexialabs.com, plus the Dawn / OS 2.0 patterns). Set " +
+                    "it when your theme prints the main price somewhere the " +
+                    "built-in list misses."
                   }
                 />
               </Box>

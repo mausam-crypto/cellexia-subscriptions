@@ -49,7 +49,11 @@ const mocks = vi.hoisted(() => ({
   otpCodeDeleteMany: vi.fn(async (_a?: unknown) => ({ count: 0 })),
   portalSessionDeleteMany: vi.fn(async (_a?: unknown) => ({ count: 0 })),
   magicLinkTokenDeleteMany: vi.fn(async (_a?: unknown) => ({ count: 0 })),
+  klaviyoOutboxDeleteMany: vi.fn(async (_a?: unknown) => ({ count: 0 })),
+  klaviyoOutboxUpdateMany: vi.fn(async (_a?: unknown) => ({ count: 0 })),
   alertCreate: vi.fn(async (args: unknown): Promise<unknown> => args),
+  alertFindMany: vi.fn(async (_a?: unknown): Promise<unknown[]> => []),
+  alertUpdate: vi.fn(async (args: unknown): Promise<unknown> => args),
   getCustomer: vi.fn(async (_admin: unknown, _gid: string): Promise<unknown> => null),
 }));
 
@@ -70,7 +74,15 @@ vi.mock("~/db.server", () => ({
     otpCode: { deleteMany: mocks.otpCodeDeleteMany },
     portalSession: { deleteMany: mocks.portalSessionDeleteMany },
     magicLinkToken: { deleteMany: mocks.magicLinkTokenDeleteMany },
-    alert: { create: mocks.alertCreate },
+    klaviyoOutbox: {
+      deleteMany: mocks.klaviyoOutboxDeleteMany,
+      updateMany: mocks.klaviyoOutboxUpdateMany,
+    },
+    alert: {
+      create: mocks.alertCreate,
+      findMany: mocks.alertFindMany,
+      update: mocks.alertUpdate,
+    },
   },
 }));
 
@@ -78,7 +90,10 @@ vi.mock("~/shopify.server", () => ({
   adminClientForShop: vi.fn(async (): Promise<unknown> => ({})),
 }));
 
-vi.mock("~/lib/events/log.server", () => ({ logEvent: mocks.logEvent }));
+vi.mock("~/lib/events/log.server", () => ({
+  logEvent: mocks.logEvent,
+  logEventOrThrow: mocks.logEvent,
+}));
 
 vi.mock("~/lib/settings/settings.server", () => ({ getSetting: vi.fn() }));
 
@@ -133,6 +148,9 @@ beforeEach(() => {
   mocks.contractFindFirst.mockResolvedValue(null);
   mocks.contractFindMany.mockResolvedValue([]);
   mocks.contractUpdateMany.mockResolvedValue({ count: 1 });
+  mocks.klaviyoOutboxDeleteMany.mockResolvedValue({ count: 0 });
+  mocks.klaviyoOutboxUpdateMany.mockResolvedValue({ count: 0 });
+  mocks.alertFindMany.mockResolvedValue([]);
   mocks.getCustomer.mockResolvedValue(null);
 });
 
@@ -328,6 +346,9 @@ describe("buildAcquisitionCapture — the bundle never carries IP or full UA", (
         "landingSite",
         "referringSite",
         "utm",
+        // Capped-only recompute reserve for the utm scrub — deliberately
+        // unscrubbed, rides inside acqRaw so CUSTOMERS_REDACT clears it.
+        "rawUtm",
         "countryCode",
         "provinceCode",
         "city",
@@ -337,6 +358,16 @@ describe("buildAcquisitionCapture — the bundle never carries IP or full UA", (
         "orderCurrencyCode",
         "orderValueBand",
         "orderProcessedAt",
+        // Order-payload extras (ACQ-7): always present, null when the ingest
+        // cannot supply them.
+        "discountCodes",
+        "checkoutLocale",
+        "presentmentCurrencyCode",
+        "presentmentTotalCents",
+        "appId",
+        "sourceIdentifier",
+        "buyerAcceptsMarketing",
+        "orderTags",
       ].sort(),
     );
     const raw = JSON.stringify(capture.acqRaw).toLowerCase();
@@ -586,7 +617,16 @@ describe("ORDERS_CREATE acquisition capture", () => {
     expect(mocks.logEvent).not.toHaveBeenCalled();
   });
 
-  it("a customer lookup failure degrades to a null time-to-purchase, not a lost capture", async () => {
+  it("a TRANSIENT customer-lookup failure defers the persist — enrichment nulls never consume the only capture", async () => {
+    // ACQ-5: the acqRaw-null claim is the bundle's only write ever. The old
+    // behavior persisted customerCreatedAt/numberOfOrders/time-to-purchase
+    // as null on a retryable error, consuming the claim and permanently
+    // forfeiting the enrichment (the Shopify customer record stays fetchable
+    // forever) — with the missingness clustered on exactly the API-outage
+    // windows that bias a future training set. Now the whole persist defers:
+    // the stash below is the retry fuel (contract-create pickup / nightly
+    // backfill re-run it; the backfill counts the contained throw as
+    // acqFailed and stamps acqPickupExhaustedAt only when NO stash exists).
     mocks.contractFindFirst.mockResolvedValue({
       id: "cm_c1",
       shopId: "shop_1",
@@ -597,6 +637,28 @@ describe("ORDERS_CREATE acquisition capture", () => {
       originOrderProcessedAt: null,
     });
     mocks.getCustomer.mockRejectedValue(new Error("shopify down"));
+    await run(orderPayload());
+    // The claim was NOT consumed — a later retry can still land the full
+    // enrichment — and the webhook itself survived (containment).
+    expect(mocks.contractUpdateMany).not.toHaveBeenCalled();
+    // The stash is intact: the retry lanes have something to pick up.
+    expect(stashEvents()).toHaveLength(1);
+  });
+
+  it("a conclusively ABSENT customer persists honest nulls (deleted customer, not an outage)", async () => {
+    // getCustomer resolving null is Shopify's definitive "no such customer"
+    // (deleted / GDPR-erased) — null enrichment is then the truth, and the
+    // capture must land rather than retry forever.
+    mocks.contractFindFirst.mockResolvedValue({
+      id: "cm_c1",
+      shopId: "shop_1",
+      ownership: "OURS",
+      acqRaw: null,
+      customerId: "gid://shopify/Customer/77",
+      email: null,
+      originOrderProcessedAt: null,
+    });
+    mocks.getCustomer.mockResolvedValue(null);
     await run(orderPayload());
     const args = mocks.contractUpdateMany.mock.calls[0][0] as {
       data: Record<string, unknown>;
@@ -906,5 +968,82 @@ describe("CUSTOMERS_REDACT scrubs every acq* column", () => {
     });
     expect(mocks.contractUpdateMany).not.toHaveBeenCalled();
     expect(mocks.subscriberEventUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.klaviyoOutboxDeleteMany).not.toHaveBeenCalled();
+    expect(mocks.klaviyoOutboxUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it("Klaviyo outbox: pending rows die, delivered rows are anonymized — nothing fires after the erasure", async () => {
+    // ACQ-2/WH-10: every contract-scoped event copied email/phone + the acq
+    // profile attrs into an outbox row, rows are retained forever, and the
+    // 1-minute flush delivers PENDING/FAILED rows for up to 24h. A completed
+    // redact that leaves them behind keeps live PII in a queryable table AND
+    // transmits it outward after the erasure was acknowledged.
+    await runRedact();
+
+    // PENDING/FAILED rows are deleted outright (delivery plumbing, not a
+    // financial record) so the flush can never send a redacted identity.
+    expect(mocks.klaviyoOutboxDeleteMany).toHaveBeenCalledTimes(1);
+    const del = mocks.klaviyoOutboxDeleteMany.mock.calls[0][0] as {
+      where: Record<string, unknown>;
+    };
+    expect(del.where.status).toEqual({ in: ["PENDING", "FAILED"] });
+    const delOr = del.where.OR as Array<Record<string, unknown>>;
+    // Matched by the original email AND by the contract snapshot each row
+    // carries — a store-email change since the last enqueue cannot hide rows.
+    expect(delOr).toContainEqual({ email: "jane@example.com" });
+    expect(delOr).toContainEqual({
+      properties: { path: ["contract_id"], equals: "c1" },
+    });
+    expect(delOr).toContainEqual({
+      properties: { path: ["contract_id"], equals: "c2" },
+    });
+
+    // SENT/DEAD rows stay as delivery audit, minus every identity and
+    // acquisition copy (profileAttrs carry cellexia_acq_source/_country).
+    expect(mocks.klaviyoOutboxUpdateMany).toHaveBeenCalledTimes(1);
+    const scrub = mocks.klaviyoOutboxUpdateMany.mock.calls[0][0] as {
+      where: Record<string, unknown>;
+      data: Record<string, unknown>;
+    };
+    expect(scrub.data).toEqual({
+      email: "redacted+42@example.invalid",
+      phone: null,
+      profileAttrs: Prisma.DbNull,
+      properties: Prisma.DbNull,
+    });
+  });
+
+  it("rewrites GDPR_DATA_REQUEST alert context/message for the redacted identity", async () => {
+    // handleCustomersDataRequest stores the customer's email + order list in
+    // Alert.context as operator guidance; the redact supersedes it.
+    mocks.alertFindMany.mockResolvedValue([
+      {
+        id: "alert_1",
+        context: {
+          customerId: "gid://shopify/Customer/42",
+          email: "jane@example.com",
+          ordersRequested: [999001],
+          dataRequestId: "req_9",
+        },
+      },
+    ]);
+    await runRedact();
+
+    const query = mocks.alertFindMany.mock.calls[0][0] as {
+      where: Record<string, unknown>;
+    };
+    expect(query.where.type).toBe("GDPR_DATA_REQUEST");
+
+    expect(mocks.alertUpdate).toHaveBeenCalledTimes(1);
+    const update = mocks.alertUpdate.mock.calls[0][0] as {
+      where: Record<string, unknown>;
+      data: { message: string; context: Record<string, unknown> };
+    };
+    expect(update.where).toEqual({ id: "alert_1" });
+    // The email is gone from BOTH copies; the audit key survives.
+    expect(update.data.message).not.toContain("jane@example.com");
+    expect(update.data.context.email).toBe("redacted+42@example.invalid");
+    expect(update.data.context.ordersRequested).toEqual([]);
+    expect(update.data.context.dataRequestId).toBe("req_9");
   });
 });

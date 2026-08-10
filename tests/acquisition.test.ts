@@ -1,10 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
+  ACQ_LIST_MAX,
+  ACQ_SLUG_MAX,
   ACQ_URL_MAX,
   buildAcquisitionCapture,
   deviceTypeFromUserAgent,
+  discountCodesFromInput,
+  orderTagsFromInput,
   orderValueBandFromCents,
+  rawUtmFromUrl,
   sanitizeAcquisitionUrl,
+  sanitizeUtmValue,
   stripPiiFromText,
   timeToPurchaseSeconds,
   truncateAcqField,
@@ -47,6 +53,58 @@ describe("stripPiiFromText", () => {
       "/products/night-cream",
     );
   });
+
+  // The token heuristic must not eat human slugs: redacting every 20+ char
+  // run destroyed real campaign names and product handles at capture, with
+  // no raw copy anywhere to recompute from.
+  it("keeps 20+ char kebab/snake slugs (campaign names, product handles)", () => {
+    expect(stripPiiFromText("black-friday-2025-conversion")).toBe(
+      "black-friday-2025-conversion",
+    );
+    expect(stripPiiFromText("/products/advanced-night-repair-serum")).toBe(
+      "/products/advanced-night-repair-serum",
+    );
+  });
+
+  it("still redacts separator-less letter+digit fusions (hex-ish tokens)", () => {
+    expect(stripPiiFromText("aabbccddeeff00112233")).toContain("[redacted]");
+    expect(stripPiiFromText("SECRETTOKEN1234567890")).toContain("[redacted]");
+  });
+
+  it("redacts any run longer than ACQ_SLUG_MAX regardless of shape", () => {
+    const monster = "very-long-".repeat(8) + "slug"; // 84 chars
+    expect(monster.length).toBeGreaterThan(ACQ_SLUG_MAX);
+    expect(stripPiiFromText(monster)).toContain("[redacted]");
+  });
+});
+
+// ── sanitizeUtmValue ─────────────────────────────────────────────────────────
+
+describe("sanitizeUtmValue (utm values: digit runs are ad ids, not phones)", () => {
+  it("keeps realistic campaign values verbatim", () => {
+    expect(sanitizeUtmValue("black-friday-2025-conversion")).toBe(
+      "black-friday-2025-conversion",
+    );
+    expect(sanitizeUtmValue("20260801_summer_sale")).toBe(
+      "20260801_summer_sale",
+    );
+    // Meta/Google {{campaign.id}} templates resolve to pure-digit ids.
+    expect(sanitizeUtmValue("120210123456789012")).toBe("120210123456789012");
+  });
+
+  it("still scrubs emails and token-shaped values", () => {
+    expect(sanitizeUtmValue("jane.doe@example.com")).not.toContain(
+      "jane.doe@example.com",
+    );
+    expect(sanitizeUtmValue("AbCdEf1234567890AbCdEf12")).toBe("[redacted]");
+  });
+
+  it("caps and nulls like every other field", () => {
+    expect(sanitizeUtmValue("x".repeat(500))!.length).toBeLessThanOrEqual(128);
+    expect(sanitizeUtmValue("")).toBeNull();
+    expect(sanitizeUtmValue(undefined)).toBeNull();
+    expect(sanitizeUtmValue(42)).toBeNull();
+  });
 });
 
 // ── sanitizeAcquisitionUrl ───────────────────────────────────────────────────
@@ -86,6 +144,33 @@ describe("sanitizeAcquisitionUrl", () => {
     const out = sanitizeAcquisitionUrl("not a url with jane@doe.com inside");
     expect(out).not.toContain("jane@doe.com");
   });
+
+  // Landing paths ARE the landing-page dimension: a 20+ char product handle
+  // must survive, or every long-handle product reads "[redacted]" forever.
+  it("keeps long product-handle path segments and digit-run segments", () => {
+    expect(
+      sanitizeAcquisitionUrl("/products/advanced-night-repair-serum?utm_source=ig"),
+    ).toBe("/products/advanced-night-repair-serum?utm_source=ig");
+    expect(sanitizeAcquisitionUrl("/collections/20260801_summer_sale")).toBe(
+      "/collections/20260801_summer_sale",
+    );
+  });
+
+  it("still redacts checkout-token path segments", () => {
+    const out = sanitizeAcquisitionUrl(
+      "/checkouts/cn/AbCdEf1234567890AbCdEf12/thank_you",
+    );
+    expect(out).not.toContain("AbCdEf1234567890AbCdEf12");
+    expect(out).toContain("/thank_you");
+  });
+
+  it("keeps digit-heavy utm values (ad-platform ids), scrubs token values", () => {
+    const out = sanitizeAcquisitionUrl(
+      "/l?utm_campaign=120210123456789012&utm_content=AbCdEf1234567890AbCdEf12",
+    );
+    expect(out).toContain("utm_campaign=120210123456789012");
+    expect(out).not.toContain("AbCdEf1234567890AbCdEf12");
+  });
 });
 
 // ── utmFromUrl ───────────────────────────────────────────────────────────────
@@ -109,6 +194,44 @@ describe("utmFromUrl", () => {
     expect(utmFromUrl("/products/serum?variant=123")).toBeNull();
     expect(utmFromUrl("")).toBeNull();
     expect(utmFromUrl(null)).toBeNull();
+  });
+
+  // The exact values the old scrub destroyed (kebab names, date-stamped
+  // names, numeric platform ids) — the campaign dimension must survive.
+  it("keeps realistic campaign values intact", () => {
+    expect(
+      utmFromUrl(
+        "/l?utm_source=meta&utm_campaign=black-friday-2025-conversion",
+      )?.campaign,
+    ).toBe("black-friday-2025-conversion");
+    expect(utmFromUrl("/l?utm_campaign=20260801_summer_sale")?.campaign).toBe(
+      "20260801_summer_sale",
+    );
+    expect(utmFromUrl("/l?utm_campaign=120210123456789012")?.campaign).toBe(
+      "120210123456789012",
+    );
+  });
+});
+
+// ── rawUtmFromUrl (the recompute reserve) ────────────────────────────────────
+
+describe("rawUtmFromUrl", () => {
+  it("keeps the values capped-only — even ones the scrub would redact", () => {
+    const raw = rawUtmFromUrl(
+      "/l?utm_source=ig&utm_content=AbCdEf1234567890AbCdEf12",
+    );
+    expect(raw).toEqual({
+      source: "ig",
+      medium: null,
+      campaign: null,
+      term: null,
+      content: "AbCdEf1234567890AbCdEf12",
+    });
+  });
+
+  it("null when no utm at all (matches utmFromUrl's null semantics)", () => {
+    expect(rawUtmFromUrl("/products/serum?variant=123")).toBeNull();
+    expect(rawUtmFromUrl(null)).toBeNull();
   });
 });
 
@@ -212,6 +335,33 @@ describe("truncateAcqField", () => {
   });
 });
 
+// ── List-shaped bundle fields ────────────────────────────────────────────────
+
+describe("discountCodesFromInput / orderTagsFromInput", () => {
+  it("accepts REST {code} objects and plain strings, capped", () => {
+    expect(
+      discountCodesFromInput([{ code: "WELCOME10", amount: "10.00" }, "VIP"]),
+    ).toEqual(["WELCOME10", "VIP"]);
+    expect(discountCodesFromInput([])).toEqual([]);
+    expect(discountCodesFromInput(undefined)).toBeNull();
+    expect(
+      discountCodesFromInput(
+        Array.from({ length: 50 }, (_, i) => `CODE${i}`),
+      )!.length,
+    ).toBe(ACQ_LIST_MAX);
+  });
+
+  it("accepts the REST comma-separated tags string and arrays, capped", () => {
+    expect(orderTagsFromInput("vip, wholesale ,  ")).toEqual([
+      "vip",
+      "wholesale",
+    ]);
+    expect(orderTagsFromInput(["a", "b"])).toEqual(["a", "b"]);
+    expect(orderTagsFromInput("")).toEqual([]);
+    expect(orderTagsFromInput(undefined)).toBeNull();
+  });
+});
+
 // ── buildAcquisitionCapture ──────────────────────────────────────────────────
 
 describe("buildAcquisitionCapture", () => {
@@ -268,6 +418,68 @@ describe("buildAcquisitionCapture", () => {
     expect(capture.acqDeviceType).toBeNull();
     expect(capture.acqOrderValueBand).toBeNull();
     expect(capture.acqRaw.orderId).toBeNull();
+  });
+
+  it("acqRaw.rawUtm keeps the capped-only utm alongside the scrubbed edge", () => {
+    const capture = buildAcquisitionCapture({
+      landingSite:
+        "/products/serum?utm_source=ig&utm_content=AbCdEf1234567890AbCdEf12",
+    });
+    expect(capture.acqUtm).toEqual({
+      source: "ig",
+      medium: null,
+      campaign: null,
+      term: null,
+      content: "[redacted]",
+    });
+    expect(capture.acqRaw.rawUtm).toEqual({
+      source: "ig",
+      medium: null,
+      campaign: null,
+      term: null,
+      content: "AbCdEf1234567890AbCdEf12",
+    });
+    // No utm anywhere → both edges null (never an all-null object).
+    const bare = buildAcquisitionCapture({ landingSite: "/products/serum" });
+    expect(bare.acqUtm).toBeNull();
+    expect(bare.acqRaw.rawUtm).toBeNull();
+  });
+
+  it("carries the order-payload extras, sanitized, null when absent", () => {
+    const capture = buildAcquisitionCapture({
+      ...input,
+      discountCodes: [{ code: "WELCOME10" }, "VIP"],
+      checkoutLocale: "fr-CH",
+      presentmentCurrencyCode: "eur",
+      presentmentTotalCents: 11900,
+      appId: 580111,
+      sourceIdentifier: "pos-till-3",
+      buyerAcceptsMarketing: true,
+      orderTags: "subscription, first-order",
+    });
+    expect(capture.acqRaw.discountCodes).toEqual(["WELCOME10", "VIP"]);
+    expect(capture.acqRaw.checkoutLocale).toBe("fr-CH");
+    expect(capture.acqRaw.presentmentCurrencyCode).toBe("EUR");
+    expect(capture.acqRaw.presentmentTotalCents).toBe(11900);
+    expect(capture.acqRaw.appId).toBe(580111);
+    expect(capture.acqRaw.sourceIdentifier).toBe("pos-till-3");
+    expect(capture.acqRaw.buyerAcceptsMarketing).toBe(true);
+    expect(capture.acqRaw.orderTags).toEqual(["subscription", "first-order"]);
+
+    // Keys are ALWAYS present (shape parity) — null when the ingest cannot
+    // supply them, so pre-feature vs no-value rows stay distinguishable.
+    const bare = buildAcquisitionCapture({});
+    expect(bare.acqRaw).toMatchObject({
+      discountCodes: null,
+      checkoutLocale: null,
+      presentmentCurrencyCode: null,
+      presentmentTotalCents: null,
+      appId: null,
+      sourceIdentifier: null,
+      buyerAcceptsMarketing: null,
+      orderTags: null,
+      rawUtm: null,
+    });
   });
 });
 

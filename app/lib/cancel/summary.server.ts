@@ -1,5 +1,6 @@
 import type { Shop } from "@prisma/client";
 import { getSetting } from "~/lib/settings/settings.server";
+import { contractFrequency } from "~/lib/frequency";
 import type { LocalContractWithLines } from "~/lib/contracts/shared.server";
 
 /**
@@ -20,7 +21,8 @@ export interface RetentionSummary {
   currencyCode: string;
   /** What the subscriber price saves vs one-time prices, per delivery. */
   perCycleSavingsCents: number;
-  /** The per-delivery saving annualized over 52/intervalWeeks cycles. */
+  /** The per-delivery saving annualized over the contract's exact cadence
+   * (WEEK 52/count, MONTH 12/count, DAY 365.25/count cycles per year). */
   annualSavingsCents: number;
   daysSubscribed: number;
   ordersCount: number;
@@ -50,8 +52,16 @@ export async function buildRetentionSummary(
     }
   }
 
+  // Exact-unit cycle math — never the intervalWeeks approximation (a monthly
+  // contract is 12 cycles/year, not 52/4=13). contractFrequency degrades a
+  // missing unit mirror to {WEEK, intervalWeeks}, i.e. 52/intervalWeeks.
+  const freq = contractFrequency(contract);
   const cyclesPerYear =
-    contract.intervalWeeks > 0 ? 52 / contract.intervalWeeks : 0;
+    freq.unit === "MONTH"
+      ? 12 / freq.count
+      : freq.unit === "DAY"
+        ? 365.25 / freq.count
+        : 52 / freq.count;
   const annualSavingsCents = Math.round(perCycleSavingsCents * cyclesPerYear);
 
   const since = contract.firstChargeAt ?? contract.createdAt;

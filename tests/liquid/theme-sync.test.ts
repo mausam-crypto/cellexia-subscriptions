@@ -251,6 +251,8 @@ describe("themeSync config", () => {
     });
     expect(rootAttr(html, "data-cellexia-price-sync")).toBe("true");
     expect(rootAttr(html, "data-cellexia-price-selector")).toBe("");
+    expect(rootAttr(html, "data-cellexia-price-sync-main")).toBe("true");
+    expect(rootAttr(html, "data-cellexia-main-selector")).toBe("");
   });
 
   it("syncAddToCartPrice:false switches the module off in the markup", async () => {
@@ -259,9 +261,30 @@ describe("themeSync config", () => {
       launchStatus: "live",
     });
     expect(rootAttr(html, "data-cellexia-price-sync")).toBe("false");
+    // …independently of the main-price surface, which keeps its own flag.
+    expect(rootAttr(html, "data-cellexia-price-sync-main")).toBe("true");
     // The money strings stay — they are honest data either way; the flag is
     // what buy-box.js reads before it touches anything.
     expect(rootAttrDecoded(html, "data-cellexia-money-onetime")).toBe("CHF 64.00");
+  });
+
+  it("syncMainPrice:false switches only the main-price surface off", async () => {
+    const html = await renderWidget({
+      config: configWith("classic", { syncMainPrice: false }),
+      launchStatus: "live",
+    });
+    expect(rootAttr(html, "data-cellexia-price-sync-main")).toBe("false");
+    expect(rootAttr(html, "data-cellexia-price-sync")).toBe("true");
+  });
+
+  it("carries a merchant mainPriceSelector verbatim", async () => {
+    const html = await renderWidget({
+      config: configWith("classic", { mainPriceSelector: ".pdp__price" }),
+      launchStatus: "live",
+    });
+    expect(rootAttrDecoded(html, "data-cellexia-main-selector")).toBe(
+      ".pdp__price",
+    );
   });
 
   it("carries a merchant priceSelector verbatim", async () => {
@@ -285,6 +308,8 @@ describe("themeSync config", () => {
     expect(parsed.themeSync).toEqual({
       syncAddToCartPrice: true,
       priceSelector: "",
+      syncMainPrice: true,
+      mainPriceSelector: "",
     });
 
     // 2. …and the Liquid, which reads the raw metafield JSON with no zod in
@@ -292,6 +317,8 @@ describe("themeSync config", () => {
     const html = await renderWidget({ config, launchStatus: "live" });
     expect(rootAttr(html, "data-cellexia-price-sync")).toBe("true");
     expect(rootAttr(html, "data-cellexia-price-selector")).toBe("");
+    expect(rootAttr(html, "data-cellexia-price-sync-main")).toBe("true");
+    expect(rootAttr(html, "data-cellexia-main-selector")).toBe("");
     expect(rootAttrDecoded(html, "data-cellexia-money-sub")).toBe("CHF 51.20");
   });
 
@@ -350,7 +377,7 @@ describe("hostile money formats", () => {
 describe("assets/buy-box.js price-sync module", () => {
   const source = readAsset("buy-box.js");
 
-  it("reads exactly the four attributes the Liquid emits", async () => {
+  it("reads exactly the six attributes the Liquid emits", async () => {
     const html = await renderWidget({
       config: configWith("classic", { priceSelector: ".x" }),
       launchStatus: "live",
@@ -360,6 +387,8 @@ describe("assets/buy-box.js price-sync module", () => {
       "data-cellexia-money-sub",
       "data-cellexia-price-sync",
       "data-cellexia-price-selector",
+      "data-cellexia-price-sync-main",
+      "data-cellexia-main-selector",
     ]) {
       expect(source, attribute).toContain(attribute);
       expect(rootAttr(html, attribute), attribute).not.toBeNull();
@@ -373,6 +402,10 @@ describe("assets/buy-box.js price-sync module", () => {
       ".product-form__submit",
       "[data-add-to-cart]",
       ".btn--atc",
+      // v1.11.0 main-price surface — the client's theme first, then generic.
+      ".pdp__price",
+      ".product__price",
+      "[data-product-price]",
     ]) {
       expect(source, selector).toContain(selector);
     }

@@ -6,6 +6,12 @@ import { t } from "~/lib/i18n/i18n.server";
 import { getSetting } from "~/lib/settings/settings.server";
 import { clampGrantPercentForContract } from "~/lib/billing/stacking.server";
 import { formatShopDate } from "~/lib/dates.server";
+import {
+  contractFrequency,
+  formatFrequency,
+  parseFrequencyToken,
+  type Frequency,
+} from "~/lib/frequency";
 import { withLocale } from "~/lib/portal/layout.server";
 import {
   FINAL_DISCOUNT,
@@ -83,6 +89,7 @@ function toPath(
   return withLocale(
     `${cancelPublicPath(ctx.contract.id, step)}${error ? "?error=1" : ""}`,
     ctx.locale,
+    ctx.portalSession.previewToken,
   );
 }
 
@@ -151,6 +158,7 @@ async function loadReason(ctx: CancelRouteContext, hasError: boolean) {
     selectedReason,
     detail,
     showError: hasError,
+    previewToken: ctx.portalSession.previewToken,
   }));
 }
 
@@ -179,6 +187,7 @@ async function loadSaves(
       currencyCode: contract.currencyCode,
       showError: hasError,
       finalOfferEligible: true,
+      previewToken: ctx.portalSession.previewToken,
     }));
   }
 
@@ -212,6 +221,7 @@ async function loadSaves(
     currencyCode: contract.currencyCode,
     showError: hasError,
     finalOfferEligible,
+    previewToken: ctx.portalSession.previewToken,
   }));
 }
 
@@ -236,6 +246,7 @@ async function loadFinal(ctx: CancelRouteContext, hasError: boolean) {
       cycles: cancelFlow.finalOfferCycles,
       copyVariant: copyVariantFor(contract.id),
       showError: hasError,
+      previewToken: ctx.portalSession.previewToken,
     }));
   }
 
@@ -268,6 +279,7 @@ async function loadFinal(ctx: CancelRouteContext, hasError: boolean) {
     cycles: cancelFlow.finalOfferCycles,
     copyVariant: copyVariantFor(contract.id),
     showError: hasError,
+    previewToken: ctx.portalSession.previewToken,
   }));
 }
 
@@ -295,6 +307,7 @@ async function loadConfirm(ctx: CancelRouteContext, hasError: boolean) {
     contractId: ctx.contract.id,
     showError: hasError,
     finalOfferEligible,
+    previewToken: ctx.portalSession.previewToken,
   }));
 }
 
@@ -304,6 +317,7 @@ async function loadDone(ctx: CancelRouteContext) {
     locale: ctx.locale,
     contractId: ctx.contract.id,
     csrf: ctx.portalSession.csrfToken,
+    previewToken: ctx.portalSession.previewToken,
   }));
 }
 
@@ -328,8 +342,15 @@ async function loadSaved(ctx: CancelRouteContext) {
       break;
     case "FREQUENCY":
       messageKey = "cancel.saved.frequency";
+      // The accepted cadence is read back off the contract itself:
+      // contractFrequency uses the exact unit/count mirror when present, else
+      // the legacy intervalWeeks as a WEEK cadence.
       messageVars = {
-        weeks: contract.intervalWeeks,
+        frequency: formatFrequency(
+          (key, vars) => t(locale, key, vars),
+          "every",
+          contractFrequency(contract),
+        ),
         date: fmt(contract.nextBillingDate),
       };
       break;
@@ -386,6 +407,7 @@ async function loadSaved(ctx: CancelRouteContext) {
     messageVars,
     showEducationLinks,
     showSupportLink,
+    previewToken: ctx.portalSession.previewToken,
   }));
 }
 
@@ -482,6 +504,16 @@ function optionalString(value: FormDataEntryValue | null): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+/** v1.8.0 save cards post a "frequency" token; malformed tokens are dropped
+ *  (the engine then falls back to the legacy weeks int, if posted). */
+function optionalFrequency(
+  value: FormDataEntryValue | null,
+): Frequency | undefined {
+  return typeof value === "string" && value.length > 0
+    ? (parseFrequencyToken(value) ?? undefined)
+    : undefined;
+}
+
 async function actionSaves(ctx: CancelRouteContext, form: FormData) {
   const { contract } = ctx;
   const session = await requireSessionOrRestart(ctx);
@@ -494,6 +526,7 @@ async function actionSaves(ctx: CancelRouteContext, form: FormData) {
   const kind = kindRaw as SaveKind;
 
   const cleanParams: AcceptSaveParams = {
+    frequency: optionalFrequency(form.get("frequency")),
     weeks: parsePositiveInt(form.get("weeks")),
     months: parsePositiveInt(form.get("months")),
     lineId: optionalString(form.get("lineId")),

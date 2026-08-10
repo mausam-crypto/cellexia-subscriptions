@@ -9,7 +9,7 @@ import {
   escapeHtml,
   localeFromRequest,
   portalPage,
-  setupGatePage,
+  closedPortalPage,
   withLocale,
 } from "~/lib/portal/layout.server";
 import {
@@ -34,7 +34,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   // Launch gate: while in setup mode the portal is closed to the public —
   // only admin preview sessions pass through.
   if (!portalSession.isPreview && (await isSetupMode(shop.id))) {
-    return liquid(setupGatePage(locale), {
+    return liquid(closedPortalPage(request, locale), {
       headers: { "X-Robots-Tag": "noindex" },
     });
   }
@@ -65,9 +65,21 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         c.lines.map((l) => l.title).join(", ") ||
         t(locale, "portal.account.subscription_fallback");
       const status = t(locale, `portal.status.${c.status.toLowerCase()}`);
-      return `<a class="cx-item" style="text-decoration:none;color:inherit" href="${withLocale(`${PORTAL_BASE_PATH}/subscription/${c.id}`, locale)}"><div class="cx-item__body"><p class="cx-item__title">${escapeHtml(label)}</p><p class="cx-item__meta">${escapeHtml(status)}</p></div><span class="cx-muted">&rsaquo;</span></a>`;
+      return `<a class="cx-item" style="text-decoration:none;color:inherit" href="${withLocale(`${PORTAL_BASE_PATH}/subscription/${c.id}`, locale, portalSession.previewToken)}"><div class="cx-item__body"><p class="cx-item__title">${escapeHtml(label)}</p><p class="cx-item__meta">${escapeHtml(status)}</p></div><span class="cx-muted">&rsaquo;</span></a>`;
     })
     .join("");
+
+  // Sign-out control. A storefront-login session (logged_in_customer_id) has
+  // no app credential to destroy — Shopify re-appends the identity to every
+  // proxied request, so POSTing our /logout would silently sign the customer
+  // straight back in (see viaStorefrontLogin). For those sessions the only
+  // honest sign-out is Shopify's own /account/logout; cookie and preview
+  // sessions keep the app's POST /logout.
+  const signOutHtml = portalSession.viaStorefrontLogin
+    ? `<a class="cx-btn cx-btn--quiet cx-btn--full" href="/account/logout">${escapeHtml(t(locale, "portal.account.sign_out"))}</a>`
+    : `<form method="post" action="${withLocale(`${PORTAL_BASE_PATH}/logout`, locale)}">
+    <button type="submit" class="cx-btn cx-btn--quiet cx-btn--full">${escapeHtml(t(locale, "portal.account.sign_out"))}</button>
+  </form>`;
 
   const body = `
 <div class="cx-card">
@@ -90,9 +102,7 @@ ${
 }
 <div class="cx-card">
   <p class="cx-muted cx-small" style="margin:0 0 14px">${escapeHtml(t(locale, "portal.account.help"))}</p>
-  <form method="post" action="${withLocale(`${PORTAL_BASE_PATH}/logout`, locale)}">
-    <button type="submit" class="cx-btn cx-btn--quiet cx-btn--full">${escapeHtml(t(locale, "portal.account.sign_out"))}</button>
-  </form>
+  ${signOutHtml}
 </div>`;
 
   return liquid(
@@ -102,6 +112,7 @@ ${
       body,
       activeNav: "account",
       isPreview: portalSession.isPreview,
+      previewToken: portalSession.previewToken,
     }),
   );
 };

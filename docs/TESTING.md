@@ -111,6 +111,39 @@ contract → set next date), wait for a scheduler tick (≤60s internal / ≤5mi
 external), and confirm attempt → order → `billing.attempt_succeeded`,
 `billing.order_created`, `ordersCount` incremented, renewal notification sent.
 
+**Mixed-unit frequency pass (v1.8.0).** Frequencies are `{unit, count}` pairs —
+days, weeks and months mix inside one plan group. Author one mixed plan and
+walk the units end to end:
+
+1. Plans page → create (or edit) a plan config with frequencies `10d, 2, 1mo`
+   — i.e. "Every 10 days" + "Every 2 weeks" + "Every 1 month"; bare integers
+   still mean weeks — default `1mo`, sync, and confirm the buy box lists all
+   three options.
+2. For each of the three options in turn: select it, add to cart, proceed to
+   **checkout** — the native recurring terms on the line item must match the
+   selected option ("every 10 days" / "every 2 weeks" / "every month"), never
+   a week conversion. Wrong terms here mean the selling plan synced with the
+   wrong billing interval — stop and fix before going further.
+3. Subscribe on the monthly option (test card, §2). Portal home must show the
+   localized cadence phrase ("Delivered every 1 month" — repeat in the §8
+   languages; no raw `{frequency}` placeholder, no English mid-sentence), and
+   the upcoming-order email must carry the same phrase.
+4. Change frequency **across units** in the portal: 1 month → 10 days →
+   2 weeks. For each change verify (a) Shopify admin shows the new billing
+   interval on the contract, (b) `contract.frequency_changed` is logged with
+   old/new unit+count (the week approximations still present alongside),
+   (c) the Klaviyo event arrived.
+5. Monthly date math: set the monthly contract's next date to the **31st** of
+   a month, then skip → the next date lands one calendar month later, clamped
+   to the last day of shorter months (Jan 31 → Feb 28/29, never March 2/3).
+   Then delay it (e.g. +2 weeks) from a month-end date → the pushed date is
+   exactly that far out, on the expected calendar month.
+6. Cancel flow on the monthly contract, reason `TOO_MUCH_PRODUCT` → the
+   slower-frequency save must be expressed in **months** (e.g. "every
+   2 months"), not a weeks conversion of the current cadence. Accept it →
+   `cancel.save_accepted`, and the contract now bills on the suggested month
+   cadence (admin billing policy and portal phrase agree).
+
 ## 4. Dunning ladder — day 0/3/7/14 simulation
 
 The real ladder (settings key `dunning.softRetryDays`, default `[0,3,7,14]`)
@@ -349,6 +382,17 @@ live PDP):
      back → subscription price again. Then run checks 3 and 4 above in this
      preset: subscription add carries plan + `_cellexia_design`
      (= `subscription_max`); the quiet-link add carries neither.
+   - **Subscription ultra max satellite** (v1.11.0) — when
+     `subscription_ultra_max` is (or a market resolves to) the active
+     preset, run the same four checks (`_cellexia_design` =
+     `subscription_ultra_max`) plus two placement checks: the quiet
+     one-time line renders **below the theme's whole buy area** (under
+     quantity, Add to cart and the guarantee content — not inside the
+     widget card), still priced and still selecting one-time in a single
+     tap from down there; and on a launch-gated page (the widget hidden —
+     e.g. the same URL without a validated preview) there must be **NO**
+     one-time line anywhere on the page — the relocated line hides and
+     shows with the widget.
 6. **Per-market presets** (if the Markets card assigns any): the storefront
    preview link shows the market of the **domain you open it on** — open it
    on each assigned market's own domain/URL and confirm that market's

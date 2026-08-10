@@ -56,9 +56,12 @@ api_version = "2025-01"
     "customer_payment_methods/create",
     "customer_payment_methods/update",
     "customer_payment_methods/revoke",
+    "customers/update",
     "orders/create",
+    "orders/cancelled",
     "orders/fulfilled",
-    "refunds/create"
+    "refunds/create",
+    "shop/update"
   ]
   uri = "/webhooks"
 

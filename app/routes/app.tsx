@@ -46,6 +46,7 @@ export default function App() {
         <Link to="/app/import">Import</Link>
         <Link to="/app/alerts">Alerts</Link>
         <Link to="/app/audit">Audit</Link>
+        <Link to="/app/debug">Debug</Link>
         <Link to="/app/settings">Settings</Link>
       </NavMenu>
       <Outlet />

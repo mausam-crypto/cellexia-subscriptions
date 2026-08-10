@@ -36,6 +36,18 @@ vi.mock("~/db.server", () => ({
   default: {
     priceChangeBatch: { create: mocks.batchCreate },
     subscriptionContract: { count: mocks.contractCount },
+    // createPriceChangeBatch stamps the batch currency from the shop.
+    shop: {
+      findUniqueOrThrow: vi.fn(async (): Promise<unknown> => ({
+        id: "shop_1",
+        currencyCode: "GBP",
+        ianaTimezone: "Europe/London",
+      })),
+    },
+    priceChangeContractOutcome: {
+      create: vi.fn(async (): Promise<unknown> => ({})),
+      findMany: vi.fn(async (): Promise<unknown[]> => []),
+    },
   },
 }));
 vi.mock("~/shopify.server", () => ({

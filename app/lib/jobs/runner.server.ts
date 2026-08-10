@@ -66,6 +66,14 @@ const FAILED_RETRY_MINUTES = 30;
  * missing. Days older than ROLLUP_RECOMPUTE_DAYS that already have a row are
  * NOT recomputed (closed days keep their historical snapshots); only absent
  * days are filled, and never from before the shop's first rollup ever ran.
+ * Backfilled days are written with `backfill: true`: flow columns (charged,
+ * new subscribers, churn) recompute from source exactly as a live run would,
+ * but the SNAPSHOT columns (activeSubscribers, mrrCents, …) are unknowable
+ * after the fact — a live count at backfill time would stamp the whole gap
+ * flat with post-outage values and the forecast would train on fabricated
+ * history as if observed. They stay zero with `snapshotFabricated = true`,
+ * and the forecast treats fabricated days as carry-forward-filled, annotated
+ * in its accuracy reasons, not as observations.
  */
 const ROLLUP_BACKFILL_MAX_DAYS = 90;
 
@@ -86,10 +94,27 @@ const ROLLUP_RECOMPUTE_DAYS = 2;
 
 /**
  * CancelSessions saved ~90 days ago get their retention verdict: was the save
- * real (contract still ACTIVE/PAUSED) or just a delayed churn? Feeds the
+ * real (still subscribed at day 90) or just a delayed churn? Feeds the
  * cancel-flow analytics ("saves that stick" is the metric that matters).
+ *
+ * The verdict is AS OF completedAt+90d, derived from the contract's status
+ * timestamps — NOT the status at evaluation time. The query has no upper
+ * completedAt bound and drains backlogs 500 at a time, so a session can be
+ * evaluated at day 90+N (job downtime, or old sessions present when the job
+ * first shipped); reading today's status there would label a subscriber who
+ * was retained at day 90 but churned at day 150 as a failed save. A terminal
+ * timestamp (cancelledAt / failedAt / expiredAt) at or before day 90 means
+ * the save did not stick; none means the contract was still ACTIVE or PAUSED
+ * at day 90. Known approximation: reactivation clears cancelledAt
+ * (winback/engine + contract sync transitions), so a churn-inside-90-days
+ * that was later won back reads as retained — the same answer the old
+ * status-at-evaluation read gave, so no label gets worse. Sessions already
+ * labeled are NOT backfilled: the cleared-timestamp ambiguity makes old
+ * labels unrecoverable in exactly the cases that would need correcting.
+ *
+ * Exported for tests — the as-of-day-90 derivation is the regression surface.
  */
-async function runRetention90d(now: Date): Promise<unknown> {
+export async function runRetention90d(now: Date): Promise<unknown> {
   const cutoff = new Date(now.getTime() - 90 * DAY_MS);
   const sessions = await prisma.cancelSession.findMany({
     where: {
@@ -97,7 +122,7 @@ async function runRetention90d(now: Date): Promise<unknown> {
       retainedAt90d: null,
       completedAt: { lte: cutoff },
     },
-    select: { id: true, contractId: true },
+    select: { id: true, contractId: true, completedAt: true },
     take: 500,
   });
 
@@ -105,10 +130,19 @@ async function runRetention90d(now: Date): Promise<unknown> {
   for (const session of sessions) {
     const contract = await prisma.subscriptionContract.findUnique({
       where: { id: session.contractId },
-      select: { status: true },
+      select: { cancelledAt: true, failedAt: true, expiredAt: true },
     });
-    const isRetained =
-      contract?.status === "ACTIVE" || contract?.status === "PAUSED";
+    // completedAt is non-null by the query filter; a deleted contract (demo
+    // reset is the only deleter) is not a retained subscriber.
+    const day90 = new Date(
+      (session.completedAt?.getTime() ?? now.getTime()) + 90 * DAY_MS,
+    );
+    const churnedBy90 =
+      contract == null ||
+      [contract.cancelledAt, contract.failedAt, contract.expiredAt].some(
+        (ts) => ts != null && ts.getTime() <= day90.getTime(),
+      );
+    const isRetained = !churnedBy90;
     await prisma.cancelSession.update({
       where: { id: session.id },
       data: { retainedAt90d: isRetained },
@@ -117,6 +151,166 @@ async function runRetention90d(now: Date): Promise<unknown> {
   }
 
   return { evaluated: sessions.length, retained };
+}
+
+// ── Inline job: per-step containment for multi-recorder jobs ─────────────────
+
+/**
+ * Run a job's independent sub-steps so one failing step cannot starve the
+ * others (the between-modules half of "analytics failures are contained" —
+ * each module contains its own internals, but a job that chains two
+ * independent recorders with a bare `await` lets a DETERMINISTIC failure in
+ * the first permanently suppress the second: it fails identically on every
+ * 30-minute FAILED retry, and e.g. a forecast-accuracy week that never
+ * records is a hole that can never be measured after the fact). Every step
+ * runs; if any failed, the job still surfaces as FAILED (so the retry leash
+ * and the BILLING_RUN_FAILED-style JobRun audit trail stay honest) with an
+ * error naming each failed step AND what completed — a retry re-runs the
+ * completed steps too, which is safe: all of them are idempotent recomputes.
+ *
+ * Exported for tests — the "second step runs after the first throws"
+ * guarantee is the regression surface.
+ */
+export async function runStepsContained(
+  steps: ReadonlyArray<readonly [name: string, step: () => Promise<unknown>]>,
+): Promise<Record<string, unknown>> {
+  const results: Record<string, unknown> = {};
+  const failed: Array<{ name: string; message: string }> = [];
+  for (const [name, step] of steps) {
+    try {
+      results[name] = await step();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[jobs] contained step "${name}" failed`, err);
+      failed.push({ name, message });
+    }
+  }
+  if (failed.length > 0) {
+    const completed = steps
+      .map(([name]) => name)
+      .filter((name) => !failed.some((f) => f.name === name));
+    throw new Error(
+      failed.map((f) => `${f.name}: ${f.message}`).join("; ") +
+        (completed.length > 0 ? ` (completed: ${completed.join(", ")})` : ""),
+    );
+  }
+  return results;
+}
+
+// ── Inline job: daily rollup recompute + gap backfill ────────────────────────
+
+/**
+ * rollup_run body. Exported for tests — the backfill honesty contract (gap
+ * days are written with `backfill: true`, see ROLLUP_BACKFILL_MAX_DAYS above)
+ * and the trailing-recompute window are the regression surface.
+ */
+export async function runRollupJob(now: Date): Promise<unknown> {
+  const shop = await getPrimaryShop();
+  if (!shop) return { skipped: "no_shop" };
+  const tz = shop.ianaTimezone;
+  const { runDailyRollup } = await import("~/lib/analytics/rollup.server");
+  const { shopDayLabelUtc, utcDayKey } = await import(
+    "~/lib/analytics/queries.server"
+  );
+
+  // ── Self-heal: backfill days the job missed entirely ──────────────────────
+  // A multi-day outage leaves interior gaps ("yesterday + today" on resume
+  // only closes the most recent day). Fill any day label absent from
+  // DailyRollup within the lookback window — but never before the shop's
+  // first rollup (no synthesized pre-analytics history), and never a day
+  // that already has a row (closed days keep their historical snapshots).
+  // backfill:true keeps the synthesized rows honest: flow columns recompute
+  // from source, snapshot columns are NOT stamped with post-outage live
+  // counts (they are unknowable for a past day) — the row carries
+  // snapshotFabricated instead so the forecast can carry forward and
+  // annotate rather than train on fabricated history.
+  let backfilled = 0;
+  const oldest = await prisma.dailyRollup.findFirst({
+    where: { shopId: shop.id },
+    orderBy: { date: "asc" },
+    select: { date: true },
+  });
+  if (oldest) {
+    const windowStartLabel = shopDayLabelUtc(
+      addDaysTz(now, -ROLLUP_BACKFILL_MAX_DAYS, tz),
+      tz,
+    );
+    const existing = await prisma.dailyRollup.findMany({
+      where: { shopId: shop.id, date: { gte: windowStartLabel } },
+      select: { date: true },
+    });
+    const have = new Set(existing.map((row) => utcDayKey(row.date)));
+    const oldestKey = utcDayKey(oldest.date);
+    // Oldest-first so a crash mid-backfill leaves a shrinking gap, not a
+    // moving one; days inside the trailing recompute window run below
+    // unconditionally, so the backfill starts just beyond it.
+    for (
+      let daysAgo = ROLLUP_BACKFILL_MAX_DAYS;
+      daysAgo > ROLLUP_RECOMPUTE_DAYS;
+      daysAgo--
+    ) {
+      const day = addDaysTz(now, -daysAgo, tz);
+      const key = utcDayKey(shopDayLabelUtc(day, tz));
+      if (key <= oldestKey || have.has(key)) continue;
+      await runDailyRollup(shop.id, day, { backfill: true });
+      backfilled += 1;
+    }
+  }
+
+  // Trailing recompute: oldest day first, today-so-far last; the upsert
+  // on (shopId, date) makes every pass idempotent. Re-upserting the last
+  // ROLLUP_RECOMPUTE_DAYS closed days picks up charges whose completedAt
+  // was backdated to the order's real charge instant by a late webhook or
+  // the stale sweep (see ROLLUP_RECOMPUTE_DAYS above). These are LIVE runs
+  // (never backfill): within the trailing window a re-snapshot is the same
+  // semantics "yesterday" always had.
+  for (let daysAgo = ROLLUP_RECOMPUTE_DAYS; daysAgo >= 0; daysAgo--) {
+    await runDailyRollup(shop.id, addDaysTz(now, -daysAgo, tz));
+  }
+  return { days: ROLLUP_RECOMPUTE_DAYS + 1 + backfilled, backfilled };
+}
+
+// ── Inline jobs: nightly analytics recorder pairs ────────────────────────────
+
+/**
+ * risk_learning_run body: rebuild churn snapshots from history, train /
+ * evaluate the risk model (promotion only on a proven holdout win — see
+ * learning.server.ts), and persist this week's per-model forecast holdout
+ * error. Two INDEPENDENT recorders on one tick, so each runs step-contained:
+ * a deterministic trainer failure must not starve forecast-accuracy
+ * recording — a week recordForecastAccuracyWeek never records is a permanent
+ * hole in forecastModelHistory, unmeasurable after the fact — nor vice
+ * versa. Exported for tests — that containment is the regression surface.
+ */
+export async function runRiskLearningJob(now: Date): Promise<unknown> {
+  const shop = await getPrimaryShop();
+  if (!shop) return { skipped: "no_shop" };
+  const { runRiskLearning } = await import("~/lib/analytics/learning.server");
+  const { recordForecastAccuracyWeek } = await import(
+    "~/lib/analytics/forecast.server"
+  );
+  return runStepsContained([
+    ["learning", () => runRiskLearning(shop.id, now)],
+    ["forecastHistory", () => recordForecastAccuracyWeek(shop.id, now)],
+  ]);
+}
+
+/**
+ * churn_risk_run body: risk scores, then predicted empty dates. Same
+ * step containment as risk_learning_run — a scoring failure must not freeze
+ * predictedEmptyDate (win-back timing would silently go stale, with no alert
+ * tied to the starved step). Exported for tests.
+ */
+export async function runChurnRiskJob(now: Date): Promise<unknown> {
+  const shop = await getPrimaryShop();
+  if (!shop) return { skipped: "no_shop" };
+  const { runChurnRiskScoring, runPredictedEmptyDates } = await import(
+    "~/lib/analytics/risk.server"
+  );
+  return runStepsContained([
+    ["risk", () => runChurnRiskScoring(shop.id, now)],
+    ["emptyDates", () => runPredictedEmptyDates(shop.id, now)],
+  ]);
 }
 
 // ── Registry ─────────────────────────────────────────────────────────────────
@@ -253,64 +447,7 @@ const registry: JobDef[] = [
   {
     name: "rollup_run",
     everyMinutes: 1440,
-    fn: async (now) => {
-      const shop = await getPrimaryShop();
-      if (!shop) return { skipped: "no_shop" };
-      const tz = shop.ianaTimezone;
-      const { runDailyRollup } = await import("~/lib/analytics/rollup.server");
-      const { shopDayLabelUtc, utcDayKey } = await import(
-        "~/lib/analytics/queries.server"
-      );
-
-      // ── Self-heal: backfill days the job missed entirely ──────────────────
-      // A multi-day outage leaves interior gaps ("yesterday + today" on resume
-      // only closes the most recent day). Fill any day label absent from
-      // DailyRollup within the lookback window — but never before the shop's
-      // first rollup (no synthesized pre-analytics history), and never a day
-      // that already has a row (closed days keep their historical snapshots).
-      let backfilled = 0;
-      const oldest = await prisma.dailyRollup.findFirst({
-        where: { shopId: shop.id },
-        orderBy: { date: "asc" },
-        select: { date: true },
-      });
-      if (oldest) {
-        const windowStartLabel = shopDayLabelUtc(
-          addDaysTz(now, -ROLLUP_BACKFILL_MAX_DAYS, tz),
-          tz,
-        );
-        const existing = await prisma.dailyRollup.findMany({
-          where: { shopId: shop.id, date: { gte: windowStartLabel } },
-          select: { date: true },
-        });
-        const have = new Set(existing.map((row) => utcDayKey(row.date)));
-        const oldestKey = utcDayKey(oldest.date);
-        // Oldest-first so a crash mid-backfill leaves a shrinking gap, not a
-        // moving one; days inside the trailing recompute window run below
-        // unconditionally, so the backfill starts just beyond it.
-        for (
-          let daysAgo = ROLLUP_BACKFILL_MAX_DAYS;
-          daysAgo > ROLLUP_RECOMPUTE_DAYS;
-          daysAgo--
-        ) {
-          const day = addDaysTz(now, -daysAgo, tz);
-          const key = utcDayKey(shopDayLabelUtc(day, tz));
-          if (key <= oldestKey || have.has(key)) continue;
-          await runDailyRollup(shop.id, day);
-          backfilled += 1;
-        }
-      }
-
-      // Trailing recompute: oldest day first, today-so-far last; the upsert
-      // on (shopId, date) makes every pass idempotent. Re-upserting the last
-      // ROLLUP_RECOMPUTE_DAYS closed days picks up charges whose completedAt
-      // was backdated to the order's real charge instant by a late webhook or
-      // the stale sweep (see ROLLUP_RECOMPUTE_DAYS above).
-      for (let daysAgo = ROLLUP_RECOMPUTE_DAYS; daysAgo >= 0; daysAgo--) {
-        await runDailyRollup(shop.id, addDaysTz(now, -daysAgo, tz));
-      }
-      return { days: ROLLUP_RECOMPUTE_DAYS + 1 + backfilled, backfilled };
-    },
+    fn: (now) => runRollupJob(now),
   },
   {
     name: "cohort_run",
@@ -333,33 +470,12 @@ const registry: JobDef[] = [
     // state, touches no customer.
     name: "risk_learning_run",
     everyMinutes: 1440,
-    fn: async (now) => {
-      const shop = await getPrimaryShop();
-      if (!shop) return { skipped: "no_shop" };
-      const { runRiskLearning } = await import(
-        "~/lib/analytics/learning.server"
-      );
-      const { recordForecastAccuracyWeek } = await import(
-        "~/lib/analytics/forecast.server"
-      );
-      const learning = await runRiskLearning(shop.id, now);
-      const forecastHistory = await recordForecastAccuracyWeek(shop.id, now);
-      return { learning, forecastHistory };
-    },
+    fn: (now) => runRiskLearningJob(now),
   },
   {
     name: "churn_risk_run",
     everyMinutes: 1440,
-    fn: async (now) => {
-      const shop = await getPrimaryShop();
-      if (!shop) return { skipped: "no_shop" };
-      const { runChurnRiskScoring, runPredictedEmptyDates } = await import(
-        "~/lib/analytics/risk.server"
-      );
-      const risk = await runChurnRiskScoring(shop.id, now);
-      const emptyDates = await runPredictedEmptyDates(shop.id, now);
-      return { risk, emptyDates };
-    },
+    fn: (now) => runChurnRiskJob(now),
   },
   {
     name: "retention_90d_run",
@@ -379,6 +495,44 @@ const registry: JobDef[] = [
         "~/lib/contracts/sync.server"
       );
       return runOriginOrderBackfill();
+    },
+  },
+  {
+    // Re-attempts the refund matches the REFUNDS_CREATE handler had to give
+    // up on: a refund can arrive before its attempt/origin mirror exists
+    // (webhook race, pre-import history), and the unmatched-refund guard
+    // event was previously a dead letter — logged once, never revisited, the
+    // refund permanently missing from netting. Read-only against Shopify;
+    // rewrites nothing that already matched. Ungated like the other recovery
+    // plumbing: it only completes already-recorded money data.
+    name: "refund_reconcile",
+    everyMinutes: 1440,
+    fn: async () => {
+      const { reconcileUnmatchedRefunds } = await import(
+        "~/lib/webhooks/handlers.server"
+      );
+      return reconcileUnmatchedRefunds();
+    },
+  },
+  {
+    // Full contract-mirror reconciliation: re-syncs every contract from
+    // Shopify (paged 100 at a time) so a webhook the app never received —
+    // delivery disabled, extended downtime past Shopify's ~48h retry horizon
+    // — cannot leave a mirror row drifted forever. Ungated in SETUP like
+    // origin_order_backfill: mirror-only reads + local upserts, no customer
+    // contact, and a store being set up is exactly where drift accumulates.
+    name: "full_sync_reconcile",
+    everyMinutes: 1440,
+    fn: async () => {
+      const shop = await getPrimaryShop();
+      if (!shop) return { skipped: "no_shop" };
+      const { backfillAllContracts } = await import(
+        "~/lib/contracts/sync.server"
+      );
+      const result = await backfillAllContracts(shop.domain);
+      // JobRun.stats is an audit row, not an error archive — cap the
+      // per-contract error list the way alert contexts cap their samples.
+      return { ...result, errors: result.errors.slice(0, 20) };
     },
   },
   {
@@ -403,6 +557,27 @@ const registry: JobDef[] = [
 
       const { runAlertScan } = await import("~/lib/analytics/alerts.server");
       return runAlertScan(shop.id, { now, variantAvailability });
+    },
+  },
+  {
+    // Live self-check behind the admin Debug tab: probes the deployed store
+    // end-to-end (billing pipeline, dunning, portal-through-proxy, webhooks,
+    // jobs, Klaviyo, config/secrets, data integrity), persists the report and
+    // keeps the SELF_CHECK_FAILED alert in sync. Ungated: it only READS —
+    // catching a dead proxy or a drifted secret BEFORE go-live is its job.
+    name: "selfcheck_run",
+    everyMinutes: 30,
+    fn: async () => {
+      const shop = await getPrimaryShop();
+      if (!shop) return { skipped: "no_shop" };
+      const { runSelfCheck } = await import("~/lib/debug/selfcheck.server");
+      const report = await runSelfCheck(shop.domain, { trigger: "job" });
+      return {
+        verdict: report.verdict,
+        pass: report.passCount,
+        warn: report.warnCount,
+        fail: report.failCount,
+      };
     },
   },
 ];
@@ -461,6 +636,18 @@ export async function collectRenewalVariantAvailability(
 
 /** Registered job names, in run order (health endpoint reads this). */
 export const JOB_NAMES: readonly string[] = registry.map((job) => job.name);
+
+/** Name + cadence + gate of every job, in run order — the self-check reads
+ * this to judge per-job freshness without duplicating the registry. */
+export const JOB_SCHEDULE: ReadonlyArray<{
+  name: string;
+  everyMinutes: number;
+  gatedInSetup: boolean;
+}> = registry.map((job) => ({
+  name: job.name,
+  everyMinutes: job.everyMinutes,
+  gatedInSetup: job.gatedInSetup === true,
+}));
 
 /** Job names the SETUP launch gate skips (launch checklist + tests read this). */
 export const SETUP_GATED_JOB_NAMES: readonly string[] = registry

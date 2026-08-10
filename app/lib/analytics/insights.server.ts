@@ -4,6 +4,7 @@ import { subDays } from "date-fns";
 import { OURS_ONLY } from "~/lib/ownership/ownership.server";
 import { requireShopById } from "./queries.server";
 import { getCostCoverage } from "./costs.server";
+import { getForecast, type AccuracyGrade } from "./forecast.server";
 
 /**
  * Rule-based, plain-language insights for the dashboard and analytics pages.
@@ -42,9 +43,17 @@ export interface InsightInputs {
     churnedVoluntary: number;
     churnedInvoluntary: number;
     skips: number;
-    cancels: number;
     takeRateNum: number;
     takeRateDen: number;
+    /**
+     * Completed bounded plans (status EXPIRED, expiredAt in day) — a SUBSET
+     * of churnedVoluntary (the shared retention classification), supplied by
+     * the wrapper so the two alarm rules can subtract scheduled completions:
+     * a billingMaxCycles cohort finishing on schedule is churn nobody chose,
+     * and must not read as a churn spike or a skip→cancel deterioration.
+     * Optional: absent means "no expiry split available" (treated as 0).
+     */
+    expiredInDay?: number;
   }[];
   /** Whole weeks of rollup history available (0 for a brand-new store). */
   rollupWeeks: number;
@@ -122,17 +131,39 @@ export function deriveInsights(input: InsightInputs): Insight[] {
   const prior28 = rollups.slice(-35, -7);
   const last14 = rollups.slice(-14);
   const prior14 = rollups.slice(-28, -14);
-  const sum = (rows: typeof rollups, key: keyof (typeof rollups)[number]) =>
+  const sum = (
+    rows: typeof rollups,
+    key: Exclude<keyof (typeof rollups)[number], "expiredInDay">,
+  ) =>
     rows.reduce((total, r) => total + (Number.isFinite(r[key]) ? r[key] : 0), 0);
+  // Voluntary churn somebody CHOSE: the rollup column minus that day's
+  // scheduled bounded-plan completions (see the expiredInDay doc above).
+  // The retention surfaces keep classifying EXPIRED as voluntary churn —
+  // this subtraction is scoped to the two ALARM rules (1 and 6), which
+  // diagnose behavior ("review save offers", "cancelling instead of
+  // skipping") that a completion on schedule says nothing about. Clamped
+  // defensively; by construction expiredInDay ⊆ churnedVoluntary.
+  const chosenVoluntary = (rows: typeof rollups) =>
+    rows.reduce(
+      (total, r) =>
+        total +
+        Math.max(
+          0,
+          (Number.isFinite(r.churnedVoluntary) ? r.churnedVoluntary : 0) -
+            (r.expiredInDay ?? 0),
+        ),
+      0,
+    );
 
   // 1) Churn spike vs the 4-week baseline. Uses the voluntary+involuntary
-  // columns (consolidation-merge SYSTEM cancels are excluded by the rollup).
-  const churnNowVol = sum(last7, "churnedVoluntary");
+  // columns (consolidation-merge SYSTEM cancels are excluded by the rollup;
+  // scheduled expiries are subtracted — churn nobody chose cannot spike).
+  const churnNowVol = chosenVoluntary(last7);
   const churnNowInv = sum(last7, "churnedInvoluntary");
   const churnNow = churnNowVol + churnNowInv;
   const churnBaseWeekly =
     prior28.length > 0
-      ? ((sum(prior28, "churnedVoluntary") + sum(prior28, "churnedInvoluntary")) /
+      ? ((chosenVoluntary(prior28) + sum(prior28, "churnedInvoluntary")) /
           prior28.length) *
         7
       : 0;
@@ -251,8 +282,17 @@ export function deriveInsights(input: InsightInputs): Insight[] {
   }
 
   // 6) Skip:cancel ratio deteriorating (skips are the healthy pressure valve).
-  const cancelsNow = sum(last14, "cancels");
-  const cancelsPrev = sum(prior14, "cancels");
+  // Uses the churn columns like rule 1, NOT the raw `cancels` column: that
+  // one counts every cancelledAt-in-day contract including consolidation
+  // merges (reason MERGED, cancelSource SYSTEM — the customer stayed), so a
+  // single dedupe batch could deflate the ratio and fire this warning on
+  // churn that never happened. The churn columns exclude SYSTEM/null-source
+  // cancels by construction — and scheduled expiries are subtracted too: a
+  // bounded plan completing on schedule is not "cancelling instead of
+  // skipping".
+  const cancelsNow = chosenVoluntary(last14) + sum(last14, "churnedInvoluntary");
+  const cancelsPrev =
+    chosenVoluntary(prior14) + sum(prior14, "churnedInvoluntary");
   if (cancelsNow >= SKIP_RATIO_MIN_CANCELS && cancelsPrev >= SKIP_RATIO_MIN_CANCELS) {
     const ratioNow = safeDiv(sum(last14, "skips"), cancelsNow);
     const ratioPrev = safeDiv(sum(prior14, "skips"), cancelsPrev);
@@ -298,10 +338,21 @@ const ROLLUP_WINDOW_DAYS = 35;
 /**
  * Fetch the aggregates and run the rule engine. Returns [] on any error —
  * never throws into a page loader.
+ *
+ * `opts.forecastGrade` feeds rule 7's grade-D leg. Callers that already run
+ * getForecast in the same loader (both dashboards do, and both now chain
+ * their own forecast promise in) should pass `forecast.accuracy.grade` to
+ * skip the duplicate computation; pass null for "known unknown". When
+ * omitted, the grade is computed here — without this self-service default
+ * the grade-D leg was production-dead: the interface declared the input,
+ * both loaders held the grade, and nothing ever passed it. The internal
+ * fetch is failure-contained on its own — a broken forecast must degrade to
+ * "no grade", never to zero insights.
  */
 export async function getInsights(
   shopId: string,
   now: Date = new Date(),
+  opts?: { forecastGrade?: AccuracyGrade | null },
 ): Promise<Insight[]> {
   try {
     const shop = await requireShopById(shopId);
@@ -317,11 +368,13 @@ export async function getInsights(
 
     const [
       contractsTotal,
-      rollups,
+      rollupRows,
+      expiredContracts,
       firstRollup,
       dunningGroups,
       saveGroups,
       coverage,
+      forecastGrade,
     ] = await Promise.all([
       prisma.subscriptionContract.count({
         where: { shopId, isDemo: false, ...OURS_ONLY },
@@ -330,13 +383,29 @@ export async function getInsights(
         where: { shopId, date: { gte: rollupCutoff } },
         orderBy: { date: "asc" },
         select: {
+          date: true,
           churnedVoluntary: true,
           churnedInvoluntary: true,
           skips: true,
-          cancels: true,
           takeRateNum: true,
           takeRateDen: true,
         },
+      }),
+      // Scheduled bounded-plan completions in the window: the rollup counts
+      // them inside churnedVoluntary (the shared retention classification),
+      // but the two alarm rules must subtract them (see expiredInDay on
+      // InsightInputs). Fetched by instant with a day of slack and bucketed
+      // into the same shop-tz labels the rollup rows carry — only instants
+      // whose label matches a fetched row ever count.
+      prisma.subscriptionContract.findMany({
+        where: {
+          shopId,
+          isDemo: false,
+          ...OURS_ONLY,
+          status: "EXPIRED",
+          expiredAt: { gte: subDays(now, ROLLUP_WINDOW_DAYS + 1) },
+        },
+        select: { expiredAt: true },
       }),
       prisma.dailyRollup.findFirst({
         where: { shopId },
@@ -361,7 +430,29 @@ export async function getInsights(
         _count: { _all: true },
       }),
       getCostCoverage(shopId),
+      // See the doc block: supplied grade wins (including an explicit null);
+      // otherwise compute it, contained to null on failure.
+      opts?.forecastGrade !== undefined
+        ? Promise.resolve(opts.forecastGrade)
+        : getForecast(shopId, { now }).then(
+            (forecast) => forecast.accuracy.grade,
+            (): AccuracyGrade | null => null,
+          ),
     ]);
+
+    // Bucket expiries into the rollup rows' shop-tz day labels.
+    const expiredByDay = new Map<string, number>();
+    for (const c of expiredContracts) {
+      if (!c.expiredAt) continue;
+      const key = formatTz(toZonedTime(c.expiredAt, tz), "yyyy-MM-dd", {
+        timeZone: tz,
+      });
+      expiredByDay.set(key, (expiredByDay.get(key) ?? 0) + 1);
+    }
+    const rollups = rollupRows.map(({ date, ...columns }) => ({
+      ...columns,
+      expiredInDay: expiredByDay.get(date.toISOString().slice(0, 10)) ?? 0,
+    }));
 
     let resolved = 0;
     let recovered = 0;
@@ -403,6 +494,7 @@ export async function getInsights(
         coveragePct: coverage.linesWithKnownCogsPct,
         productsMissingCost: coverage.productsMissingCogs.length,
       },
+      forecastGrade,
     });
   } catch (error) {
     console.error("[insights] getInsights failed — returning no insights", error);

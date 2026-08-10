@@ -13,7 +13,6 @@ function day(overrides: Partial<InsightInputs["rollups"][number]> = {}) {
     churnedVoluntary: 0,
     churnedInvoluntary: 0,
     skips: 1,
-    cancels: 1,
     takeRateNum: 2,
     takeRateDen: 10,
     ...overrides,
@@ -206,14 +205,72 @@ describe("deriveInsights", () => {
   it("warns when the skip:cancel ratio deteriorates sharply", () => {
     const rollups = [
       ...Array.from({ length: 7 }, () => day()),
-      ...Array.from({ length: 14 }, () => day({ skips: 5, cancels: 1 })), // 5:1
-      ...Array.from({ length: 14 }, () => day({ skips: 1, cancels: 1 })), // 1:1
+      ...Array.from({ length: 14 }, () => day({ skips: 5, churnedVoluntary: 1 })), // 5:1
+      ...Array.from({ length: 14 }, () => day({ skips: 1, churnedVoluntary: 1 })), // 1:1
     ];
     const out = deriveInsights(healthyInputs({ rollups }));
     const insight = out.find((i) => i.headline.match(/skipping/i));
     expect(insight).toBeDefined();
     expect(insight!.tone).toBe("warning");
     expect(insight!.actionUrl).toBe("/app/plans");
+  });
+
+  it("consolidation-merge SYSTEM cancels cannot fire the skip:cancel warning (FR-10)", () => {
+    // A dedupe batch cancels N source contracts with reason MERGED / source
+    // SYSTEM while every customer stays subscribed. The rollup books those in
+    // its raw `cancels` column but in NEITHER churn column — and rule 6 now
+    // reads only the churn columns (like rule 1 always claimed), so a merge
+    // wave coinciding with fewer skips produces no churn-pressure warning.
+    const rollups = [
+      ...Array.from({ length: 7 }, () => day()),
+      ...Array.from({ length: 14 }, () => day({ skips: 5 })),
+      // Merges happened here — zero real churn, skips settle back down.
+      ...Array.from({ length: 14 }, () => day({ skips: 1 })),
+    ];
+    expect(deriveInsights(healthyInputs({ rollups }))).toEqual([]);
+  });
+
+  it("an EXPIRED-heavy week cannot fire the churn-spike warning (scheduled completions are churn nobody chose)", () => {
+    // A bounded-plan (billingMaxCycles) cohort finishing on schedule: the
+    // rollup classifies every expiry into churnedVoluntary (the shared
+    // retention classification), but the alarm rule must subtract them —
+    // "review save offers" is meaningless advice about a plan that ended
+    // exactly as sold.
+    const rollups = [
+      ...Array.from({ length: 28 }, () => day()),
+      ...Array.from({ length: 7 }, () =>
+        day({ churnedVoluntary: 3, expiredInDay: 3 }),
+      ), // 21 expiries, zero chosen churn
+    ];
+    expect(deriveInsights(healthyInputs({ rollups }))).toEqual([]);
+  });
+
+  it("chosen churn still spikes when it hides behind a wave of expiries", () => {
+    const rollups = [
+      ...Array.from({ length: 28 }, () => day({ churnedVoluntary: 1 })), // 7/week chosen baseline
+      ...Array.from({ length: 7 }, () =>
+        day({ churnedVoluntary: 5, expiredInDay: 3 }),
+      ), // 14 chosen + 21 scheduled
+    ];
+    const out = deriveInsights(healthyInputs({ rollups }));
+    const insight = out.find((i) => i.headline.match(/churn spiked/i));
+    expect(insight).toBeDefined();
+    // The evidence reports the CHOSEN voluntary count, not the raw column.
+    expect(insight!.detail).toContain("14 subscribers churned");
+  });
+
+  it("an EXPIRED-heavy fortnight cannot fire the skip:cancel warning (R2 regression case)", () => {
+    // Same book as the merge-wave case, but the cancels are scheduled
+    // expiries INSIDE churnedVoluntary: a completion on schedule is not
+    // "cancelling instead of skipping".
+    const rollups = [
+      ...Array.from({ length: 7 }, () => day()),
+      ...Array.from({ length: 14 }, () => day({ skips: 5, churnedVoluntary: 1 })),
+      ...Array.from({ length: 14 }, () =>
+        day({ skips: 5, churnedVoluntary: 3, expiredInDay: 2 }),
+      ), // still 1 CHOSEN cancel/day — the raw column tripled on expiries only
+    ];
+    expect(deriveInsights(healthyInputs({ rollups }))).toEqual([]);
   });
 
   it("adds the calibration note for young stores and grade-D forecasts", () => {
@@ -229,13 +286,13 @@ describe("deriveInsights", () => {
 
   it("caps output at 5 insights, most important first", () => {
     const rollups = [
-      // churn spike + take-rate drop + skip deterioration all at once
+      // churn spike + skip deterioration + every 30d-window warning at once
       ...Array.from({ length: 7 }, () => day()),
       ...Array.from({ length: 14 }, () =>
-        day({ skips: 5, cancels: 1, takeRateNum: 3, takeRateDen: 10 }),
+        day({ skips: 5, churnedVoluntary: 1, takeRateNum: 3, takeRateDen: 10 }),
       ),
       ...Array.from({ length: 14 }, () =>
-        day({ skips: 1, cancels: 1, churnedVoluntary: 1, takeRateNum: 2, takeRateDen: 10 }),
+        day({ skips: 1, churnedVoluntary: 2, takeRateNum: 2, takeRateDen: 10 }),
       ),
     ];
     const out = deriveInsights(
@@ -282,7 +339,7 @@ describe("deriveInsights", () => {
 
   it("never divides by zero on an all-zero book", () => {
     const rollups = Array.from({ length: 35 }, () =>
-      day({ skips: 0, cancels: 0, takeRateNum: 0, takeRateDen: 0 }),
+      day({ skips: 0, takeRateNum: 0, takeRateDen: 0 }),
     );
     const out = deriveInsights(
       healthyInputs({

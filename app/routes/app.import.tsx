@@ -33,6 +33,17 @@ import { getPrimaryShop } from "~/lib/shop/install.server";
 import { logEvent } from "~/lib/events/log.server";
 import { decimalStringFromCents } from "~/lib/money";
 import { parseCsvDate } from "~/lib/csv-date";
+import { buildAcquisitionCapture } from "~/lib/acquisition/sanitize";
+import {
+  FREQUENCY_COUNT_LIMITS,
+  FREQUENCY_UNITS,
+  approxWeeks,
+  contractFrequency,
+  frequencyLabelEn,
+  frequencyToken,
+  type Frequency,
+  type FrequencyUnit,
+} from "~/lib/frequency";
 import { addDaysTz, shopDayStartUtc } from "~/lib/dates.server";
 import {
   ShopifyUserError,
@@ -173,6 +184,8 @@ const REQUIRED_COLUMNS = [
   "variant_id",
   "quantity",
   "interval_weeks",
+  "interval_unit",
+  "interval_count",
   "next_charge_date",
   "status",
   "price_cents",
@@ -186,6 +199,30 @@ const REQUIRED_COLUMNS = [
   "payment_method_id",
   "origin",
 ] as const;
+
+/**
+ * The interval columns are alternatives, not all-required: a header passes
+ * with the legacy `interval_weeks` column, with the v1.8.0 `interval_unit` +
+ * `interval_count` pair, or with all three (per row, a filled unit+count pair
+ * wins — see rowSchema's superRefine). Everything else in REQUIRED_COLUMNS
+ * must be present.
+ */
+const INTERVAL_COLUMNS = ["interval_weeks", "interval_unit", "interval_count"] as const;
+
+function missingRequiredColumns(headers: string[]): string[] {
+  const missing: string[] = REQUIRED_COLUMNS.filter(
+    (c) =>
+      !(INTERVAL_COLUMNS as readonly string[]).includes(c) &&
+      !headers.includes(c),
+  );
+  const hasWeeks = headers.includes("interval_weeks");
+  const hasPair =
+    headers.includes("interval_unit") && headers.includes("interval_count");
+  if (!hasWeeks && !hasPair) {
+    missing.push("interval_weeks (or interval_unit + interval_count)");
+  }
+  return missing;
+}
 
 const emptyToUndefined = (v: unknown) =>
   typeof v === "string" && v.trim() !== "" ? v.trim() : undefined;
@@ -209,6 +246,33 @@ const requiredInt = (label: string, min: number, max: number) =>
       .min(min, `${label} must be >= ${min}`)
       .max(max, `${label} must be <= ${max}`),
   );
+
+const optionalInt = (label: string, min: number, max: number) =>
+  z.preprocess(
+    (v) => {
+      if (typeof v !== "string") return v;
+      const t = v.trim();
+      if (t === "") return undefined;
+      return /^-?\d+$/.test(t) ? Number(t) : t;
+    },
+    z
+      .number({ invalid_type_error: `${label} must be an integer` })
+      .int()
+      .min(min, `${label} must be >= ${min}`)
+      .max(max, `${label} must be <= ${max}`)
+      .optional(),
+  );
+
+/**
+ * Per-unit interval_count bounds. WEEK allows up to 52 — the full historical
+ * interval_weeks import range — rather than FREQUENCY_COUNT_LIMITS' 26-week
+ * merchant-offering cap; DAY and MONTH use the shared limits.
+ */
+const IMPORT_COUNT_LIMITS: Record<FrequencyUnit, { min: number; max: number }> =
+  {
+    ...FREQUENCY_COUNT_LIMITS,
+    WEEK: { min: 1, max: 52 },
+  };
 
 // next_charge_date parsing is the shared strict helper in ~/lib/csv-date —
 // see that module for what is accepted and the billing defects a lenient
@@ -252,7 +316,22 @@ const rowSchema = z.object({
     (v) => (typeof v === "string" && v.trim() === "" ? "1" : v),
     requiredInt("quantity", 1, 999),
   ),
-  interval_weeks: requiredInt("interval_weeks", 1, 52),
+  // The cadence comes in two row shapes: legacy interval_weeks alone, or the
+  // v1.8.0 interval_unit + interval_count pair (which wins when both are
+  // filled). The cross-field rules live in the superRefine below.
+  interval_weeks: optionalInt("interval_weeks", 1, 52),
+  interval_unit: z.preprocess(
+    (v) =>
+      typeof v === "string" && v.trim() !== ""
+        ? v.trim().toUpperCase()
+        : undefined,
+    z
+      .enum(FREQUENCY_UNITS, {
+        errorMap: () => ({ message: "interval_unit must be DAY, WEEK or MONTH" }),
+      })
+      .optional(),
+  ),
+  interval_count: optionalInt("interval_count", 1, 999),
   next_charge_date: z
     .string()
     .trim()
@@ -316,9 +395,68 @@ const rowSchema = z.object({
       .optional(),
   ),
   origin: optionalString,
+  // The original signup date on the source platform. Optional — but when
+  // provided it becomes firstChargeAt, so every arrival/cohort surface books
+  // the subscriber on their real signup date instead of import day (a
+  // migrated book without it arrives as one giant import-day cohort). Must
+  // be a real past instant: a future or malformed value would silently
+  // corrupt the cohort triangle, so it is a row error, not a warning.
+  subscribed_since: z.preprocess(
+    emptyToUndefined,
+    z
+      .string()
+      .refine(
+        (v) => parseCsvDate(v) !== null,
+        "subscribed_since must be YYYY-MM-DD or an ISO-8601 timestamp with timezone (e.g. 2024-03-17 or 2024-03-17T10:00:00Z)",
+      )
+      .refine((v) => {
+        const parsed = parseCsvDate(v);
+        return parsed == null || parsed.getTime() < Date.now();
+      }, "subscribed_since must be in the past")
+      .optional(),
+  ),
+}).superRefine((row, ctx) => {
+  // Half a unit+count pair is always a row error — never guess the other half.
+  if ((row.interval_unit == null) !== (row.interval_count == null)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: [row.interval_unit == null ? "interval_unit" : "interval_count"],
+      message: "interval_unit and interval_count must be provided together",
+    });
+    return;
+  }
+  if (row.interval_unit != null && row.interval_count != null) {
+    const limits = IMPORT_COUNT_LIMITS[row.interval_unit];
+    if (row.interval_count < limits.min || row.interval_count > limits.max) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["interval_count"],
+        message: `interval_count must be between ${limits.min} and ${limits.max} for ${row.interval_unit}`,
+      });
+    }
+  } else if (row.interval_weeks == null) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["interval_weeks"],
+      message:
+        "row must specify interval_weeks, or interval_unit + interval_count",
+    });
+  }
 });
 
 type ImportRow = z.infer<typeof rowSchema> & { line: number };
+
+/**
+ * The frequency a row asks for: the exact unit+count pair when filled, else
+ * the legacy weeks column as a WEEK frequency (superRefine guarantees one of
+ * the two shapes is present on every valid row).
+ */
+function rowFrequency(row: ImportRow): Frequency {
+  if (row.interval_unit != null && row.interval_count != null) {
+    return { unit: row.interval_unit, count: row.interval_count };
+  }
+  return { unit: "WEEK", count: row.interval_weeks ?? 1 };
+}
 
 // ── Result types ─────────────────────────────────────────────────────────────
 
@@ -338,7 +476,12 @@ type GroupStatus =
 interface GroupResult {
   rows: string;
   email: string;
+  /** approxWeeks mirror — kept in the persisted batch JSON (additive shape). */
   intervalWeeks: number;
+  intervalUnit: FrequencyUnit;
+  intervalCount: number;
+  /** English cadence label ("Every 10 days") — what the results table shows. */
+  frequencyLabel: string;
   lineCount: number;
   status: GroupStatus;
   detail: string;
@@ -389,6 +532,8 @@ interface ActionData {
 
 interface ContractGroup {
   email: string;
+  frequency: Frequency;
+  /** approxWeeks(frequency) — the legacy intervalWeeks mirror + display compat. */
   intervalWeeks: number;
   rows: ImportRow[];
   warnings: string[];
@@ -397,12 +542,14 @@ interface ContractGroup {
 function groupRows(rows: ImportRow[]): ContractGroup[] {
   const groups = new Map<string, ContractGroup>();
   for (const row of rows) {
-    const key = `${row.email}::${row.interval_weeks}`;
+    const frequency = rowFrequency(row);
+    const key = `${row.email}::${frequencyToken(frequency)}`;
     let group = groups.get(key);
     if (!group) {
       group = {
         email: row.email,
-        intervalWeeks: row.interval_weeks,
+        frequency,
+        intervalWeeks: approxWeeks(frequency.unit, frequency.count),
         rows: [],
         warnings: [],
       };
@@ -412,10 +559,11 @@ function groupRows(rows: ImportRow[]): ContractGroup[] {
       if (
         row.next_charge_date !== first.next_charge_date ||
         row.status !== first.status ||
-        row.currency !== first.currency
+        row.currency !== first.currency ||
+        (row.subscribed_since ?? "") !== (first.subscribed_since ?? "")
       ) {
         group.warnings.push(
-          `line ${row.line} differs from line ${first.line} (date/status/currency) — using line ${first.line}'s values`,
+          `line ${row.line} differs from line ${first.line} (date/status/currency/subscribed_since) — using line ${first.line}'s values`,
         );
       }
     }
@@ -558,6 +706,9 @@ async function processGroup(
     rows: group.rows.map((r) => r.line).join(","),
     email: group.email,
     intervalWeeks: group.intervalWeeks,
+    intervalUnit: group.frequency.unit,
+    intervalCount: group.frequency.count,
+    frequencyLabel: frequencyLabelEn(group.frequency),
     lineCount: group.rows.length,
   };
   const withWarnings = (detail: string) =>
@@ -565,8 +716,8 @@ async function processGroup(
       ? `${detail}. Warnings: ${group.warnings.join("; ")}`
       : detail;
 
-  // Idempotency: an email that already has a local contract at this interval
-  // in ANY status the importer can create (ACTIVE or PAUSED —
+  // Idempotency: an email that already has a local contract at this exact
+  // cadence in ANY status the importer can create (ACTIVE or PAUSED —
   // IMPORTABLE_STATUSES) was already migrated — never double-import. The
   // guard must cover the full creatable set: the sequential re-run the UI
   // supports (fix the errored rows, dry-run again, execute again) re-feeds
@@ -582,20 +733,34 @@ async function processGroup(
   // prescribed re-run created a SECOND live Shopify contract for them
   // (Shopify's own customer search is case-insensitive, so processGroup finds
   // the customer and bills them twice per interval).
-  const duplicate = await prisma.subscriptionContract.findFirst({
+  //
+  // The cadence comparison happens in JS, not the where: it must go through
+  // contractFrequency so a pre-v1.8.0 mirror (week approximation only) and a
+  // post-v1.8.0 mirror (exact unit+count) both compare correctly. Same email
+  // at a DIFFERENT cadence is a different subscription, never a duplicate.
+  const groupToken = frequencyToken(group.frequency);
+  const candidates = await prisma.subscriptionContract.findMany({
     where: {
       shopId: ctx.shop.id,
       email: { equals: group.email, mode: "insensitive" },
-      intervalWeeks: group.intervalWeeks,
       status: { in: [...IMPORTABLE_STATUSES] },
     },
-    select: { id: true, status: true },
+    select: {
+      id: true,
+      status: true,
+      intervalWeeks: true,
+      billingIntervalUnit: true,
+      billingIntervalCount: true,
+    },
   });
+  const duplicate = candidates.find(
+    (candidate) => frequencyToken(contractFrequency(candidate)) === groupToken,
+  );
   if (duplicate) {
     return {
       ...base,
       status: "SKIPPED_DUPLICATE",
-      detail: `${duplicate.status.toLowerCase()} local contract ${duplicate.id} already exists at ${group.intervalWeeks}w`,
+      detail: `${duplicate.status.toLowerCase()} local contract ${duplicate.id} already exists at ${frequencyLabelEn(group.frequency).toLowerCase()}`,
     };
   }
 
@@ -687,8 +852,14 @@ async function processGroup(
     contract: compact({
       status: first.status,
       paymentMethodId,
-      billingPolicy: { interval: "WEEK", intervalCount: group.intervalWeeks },
-      deliveryPolicy: { interval: "WEEK", intervalCount: group.intervalWeeks },
+      billingPolicy: {
+        interval: group.frequency.unit,
+        intervalCount: group.frequency.count,
+      },
+      deliveryPolicy: {
+        interval: group.frequency.unit,
+        intervalCount: group.frequency.count,
+      },
       deliveryMethod: { shipping: { address } },
       note: first.origin
         ? `Imported from ${first.origin} (Cellexia admin import)`
@@ -723,7 +894,10 @@ async function processGroup(
         lastName: first.last_name ?? null,
         status: first.status,
         currencyCode: first.currency,
+        // Exact cadence + the week approximation (rollback safety).
         intervalWeeks: group.intervalWeeks,
+        billingIntervalUnit: group.frequency.unit,
+        billingIntervalCount: group.frequency.count,
         nextBillingDate,
         paymentMethodId,
         deliveryAddress: address as object,
@@ -756,12 +930,83 @@ async function processGroup(
   // Imported subscribers keep their migrated price — grandfather them — and
   // are stamped OURS here, the only place with positive evidence that this
   // contract is not another subscription app's (see
-  // app/lib/ownership/ownership.server.ts).
-  if (!local.grandfatheredPricing || local.ownership !== "OURS") {
+  // app/lib/ownership/ownership.server.ts). subscribed_since lands here too:
+  // imported contracts have no origin order, so the origin-date backfill can
+  // never fill firstChargeAt, and a null firstChargeAt makes every
+  // arrival/cohort surface book the subscriber on import day
+  // (`firstChargeAt ?? createdAt`). Never overwrites an existing stamp.
+  const subscribedSince = first.subscribed_since
+    ? parseCsvDate(first.subscribed_since)
+    : null;
+  const needsFirstCharge =
+    subscribedSince != null && local.firstChargeAt == null;
+  if (
+    !local.grandfatheredPricing ||
+    local.ownership !== "OURS" ||
+    needsFirstCharge
+  ) {
     local = await prisma.subscriptionContract.update({
       where: { id: local.id },
-      data: { grandfatheredPricing: true, ownership: "OURS" },
+      data: {
+        grandfatheredPricing: true,
+        ownership: "OURS",
+        ...(needsFirstCharge ? { firstChargeAt: subscribedSince } : {}),
+      },
     });
+  }
+
+  // Acquisition capture (docs/DATA_FOUNDATION.md): every imported contract
+  // gets its first-order shape (units, order total, value band) computed from
+  // the CSV quantities + prices — the migrated-cadence approximation of the
+  // true first order, flagged importPassthrough — and geo from the
+  // delivery-address columns, because imported contracts have no origin order
+  // and nothing else can ever fill these columns. (The CLI importer
+  // additionally accepts acq_* passthrough columns; this compact admin CSV
+  // does not.) Contained: a failure here never loses the imported contract.
+  if (local.acqRaw == null) {
+    try {
+      const capture = buildAcquisitionCapture({
+        countryCode: first.country_code,
+        city: first.city,
+        provinceCode: first.province_code,
+        unitsFirstOrder: mergedLines.reduce((sum, l) => sum + l.quantity, 0),
+        orderTotalCents: mergedLines.reduce(
+          (sum, l) => sum + l.priceCents * l.quantity,
+          0,
+        ),
+        orderCurrencyCode: first.currency,
+      });
+      await prisma.subscriptionContract.update({
+        where: { id: local.id },
+        data: {
+          acqCountryCode: capture.acqCountryCode,
+          acqCity: capture.acqCity,
+          acqProvinceCode: capture.acqProvinceCode,
+          acqUnitsFirstOrder: capture.acqUnitsFirstOrder,
+          acqOrderValueBand: capture.acqOrderValueBand,
+          acqRaw: JSON.parse(
+            JSON.stringify({
+              ...capture.acqRaw,
+              // Shape parity with the webhook bundle: keys always present,
+              // null where an import cannot know them (no Shopify customer
+              // read happens here).
+              customerCreatedAt: null,
+              customerNumberOfOrders: null,
+              timeToPurchaseSeconds: null,
+              importedFrom: first.origin ?? null,
+              importPassthrough: true,
+              // Audit trail for the firstChargeAt stamp above — the raw CSV
+              // value, additive alongside the importPassthrough marker.
+              importSubscribedSince: first.subscribed_since ?? null,
+            }),
+          ) as object,
+        },
+      });
+    } catch (err) {
+      group.warnings.push(
+        `acquisition capture failed (${errorMessage(err)}) — contract imported without it`,
+      );
+    }
   }
 
   await logEvent({
@@ -776,7 +1021,11 @@ async function processGroup(
       shopifyContractId: created.contractId,
       importBatchId: ctx.importBatchId,
       origin: first.origin ?? null,
+      // intervalWeeks stays the week approximation (additive payload contract);
+      // the exact cadence rides alongside.
       intervalWeeks: group.intervalWeeks,
+      intervalUnit: group.frequency.unit,
+      intervalCount: group.frequency.count,
       status: first.status,
       lineCount: mergedLines.length,
       priceCentsTotal: mergedLines.reduce(
@@ -785,6 +1034,9 @@ async function processGroup(
       ),
       currency: first.currency,
       grandfatheredPricing: true,
+      // The source platform's signup date (verbatim CSV value) — additive
+      // audit alongside the firstChargeAt stamp; null when not provided.
+      subscribedSince: first.subscribed_since ?? null,
       sourceLines: group.rows.map((r) => r.line),
     },
   });
@@ -818,7 +1070,7 @@ async function runImport(args: {
   }
   const { headers, records } = parsedCsv;
 
-  const missingColumns = REQUIRED_COLUMNS.filter((c) => !headers.includes(c));
+  const missingColumns = missingRequiredColumns(headers);
   if (missingColumns.length > 0) {
     return {
       error:
@@ -943,6 +1195,9 @@ async function runImport(args: {
           rows: group.rows.map((r) => r.line).join(","),
           email: group.email,
           intervalWeeks: group.intervalWeeks,
+          intervalUnit: group.frequency.unit,
+          intervalCount: group.frequency.count,
+          frequencyLabel: frequencyLabelEn(group.frequency),
           lineCount: group.rows.length,
           status: "ERROR",
           detail: errorMessage(err),
@@ -1256,7 +1511,7 @@ export default function ImportPage() {
   const resultRows = (actionData?.results ?? []).map((result) => [
     result.rows,
     result.email,
-    `${result.intervalWeeks}w`,
+    result.frequencyLabel,
     String(result.lineCount),
     statusBadge(result.status),
     result.detail,
@@ -1300,7 +1555,8 @@ export default function ImportPage() {
                   </List.Item>
                   <List.Item>
                     One CSV row per subscription line; rows sharing email +
-                    interval become one contract. Header:{" "}
+                    cadence (interval_weeks, or interval_unit + interval_count)
+                    become one contract. Header:{" "}
                     <code>{REQUIRED_COLUMNS.join(",")}</code>.
                   </List.Item>
                   <List.Item>

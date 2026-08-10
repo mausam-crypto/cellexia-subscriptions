@@ -437,13 +437,18 @@ export const settingsSchemas = {
     }),
 
   /**
-   * INTERNAL / MACHINE-WRITTEN — rolling per-model forecast backtest error
-   * history (one entry per ISO week, capped at 26 by the writer). Written by
+   * INTERNAL / MACHINE-WRITTEN — rolling per-model forecast error history
+   * (one entry per ISO week, capped at 26 by the writer). Written by
    * recordForecastAccuracyWeek (app/lib/analytics/forecast.server.ts) on the
    * nightly risk_learning_run tick; never edited by hand and not rendered on
-   * the Settings page. `errors` maps forecast model key → that week's mean
-   * walk-forward backtest MAPE (fraction; null = model unavailable that
-   * week). getForecast's "auto" selection exponentially weights these entries
+   * the Settings page. `errors` maps forecast model key → that week's
+   * out-of-sample one-step holdout APE (mean over MRR + actives, as a
+   * fraction; null = model unavailable that week): the error of a forecast
+   * trained strictly on earlier weeks, evaluated once on the newest complete
+   * week — NOT the mean walk-forward backtest MAPE (the pre-hindsight-audit
+   * behavior, whose overlapping folds made consecutive weeks correlated
+   * re-measurements of the same history; these entries are independent).
+   * getForecast's "auto" selection exponentially weights these entries
    * (recent weeks weigh more) and degrades gracefully when none exist.
    */
   forecastModelHistory: z
@@ -474,6 +479,45 @@ export const settingsSchemas = {
       churnSpikeThresholdPct: 8,
       stuckContractHours: 24,
     }),
+
+  /**
+   * INTERNAL / MACHINE-WRITTEN — the latest live self-check report, written
+   * by runSelfCheck (app/lib/debug/selfcheck.server.ts) every `selfcheck_run`
+   * tick and on every manual run from the Debug page; never edited by hand
+   * and not rendered on the Settings page. The Debug page reads it so the
+   * report survives restarts and is instantly available without re-probing
+   * the live store on page load.
+   */
+  selfCheck: z
+    .object({
+      version: z.literal(1),
+      lastReport: z
+        .object({
+          ranAt: z.string(),
+          tookMs: z.number().int().nonnegative(),
+          trigger: z.enum(["job", "admin"]),
+          verdict: z.enum(["HEALTHY", "DEGRADED", "BROKEN"]),
+          passCount: z.number().int().nonnegative(),
+          warnCount: z.number().int().nonnegative(),
+          failCount: z.number().int().nonnegative(),
+          skipCount: z.number().int().nonnegative(),
+          checks: z.array(
+            z.object({
+              key: z.string(),
+              label: z.string(),
+              // Loose on purpose: category names are presentation, and a
+              // renamed category must not invalidate a stored report.
+              category: z.string(),
+              status: z.enum(["PASS", "FAIL", "WARN", "SKIP"]),
+              detail: z.string(),
+              remediation: z.string().optional(),
+              ms: z.number().int().nonnegative(),
+            }),
+          ),
+        })
+        .nullable(),
+    })
+    .default({ version: 1, lastReport: null }),
 } as const;
 
 export type SettingsKey = keyof typeof settingsSchemas;

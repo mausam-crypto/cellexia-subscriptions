@@ -242,3 +242,27 @@ export function categorizeDeclineCode(
   if (!normalized) return UNKNOWN_DECLINE;
   return DECLINE_CODES[normalized] ?? UNKNOWN_DECLINE;
 }
+
+/**
+ * The machine-readable `code` of the first userError that carries one, from
+ * a refused mutation's userErrors array (attempt-create refusals reach the
+ * billing scheduler and the dunning retry engine as ShopifyUserError).
+ *
+ * Shopify's BillingAttemptUserError exposes `code` alongside field/message;
+ * the GraphQL layer adopts it in its selections additively, so this reads
+ * the key structurally and returns null for payloads that don't carry it —
+ * refusal ingest is live the moment the selection is extended, and a
+ * refused row keeps its structured reason instead of collapsing into the
+ * UNKNOWN/SOFT bucket that categorizeDeclineCode(null) yields.
+ */
+export function structuredUserErrorCode(
+  errors: ReadonlyArray<object> | null | undefined,
+): string | null {
+  for (const err of errors ?? []) {
+    const code = (err as { code?: unknown }).code;
+    if (typeof code === "string" && code.trim() !== "") {
+      return code.trim().toUpperCase();
+    }
+  }
+  return null;
+}

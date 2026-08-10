@@ -182,11 +182,45 @@ export async function onSuccessfulCycle(
 // ── Rewards unlock sweep ─────────────────────────────────────────────────────
 
 /**
- * Grace window (days) for catching unlocks the sweep missed: the target is
- * "crossed within the last day", but downtime must not permanently skip a
- * subscriber — the event-existence dedupe makes the wider window safe.
+ * Minimum grace window (days) for catching unlocks the sweep missed: the
+ * target is "crossed within the last day", but downtime must not permanently
+ * skip a subscriber — the event-existence dedupe makes a wider window safe.
+ * A fixed window only protects outages shorter than itself, so the actual
+ * lookback stretches to cover the gap since the job's last SUCCESS (see
+ * rewardsLookbackDays); this floor is also the fallback when no run history
+ * exists at all (fresh install), where a wide window would instead fire
+ * "just unlocked!" notifications at an entire imported base whose day-N
+ * passed long ago.
  */
-const REWARDS_LOOKBACK_DAYS = 3;
+const REWARDS_LOOKBACK_MIN_DAYS = 3;
+
+/**
+ * Days of firstChargeAt history to scan, derived from the lifecycle_run
+ * job's own last SUCCESS (the JobRun log): gap since that run + 1 day of
+ * slack, floored at REWARDS_LOOKBACK_MIN_DAYS. An outage of any length —
+ * including a full undeploy — then widens the window to exactly the missed
+ * stretch, and the hasEvent dedupe keeps the wider scan idempotent. The
+ * current run's own row is RUNNING while this executes, so the newest
+ * SUCCESS is genuinely the previous completed run.
+ */
+async function rewardsLookbackDays(now: Date): Promise<number> {
+  try {
+    const lastSuccess = await prisma.jobRun.findFirst({
+      where: { jobName: "lifecycle_run", status: "SUCCESS" },
+      orderBy: { startedAt: "desc" },
+      select: { startedAt: true },
+    });
+    if (!lastSuccess) return REWARDS_LOOKBACK_MIN_DAYS;
+    const gapDays = Math.ceil(
+      Math.max(0, now.getTime() - lastSuccess.startedAt.getTime()) / 86_400_000,
+    );
+    return Math.max(REWARDS_LOOKBACK_MIN_DAYS, gapDays + 1);
+  } catch (err) {
+    // History unavailable — the floor still covers the common case.
+    console.error("[lifecycle] rewards lookback derivation failed", err);
+    return REWARDS_LOOKBACK_MIN_DAYS;
+  }
+}
 
 export interface RewardsUnlockStats {
   scanned: number;
@@ -215,8 +249,9 @@ export async function runRewardsUnlock(now: Date): Promise<RewardsUnlockStats> {
 
   // unlockAt = firstChargeAt + rewardsUnlockDay ∈ (now − lookback, now]
   //   ⇔ firstChargeAt ∈ (now − rewardsUnlockDay − lookback, now − rewardsUnlockDay]
+  const lookbackDays = await rewardsLookbackDays(now);
   const windowEnd = addDaysTz(now, -lifecycle.rewardsUnlockDay, tz);
-  const windowStart = addDaysTz(windowEnd, -REWARDS_LOOKBACK_DAYS, tz);
+  const windowStart = addDaysTz(windowEnd, -lookbackDays, tz);
 
   const candidates = await prisma.subscriptionContract.findMany({
     where: {

@@ -58,11 +58,23 @@ describe("webhook handleBillingAttemptChallenged", () => {
 });
 
 describe("billing stale sweep resolveStaleAttempt", () => {
-  it("both webhook-raceable branches (CHALLENGED and FAILED) claim from PENDING only", () => {
+  it("the CHALLENGED branch and the 24h expiry claim from PENDING only", () => {
+    // A settled attempt is never re-challenged, and a CHALLENGED attempt is
+    // never expired (its lifetime belongs to the dunning case's timeout).
     const claims = schedulerSource.match(
       /where: \{ id: attempt\.id, status: "PENDING" \},/g,
     );
     expect(claims?.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("the FAILED branch claims from PENDING **or CHALLENGED** — the lost-3DS-failure lane", () => {
+    // A challenged attempt whose customer failed/abandoned 3DS lands here
+    // when the FAILURE webhook was lost; a concurrently-settled SUCCESS
+    // still loses the claim (status guard), so a paid cycle is never
+    // flipped back to FAILED.
+    expect(schedulerSource).toContain(
+      'where: { id: attempt.id, status: { in: ["PENDING", "CHALLENGED"] } },',
+    );
   });
 
   it("a lost CHALLENGED claim hands off NOTHING to dunning", () => {
@@ -70,6 +82,15 @@ describe("billing stale sweep resolveStaleAttempt", () => {
       "an unguarded update would flip a settled",
     );
     expect(schedulerSource).toContain("hand off nothing");
+  });
+
+  it("CHALLENGED rows are never expired by the stale sweep", () => {
+    expect(schedulerSource).toContain(
+      'if (attempt.status === "CHALLENGED") {',
+    );
+    expect(schedulerSource).toContain(
+      "Expiring it here would stomp an in-flight authentication",
+    );
   });
 });
 

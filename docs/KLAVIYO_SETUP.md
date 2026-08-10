@@ -53,7 +53,7 @@ Every contract-scoped event also carries the **standard snapshot properties**
 | `Cellexia Order Skipped` | Next cycle skipped | snapshot, `cycleIndex`* |
 | `Cellexia Order Unskipped` | Skip reversed | snapshot, `cycleIndex`* |
 | `Cellexia Order Delayed` | Next order pushed out | snapshot, `weeks`* |
-| `Cellexia Frequency Changed` | Delivery interval changed | snapshot, old/new weeks* |
+| `Cellexia Frequency Changed` | Delivery interval changed | snapshot, `oldUnit`/`oldCount`/`newUnit`/`newCount` (exact interval), `oldWeeks`/`newWeeks` (whole-week approximation, retained for existing flows)* |
 | `Cellexia Product Swapped` | Line variant swapped | snapshot, old/new variant* |
 | `Cellexia Add-on Added` | One-time add-on attached to next order | snapshot, `variantId`* |
 | `Cellexia Payment Failed` | A billing attempt failed (also fired by the dunning ladder notifications) | snapshot, `attempt_number`, `amount_cents`, `amount_formatted`, `decline_code`, `decline_category`, `dunning_state`, `dunning_ladder_step`, `next_retry_at`, `card_brand`, `card_last4`, `card_expiry`, **magic links** |
@@ -104,7 +104,9 @@ and an explicit confirmation notification never double-fire a flow.
 | `contract_id` | `clx1abc...` (app-internal ID — used by support) |
 | `shopify_contract_id` | `gid://shopify/SubscriptionContract/123` |
 | `contract_status` | `ACTIVE` |
-| `interval_weeks` | `8` |
+| `interval_weeks` | `8` (whole-week approximation, retained for existing flows) |
+| `interval_unit` | `MONTH` (`DAY` / `WEEK` / `MONTH` — v1.8.0) |
+| `interval_count` | `2` — with `interval_unit`, the exact billing interval ("every 2 months") |
 | `orders_count` | `4` |
 | `currency` | `GBP` |
 | `is_prepaid` | `false` |
@@ -175,7 +177,8 @@ In a Klaviyo template, use them like any event variable:
 |---|---|
 | `cellexia_subscription_status` | `ACTIVE` / `PAUSED` / `CANCELLED` / `FAILED` / `EXPIRED` |
 | `cellexia_orders_count` | Successful cycles billed |
-| `cellexia_interval_weeks` | Current delivery interval |
+| `cellexia_interval_weeks` | Current delivery interval in weeks (whole-week approximation, retained for existing flows) |
+| `cellexia_interval_unit` / `cellexia_interval_count` | Exact delivery interval — `DAY`/`WEEK`/`MONTH` + count (v1.8.0) |
 | `cellexia_next_billing_date` | ISO datetime of next renewal |
 | `cellexia_churn_risk` | 0–1 churn-risk score from the analytics engine |
 | `cellexia_dunning_open` | `true` while a payment failure is unresolved |
@@ -373,7 +376,8 @@ Variables available in Klaviyo templates via `{{ event.* }}`:
 |---|---|---|
 | `contract_id`, `shopify_contract_id` | all contract metrics | for support deep links |
 | `contract_status` | all contract metrics | `ACTIVE`, `PAUSED`, ... |
-| `interval_weeks`, `orders_count`, `currency`, `is_prepaid` | all contract metrics | |
+| `interval_weeks`, `orders_count`, `currency`, `is_prepaid` | all contract metrics | `interval_weeks` is a whole-week approximation, retained for existing flows |
+| `interval_unit`, `interval_count` | all contract metrics | exact billing interval — `DAY`/`WEEK`/`MONTH` + count (v1.8.0) |
 | `item_titles` | all contract metrics | array — loop or join |
 | `items` | all contract metrics | array of `{title, variant_title, quantity, is_gift, is_one_time_addon}` |
 | `next_billing_date`, `next_billing_date_formatted` | all contract metrics | formatted = shop timezone + locale |
@@ -387,6 +391,9 @@ Variables available in Klaviyo templates via `{{ event.* }}`:
 | `card_brand`, `card_last4`, `card_expiry` | Payment Failed, Card Expiring | e.g. `visa`, `4242`, `09/2026` |
 | `threeds_url` | 3DS Action Required | the bank's challenge URL |
 | `cycleIndex` | Upcoming Order + cycle metrics | used for once-per-cycle logic app-side |
+| `frequency_weeks` | Upcoming Order, Resume Reminder | whole-week approximation, retained for existing flows |
+| `frequency_unit`, `frequency_count`, `frequency` | Upcoming Order, Resume Reminder | exact cadence (`DAY`/`WEEK`/`MONTH` + count); `frequency` is the localized phrase ("every 2 months") in the contract locale (v1.8.0) |
+| `oldUnit`, `oldCount`, `newUnit`, `newCount` | Frequency Changed | exact cadence before/after; `oldWeeks`/`newWeeks` remain the whole-week approximations |
 | `event_type` / `template` | state-change / notification metrics | internal origin identifiers |
 
 Direct-SMTP templates (OTP, 3DS, admin alert, import summary) render from the

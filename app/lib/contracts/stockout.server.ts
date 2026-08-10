@@ -203,9 +203,16 @@ export async function evaluateStockoutForContract(
     const remainingVariantIds = [
       ...new Set(remaining.map((lp) => lp.line.variantId)),
     ];
-    let wantSkip = remaining.some((lp) => lp.policy === "SKIP_NOTIFY");
+    // Why the cycle is being skipped (null = not skipping): the policy said
+    // so outright, or the delay cap escalated. Carried into cycle.skipped so
+    // the merchant-skip audit can tell the two apart.
+    let skipReason: "SKIP_NOTIFY" | "MAX_DELAYS_REACHED" | null = remaining.some(
+      (lp) => lp.policy === "SKIP_NOTIFY",
+    )
+      ? "SKIP_NOTIFY"
+      : null;
 
-    if (!wantSkip) {
+    if (!skipReason) {
       // DELAY, capped: count this cycle's stockout delays; at the cap the
       // cycle is skipped instead so the customer is never strung along.
       let delaysThisCycle = 0;
@@ -218,11 +225,20 @@ export async function evaluateStockoutForContract(
           },
         });
       }
-      if (delaysThisCycle >= settings.maxDelays) wantSkip = true;
+      if (delaysThisCycle >= settings.maxDelays) {
+        skipReason = "MAX_DELAYS_REACHED";
+      }
     }
 
-    if (wantSkip) {
-      await skipNextCycle(shopDomain, contract.id, options);
+    if (skipReason) {
+      // STOCKOUT initiator: the skip is the merchant's inventory problem, not
+      // the customer's disengagement — it lands in merchantSkipCount, never
+      // in skipCount/lastSkippedAt (see skipNextCycle).
+      await skipNextCycle(shopDomain, contract.id, {
+        ...options,
+        initiator: "STOCKOUT",
+        reason: skipReason,
+      });
       if (settings.notifyCustomer) {
         await sendNotification({
           shopId: shop.id,

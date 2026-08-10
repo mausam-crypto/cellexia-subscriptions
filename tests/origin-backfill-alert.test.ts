@@ -85,7 +85,17 @@ vi.mock("~/lib/settings/settings.server", () => ({
   })),
 }));
 
-vi.mock("~/lib/events/log.server", () => ({ logEvent: mocks.logEvent }));
+vi.mock("~/lib/events/log.server", () => ({
+  logEvent: mocks.logEvent,
+  // Zero-loss stats keep the EVENT_WRITE_FAILURES check all-clear — this
+  // suite is about the origin-backfill stats shapes only.
+  getEventWriteFailureStats: vi.fn(() => ({
+    count: 0,
+    lastAt: null,
+    lastType: null,
+    processStartedAt: "2026-08-01T00:00:00.000Z",
+  })),
+}));
 
 import { runAlertScan } from "~/lib/analytics/alerts.server";
 

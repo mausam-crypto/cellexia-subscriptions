@@ -29,6 +29,7 @@ export const PRESET_KEYS = [
   "value_stack",
   "planner",
   "subscription_max",
+  "subscription_ultra_max",
 ] as const;
 
 export type PresetKey = (typeof PRESET_KEYS)[number];
@@ -142,6 +143,29 @@ export const PRESET_META: Record<PresetKey, PresetMeta> = {
       "Replenishable heroes with warm traffic, where subscribing should " +
       "read as the obvious way to buy.",
   },
+  subscription_ultra_max: {
+    name: "Subscription ultra max",
+    tagline:
+      "The subscription reads as the plain, normal way of buying; one-time " +
+      "moves below the whole buy area.",
+    croRationale:
+      "Subscription max taken to its logical end. The card loses every " +
+      "piece of offer chrome — no border, no tint, no badge, no savings " +
+      "pill, no reassurance line by default — so the subscription price " +
+      "reads exactly like the product's price, not like a special plan " +
+      "being sold. The recurring cadence line stays visible (recurrence " +
+      "disclosure is never optional), and the priced one-time link stays " +
+      "one tap away — but relocated below the entire buy area (quantity, " +
+      "add to cart, guarantees), where only a shopper actively looking for " +
+      "it will find it. Maximum posture means maximum accountability: " +
+      "watch PDP conversion AND refund/cancel quality in Design " +
+      "performance, not just take-rate — shoppers who did not understand " +
+      "they subscribed are expensive.",
+    conversionRisk: "medium",
+    bestFor:
+      "Warm traffic on a hero product where subscription IS the intended " +
+      "default and one-time is the exception.",
+  },
 };
 
 // ── Config schema (version 1) ────────────────────────────────────────────────
@@ -230,6 +254,8 @@ export const PRICE_SELECTOR_MAX_LENGTH = 300;
 const DEFAULT_THEME_SYNC = {
   syncAddToCartPrice: true,
   priceSelector: "",
+  syncMainPrice: true,
+  mainPriceSelector: "",
 } as const;
 
 /**
@@ -251,13 +277,28 @@ const DEFAULT_THEME_SYNC = {
  * does not cover (e.g. `.pdp__actions .btn--atc`); "" means "use the built-in
  * list". Sanitized exactly like `placement.selector`.
  *
- * Added in v1.2.2 with object- AND field-level defaults, so every stored
- * revision and the live `cellexia.buybox_design` metafield keep validating.
+ * `syncMainPrice` / `mainPriceSelector` (v1.11.0) extend the same swap to the
+ * theme's MAIN price display (the price under the product title —
+ * `.pdp__price` on cellexialabs.com). Same mechanism, same safety: an exact
+ * money-string swap in text nodes, reverted on one-time/hidden/gated, a no-op
+ * unless the element literally contains the one-time string. Struck-through
+ * compare-at and per-unit strings are deliberately untouched (they are not
+ * the one-time money string, and this module never computes money).
+ *
+ * Added in v1.2.2 (v1.11.0 for the main-price pair) with object- AND
+ * field-level defaults, so every stored revision and the live
+ * `cellexia.buybox_design` metafield keep validating.
  */
 const themeSyncSchema = z
   .object({
     syncAddToCartPrice: z.boolean().default(true),
     priceSelector: z
+      .string()
+      .max(PRICE_SELECTOR_MAX_LENGTH)
+      .default("")
+      .transform(sanitizePlacementSelector),
+    syncMainPrice: z.boolean().default(true),
+    mainPriceSelector: z
       .string()
       .max(PRICE_SELECTOR_MAX_LENGTH)
       .default("")
@@ -297,7 +338,7 @@ export const widgetDesignConfigSchema = z
         borderWidthPx: z.number().int().min(1).max(3),
         frequencyStyle: z.enum(["dropdown", "chips"]),
         /**
-         * Show the delivery-frequency selector. false removes it from ALL six
+         * Show the delivery-frequency selector. false removes it from ALL
          * presets (the planner keeps a single recommended-cadence line) and
          * every add-to-cart uses the plan's default frequency; subscribers can
          * still change frequency any time in the portal. Field-level default
@@ -418,6 +459,8 @@ export const DEFAULT_DESIGN_CONFIG: WidgetDesignConfig = {
   themeSync: {
     syncAddToCartPrice: true,
     priceSelector: "",
+    syncMainPrice: true,
+    mainPriceSelector: "",
   },
   text: {},
   markets: {},

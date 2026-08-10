@@ -19,6 +19,14 @@
 export const ACQ_URL_MAX = 512;
 export const ACQ_FIELD_MAX = 128;
 export const ACQ_CITY_MAX = 64;
+/**
+ * Longest alnum/`_`/`-` run still treated as a human-written slug (campaign
+ * name, product handle). Anything longer is machine output and is redacted
+ * regardless of shape — no human types a 65-character campaign name.
+ */
+export const ACQ_SLUG_MAX = 64;
+/** Cap on list-shaped bundle entries (discount codes, order tags). */
+export const ACQ_LIST_MAX = 20;
 
 // ── Small scrubbers ───────────────────────────────────────────────────────────
 
@@ -33,21 +41,81 @@ export function truncateAcqField(
   return trimmed.length > max ? trimmed.slice(0, max) : trimmed;
 }
 
+const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+/** Candidate runs the token heuristic inspects (20+ of base64/slug alphabet). */
+const TOKEN_RUN_RE = /[A-Za-z0-9_-]{20,}/g;
+const PHONE_RUN_RE = /\+?\d(?:[\s().-]?\d){6,}/g;
+
+/**
+ * Machine token vs human slug. Redacting every 20+ char run destroyed the
+ * campaign dimension at capture ("black-friday-2025-conversion",
+ * "advanced-night-repair-serum" product handles), so the heuristic keeps
+ * slug-shaped runs — `^[a-z0-9]+([_-][a-z0-9]+)*$`-ish names people type —
+ * and redacts only shapes people do not type:
+ *  - mixed-case WITH digits (base64 entropy: session tokens, JWT segments);
+ *  - a separator-less letter+digit fusion (hex-ish checkout/cart tokens —
+ *    real campaign names that long always carry `-`/`_` separators);
+ *  - anything longer than ACQ_SLUG_MAX.
+ * Pure-digit runs are ad-platform campaign/ad ids and are always kept here
+ * (free TEXT still phone-scrubs digit runs — see stripPiiFromText).
+ */
+function isTokenShaped(run: string): boolean {
+  if (run.length > ACQ_SLUG_MAX) return true;
+  const hasDigit = /\d/.test(run);
+  const hasLower = /[a-z]/.test(run);
+  const hasUpper = /[A-Z]/.test(run);
+  if (hasLower && hasUpper && hasDigit) return true;
+  if (hasDigit && (hasLower || hasUpper) && !/[_-]/.test(run)) return true;
+  return false;
+}
+
+const redactTokenRuns = (text: string): string =>
+  text.replace(TOKEN_RUN_RE, (run) => (isTokenShaped(run) ? "[redacted]" : run));
+
 /**
  * Remove PII-shaped substrings from free text: email addresses, phone-length
- * digit runs (7+, separators tolerated) and long token-shaped strings (20+
- * chars of base64/hex-ish alphabet — session tokens, checkout tokens, JWTs).
+ * digit runs (7+, separators tolerated) and token-shaped strings (see
+ * isTokenShaped — session tokens, checkout tokens, JWTs; human slugs
+ * survive). For utm values and slug path segments, where digit runs are
+ * campaign/ad ids rather than phone numbers, use sanitizeUtmValue / the URL
+ * sanitizer instead — this full scrub is for genuinely free text.
  */
 export function stripPiiFromText(text: string): string {
-  return (
-    text
-      // emails first (they contain token-shaped local parts)
-      .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "[redacted]")
-      // long token-shaped runs (before digit runs, which they may contain)
-      .replace(/[A-Za-z0-9_-]{20,}/g, "[redacted]")
-      // phone-length digit runs, tolerating common separators
-      .replace(/\+?\d(?:[\s().-]?\d){6,}/g, "[redacted]")
-  );
+  return redactTokenRuns(
+    // emails first (they contain token-shaped local parts)
+    text.replace(EMAIL_RE, "[redacted]"),
+  ).replace(PHONE_RUN_RE, "[redacted]");
+}
+
+/**
+ * Scrub + cap a single utm_* VALUE. Emails and token-shaped strings are
+ * redacted, but — unlike free text — digit runs are kept: a pure-digit utm
+ * value is a Meta/Google campaign or ad id ({{campaign.id}} templates), not
+ * a phone number, and redacting it severed the ad-platform join for every
+ * numeric-id campaign. Null when empty/absent.
+ */
+export function sanitizeUtmValue(value: unknown): string | null {
+  const raw = truncateAcqField(value, ACQ_FIELD_MAX * 2);
+  if (!raw) return null;
+  const scrubbed = redactTokenRuns(raw.replace(EMAIL_RE, "[redacted]"));
+  return truncateAcqField(scrubbed, ACQ_FIELD_MAX);
+}
+
+/**
+ * Scrub a URL pathname segment-wise: a slug-shaped segment (product handle,
+ * collection slug, numeric id — the alphabet people put in URLs) keeps its
+ * digits and only loses token-shaped runs; anything else (dots, %, @…) gets
+ * the full free-text scrub, so an email or phone in a path still dies.
+ */
+function sanitizeUrlPathname(pathname: string): string {
+  return pathname
+    .split("/")
+    .map((segment) =>
+      /^[A-Za-z0-9_-]+$/.test(segment)
+        ? redactTokenRuns(segment)
+        : stripPiiFromText(segment),
+    )
+    .join("/");
 }
 
 /**
@@ -77,13 +145,10 @@ export function sanitizeAcquisitionUrl(value: unknown): string | null {
   const params = new URLSearchParams();
   for (const [key, val] of url.searchParams) {
     if (/^utm_[a-z_]+$/i.test(key)) {
-      params.append(
-        key.toLowerCase(),
-        stripPiiFromText(val).slice(0, ACQ_FIELD_MAX),
-      );
+      params.append(key.toLowerCase(), sanitizeUtmValue(val) ?? "");
     }
   }
-  const path = stripPiiFromText(url.pathname);
+  const path = sanitizeUrlPathname(url.pathname);
   const host = relative ? "" : url.host;
   const query = params.toString();
   const out = `${host}${path}${query ? `?${query}` : ""}`;
@@ -100,25 +165,51 @@ export interface AcqUtm {
   content: string | null;
 }
 
-/**
- * UTM params from a raw URL (absolute or path-relative). Null when the input
- * carries none — a null column reads "no UTM", not "empty UTM".
- */
-export function utmFromUrl(value: unknown): AcqUtm | null {
+/** Loose URL parse shared by the two utm extractors; null on unparseable. */
+function parseUrlLoose(value: unknown): URL | null {
   const raw = typeof value === "string" ? value.trim() : "";
   if (!raw) return null;
-  let url: URL;
   try {
-    url = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw)
+    return /^[a-z][a-z0-9+.-]*:\/\//i.test(raw)
       ? new URL(raw)
       : new URL(raw, "https://relative.invalid");
   } catch {
     return null;
   }
-  const get = (k: string): string | null => {
-    const v = url.searchParams.get(k);
-    return v ? stripPiiFromText(v).slice(0, ACQ_FIELD_MAX) : null;
+}
+
+/**
+ * UTM params from a raw URL (absolute or path-relative). Null when the input
+ * carries none — a null column reads "no UTM", not "empty UTM".
+ */
+export function utmFromUrl(value: unknown): AcqUtm | null {
+  const url = parseUrlLoose(value);
+  if (!url) return null;
+  const get = (k: string): string | null =>
+    sanitizeUtmValue(url.searchParams.get(k));
+  const utm: AcqUtm = {
+    source: get("utm_source"),
+    medium: get("utm_medium"),
+    campaign: get("utm_campaign"),
+    term: get("utm_term"),
+    content: get("utm_content"),
   };
+  return Object.values(utm).some((v) => v != null) ? utm : null;
+}
+
+/**
+ * The same five params, length-capped ONLY — no scrub. Persisted as
+ * `acqRaw.rawUtm`, the recompute reserve: whenever the scrub heuristics
+ * change, the sanitized `acqUtm` edge can be rebuilt from this instead of
+ * being lost forever (the same escape hatch `acqRaw.orderTotalCents` gives
+ * the value bands). It may therefore hold PII a scrub would catch — it lives
+ * inside `acqRaw` precisely so CUSTOMERS_REDACT clears it with the rest.
+ */
+export function rawUtmFromUrl(value: unknown): AcqUtm | null {
+  const url = parseUrlLoose(value);
+  if (!url) return null;
+  const get = (k: string): string | null =>
+    truncateAcqField(url.searchParams.get(k), ACQ_FIELD_MAX);
   const utm: AcqUtm = {
     source: get("utm_source"),
     medium: get("utm_medium"),
@@ -198,6 +289,53 @@ export function timeToPurchaseSeconds(
   return Math.max(0, Math.round((b - a) / 1000));
 }
 
+// ── List-shaped bundle fields ────────────────────────────────────────────────
+
+/**
+ * Discount codes as a capped list of code strings. Accepts plain strings or
+ * REST `{ code }` objects so the caller does not have to reshape the payload.
+ * Null when absent (a pre-feature row reads "not captured"); an empty array
+ * reads "no codes on the order".
+ */
+export function discountCodesFromInput(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  const out: string[] = [];
+  for (const item of value) {
+    const code =
+      typeof item === "string"
+        ? item
+        : item != null &&
+            typeof item === "object" &&
+            typeof (item as { code?: unknown }).code === "string"
+          ? (item as { code: string }).code
+          : null;
+    const cleaned = truncateAcqField(code, ACQ_SLUG_MAX);
+    if (cleaned) out.push(cleaned);
+    if (out.length >= ACQ_LIST_MAX) break;
+  }
+  return out;
+}
+
+/**
+ * Order tags as a capped list. Accepts the REST comma-separated `tags`
+ * string or an array. Null when absent; empty array when there are no tags.
+ */
+export function orderTagsFromInput(value: unknown): string[] | null {
+  const items = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(",")
+      : null;
+  if (items == null) return null;
+  const out: string[] = [];
+  for (const item of items) {
+    const cleaned = truncateAcqField(item, ACQ_SLUG_MAX);
+    if (cleaned) out.push(cleaned);
+    if (out.length >= ACQ_LIST_MAX) break;
+  }
+  return out;
+}
+
 // ── The whole bundle ─────────────────────────────────────────────────────────
 
 /** Raw (webhook-shaped) inputs the bundle is built from. All optional. */
@@ -216,6 +354,21 @@ export interface AcquisitionInput {
   orderTotalCents?: number | null;
   orderCurrencyCode?: string | null;
   orderProcessedAt?: Date | null;
+  /** `discount_codes` — strings or REST `{ code }` objects. */
+  discountCodes?: unknown;
+  /** `customer_locale` (fallback `client_details.accept_language`). */
+  checkoutLocale?: unknown;
+  /** Shopify Markets: `presentment_currency` + presentment total in cents. */
+  presentmentCurrencyCode?: unknown;
+  presentmentTotalCents?: number | null;
+  /** `app_id` — the numeric sales-channel app id. */
+  appId?: unknown;
+  /** `source_identifier` — channel-specific order reference. */
+  sourceIdentifier?: unknown;
+  /** `buyer_accepts_marketing` — consent snapshot at checkout. */
+  buyerAcceptsMarketing?: unknown;
+  /** Order `tags` — REST comma-separated string or an array. */
+  orderTags?: unknown;
 }
 
 /** Sanitized, column-shaped acquisition capture. */
@@ -268,6 +421,9 @@ export function buildAcquisitionCapture(
     acqOrderValueBand: orderValueBandFromCents(input.orderTotalCents ?? null),
   };
 
+  const presentmentCurrency = truncateAcqField(input.presentmentCurrencyCode, 8);
+  const sourceIdentifier = truncateAcqField(input.sourceIdentifier, 64);
+
   // The mining bundle: everything above plus the raw-but-safe numerics.
   // NEVER the IP, NEVER the full UA — those inputs are not even accepted here
   // beyond the device classification above.
@@ -278,6 +434,9 @@ export function buildAcquisitionCapture(
     landingSite: capture.acqLandingSite,
     referringSite: capture.acqReferringSite,
     utm: capture.acqUtm,
+    // Length-capped ONLY, deliberately unscrubbed — the recompute reserve for
+    // the utm scrub (see rawUtmFromUrl). Same source precedence as `utm`.
+    rawUtm: rawUtmFromUrl(landingRaw) ?? rawUtmFromUrl(referringRaw),
     countryCode: capture.acqCountryCode,
     provinceCode: capture.acqProvinceCode,
     city: capture.acqCity,
@@ -291,6 +450,31 @@ export function buildAcquisitionCapture(
     orderCurrencyCode: input.orderCurrencyCode ?? null,
     orderValueBand: capture.acqOrderValueBand,
     orderProcessedAt: input.orderProcessedAt?.toISOString() ?? null,
+    // Order-payload extras — additive keys (null when the ingest cannot
+    // supply them): which promo acquired the subscriber, checkout locale,
+    // Markets presentment, sales channel, consent snapshot, tags.
+    discountCodes: discountCodesFromInput(input.discountCodes),
+    checkoutLocale: truncateAcqField(input.checkoutLocale, 16),
+    presentmentCurrencyCode: presentmentCurrency
+      ? presentmentCurrency.toUpperCase()
+      : null,
+    presentmentTotalCents:
+      typeof input.presentmentTotalCents === "number" &&
+      Number.isFinite(input.presentmentTotalCents)
+        ? input.presentmentTotalCents
+        : null,
+    appId:
+      typeof input.appId === "number" && Number.isFinite(input.appId)
+        ? input.appId
+        : truncateAcqField(input.appId, 64),
+    sourceIdentifier: sourceIdentifier
+      ? stripPiiFromText(sourceIdentifier)
+      : null,
+    buyerAcceptsMarketing:
+      typeof input.buyerAcceptsMarketing === "boolean"
+        ? input.buyerAcceptsMarketing
+        : null,
+    orderTags: orderTagsFromInput(input.orderTags),
   };
 
   return { ...capture, acqRaw };

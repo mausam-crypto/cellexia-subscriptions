@@ -3,7 +3,8 @@
  *
  * Idempotently creates:
  *   - the Shop row for --shop (or reuses the installed shop),
- *   - a demo SellingPlanConfig (frequencies 6/8/10/12 weeks, schema defaults),
+ *   - a demo SellingPlanConfig (multi-unit frequencies: every 10 days / 2
+ *     weeks / 8 weeks / 1 month, default 8 weeks, schema defaults),
  *   - three GiftRules (cycle-2 surprise, order-6 milestone, 365-day anniversary)
  *     with placeholder variant GIDs clearly marked REPLACE_ME.
  *
@@ -15,6 +16,9 @@
  */
 import { parseArgs } from "node:util";
 import { loadDotEnv } from "./lib/env";
+// Pure module, no server deps — safe to import before loadDotEnv resolves
+// (scripts import from app, never the reverse).
+import { approxWeeks } from "../app/lib/frequency";
 
 loadDotEnv();
 
@@ -28,6 +32,21 @@ const REPLACE_ME_PRODUCT = "gid://shopify/Product/REPLACE_ME";
 const REPLACE_ME_VARIANT = "gid://shopify/ProductVariant/REPLACE_ME";
 
 const DEMO_PLAN_NAME = "Cellexia Subscribe & Save (demo)";
+
+/**
+ * Multi-unit demo cadences (v1.8.0) — one of each unit plus a second WEEK
+ * option, so the Plans page and portal preview exercise the full mix. The
+ * legacy frequenciesWeeks/defaultFrequencyWeeks columns keep being written
+ * as approxWeeks values (rollback safety — a pre-v1.8.0 build still sees a
+ * coherent week-only view of the config).
+ */
+const DEMO_FREQUENCIES = [
+  { unit: "DAY", count: 10 },
+  { unit: "WEEK", count: 2 },
+  { unit: "WEEK", count: 8 },
+  { unit: "MONTH", count: 1 },
+] as const;
+const DEMO_DEFAULT_FREQUENCY = { unit: "WEEK", count: 8 } as const;
 
 const DEMO_GIFT_RULES: Array<{
   name: string;
@@ -114,8 +133,18 @@ async function main(): Promise<void> {
           shopId: shop.id,
           name: DEMO_PLAN_NAME,
           productIds: [REPLACE_ME_PRODUCT],
-          frequenciesWeeks: [6, 8, 10, 12],
-          defaultFrequencyWeeks: 8,
+          frequencies: [...DEMO_FREQUENCIES],
+          defaultFrequency: DEMO_DEFAULT_FREQUENCY,
+          // Legacy week-approximation mirrors — always written alongside.
+          frequenciesWeeks: [
+            ...new Set(
+              DEMO_FREQUENCIES.map((f) => approxWeeks(f.unit, f.count)),
+            ),
+          ].sort((a, b) => a - b),
+          defaultFrequencyWeeks: approxWeeks(
+            DEMO_DEFAULT_FREQUENCY.unit,
+            DEMO_DEFAULT_FREQUENCY.count,
+          ),
           // Stays PENDING until the plans module syncs it to Shopify.
           syncStatus: "PENDING",
         },

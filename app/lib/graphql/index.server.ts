@@ -16,3 +16,4 @@ export * from "./orders.server";
 export * from "./customers.server";
 export * from "./metafields.server";
 export * from "./markets.server";
+export * from "./appInstallation.server";

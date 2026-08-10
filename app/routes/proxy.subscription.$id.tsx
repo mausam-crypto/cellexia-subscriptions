@@ -9,12 +9,13 @@ import { t } from "~/lib/i18n/i18n.server";
 import { formatMoney } from "~/lib/money";
 import { addDaysTz, formatShopDate } from "~/lib/dates.server";
 import { isSetupMode } from "~/lib/launch/launch.server";
+import { logEvent } from "~/lib/events/log.server";
 import {
   escapeHtml,
   localeFromRequest,
   portalPage,
   resolveToast,
-  setupGatePage,
+  closedPortalPage,
   withLocale,
   type PortalToast,
 } from "~/lib/portal/layout.server";
@@ -35,6 +36,14 @@ import type {
   LocalContractLine,
   LocalContractWithLines,
 } from "~/lib/contracts/shared.server";
+import {
+  contractFrequency,
+  formatFrequency,
+  frequencyToken,
+  parseFrequencyToken,
+  sameFrequency,
+  type Frequency,
+} from "~/lib/frequency";
 import { OURS_ONLY } from "~/lib/ownership/ownership.server";
 
 /**
@@ -86,6 +95,8 @@ interface PageContext {
   contract: LocalContractWithLines;
   csrf: string;
   returnTo: string;
+  /** Preview session's raw cx_pp token — carried on every link/form URL. */
+  preview: string | null;
   /** settings.portal.nextDateMaxDays — same bound the api action validates. */
   nextDateMaxDays: number;
   /** settings.portal.maxLineQuantity — same bound the api action validates. */
@@ -93,7 +104,7 @@ interface PageContext {
 }
 
 function api(ctx: PageContext, action: string): string {
-  return withLocale(`${PORTAL_BASE_PATH}/api/${action}`, ctx.locale);
+  return withLocale(`${PORTAL_BASE_PATH}/api/${action}`, ctx.locale, ctx.preview);
 }
 
 function baseFields(ctx: PageContext): Array<[string, string]> {
@@ -228,21 +239,31 @@ function itemsCardHtml(
 
 // ── Add a product ────────────────────────────────────────────────────────────
 
+interface AddProductSection {
+  html: string;
+  /** Variants actually offered (rendered), for the impression event below. */
+  offered: Array<{ variantId: string; productId: string }>;
+}
+
 function addProductHtml(
   ctx: PageContext,
   catalog: CatalogProduct[],
   discountByProduct: Map<string, number>,
-): string {
+): AddProductSection {
   const { locale, contract } = ctx;
   const inContract = new Set(
     contract.lines.filter((l) => !l.isOneTimeAddon).map((l) => l.variantId),
   );
+  const offered: AddProductSection["offered"] = [];
 
   const cards = catalog
     .map((product) => {
       const pct = discountByProduct.get(product.id) ?? 0;
       const variants = product.variants.filter((v) => !inContract.has(v.id));
       if (variants.length === 0) return "";
+      for (const v of variants) {
+        offered.push({ variantId: v.id, productId: product.id });
+      }
 
       const first = variants[0];
       const priceHtml =
@@ -281,25 +302,87 @@ function addProductHtml(
     .filter(Boolean)
     .join("");
 
-  if (!cards) return "";
+  if (!cards) return { html: "", offered: [] };
 
-  return `<details class="cx-acc">
+  const html = `<details class="cx-acc">
   <summary>${escapeHtml(t(locale, "portal.add.title"))}</summary>
   <div class="cx-acc__body">
     <p class="cx-muted cx-small" style="margin:0 0 14px">${escapeHtml(t(locale, "portal.add.intro"))}</p>
     <div class="cx-grid">${cards}</div>
   </div>
 </details>`;
+  return { html, offered };
+}
+
+/**
+ * cycle.addon_offer_shown — the impression half of the add-on funnel.
+ * cycle.addon_added alone forced attach rate onto a charges denominator
+ * (subscribers who never saw the offer were indistinguishable), so the
+ * render logs one event per offered variant, throttled to once per
+ * (contract, upcoming order, variant) by event existence. `orderNumber` is
+ * ORDER-NUMBER space (ordersCount + 1 — stable across page reloads, and a
+ * skip keeps the offer's target order the same), not the Shopify cycle
+ * index; resolving the real cycle would cost an admin round-trip per page
+ * view. Unmapped in the Klaviyo event map — an impression is analytics, not
+ * a customer moment. Contained: a failed write must never break the page.
+ */
+async function logAddonOfferImpressions(
+  ctx: PageContext,
+  offered: AddProductSection["offered"],
+): Promise<void> {
+  if (offered.length === 0) return;
+  const { contract } = ctx;
+  const orderNumber = contract.ordersCount + 1;
+  try {
+    const logged = await prisma.subscriberEvent.findMany({
+      where: {
+        contractId: contract.id,
+        type: "cycle.addon_offer_shown",
+        payload: { path: ["orderNumber"], equals: orderNumber },
+      },
+      select: { payload: true },
+    });
+    const seen = new Set(
+      logged.map(
+        (e) => (e.payload as { variantId?: unknown } | null)?.variantId,
+      ),
+    );
+    for (const offer of offered) {
+      if (seen.has(offer.variantId)) continue;
+      await logEvent({
+        shopId: contract.shopId,
+        contractId: contract.id,
+        customerId: contract.customerId,
+        email: contract.email,
+        type: "cycle.addon_offer_shown",
+        source: "CUSTOMER_PORTAL",
+        actor: "customer",
+        payload: {
+          orderNumber,
+          variantId: offer.variantId,
+          productId: offer.productId,
+        },
+      });
+    }
+  } catch (err) {
+    console.error(
+      "[portal] addon offer impression log failed",
+      contract.id,
+      err,
+    );
+  }
 }
 
 // ── Schedule ─────────────────────────────────────────────────────────────────
 
 function scheduleHtml(
   ctx: PageContext,
-  frequencies: number[],
+  frequencies: Frequency[],
   allowFrequencyChoice: boolean,
 ): string {
   const { locale, tz, contract } = ctx;
+  const tr = (key: string, vars?: Record<string, string | number>) =>
+    t(locale, key, vars);
   const now = new Date();
   const minDate = dateInputValue(addDaysTz(now, 1, tz), tz);
   const maxDate = dateInputValue(addDaysTz(now, ctx.nextDateMaxDays, tz), tz);
@@ -316,15 +399,19 @@ function scheduleHtml(
     </form>
   </div>`;
 
+  // Option values are machine tokens ("2:WEEK") the api action parses back —
+  // only emit tokens that round-trip parseFrequencyToken, never display text.
+  const currentFrequency = contractFrequency(contract);
   const frequencyForm = allowFrequencyChoice
     ? `<div class="cx-field">
     <label class="cx-label" for="cx-frequency">${escapeHtml(t(locale, "portal.schedule.frequency_label"))}</label>
     <form method="post" action="${api(ctx, "frequency")}" class="cx-row">
       ${hiddenFields(baseFields(ctx))}
-      <select class="cx-select" style="flex:1" id="cx-frequency" name="weeks">${frequencies
+      <select class="cx-select" style="flex:1" id="cx-frequency" name="frequency">${frequencies
+        .filter((f) => parseFrequencyToken(frequencyToken(f)) !== null)
         .map(
-          (w) =>
-            `<option value="${w}"${w === contract.intervalWeeks ? " selected" : ""}>${escapeHtml(t(locale, "portal.schedule.every_weeks_option", { weeks: w }))}</option>`,
+          (f) =>
+            `<option value="${escapeHtml(frequencyToken(f))}"${sameFrequency(f, currentFrequency) ? " selected" : ""}>${escapeHtml(formatFrequency(tr, "option", f))}</option>`,
         )
         .join("")}</select>
       <button type="submit" class="cx-btn cx-btn--ghost cx-btn--small">${escapeHtml(t(locale, "common.save"))}</button>
@@ -488,7 +575,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   // Launch gate: while in setup mode the portal is closed to the public —
   // only admin preview sessions pass through.
   if (!portalSession.isPreview && (await isSetupMode(shop.id))) {
-    return liquid(setupGatePage(locale), {
+    return liquid(closedPortalPage(request, locale), {
       headers: { "X-Robots-Tag": "noindex" },
     });
   }
@@ -499,7 +586,13 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     portalSession,
   );
   if (!contract) {
-    throw redirect(withLocale(`${PORTAL_BASE_PATH}/?toast=not_found`, locale));
+    throw redirect(
+      withLocale(
+        `${PORTAL_BASE_PATH}/?toast=not_found`,
+        locale,
+        portalSession.previewToken,
+      ),
+    );
   }
 
   const [portalSettings, pauseSettings, frequency] = await Promise.all([
@@ -531,6 +624,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     contract,
     csrf: portalSession.csrfToken,
     returnTo: `/subscription/${contract.id}`,
+    preview: portalSession.previewToken,
     nextDateMaxDays: portalSettings.nextDateMaxDays,
     maxQuantity: portalSettings.maxLineQuantity,
   };
@@ -565,7 +659,13 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   body += itemsCardHtml(ctx, catalog, discountByProduct, isActive);
 
   if (isActive && portalSettings.allowAddProducts) {
-    body += addProductHtml(ctx, catalog, discountByProduct);
+    const addSection = addProductHtml(ctx, catalog, discountByProduct);
+    body += addSection.html;
+    // Impressions: real customers only — the admin preview and the demo
+    // fixture must never inflate the offer-shown denominator.
+    if (!portalSession.isPreview && !contract.isDemo) {
+      await logAddonOfferImpressions(ctx, addSection.offered);
+    }
   }
   if (isActive) {
     body += scheduleHtml(ctx, frequency.options, frequency.allowChoice);
@@ -581,7 +681,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   }
   if (editable) {
     // Cancel flow entry — the cancel-flow module owns everything past here.
-    body += `<p style="text-align:center;margin:24px 0 0"><a href="${withLocale(`${PORTAL_BASE_PATH}/cancel/${contract.id}`, locale)}" class="cx-muted cx-small" style="color:var(--cx-muted)">${escapeHtml(t(locale, "portal.detail.cancel_link"))}</a></p>`;
+    body += `<p style="text-align:center;margin:24px 0 0"><a href="${withLocale(`${PORTAL_BASE_PATH}/cancel/${contract.id}`, locale, ctx.preview)}" class="cx-muted cx-small" style="color:var(--cx-muted)">${escapeHtml(t(locale, "portal.detail.cancel_link"))}</a></p>`;
   }
 
   const toast = resolveToast(request, locale)?.toast ?? null;
@@ -600,9 +700,10 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       body,
       activeNav: "subscriptions",
       toast: toastWithUndo,
-      backHref: withLocale(`${PORTAL_BASE_PATH}/`, locale),
+      backHref: withLocale(`${PORTAL_BASE_PATH}/`, locale, ctx.preview),
       backLabel: t(locale, "portal.detail.back"),
       isPreview: portalSession.isPreview,
+      previewToken: portalSession.previewToken,
     }),
   );
 };

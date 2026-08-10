@@ -34,6 +34,15 @@ import {
   formatMoney,
 } from "~/lib/money";
 import { shopDayStartUtc } from "~/lib/dates.server";
+import {
+  approxWeeks,
+  contractFrequency,
+  frequencyLabelEn,
+  frequencyToken,
+  normalizeFrequencies,
+  parseConfigFrequencies,
+  parseFrequencyToken,
+} from "~/lib/frequency";
 import { buildMitEvidence } from "~/lib/billing/mit-evidence.server";
 import { buildMagicUrl } from "~/lib/magiclinks/builder.server";
 import {
@@ -164,13 +173,24 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const configs = await prisma.sellingPlanConfig.findMany({
     where: { shopId: shop.id, active: true },
   });
-  const freqSet = new Set<number>([contract.intervalWeeks]);
-  for (const config of configs) {
-    const parsed = z.array(z.number().int()).safeParse(config.frequenciesWeeks);
-    if (parsed.success) parsed.data.forEach((w) => freqSet.add(w));
-  }
-  if (freqSet.size <= 1) [2, 4, 6, 8, 10, 12].forEach((w) => freqSet.add(w));
-  const frequencies = [...freqSet].sort((a, b) => a - b);
+  // Everything the active configs offer plus the contract's own cadence (it
+  // may predate a config edit); the week ladder only when the configs add
+  // nothing, so the Select stays usable on a shop without plans.
+  const merged = normalizeFrequencies([
+    contractFrequency(contract),
+    ...configs.flatMap((config) => parseConfigFrequencies(config)),
+  ]);
+  const frequencies = (
+    merged.length > 1
+      ? merged
+      : normalizeFrequencies([
+          ...merged,
+          ...[2, 4, 6, 8, 10, 12].map((count) => ({
+            unit: "WEEK" as const,
+            count,
+          })),
+        ])
+  ).map((f) => ({ token: frequencyToken(f), label: frequencyLabelEn(f) }));
 
   const events = await contractTimeline(contract.id, 200);
 
@@ -210,6 +230,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       merged: contract.mergeGroupId != null,
       churnRiskScore: contract.churnRiskScore,
       intervalWeeks: contract.intervalWeeks,
+      frequencyToken: frequencyToken(contractFrequency(contract)),
       nextBillingDate: contract.nextBillingDate?.toISOString() ?? null,
       pausedAt: contract.pausedAt?.toISOString() ?? null,
       resumeAt: contract.resumeAt?.toISOString() ?? null,
@@ -478,7 +499,13 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       // ── Quick actions ───────────────────────────────────────────────────
       case "pause": {
         const months = Math.max(1, int(formData, "months", 1));
-        await pauseContract(shop.domain, contractId, months, opts);
+        // reason ADMIN → SubscriptionContract.pausedReason (migration 0016):
+        // the cockpit pause is the merchant's decision, and retention
+        // analytics splits pause causes the way cancelSource splits cancels.
+        await pauseContract(shop.domain, contractId, months, {
+          ...opts,
+          reason: "ADMIN",
+        });
         await adminLog(`Paused subscription for ${months} month(s)`, {
           action: "pause",
           months,
@@ -722,7 +749,13 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
 
       // ── Schedule ────────────────────────────────────────────────────────
       case "skipNext": {
-        await skipNextCycle(shop.domain, contractId, opts);
+        // ADMIN initiator: a cockpit skip counts in merchantSkipCount, not in
+        // the customer's skip behavior (skipCount / lastSkippedAt) — the
+        // risk/win-back models must only see skips the customer chose.
+        await skipNextCycle(shop.domain, contractId, {
+          ...opts,
+          initiator: "ADMIN",
+        });
         await adminLog("Skipped the next billing cycle", { action: "skip_next" });
         return ok("Next cycle skipped");
       }
@@ -734,13 +767,25 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         return ok("Cycle restored");
       }
       case "setFrequency": {
+        // Token field ("10:DAY") from the current UI; the bare "weeks"
+        // integer keeps a stale pre-v1.8.0 tab working (bare weeks = WEEK).
         const weeks = int(formData, "weeks");
-        await changeFrequency(shop.domain, contractId, weeks, opts);
-        await adminLog(`Changed delivery frequency to every ${weeks} weeks`, {
+        const freq =
+          parseFrequencyToken(str(formData, "frequency")) ??
+          (weeks >= 1 ? { unit: "WEEK" as const, count: weeks } : null);
+        if (!freq) {
+          return json<ActionResponse>({ ok: false, intent, error: "Invalid frequency" });
+        }
+        const label = frequencyLabelEn(freq).toLowerCase();
+        await changeFrequency(shop.domain, contractId, freq, opts);
+        await adminLog(`Changed delivery frequency to ${label}`, {
           action: "set_frequency",
-          weeks,
+          // Week approximation stays first for anything built on it.
+          weeks: approxWeeks(freq.unit, freq.count),
+          unit: freq.unit,
+          count: freq.count,
         });
-        return ok(`Frequency set to every ${weeks} weeks`);
+        return ok(`Frequency set to ${label}`);
       }
       case "setNextDate": {
         const dateStr = str(formData, "date"); // YYYY-MM-DD
@@ -1179,7 +1224,7 @@ export default function SubscriberDetailPage() {
   const [nextDate, setNextDate] = useState(
     c.nextBillingDate ? c.nextBillingDate.slice(0, 10) : "",
   );
-  const [frequency, setFrequency] = useState(String(c.intervalWeeks));
+  const [frequency, setFrequency] = useState(c.frequencyToken);
   const [backupMethod, setBackupMethod] = useState(c.backupPaymentMethodId ?? "");
 
   const [grantOpen, setGrantOpen] = useState(false);
@@ -1556,16 +1601,16 @@ export default function SubscriberDetailPage() {
                     </Button>
                     <Select
                       label="Frequency"
-                      options={data.frequencies.map((w) => ({
-                        label: `Every ${w} weeks`,
-                        value: String(w),
+                      options={data.frequencies.map((f) => ({
+                        label: f.label,
+                        value: f.token,
                       }))}
                       value={frequency}
                       onChange={setFrequency}
                     />
                     <Button
-                      disabled={busy || frequency === String(c.intervalWeeks)}
-                      onClick={() => submit("setFrequency", { weeks: frequency })}
+                      disabled={busy || frequency === c.frequencyToken}
+                      onClick={() => submit("setFrequency", { frequency })}
                     >
                       Save frequency
                     </Button>

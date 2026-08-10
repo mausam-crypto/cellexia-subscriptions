@@ -111,11 +111,27 @@ const db = vi.hoisted(() => {
       if (state.kase) Object.assign(state.kase, args.data);
       return state.kase;
     }),
+    // The exactly-once marker+counter transaction claims the case by id and
+    // moves emailsSent via an atomic { increment } — mirror both semantics.
+    caseUpdateMany: vi.fn(async (args: { where: Row; data: Row }) => {
+      const k = state.kase;
+      if (!k || (args.where.id !== undefined && args.where.id !== k.id)) {
+        return { count: 0 };
+      }
+      const data: Row = { ...args.data };
+      const inc = (data.emailsSent as { increment?: number } | undefined)
+        ?.increment;
+      if (typeof inc === "number") {
+        data.emailsSent = ((k.emailsSent as number | undefined) ?? 0) + inc;
+      }
+      Object.assign(k, data);
+      return { count: 1 };
+    }),
   };
 });
 
-vi.mock("~/db.server", () => ({
-  default: {
+vi.mock("~/db.server", () => {
+  const client = {
     dunningCase: {
       findMany: vi.fn(async (): Promise<unknown[]> => []),
       findFirst: vi.fn(async (args: unknown): Promise<unknown> => {
@@ -127,6 +143,7 @@ vi.mock("~/db.server", () => ({
       }),
       create: db.caseCreate,
       update: db.caseUpdate,
+      updateMany: db.caseUpdateMany,
     },
     subscriptionContract: { update: mocks.contractUpdate },
     billingAttempt: {
@@ -143,8 +160,12 @@ vi.mock("~/db.server", () => ({
       count: vi.fn(async (): Promise<number> => 0),
     },
     notificationLog: { findFirst: mocks.notificationLogFindFirst },
-  },
-}));
+    // The engine's marker+counter tx runs its callback over the same client.
+    $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> =>
+      fn(client),
+  };
+  return { default: client };
+});
 
 vi.mock("~/lib/events/log.server", () => ({ logEvent: mocks.logEvent }));
 vi.mock("~/lib/settings/settings.server", () => ({ getSetting: mocks.getSetting }));

@@ -38,11 +38,31 @@ export function isRtlLocale(locale: string | null | undefined): boolean {
   return RTL_LANGS.has(normalizeLocale(locale).split("-")[0]);
 }
 
-/** Append ?locale= to a portal path (skipped for the default "en"). */
-export function withLocale(path: string, locale: string): string {
-  if (!locale || locale === "en") return path;
-  const sep = path.includes("?") ? "&" : "?";
-  return `${path}${sep}locale=${encodeURIComponent(locale)}`;
+/**
+ * Append ?locale= to a portal path (skipped for the default "en"), plus the
+ * ?cx_pp= admin preview token when one is given and the path targets the
+ * portal proxy. The app proxy strips cookies on a live store, so for a
+ * preview session the token in the URL IS the session — every in-portal link
+ * and redirect built while one is active must carry it, or the next click
+ * lands sessionless on the login page. Callers pass
+ * `session.previewToken` (null for cookie / storefront-login sessions, which
+ * makes this a no-op).
+ */
+export function withLocale(
+  path: string,
+  locale: string,
+  preview?: string | null,
+): string {
+  let out = path;
+  if (locale && locale !== "en") {
+    const sep = out.includes("?") ? "&" : "?";
+    out = `${out}${sep}locale=${encodeURIComponent(locale)}`;
+  }
+  if (preview && out.startsWith(PORTAL_PROXY_BASE)) {
+    const sep = out.includes("?") ? "&" : "?";
+    out = `${out}${sep}cx_pp=${encodeURIComponent(preview)}`;
+  }
+  return out;
 }
 
 /** Toast keys the layout will render; anything else in ?toast= is ignored. */
@@ -104,6 +124,26 @@ export interface PortalPageInput {
   backLabel?: string;
   /** Admin preview session — renders the persistent "Preview mode" banner. */
   isPreview?: boolean;
+  /**
+   * Raw ?cx_pp= token of the active preview session, so the nav links carry
+   * it (see withLocale). Pass `session.previewToken`; null/omitted for
+   * cookie and storefront-login sessions.
+   */
+  previewToken?: string | null;
+  /**
+   * This is the setup-gate page AND it is safe to arm the one-shot token
+   * rescue: marks the root with data-cellexia-gate so the inline script may
+   * re-try ONCE with a sessionStorage-saved preview token when the URL lost
+   * its ?cx_pp= (the storefront password page redirect is the classic
+   * query-shedding hop). Only ever set for GET-rendered gates — a gate
+   * rendered as a POST response (portal api action, cancel-flow actions,
+   * login OTP action) must not arm it, because location.replace re-issues
+   * the POST URL as a GET and lands on a raw 405/404 instead of the gate.
+   * Customers are unaffected either way: the gate only renders while the
+   * store is dark, and only a browser that previously held a live admin
+   * preview has a saved token.
+   */
+  isSetupGate?: boolean;
 }
 
 const STYLE = `
@@ -251,6 +291,61 @@ const SCRIPT = `
       },0);
     });
   });
+  // Belt-and-suspenders for the cookie-less admin preview (?cx_pp=): the app
+  // proxy strips cookies, so the token in the URL is the whole session — a
+  // single link or form that dropped it dead-ends the preview at the login
+  // page. The server threads the token through every URL it builds
+  // (withLocale's third parameter); this pass re-stamps anything that slipped
+  // through. Root-scoped like everything above — only OUR portal-base links
+  // and forms are ever touched, never the theme's. NOT a credential in the
+  // cookie sense: the token is admin-minted, 1-hour, and view-only (every
+  // mutation is intercepted server-side for preview sessions).
+  var pp=new window.URLSearchParams(window.location.search).get("cx_pp");
+  var ppBase="${PORTAL_PROXY_BASE}";
+  var ppJoin=function(url,tok){return url+(url.indexOf("?")===-1?"?":"&")+"cx_pp="+encodeURIComponent(tok);};
+  if(pp){
+    var ppAdd=function(url){return ppJoin(url,pp);};
+    root.querySelectorAll("a[href]").forEach(function(a){
+      var href=a.getAttribute("href");
+      if(href&&href.indexOf(ppBase)===0&&href.indexOf("cx_pp=")===-1){
+        a.setAttribute("href",ppAdd(href));
+      }
+    });
+    root.querySelectorAll("form").forEach(function(f){
+      var action=f.getAttribute("action")||"";
+      if(action.indexOf(ppBase)!==0){return;}
+      // The server reads cx_pp from the query string (POST bodies are not
+      // consulted), so the action URL gets it; the hidden input is a second
+      // copy for anything that rewrites the action downstream.
+      if(action.indexOf("cx_pp=")===-1){f.setAttribute("action",ppAdd(action));}
+      if(!f.querySelector('input[name="cx_pp"]')){
+        var hidden=document.createElement("input");
+        hidden.type="hidden";hidden.name="cx_pp";hidden.value=pp;
+        f.appendChild(hidden);
+      }
+    });
+  }
+  // Preview-token continuity across dropped query strings. On a live store
+  // the token in the URL IS the whole session (the proxy strips cookies), and
+  // redirects outside our control — the storefront password page above all —
+  // can shed the query on the way back. So: a page rendering a live preview
+  // (the preview bar proves the token opened a session) saves the token; the
+  // sessionless SETUP GATE page — which only renders while the store is dark,
+  // so no customer traffic exists to misdirect — re-tries once with the saved
+  // token when its own URL arrived without one. No loop is possible: the
+  // retry URL carries cx_pp, and a page whose URL carries cx_pp never
+  // retries. Same storage trade-off the buy-box preview already accepted
+  // (admin-minted, short-TTL, view-only token in sessionStorage); wrapped in
+  // try/catch because sessionStorage itself can throw (private browsing).
+  try{
+    if(pp&&root.querySelector(".cx-preview-bar")){
+      window.sessionStorage.setItem("cellexia:cx_pp",pp);
+    }
+    if(!pp&&root.hasAttribute("data-cellexia-gate")){
+      var saved=window.sessionStorage.getItem("cellexia:cx_pp");
+      if(saved){window.location.replace(ppJoin(window.location.href,saved));}
+    }
+  }catch(e){}
 })();
 `;
 
@@ -268,11 +363,12 @@ export function portalPage(input: PortalPageInput): string {
   const dir = isRtlLocale(locale) ? "rtl" : "ltr";
   const backArrow = dir === "rtl" ? "&rarr;" : "&larr;";
 
+  const preview = input.previewToken ?? null;
   const nav = input.hideNav
     ? ""
     : `<nav class="cx-nav" aria-label="${escapeHtml(t(locale, "portal.nav.label"))}">
-        <a href="${withLocale(`${base}/`, locale)}"${input.activeNav === "subscriptions" ? ' class="cx-nav--on" aria-current="page"' : ""}>${NAV_ICON_SUBSCRIPTIONS}<span>${escapeHtml(t(locale, "portal.nav.subscriptions"))}</span></a>
-        <a href="${withLocale(`${base}/account`, locale)}"${input.activeNav === "account" ? ' class="cx-nav--on" aria-current="page"' : ""}>${NAV_ICON_ACCOUNT}<span>${escapeHtml(t(locale, "portal.nav.account"))}</span></a>
+        <a href="${withLocale(`${base}/`, locale, preview)}"${input.activeNav === "subscriptions" ? ' class="cx-nav--on" aria-current="page"' : ""}>${NAV_ICON_SUBSCRIPTIONS}<span>${escapeHtml(t(locale, "portal.nav.subscriptions"))}</span></a>
+        <a href="${withLocale(`${base}/account`, locale, preview)}"${input.activeNav === "account" ? ' class="cx-nav--on" aria-current="page"' : ""}>${NAV_ICON_ACCOUNT}<span>${escapeHtml(t(locale, "portal.nav.account"))}</span></a>
       </nav>`;
 
   const toast = input.toast
@@ -288,7 +384,11 @@ export function portalPage(input: PortalPageInput): string {
     ? `<style>body{padding-top:42px !important}</style><div class="cx-preview-bar" role="status">${escapeHtml(t(locale, "portal.preview.banner"))}</div>`
     : "";
 
-  return `<div class="cx-portal" data-cellexia-portal lang="${escapeHtml(locale)}" dir="${dir}">
+  // The gate marker rides at the tag's end so the data-cellexia-portal
+  // literal keeps its plain trailing space — the lint suite's selector↔markup
+  // pairing scanner reads this source file and must keep seeing it.
+  const gateAttr = input.isSetupGate ? ' data-cellexia-gate=""' : "";
+  return `<div class="cx-portal" data-cellexia-portal lang="${escapeHtml(locale)}" dir="${dir}"${gateAttr}>
 <style>${STYLE}</style>
 ${previewBar}
 <div class="cx-shell">
@@ -312,11 +412,53 @@ ${toast}
  * Served with a 200 — a temporary state, not an error — and noindex so the
  * closed portal never enters a search index.
  */
-export function setupGatePage(locale: string): string {
+export function setupGatePage(
+  locale: string,
+  opts: { armTokenRescue?: boolean } = {},
+): string {
   return portalPage({
     locale,
     title: t(locale, "portal.setup.title"),
     body: `<meta name="robots" content="noindex"><div class="cx-card"><p style="margin:0">${escapeHtml(t(locale, "portal.setup.body"))}</p></div>`,
     hideNav: true,
+    // Default true: every direct caller renders the gate from a GET loader.
+    // POST-rendered gates go through closedPortalPage, which disarms.
+    isSetupGate: opts.armTokenRescue !== false,
   });
+}
+
+/**
+ * Dedicated page for an expired/tampered ?cx_pp= admin preview link — an
+ * honest, actionable message instead of the generic setup gate the admin
+ * used to dead-end on. Rendered even in setup mode: this URL only exists
+ * because an admin minted it.
+ */
+export function previewExpiredPage(locale: string): string {
+  return portalPage({
+    locale,
+    title: t(locale, "portal.preview.expired_title"),
+    body: `<meta name="robots" content="noindex"><div class="cx-card"><p style="margin:0">${escapeHtml(t(locale, "portal.preview.expired_body"))}</p></div>`,
+    hideNav: true,
+  });
+}
+
+/**
+ * The page to serve when the portal is CLOSED to this request (setup-mode
+ * launch gate). One rule, applied at every gate site: a request that carries
+ * a ?cx_pp= preview token reached the gate only because that token failed to
+ * open a session (a valid one bypasses the gate), so it gets the named
+ * "preview link expired" page; everything else gets the generic gate. Before
+ * this helper only the login page named the expiry — a storefront-logged-in
+ * admin on a stale preview link got a non-preview session, hit the gate on
+ * the portal home, and saw "finishing touches" with zero explanation.
+ */
+export function closedPortalPage(request: Request, locale: string): string {
+  const hasPreviewToken = new URL(request.url).searchParams.has("cx_pp");
+  if (hasPreviewToken) return previewExpiredPage(locale);
+  // The token rescue may only arm on GET-rendered gates: a gate returned as
+  // a POST response (api action, cancel-flow action) sits at a POST-only
+  // URL, and the rescue's location.replace would replay it as a GET — a raw
+  // "Method Not Allowed" (or a preview-persona 404 on cancel routes) where
+  // the designed gate page used to be.
+  return setupGatePage(locale, { armTokenRescue: request.method === "GET" });
 }

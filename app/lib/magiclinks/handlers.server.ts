@@ -703,7 +703,28 @@ async function login(
   });
 
   const base = portalUrl ?? (await buildPortalUrl(shop.id, "/"));
-  const redirectUrl = `${base}${base.includes("?") ? "&" : "?"}handoff=${handoff}`;
+  let redirectUrl = `${base}${base.includes("?") ? "&" : "?"}handoff=${handoff}`;
+
+  if (isPreview) {
+    // Straggler support for pre-1.7.0 admin preview links: on a live store
+    // Shopify's app proxy strips Set-Cookie, so the hand-off exchange above
+    // can never leave a session in the browser. Append the stateless ?cx_pp=
+    // preview token (the 1.7.0 preview identity) alongside the hand-off so
+    // the portal still opens there; in the local harness the cookie continues
+    // to work and the token is simply redundant.
+    const { mintPreviewToken, PORTAL_PREVIEW_TTL_SECONDS, PREVIEW_TOKEN_PARAM } =
+      await import("~/lib/portal/previewToken.server");
+    const previewToken = mintPreviewToken(
+      {
+        shopId: shop.id,
+        customerId,
+        contractId: contract?.id ?? null,
+        email,
+      },
+      PORTAL_PREVIEW_TTL_SECONDS,
+    );
+    redirectUrl += `&${PREVIEW_TOKEN_PARAM}=${previewToken}`;
+  }
 
   return {
     locale,

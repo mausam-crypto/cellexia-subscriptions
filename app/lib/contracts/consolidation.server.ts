@@ -1,6 +1,7 @@
 import prisma from "~/db.server";
 import { logEvent } from "~/lib/events/log.server";
 import { getSetting } from "~/lib/settings/settings.server";
+import { contractFrequency, frequencyToken } from "~/lib/frequency";
 import { draftLineAdd, withContractDraft } from "~/lib/graphql/index.server";
 import { cancelContract } from "./service.server";
 import { OURS_ONLY, isBillableOwnership } from "~/lib/ownership/ownership.server";
@@ -108,6 +109,14 @@ export async function mergeContracts(
             productVariantId: line.variantId,
             quantity: line.quantity,
             currentPriceCents: line.currentPriceCents, // ongoing price preserved
+            // Plan lineage travels with the line: dropped here, the merged
+            // line carries no selling plan on Shopify OR locally (the next
+            // sync mirrors the plan-less line back), and per-line plan
+            // attribution is erased forever. Ownership itself would survive
+            // via the monotonic OURS rule — this is about keeping "which
+            // plan did this line ride" answerable after a merge.
+            sellingPlanId: line.sellingPlanId,
+            sellingPlanName: line.sellingPlanName,
           });
           addedShopifyIds.push(id);
         }
@@ -129,6 +138,8 @@ export async function mergeContracts(
           sku: line.sku,
           imageUrl: line.imageUrl,
           quantity: line.quantity,
+          sellingPlanId: line.sellingPlanId,
+          sellingPlanName: line.sellingPlanName,
           currentPriceCents: line.currentPriceCents,
           compareAtPriceCents: line.compareAtPriceCents,
           unitCostCents: line.unitCostCents,
@@ -225,9 +236,10 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
  * When settings.consolidation.autoMergeAlignedContracts is on: group a
- * customer's ACTIVE pay-per-cycle contracts by intervalWeeks and merge those
- * whose nextBillingDate falls within alignmentWindowDays of the earliest one
- * — into that earliest contract. Called by the daily job.
+ * customer's ACTIVE pay-per-cycle contracts by their EXACT cadence
+ * (contractFrequency) and merge those whose nextBillingDate falls within
+ * alignmentWindowDays of the earliest one — into that earliest contract.
+ * Called by the daily job.
  */
 export async function runAutoConsolidation(
   shopId: string,
@@ -261,7 +273,14 @@ export async function runAutoConsolidation(
 
   const groups = new Map<string, typeof contracts>();
   for (const contract of contracts) {
-    const key = `${contract.customerId}:${contract.intervalWeeks}`;
+    // EXACT cadence key ({count}:{unit} via contractFrequency), never the
+    // intervalWeeks approximation: MONTH×4 / DAY-ceil-÷7 map DISTINCT
+    // cadences to the same integer (10 days and 2 weeks are both "2"), and
+    // this grouping feeds a DESTRUCTIVE merge — the sources are cancelled.
+    // An approximation collision must never decide that; contractFrequency
+    // still degrades pre-v1.4.0 rows (null unit) to their week mirror, which
+    // is genuinely all those rows know about themselves.
+    const key = `${contract.customerId}:${frequencyToken(contractFrequency(contract))}`;
     const list = groups.get(key);
     if (list) list.push(contract);
     else groups.set(key, [contract]);

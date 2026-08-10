@@ -7,14 +7,15 @@ import { requireShop } from "~/lib/shop/install.server";
 import { getSetting } from "~/lib/settings/settings.server";
 import { t } from "~/lib/i18n/i18n.server";
 import { formatMoney } from "~/lib/money";
-import { formatShopDate } from "~/lib/dates.server";
+import { formatShopDate, shopDayStartUtc } from "~/lib/dates.server";
 import { isSetupMode } from "~/lib/launch/launch.server";
+import { logEvent } from "~/lib/events/log.server";
 import {
   escapeHtml,
   localeFromRequest,
   portalPage,
   resolveToast,
-  setupGatePage,
+  closedPortalPage,
   withLocale,
   type PortalToast,
 } from "~/lib/portal/layout.server";
@@ -22,9 +23,11 @@ import {
   PORTAL_BASE_PATH,
   exchangeLoginHandoff,
   getPortalSession,
+  loginRedirectUrl,
   type PortalSessionContext,
 } from "~/lib/portal/session.server";
 import type { LocalContractWithLines } from "~/lib/contracts/shared.server";
+import { contractFrequency, formatFrequency } from "~/lib/frequency";
 import { OURS_ONLY } from "~/lib/ownership/ownership.server";
 
 /**
@@ -62,8 +65,12 @@ function contractTotalCents(contract: LocalContractWithLines): number {
   return items + contract.deliveryPriceCents;
 }
 
-function apiPath(locale: string, action: string): string {
-  return withLocale(`${PORTAL_BASE_PATH}/api/${action}`, locale);
+function apiPath(
+  locale: string,
+  action: string,
+  preview: string | null,
+): string {
+  return withLocale(`${PORTAL_BASE_PATH}/api/${action}`, locale, preview);
 }
 
 interface FormField {
@@ -72,8 +79,7 @@ interface FormField {
 }
 
 function postForm(
-  locale: string,
-  action: string,
+  actionUrl: string,
   fields: FormField[],
   buttonLabel: string,
   buttonClass = "cx-btn cx-btn--ghost cx-btn--small",
@@ -84,7 +90,7 @@ function postForm(
         `<input type="hidden" name="${escapeHtml(f.name)}" value="${escapeHtml(f.value)}">`,
     )
     .join("");
-  return `<form method="post" action="${apiPath(locale, action)}">${hidden}<button type="submit" class="${buttonClass}">${escapeHtml(buttonLabel)}</button></form>`;
+  return `<form method="post" action="${escapeHtml(actionUrl)}">${hidden}<button type="submit" class="${buttonClass}">${escapeHtml(buttonLabel)}</button></form>`;
 }
 
 function itemsHtml(contract: LocalContractWithLines, locale: string): string {
@@ -124,19 +130,23 @@ function contractCardHtml(params: {
   locale: string;
   tz: string;
   csrf: string;
+  /** Preview session's raw cx_pp token — carried on every link/form URL. */
+  preview: string | null;
   contextualPrompts: boolean;
   /** Prompt only when predicted-empty is this many days past the next bill. */
   promptBufferDays: number;
   /** Weeks the contextual one-tap delay pushes the next order back. */
   promptDelayWeeks: number;
 }): string {
-  const { contract, locale, tz, csrf } = params;
+  const { contract, locale, tz, csrf, preview } = params;
+  const api = (action: string) => apiPath(locale, action, preview);
   // Server-side double-submit dedupe: one-tap forms carry the cycle date they
   // target, so a duplicate POST for an already-advanced cycle is a no-op.
   const expectedNext = contract.nextBillingDate?.toISOString() ?? "";
   const manageHref = withLocale(
     `${PORTAL_BASE_PATH}/subscription/${contract.id}`,
     locale,
+    preview,
   );
   const baseFields: FormField[] = [
     { name: "contractId", value: contract.id },
@@ -169,8 +179,7 @@ function contractCardHtml(params: {
         params.promptBufferDays * 24 * 3600_000
   ) {
     promptHtml = `<div class="cx-banner"><p>${escapeHtml(t(locale, "portal.index.contextual_prompt"))}</p>${postForm(
-      locale,
-      "delay",
+      api("delay"),
       [
         ...baseFields,
         { name: "weeks", value: String(params.promptDelayWeeks) },
@@ -184,16 +193,14 @@ function contractCardHtml(params: {
   if (contract.status === "ACTIVE") {
     actions.push(
       postForm(
-        locale,
-        "skip",
+        api("skip"),
         [...baseFields, { name: "expected_next", value: expectedNext }],
         t(locale, "portal.actions.skip"),
       ),
     );
     actions.push(
       postForm(
-        locale,
-        "delay",
+        api("delay"),
         [
           ...baseFields,
           { name: "weeks", value: "1" },
@@ -206,8 +213,7 @@ function contractCardHtml(params: {
   if (contract.status === "PAUSED") {
     actions.push(
       postForm(
-        locale,
-        "resume",
+        api("resume"),
         baseFields,
         t(locale, "portal.actions.resume"),
         "cx-btn cx-btn--small",
@@ -220,8 +226,7 @@ function contractCardHtml(params: {
     // win-back grant already exists).
     actions.push(
       postForm(
-        locale,
-        "reactivate",
+        api("reactivate"),
         baseFields,
         t(locale, "portal.actions.restart"),
         "cx-btn cx-btn--small",
@@ -232,8 +237,14 @@ function contractCardHtml(params: {
     `<a class="cx-btn cx-btn--quiet cx-btn--small" href="${manageHref}">${escapeHtml(t(locale, "portal.actions.manage"))}</a>`,
   );
 
+  // contractFrequency: exact unit/count mirror when present, else the
+  // intervalWeeks approximation as a WEEK cadence.
   const frequency = t(locale, "portal.index.every_weeks", {
-    weeks: contract.intervalWeeks,
+    frequency: formatFrequency(
+      (key, vars) => t(locale, key, vars),
+      "every",
+      contractFrequency(contract),
+    ),
   });
   const total = formatMoney(
     contractTotalCents(contract),
@@ -321,7 +332,7 @@ async function buildToast(
   if (resolved.key === "skipped") {
     const cid = new URL(request.url).searchParams.get("cid");
     if (cid && contractIds.has(cid)) {
-      resolved.toast.html = `<form method="post" action="${apiPath(locale, "unskip")}"><input type="hidden" name="contractId" value="${escapeHtml(cid)}"><input type="hidden" name="_csrf" value="${escapeHtml(session.csrfToken)}"><input type="hidden" name="return_to" value="/"><button type="submit">${escapeHtml(t(locale, "portal.toast.undo"))}</button></form>`;
+      resolved.toast.html = `<form method="post" action="${apiPath(locale, "unskip", session.previewToken)}"><input type="hidden" name="contractId" value="${escapeHtml(cid)}"><input type="hidden" name="_csrf" value="${escapeHtml(session.csrfToken)}"><input type="hidden" name="return_to" value="/"><button type="submit">${escapeHtml(t(locale, "portal.toast.undo"))}</button></form>`;
     }
   }
   return resolved.toast;
@@ -336,32 +347,84 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   // ── Magic-link LOGIN hand-off ──────────────────────────────────────────────
   // ?handoff= is a single-use ~60s code minted by the magic LOGIN executor.
   // Exchange it server-side for the HttpOnly cx_portal cookie, then redirect
-  // to a clean URL either way so the code never lingers in the address bar.
-  // The long-lived session token itself never appears in any URL.
-  const handoffCode = new URL(request.url).searchParams.get("handoff");
+  // to a clean URL so the code never lingers in the address bar. The
+  // long-lived session token itself never appears in any URL. A ?cx_pp=
+  // preview token riding alongside (pre-1.7.0 preview links) survives the
+  // clean-up — on a live store the proxy strips the Set-Cookie, so that
+  // token is the only identity that reaches the next request. A failed
+  // exchange without one lands on the login page with a named reason
+  // (?signin=expired) instead of silently gating.
+  const requestUrl = new URL(request.url);
+  const handoffCode = requestUrl.searchParams.get("handoff");
   if (handoffCode) {
-    const cleanUrl = withLocale(`${PORTAL_BASE_PATH}/`, locale);
+    const previewToken = requestUrl.searchParams.get("cx_pp");
+    const cleanUrl = withLocale(`${PORTAL_BASE_PATH}/`, locale, previewToken);
     const handoff = await exchangeLoginHandoff(handoffCode, shop.id);
+    if (!handoff && !previewToken) {
+      throw redirect(
+        withLocale(`${PORTAL_BASE_PATH}/login?signin=expired`, locale),
+      );
+    }
     throw redirect(
       cleanUrl,
       handoff ? { headers: { "Set-Cookie": handoff.cookie } } : undefined,
     );
   }
 
+  // Sessionless (or wrong-shop) → login via loginRedirectUrl, which carries
+  // the request's ?cx_pp= along. The portal home is the EXACT URL the admin
+  // preview mints, so an expired preview token lands here first — dropping
+  // it would show the generic setup gate instead of "this preview link has
+  // expired" (the dead-end this release removes).
   const portalSession = await getPortalSession(request);
   if (!portalSession) {
-    throw redirect(withLocale(`${PORTAL_BASE_PATH}/login`, locale));
+    throw redirect(loginRedirectUrl(request));
   }
   if (portalSession.shopId !== shop.id) {
-    throw redirect(withLocale(`${PORTAL_BASE_PATH}/login`, locale));
+    throw redirect(loginRedirectUrl(request));
   }
 
   // Launch gate: while in setup mode the portal is closed to the public —
-  // only admin preview sessions pass through.
+  // only admin preview sessions pass through. closedPortalPage names an
+  // expired ?cx_pp= instead of gating it silently.
   if (!portalSession.isPreview && (await isSetupMode(shop.id))) {
-    return liquid(setupGatePage(locale), {
+    return liquid(closedPortalPage(request, locale), {
       headers: { "X-Robots-Tag": "noindex" },
     });
+  }
+
+  // portal.visit — the portal's own reach datum (actions were logged, plain
+  // visits were not, so "how many subscribers even open the portal" was
+  // unanswerable). Once per session per shop-day; server-side only, no PII
+  // beyond the session's own identity; no contractId so contract timelines
+  // stay action-only. Admin previews are not customers. Contained: a failed
+  // throttle read must never break the page.
+  if (!portalSession.isPreview) {
+    try {
+      const dayStart = shopDayStartUtc(new Date(), shop.ianaTimezone);
+      const already = await prisma.subscriberEvent.findFirst({
+        where: {
+          shopId: shop.id,
+          type: "portal.visit",
+          createdAt: { gte: dayStart },
+          payload: { path: ["sessionId"], equals: portalSession.id },
+        },
+        select: { id: true },
+      });
+      if (!already) {
+        await logEvent({
+          shopId: shop.id,
+          customerId: portalSession.customerId,
+          email: portalSession.email,
+          type: "portal.visit",
+          source: "CUSTOMER_PORTAL",
+          actor: "customer",
+          payload: { sessionId: portalSession.id },
+        });
+      }
+    } catch (err) {
+      console.error("[portal] visit event failed", err);
+    }
   }
 
   const [contracts, portalSettings, lifecycle] = await Promise.all([
@@ -444,6 +507,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         locale,
         tz: shop.ianaTimezone,
         csrf: portalSession.csrfToken,
+        preview: portalSession.previewToken,
         contextualPrompts: portalSettings.contextualPrompts,
         promptBufferDays: portalSettings.contextualPromptBufferDays,
         promptDelayWeeks: portalSettings.contextualPromptDelayWeeks,
@@ -459,6 +523,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       activeNav: "subscriptions",
       toast,
       isPreview: portalSession.isPreview,
+      previewToken: portalSession.previewToken,
     }),
   );
 };

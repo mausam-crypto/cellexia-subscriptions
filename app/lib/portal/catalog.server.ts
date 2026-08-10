@@ -2,6 +2,12 @@ import { z } from "zod";
 import prisma from "~/db.server";
 import { applyDiscountPct } from "~/lib/money";
 import {
+  type Frequency,
+  contractFrequency,
+  normalizeFrequencies,
+  parseConfigFrequencies,
+} from "~/lib/frequency";
+import {
   getSubscribableProducts,
   searchProducts,
   type AdminClient,
@@ -101,7 +107,6 @@ export function catalogProduct(
 // ── Ongoing discount + frequency options (from SellingPlanConfig) ────────────
 
 const productIdsSchema = z.array(z.string());
-const frequenciesSchema = z.array(z.number().int().min(1).max(52));
 
 async function activeConfigs(shopId: string) {
   return prisma.sellingPlanConfig.findMany({
@@ -151,31 +156,41 @@ export function discountedCents(priceCents: number, pct: number): number {
   return pct > 0 ? applyDiscountPct(priceCents, pct) : priceCents;
 }
 
-const FALLBACK_FREQUENCIES = [4, 6, 8, 10, 12];
+const FALLBACK_FREQUENCIES: Frequency[] = [4, 6, 8, 10, 12].map((count) => ({
+  unit: "WEEK",
+  count,
+}));
 
 /**
- * The frequency choices (in weeks) offered for a contract: from the covering
- * SellingPlanConfig's frequenciesWeeks, always including the contract's
- * current interval, ascending. Falls back to a sane default set.
+ * The frequency choices offered for a contract: from the covering
+ * SellingPlanConfig (multi-unit, mixable — see app/lib/frequency.ts), always
+ * including the contract's current cadence, shortest first. Falls back to a
+ * sane week-only default set.
  */
 export async function frequencyOptionsForContract(
   shopId: string,
-  contract: { intervalWeeks: number; lines: Array<{ productId: string }> },
-): Promise<{ options: number[]; allowChoice: boolean }> {
+  contract: {
+    intervalWeeks: number;
+    billingIntervalUnit?: string | null;
+    billingIntervalCount?: number | null;
+    lines: Array<{ productId: string }>;
+  },
+): Promise<{ options: Frequency[]; allowChoice: boolean }> {
   const config = await configForProducts(
     shopId,
     contract.lines.map((l) => l.productId),
   );
 
-  let options: number[] = FALLBACK_FREQUENCIES;
+  let options: Frequency[] = FALLBACK_FREQUENCIES;
   let allowChoice = true;
   if (config) {
-    const parsed = frequenciesSchema.safeParse(config.frequenciesWeeks);
-    if (parsed.success && parsed.data.length > 0) options = parsed.data;
+    const parsed = parseConfigFrequencies(config);
+    if (parsed.length > 0) options = parsed;
     allowChoice = config.allowFrequencyChoice;
   }
 
-  const set = new Set(options);
-  set.add(contract.intervalWeeks);
-  return { options: [...set].sort((a, b) => a - b), allowChoice };
+  return {
+    options: normalizeFrequencies([...options, contractFrequency(contract)]),
+    allowChoice,
+  };
 }

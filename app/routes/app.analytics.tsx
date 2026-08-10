@@ -115,6 +115,16 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   }
 
   const now = new Date();
+  // ONE forecast run per page load: insights reuse this promise's accuracy
+  // grade for rule 7 instead of getInsights self-computing a duplicate
+  // forecast (~5 queries + the full rollup history fetch). A failed forecast
+  // degrades insights to "no grade" (the known-unknown contract) — the
+  // Promise.all still rejects on the forecast element itself, unchanged.
+  const forecastPromise = getForecast(shop.id, {
+    model: modelChoice,
+    horizonWeeks,
+    now,
+  });
   const [
     funnel,
     ltgp,
@@ -130,8 +140,11 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     getFunnelMetrics(shop.id, rangeDays),
     getLtgpSummary(shop.id),
     getSurvivalByCycle(shop.id),
-    getForecast(shop.id, { model: modelChoice, horizonWeeks, now }),
-    getInsights(shop.id, now),
+    forecastPromise,
+    forecastPromise.then(
+      (f) => getInsights(shop.id, now, { forecastGrade: f.accuracy.grade }),
+      () => getInsights(shop.id, now, { forecastGrade: null }),
+    ),
     getCostCoverage(shop.id),
     getRiskModelStatus(shop.id),
     prisma.cohortCell.findMany({
@@ -169,14 +182,21 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }),
   ]);
 
-  // ── Churn split: one taxonomy — CUSTOMER/ADMIN voluntary, DUNNING
-  // involuntary, SYSTEM/unknown its own bucket (never silently "voluntary").
+  // ── Churn split: one taxonomy — CUSTOMER/ADMIN/EXTERNAL voluntary
+  // (EXTERNAL = a Shopify-admin/other-surface cancel the sync observed
+  // first; somebody chose it — the same non-DUNNING-is-voluntary rule the
+  // survival curves and DailyRollup apply), DUNNING involuntary,
+  // SYSTEM/unknown its own bucket (never silently "voluntary").
   let voluntaryChurn = 0;
   let involuntaryChurn = 0;
   let systemChurn = 0;
   for (const group of cancelGroups) {
     if (group.cancelSource === "DUNNING") involuntaryChurn += group._count._all;
-    else if (group.cancelSource === "CUSTOMER" || group.cancelSource === "ADMIN")
+    else if (
+      group.cancelSource === "CUSTOMER" ||
+      group.cancelSource === "ADMIN" ||
+      group.cancelSource === "EXTERNAL"
+    )
       voluntaryChurn += group._count._all;
     else systemChurn += group._count._all;
   }

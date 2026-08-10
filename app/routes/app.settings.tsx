@@ -29,6 +29,7 @@ import { authenticate } from "~/shopify.server";
 import { getPrimaryShop } from "~/lib/shop/install.server";
 import {
   getAllSettings,
+  getSetting,
   setSetting,
 } from "~/lib/settings/settings.server";
 import { settingsSchemas } from "~/lib/settings/registry.server";
@@ -831,6 +832,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       );
     }
 
+    // Read the outgoing value BEFORE the write so the audit event carries
+    // both sides of the change — `value` alone said what the settings became
+    // but never what they were, so the event log could not answer "who
+    // changed the dunning ladder and from what" without replaying every save.
+    const previous = await getSetting(shop.id, key);
+
     // parsed.data already passed the exact schema setSetting re-validates.
     await setSetting(shop.id, key, parsed.data as never, actor);
     await logEvent({
@@ -841,7 +848,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       payload: {
         action: "settings_updated",
         key,
+        // `value` keeps its historical meaning (the NEXT state — additive
+        // rule: never repurpose an event field); `previous` is the state it
+        // replaced, as getSetting resolved it (defaults included).
         value: parsed.data as Record<string, unknown>,
+        previous: previous as Record<string, unknown>,
       },
     });
 

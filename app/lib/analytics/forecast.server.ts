@@ -15,8 +15,10 @@ import { logEvent } from "~/lib/events/log.server";
  * Forecasting v2 — model choice + honesty.
  *
  * Four candidate models are fit over weekly series derived from DailyRollup
- * (active subscribers, MRR, net revenue). Every model is a pure exported
- * function so it can be unit-tested without a database:
+ * (active subscribers, MRR, net revenue — chargedCents minus refundedCents,
+ * so the series matches the "net of refunds" the analytics page promises).
+ * Every model is a pure exported function so it can be unit-tested without a
+ * database:
  *
  * - "naive":    last observed value carried forward. Always available; the
  *               honest default when history is too short for anything else.
@@ -28,9 +30,10 @@ import { logEvent } from "~/lib/events/log.server";
  *               adjustment. Refuses to run below 16 weeks of history.
  * - "cohort":   bottom-up — the current active base decayed by the empirical
  *               per-cycle survival (censoring-corrected, see
- *               `decidedCycleSurvival`) plus the new-subscriber run rate of
- *               the last 4 weeks; converted to money via the current
- *               per-active value.
+ *               `decidedCycleSurvival`; each cycle bucket decays by its OWN
+ *               hazard when enough transitions back it) plus the
+ *               new-subscriber run rate of the last 4 weeks; converted to
+ *               money via the current per-active value.
  *
  * Model selection ("auto") is a walk-forward backtest: train on weeks [0..k],
  * predict k+1..k+4, roll forward; the available model with the lowest mean
@@ -41,16 +44,23 @@ import { logEvent } from "~/lib/events/log.server";
  *
  * Censoring fix (audit): per-cycle survival is estimated only over DECIDED
  * transitions — a contract counts toward the cycle n→n+1 ratio only if it
- * either reached cycle n+1 (survived) or was cancelled at exactly cycle n
- * (churned). ACTIVE contracts still waiting for their next billing are
- * censored and excluded, so a young book no longer reads as a churn
- * catastrophe. Below `MIN_DECIDED_TRANSITIONS` decided transitions the
- * estimate falls back to `DEFAULT_CYCLE_SURVIVAL` and is flagged.
+ * either reached cycle n+1 (survived) or ended terminally at exactly cycle n
+ * (churned: CANCELLED, payment-FAILED, or EXPIRED — the same terminal set
+ * survival.server.ts uses, so the two survival surfaces cannot disagree
+ * about whether a book decays). ACTIVE/PAUSED contracts still waiting for
+ * their next billing are censored and excluded, so a young book no longer
+ * reads as a churn catastrophe. Below `MIN_DECIDED_TRANSITIONS` decided
+ * transitions the estimate falls back to `DEFAULT_CYCLE_SURVIVAL` and is
+ * flagged.
  *
  * Gap fix (audit): the weekly grid is fully materialized between the first
  * and last observed week. Missing weeks (rollup job downtime) are filled by
  * carrying the last snapshot forward and reported in `filledWeeks`, so Holt
- * never mistakes a 4-week gap for a single explosive week.
+ * never mistakes a 4-week gap for a single explosive week. Weeks whose only
+ * rollup rows were written by a gap backfill (DailyRollup.snapshotFabricated
+ * — their point-in-time columns are 0 by design, flow columns real) are
+ * treated the same way: snapshots carried forward, week annotated, never
+ * counted as observed.
  *
  * Continuity fix (audit): projections are anchored at the LAST OBSERVED
  * weekly snapshot. The live active count is used only in the no-history
@@ -66,8 +76,10 @@ import { logEvent } from "~/lib/events/log.server";
  * almost perfectly correlated, which made the "recent weeks weigh more"
  * ranking and the beat-streak reason near-tautological. One independent
  * holdout error per week is what makes them honest. "auto" ranks models by
- * the exponentially weighted error over that history — recent weeks weigh
- * more — so a model that has been winning lately keeps the job even through
+ * the exponentially weighted error over that history — recent CALENDAR weeks
+ * weigh more (decay keys on each entry's weekStartIso, never its array
+ * position, so a hole from a recording outage discounts by real elapsed
+ * time) — so a model that has been winning lately keeps the job even through
  * one noisy week. A fifth model, "blend", averages the available models
  * weighted by inverse recorded error, restricted per backtest fold to
  * entries recorded no later than the fold's first evaluated week (see
@@ -84,7 +96,18 @@ const HOLT_BETA = 0.3;
 const HOLT_PHI = 0.9;
 /** Histories shorter than this get a damped trend. */
 const DAMP_BELOW_WEEKS = 8;
-const HISTORY_WEEKS = 26;
+/**
+ * Rollup weeks the models may read. 26 made every collected week beyond six
+ * months structurally unreadable — a shop could hold two years of daily
+ * rollups and no model could ever learn annual seasonality from them. 78
+ * (18 months) keeps a full year plus margin in view for a future
+ * annual-seasonal model while staying bounded: ~550 rollup rows of small
+ * integer columns per read, and the walk-forward backtest stays
+ * O(weeks × models × horizon) — trivial at this size. Deliberately NOT
+ * unbounded: cost must stay predictable, and the backtest referee scores
+ * over the whole window, so unlimited ancient-regime data would dilute it.
+ */
+export const HISTORY_WEEKS = 78;
 const DEFAULT_HORIZON_WEEKS = 12;
 const MAX_HORIZON_WEEKS = 52;
 /** Used when the book is too young to estimate per-cycle survival. */
@@ -95,6 +118,13 @@ const DEFAULT_INTERVAL_WEEKS = 8;
 const MAX_SURVIVAL_RATIO_CYCLES = 12;
 /** Minimum decided (uncensored) transitions before the empirical survival is trusted. */
 const MIN_DECIDED_TRANSITIONS = 30;
+/**
+ * Minimum decided transitions at ONE cycle before that cycle's own hazard
+ * (rather than the blended average) decays its bucket in the cohort model —
+ * a per-cycle version of MIN_DECIDED_TRANSITIONS, lower because each ratio
+ * only steers its own bucket, not the whole projection.
+ */
+const MIN_DECIDED_PER_CYCLE = 10;
 /** Walk-forward backtest predicts up to this many weeks ahead per fold. */
 const BACKTEST_MAX_HORIZON = 4;
 /** z for the ~80% prediction interval. */
@@ -350,13 +380,27 @@ export function seasonalForecast(series: number[], horizon: number): number[] | 
  * Cohort model, subscriber count: bottom-up projection of the active base.
  *
  * Assumptions (all deliberate simplifications, documented for the admin UI):
- * - Homogeneous decay: every active contract churns at the blended per-cycle
- *   survival rate regardless of how many cycles it has already survived.
+ * - Decay: with `perCycleSurvival` + `cycleDistribution` supplied, the base
+ *   is split into per-cycle buckets and each bucket churns at its OWN
+ *   empirical hazard — early-cycle churn is demonstrably higher (the risk
+ *   model buckets orders-count for the same reason), and the old blended
+ *   rate under-churned young cohorts and over-churned mature ones. Without
+ *   them, every contract churns at the blended rate (homogeneous — the
+ *   pre-FR-6 behavior, kept for thin books where per-cycle ratios are
+ *   noise).
  * - The per-cycle rate converts to weekly retention as
  *   survival^(1 / avgIntervalWeeks) (one billing cycle spans the average
  *   interval; churn is spread evenly across its weeks).
+ * - Buckets advance one cycle in lockstep every `avgIntervalWeeks` weeks —
+ *   the phase of each contract within its current cycle is unknowable from
+ *   the ordersCount distribution, so all buckets are assumed to have just
+ *   billed. Cycles beyond the observed curve reuse its LAST ratio (the
+ *   flattest, most mature hazard observed), not the blended average, which
+ *   folds early-cycle churn back into mature buckets.
  * - Inflow: `weeklyNewSubscribers` (the last-4-week run rate) joins every
- *   week and decays from its arrival week onward.
+ *   week at cycle 1 — new arrivals face the early-cycle hazard, which is
+ *   exactly the point of the heterogeneous decay — and decays from its
+ *   arrival week onward.
  * - No pause/resume modelling; paused contracts are simply not in the base.
  */
 export function cohortActivesForecast(opts: {
@@ -366,43 +410,121 @@ export function cohortActivesForecast(opts: {
   avgIntervalWeeks: number;
   weeklyNewSubscribers: number;
   horizon: number;
+  /**
+   * Optional heterogeneous decay (FR-6): survival ratio for the cycle
+   * n → n+1 transition at index n−1. The caller fills thin cycles with the
+   * blended rate; cycles past the end reuse the last entry.
+   */
+  perCycleSurvival?: number[];
+  /**
+   * Share (or raw count — normalized here) of the active base currently in
+   * cycle n at index n−1. Both arrays must be non-empty for the bucketed
+   * path to run.
+   */
+  cycleDistribution?: number[];
 }): number[] {
   const survival = Math.min(1, Math.max(0, opts.avgCycleSurvival));
   const interval = Math.max(1, opts.avgIntervalWeeks);
-  const weeklyRetention = Math.pow(survival, 1 / interval);
   const inflow = Math.max(0, opts.weeklyNewSubscribers);
 
+  const ratios = opts.perCycleSurvival;
+  const distribution = opts.cycleDistribution;
+  const distTotal = distribution?.reduce((s, v) => s + Math.max(0, v), 0) ?? 0;
+
+  if (!ratios || ratios.length === 0 || !distribution || distTotal <= 0) {
+    // Homogeneous fallback — byte-identical to the pre-heterogeneous model.
+    const weeklyRetention = Math.pow(survival, 1 / interval);
+    const out: number[] = [];
+    let current = Math.max(0, opts.activeBase);
+    for (let h = 1; h <= opts.horizon; h++) {
+      current = current * weeklyRetention + inflow;
+      out.push(Math.max(0, Math.round(current)));
+    }
+    return out;
+  }
+
+  // Per-bucket weekly retention; cycles beyond the curve reuse its last ratio.
+  const retentionFor = (cycleIdx: number): number => {
+    const raw = ratios[Math.min(cycleIdx, ratios.length - 1)];
+    const ratio = Math.min(1, Math.max(0, Number.isFinite(raw) ? raw : survival));
+    return Math.pow(ratio, 1 / interval);
+  };
+
+  // buckets[i] = actives currently in cycle i+1, seeded proportionally to the
+  // book's ordersCount distribution. One extra tail bucket absorbs advances
+  // past the deepest observed cycle.
+  const buckets = new Array<number>(ratios.length + 1).fill(0);
+  const base = Math.max(0, opts.activeBase);
+  for (let i = 0; i < distribution.length; i++) {
+    buckets[Math.min(i, buckets.length - 1)] +=
+      (Math.max(0, distribution[i]) / distTotal) * base;
+  }
+
   const out: number[] = [];
-  let current = Math.max(0, opts.activeBase);
+  let weeksIntoCycle = 0;
   for (let h = 1; h <= opts.horizon; h++) {
-    current = current * weeklyRetention + inflow;
-    out.push(Math.max(0, Math.round(current)));
+    for (let i = 0; i < buckets.length; i++) buckets[i] *= retentionFor(i);
+    weeksIntoCycle += 1;
+    if (weeksIntoCycle >= interval) {
+      // Lockstep cycle boundary: every bucket ages one cycle; the tail stays.
+      for (let i = buckets.length - 1; i >= 1; i--) {
+        buckets[i] = (i === buckets.length - 1 ? buckets[i] : 0) + buckets[i - 1];
+      }
+      buckets[0] = 0;
+      weeksIntoCycle -= interval;
+    }
+    // Inflow joins cycle 1 AFTER any advancement so an arrival is never aged
+    // out of its first cycle in its arrival week; like the homogeneous path,
+    // the arrival week itself is not decayed.
+    buckets[0] += inflow;
+    out.push(Math.max(0, Math.round(buckets.reduce((s, v) => s + v, 0))));
   }
   return out;
 }
 
 // ── Self-improvement primitives (pure) ────────────────────────────────────────
 
+/** One week's error carrying the calendar key the decay is computed from. */
+export interface WeightedErrorEntry {
+  /** Monday "yyyy-MM-dd" of the week the error was measured for. */
+  weekStartIso: string;
+  /** That week's error; null/undefined (model unavailable) carries no weight. */
+  error: number | null | undefined;
+}
+
 /**
- * Exponentially weighted mean over a weekly error series (oldest → newest):
- * the newest entry gets weight 1, each older week is discounted by `decay`.
- * Null entries (model unavailable that week) carry no weight. Returns null
- * when nothing is measurable — the caller falls back to the one-shot
- * backtest, so a shop with no history behaves exactly as before.
+ * Exponentially weighted mean over a weekly error series: the newest entry's
+ * week gets weight 1, every other entry is discounted by
+ * decay^(calendar weeks between its week and the newest) — CALENDAR distance,
+ * never array position. Recorded histories have holes (a recording-job
+ * outage simply appends nothing), and positional decay compressed time
+ * across them: a 10-calendar-week-old error could rank as if it were 3 weeks
+ * old, so auto-selection and blend weights leaned on stale performance after
+ * every outage. Null-error entries carry no weight but their weeks still
+ * anchor real elapsed time. Returns null when nothing is measurable — the
+ * caller falls back to the one-shot backtest, so a shop with no history
+ * behaves exactly as before. (Only relative weights matter for the mean, so
+ * anchoring at the newest entry rather than "today" changes nothing.)
  */
 export function exponentiallyWeightedError(
-  weeklyErrorsOldestFirst: Array<number | null | undefined>,
+  weeklyErrorsOldestFirst: WeightedErrorEntry[],
   decay: number = FORECAST_EW_DECAY,
 ): number | null {
-  const n = weeklyErrorsOldestFirst.length;
+  let newestMs = Number.NEGATIVE_INFINITY;
+  for (const entry of weeklyErrorsOldestFirst) {
+    const ms = new Date(`${entry.weekStartIso}T00:00:00.000Z`).getTime();
+    if (Number.isFinite(ms) && ms > newestMs) newestMs = ms;
+  }
   let weightSum = 0;
   let errorSum = 0;
-  for (let i = 0; i < n; i++) {
-    const err = weeklyErrorsOldestFirst[i];
-    if (err == null || !Number.isFinite(err)) continue;
-    const weight = Math.pow(decay, n - 1 - i);
+  for (const entry of weeklyErrorsOldestFirst) {
+    if (entry.error == null || !Number.isFinite(entry.error)) continue;
+    const ms = new Date(`${entry.weekStartIso}T00:00:00.000Z`).getTime();
+    if (!Number.isFinite(ms)) continue;
+    const weeksOld = Math.max(0, Math.round((newestMs - ms) / WEEK_MS));
+    const weight = Math.pow(decay, weeksOld);
     weightSum += weight;
-    errorSum += weight * err;
+    errorSum += weight * entry.error;
   }
   return weightSum > 0 ? errorSum / weightSum : null;
 }
@@ -438,7 +560,10 @@ export function historyErrorAsOf(
       ? weeks
       : weeks.filter((w) => w.weekStartIso <= evalWeekStartIso);
   return exponentiallyWeightedError(
-    usable.map((w) => w.errors[key] ?? null),
+    usable.map((w) => ({
+      weekStartIso: w.weekStartIso,
+      error: w.errors[key] ?? null,
+    })),
     decay,
   );
 }
@@ -481,6 +606,23 @@ export function blendForecasts(
 
 // ── Censoring-corrected per-cycle survival ────────────────────────────────────
 
+/**
+ * Statuses that DECIDE a transition as churn — the same terminal set
+ * survival.server.ts applies (its TERMINAL_STATUSES). All three matter:
+ * - CANCELLED: the classic voluntary/dunning cancel with a cancelledAt.
+ * - FAILED: a dunning ladder exhausted under the default exhaustedAction
+ *   PAUSE leaves the contract FAILED with NO cancelledAt at all — counting
+ *   only CANCELLED made payment churn structurally invisible here (the same
+ *   failure mode the rollup's failedAt leg fixes) and biased survival high
+ *   by exactly the involuntary share.
+ * - EXPIRED: a bounded plan completing billingMaxCycles. Voluntary by the
+ *   shared classification (a scheduled end, not a payment failure), but for
+ *   decay purposes still a death — the contract leaves the base.
+ * The voluntary/involuntary split is irrelevant to this estimator: the
+ * cohort model needs TOTAL decay, so every terminal state churns its bucket.
+ */
+const TERMINAL_STATUSES = new Set(["CANCELLED", "FAILED", "EXPIRED"]);
+
 export interface CycleSurvivalEstimate {
   /** Blended per-cycle survival over decided transitions (or the default). */
   avgCycleSurvival: number;
@@ -503,11 +645,12 @@ export interface CycleSurvivalEstimate {
  * For the cycle n → n+1 transition:
  * - survivors = contracts with ordersCount ≥ n+1 (they demonstrably reached
  *   the next cycle — including ones that churned later);
- * - churned   = CANCELLED contracts with ordersCount exactly n (they died
- *   before billing cycle n+1);
- * - censored  = ACTIVE/PAUSED contracts with ordersCount exactly n — their
- *   next billing simply hasn't come due, so they carry NO information about
- *   this transition and are excluded from the denominator.
+ * - churned   = terminal contracts (TERMINAL_STATUSES: CANCELLED, FAILED,
+ *   EXPIRED) with ordersCount exactly n (they died before billing cycle
+ *   n+1);
+ * - censored  = live (ACTIVE/PAUSED) contracts with ordersCount exactly n —
+ *   their next billing simply hasn't come due, so they carry NO information
+ *   about this transition and are excluded from the denominator.
  *
  * This is the audit fix for the right-censoring bug: the old estimate divided
  * raw "reached cycle N" fractions, so on a young book (everyone still waiting
@@ -527,14 +670,14 @@ export function decidedCycleSurvival(
   for (const row of rows) maxObserved = Math.max(maxObserved, row.ordersCount);
   const cap = Math.min(maxObserved, maxCycles + 1);
 
-  // reached[n] = contracts with ordersCount ≥ n; cancelledAt[n] = CANCELLED with ordersCount === n.
+  // reached[n] = contracts with ordersCount ≥ n; churnedAt[n] = terminal with ordersCount === n.
   const reached = new Array<number>(cap + 2).fill(0);
-  const cancelledAt = new Array<number>(cap + 2).fill(0);
+  const churnedAt = new Array<number>(cap + 2).fill(0);
   for (const row of rows) {
     const upTo = Math.min(row.ordersCount, cap + 1);
     for (let n = 1; n <= upTo; n++) reached[n] += row.count;
-    if (row.status === "CANCELLED" && row.ordersCount <= cap + 1) {
-      cancelledAt[Math.min(row.ordersCount, cap + 1)] += row.count;
+    if (TERMINAL_STATUSES.has(row.status) && row.ordersCount <= cap + 1) {
+      churnedAt[Math.min(row.ordersCount, cap + 1)] += row.count;
     }
   }
 
@@ -543,7 +686,7 @@ export function decidedCycleSurvival(
   let totalAtRisk = 0;
   for (let n = 1; n <= Math.min(maxObserved, maxCycles); n++) {
     const survivors = reached[n + 1] ?? 0;
-    const churned = cancelledAt[n] ?? 0;
+    const churned = churnedAt[n] ?? 0;
     const atRisk = survivors + churned;
     if (atRisk === 0) continue;
     perCycle.push({
@@ -818,19 +961,44 @@ export function predictionIntervals(
 export interface WeeklyObservation {
   mrrCents: number;
   activeSubscribers: number;
+  /** Charged minus refunded, clamped ≥ 0 per week by the caller. */
   netRevenueCents: number;
   newSubscribers: number;
+  /**
+   * Churn split + paused snapshot (FR-6c): collected by the rollup for
+   * exactly this kind of consumer but not yet wired into any model — outflow
+   * decomposition and pause/resume dynamics need a validated model of their
+   * own, and forcing them in without one degrades backtests. Exposed on the
+   * grid so a future model starts with history from day one.
+   */
+  churnedVoluntary?: number;
+  churnedInvoluntary?: number;
+  pausedSubscribers?: number;
+  /**
+   * True when every rollup row of the week was gap-backfilled
+   * (DailyRollup.snapshotFabricated): its point-in-time columns are 0 by
+   * design, so the week's snapshot must be carried forward, not believed.
+   */
+  snapshotFabricated?: boolean;
 }
 
 export interface WeeklyGrid {
   /** Every Monday between the first and last observed week, inclusive. */
   weeks: string[];
-  /** Weeks with no rollup rows, filled by carrying the last snapshot forward. */
+  /**
+   * Weeks whose snapshots were carried forward rather than observed: weeks
+   * with no rollup rows at all, plus weeks whose only rows were
+   * gap-backfilled (snapshotFabricated — flows real, snapshots unusable).
+   */
   filledWeeks: string[];
   mrrCents: number[];
   activeSubscribers: number[];
   netRevenueCents: number[];
   newSubscribers: number[];
+  /** See WeeklyObservation — exposed for future models, unconsumed today. */
+  churnedVoluntary: number[];
+  churnedInvoluntary: number[];
+  pausedSubscribers: number[];
 }
 
 /**
@@ -840,6 +1008,15 @@ export interface WeeklyGrid {
  * observation forward — honest for point-in-time metrics (MRR, actives) and
  * the least-bad assumption for the flow metrics — and are listed in
  * `filledWeeks` so the UI can annotate them.
+ *
+ * Weeks flagged snapshotFabricated keep their REAL flow values (backfilled
+ * rollup rows recompute flows from source) but carry the previous week's
+ * point-in-time snapshot forward — the backfill's zeros would otherwise read
+ * as a fake collapse — and are annotated in `filledWeeks` alongside wholly
+ * missing weeks, so they never count as observed history. A leading
+ * fabricated week has no earlier snapshot to carry and keeps the backfill's
+ * zeros (annotated); in practice the runner only backfills gaps BETWEEN real
+ * rollup days, so a fabricated week always follows a real one.
  */
 export function materializeWeeklyGrid(
   observed: Map<string, WeeklyObservation>,
@@ -852,6 +1029,9 @@ export function materializeWeeklyGrid(
     activeSubscribers: [],
     netRevenueCents: [],
     newSubscribers: [],
+    churnedVoluntary: [],
+    churnedInvoluntary: [],
+    pausedSubscribers: [],
   };
   if (keys.length === 0) return grid;
 
@@ -862,13 +1042,28 @@ export function materializeWeeklyGrid(
   for (let t = first; t <= last; t += WEEK_MS) {
     const key = utcDayKey(new Date(t));
     const row = observed.get(key);
-    const snapshot = row ?? previous;
-    if (!row) grid.filledWeeks.push(key);
+    // Effective observation: a real row as-is; a fabricated row with its
+    // snapshot columns replaced by the carried-forward ones; a missing week
+    // entirely carried forward.
+    const snapshot: WeeklyObservation = !row
+      ? previous
+      : row.snapshotFabricated === true
+        ? {
+            ...row,
+            mrrCents: previous.mrrCents,
+            activeSubscribers: previous.activeSubscribers,
+            pausedSubscribers: previous.pausedSubscribers,
+          }
+        : row;
+    if (!row || row.snapshotFabricated === true) grid.filledWeeks.push(key);
     grid.weeks.push(key);
     grid.mrrCents.push(snapshot.mrrCents);
     grid.activeSubscribers.push(snapshot.activeSubscribers);
     grid.netRevenueCents.push(snapshot.netRevenueCents);
     grid.newSubscribers.push(snapshot.newSubscribers);
+    grid.churnedVoluntary.push(snapshot.churnedVoluntary ?? 0);
+    grid.churnedInvoluntary.push(snapshot.churnedInvoluntary ?? 0);
+    grid.pausedSubscribers.push(snapshot.pausedSubscribers ?? 0);
     previous = snapshot;
   }
   return grid;
@@ -946,7 +1141,16 @@ export async function getForecast(
         mrrCents: true,
         activeSubscribers: true,
         chargedCents: true,
+        // Netting column: refunds are booked on the day they were RECORDED
+        // (rollup.server.ts), so per-week subtraction is well-defined.
+        refundedCents: true,
         newSubscribers: true,
+        // Churn split + paused snapshot ride into the grid for future models
+        // (FR-6c) — see WeeklyObservation.
+        churnedVoluntary: true,
+        churnedInvoluntary: true,
+        pausedSubscribers: true,
+        snapshotFabricated: true,
       },
     }),
     prisma.subscriptionContract.count({
@@ -963,19 +1167,49 @@ export async function getForecast(
     }),
   ]);
 
-  // Weekly buckets. MRR / actives are point-in-time → the LAST rollup in each
-  // week is that week's snapshot (rows arrive date-ascending). Charged and
-  // new-subscriber counts are flows → summed across the week's rollups.
+  // Weekly buckets. MRR / actives / paused are point-in-time → the LAST
+  // rollup in each week is that week's snapshot (rows arrive date-ascending);
+  // money, churn and new-subscriber counts are flows → summed across the
+  // week's rollups. Gap-backfilled rows (snapshotFabricated, I1) carry REAL
+  // flows but zeroed snapshots, so the snapshot must come from the week's
+  // last NON-fabricated row; a week with only fabricated rows keeps the flag
+  // and is carry-forward-filled + annotated by materializeWeeklyGrid.
   const weekAgg = new Map<string, WeeklyObservation>();
   for (const rollup of rollups) {
     const key = utcWeekStartKey(rollup.date);
     const prev = weekAgg.get(key);
+    const real = !rollup.snapshotFabricated;
+    const prevSnapshotReal = prev != null && prev.snapshotFabricated !== true;
     weekAgg.set(key, {
-      mrrCents: rollup.mrrCents,
-      activeSubscribers: rollup.activeSubscribers,
-      netRevenueCents: (prev?.netRevenueCents ?? 0) + rollup.chargedCents,
+      mrrCents: real ? rollup.mrrCents : prevSnapshotReal ? prev.mrrCents : 0,
+      activeSubscribers: real
+        ? rollup.activeSubscribers
+        : prevSnapshotReal
+          ? prev.activeSubscribers
+          : 0,
+      pausedSubscribers: real
+        ? rollup.pausedSubscribers
+        : prevSnapshotReal
+          ? prev.pausedSubscribers
+          : 0,
+      // Net revenue = charged − refunded, per recorded day. A week can go
+      // transiently negative here (refunds recorded for prior weeks'
+      // charges); the clamp below floors the WEEK's total, not each step.
+      netRevenueCents:
+        (prev?.netRevenueCents ?? 0) + rollup.chargedCents - rollup.refundedCents,
       newSubscribers: (prev?.newSubscribers ?? 0) + rollup.newSubscribers,
+      churnedVoluntary: (prev?.churnedVoluntary ?? 0) + rollup.churnedVoluntary,
+      churnedInvoluntary:
+        (prev?.churnedInvoluntary ?? 0) + rollup.churnedInvoluntary,
+      snapshotFabricated: real ? false : prevSnapshotReal ? false : true,
     });
+  }
+  // Clamp each week's net revenue at 0: a refund-heavy week whose recorded
+  // refunds exceed its charges is real cash-flow-wise, but every forecast
+  // metric is defined non-negative (models and bands clamp at 0 already) —
+  // a negative "collected" week would poison Holt's trend and the backtest.
+  for (const obs of weekAgg.values()) {
+    if (obs.netRevenueCents < 0) obs.netRevenueCents = 0;
   }
 
   // Only COMPLETE calendar weeks may enter the series. Two buckets can never
@@ -1018,6 +1252,9 @@ export async function getForecast(
       activeSubscribers: [activeCount],
       netRevenueCents: [0],
       newSubscribers: [0],
+      churnedVoluntary: [0],
+      churnedInvoluntary: [0],
+      pausedSubscribers: [0],
     };
   }
 
@@ -1039,6 +1276,44 @@ export async function getForecast(
   );
   const weeklyRetention = Math.pow(survival.avgCycleSurvival, 1 / avgIntervalWeeks);
 
+  // ── Heterogeneous decay inputs (FR-6a) ──
+  // The per-cycle hazard curve decidedCycleSurvival already computes was
+  // previously discarded — only the blended average reached the cohort model,
+  // which under-churned young cohorts and over-churned mature ones. Each
+  // cycle's own ratio is trusted only with MIN_DECIDED_PER_CYCLE decided
+  // transitions behind it (thin cycles keep the blended rate); the current
+  // ACTIVE ordersCount distribution seeds the buckets. Both are measured once
+  // from the current book — the same documented approximation the blended
+  // survival estimate already makes for backtest folds (per-fold historical
+  // snapshots don't exist). Books below MIN_DECIDED_TRANSITIONS keep the
+  // homogeneous model: per-cycle ratios there are noise on noise.
+  let perCycleSurvival: number[] | undefined;
+  let cycleDistribution: number[] | undefined;
+  if (!survival.insufficientData && survival.perCycle.length > 0) {
+    const deepestCycle = survival.perCycle[survival.perCycle.length - 1].cycle;
+    perCycleSurvival = new Array<number>(deepestCycle).fill(
+      survival.avgCycleSurvival,
+    );
+    for (const cycle of survival.perCycle) {
+      if (cycle.atRisk >= MIN_DECIDED_PER_CYCLE) {
+        perCycleSurvival[cycle.cycle - 1] = cycle.ratio;
+      }
+    }
+    // ACTIVE contracts by their CURRENT cycle (ordersCount 0 — awaiting the
+    // first billing — sits with cycle 1; deeper than the observed curve
+    // clamps to its last bucket). PAUSED contracts are not in the projected
+    // base, so they don't seed buckets either.
+    const distribution = new Array<number>(deepestCycle).fill(0);
+    for (const group of survivalGroups) {
+      if (group.status !== "ACTIVE") continue;
+      const bucket = Math.min(Math.max(1, group.ordersCount), deepestCycle) - 1;
+      distribution[bucket] += group._count._all;
+    }
+    if (distribution.some((count) => count > 0)) {
+      cycleDistribution = distribution;
+    }
+  }
+
   /** New-subscriber run rate over the last up-to-4 weeks ending at index k-1. */
   const inflowAt = (k: number): number => {
     const window = grid.newSubscribers.slice(Math.max(0, k - 4), k);
@@ -1048,9 +1323,10 @@ export async function getForecast(
   // ── Forecaster closures per metric ──
   // The cohort closures index the aligned actives/new-subscriber series by
   // train.length, so backtest folds only see data up to their train window
-  // (the survival curve itself is estimated once from the current book — a
-  // documented approximation, since per-fold historical survival snapshots
-  // don't exist).
+  // (the survival curve, per-cycle hazards and cycle distribution are all
+  // estimated once from the current book — a documented approximation, since
+  // per-fold historical snapshots don't exist; folds scale the distribution
+  // shares to their own active base).
   const trendForecaster: Forecaster = (train, horizon) =>
     trendForecast(train, horizon, {
       alpha: HOLT_ALPHA,
@@ -1067,6 +1343,8 @@ export async function getForecast(
       avgIntervalWeeks,
       weeklyNewSubscribers: inflowAt(train.length),
       horizon,
+      perCycleSurvival,
+      cycleDistribution,
     });
   };
 
@@ -1083,6 +1361,8 @@ export async function getForecast(
       avgIntervalWeeks,
       weeklyNewSubscribers: inflowAt(k),
       horizon,
+      perCycleSurvival,
+      cycleDistribution,
     });
     return actives.map((a) => Math.max(0, Math.round(a * perActive)));
   };
@@ -1227,9 +1507,18 @@ export async function getForecast(
   // current week is superseded by it (recorded earlier in the same week —
   // this run has strictly fresher data).
   for (const report of reports) {
+    // Entries carry their calendar week so the decay measures REAL elapsed
+    // time from the current week — recording-outage holes discount by the
+    // weeks that actually passed, not by array position.
     report.recentWeightedMape = exponentiallyWeightedError([
-      ...priorWeeks.map((w) => w.errors[report.key] ?? null),
-      report.available ? report.backtestMape : null,
+      ...priorWeeks.map((w) => ({
+        weekStartIso: w.weekStartIso,
+        error: w.errors[report.key] ?? null,
+      })),
+      {
+        weekStartIso: currentWeekKey,
+        error: report.available ? report.backtestMape : null,
+      },
     ]);
     if (report.recentWeightedMape != null) {
       report.recentWeightedMape = round4(report.recentWeightedMape);

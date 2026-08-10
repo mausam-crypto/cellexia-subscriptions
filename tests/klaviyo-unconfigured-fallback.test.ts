@@ -34,7 +34,7 @@ const mocks = vi.hoisted(() => ({
   getSetting: vi.fn(
     async (_shopId: string, _key: string): Promise<unknown> => ({}),
   ),
-  enqueue: vi.fn(async (): Promise<void> => {}),
+  enqueue: vi.fn(async (): Promise<{ id: string } | null> => ({ id: "obx_1" })),
   logEvent: vi.fn(async (_input: unknown): Promise<void> => {}),
   sendEmail: vi.fn(
     async (_mail: { to: string; subject: string; html: string }): Promise<void> => {},

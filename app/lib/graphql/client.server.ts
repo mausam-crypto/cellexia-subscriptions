@@ -20,11 +20,21 @@ export type AdminClient = {
 export interface UserError {
   field?: string[] | null;
   message: string;
+  /**
+   * Structured error code, present only when the mutation's userError type
+   * exposes one AND the query selected it (e.g. BillingAttemptUserError's
+   * `code` on subscriptionBillingAttemptCreate — consumed by
+   * structuredUserErrorCode so attempt-create refusals keep Shopify's own
+   * taxonomy instead of collapsing to UNKNOWN_DECLINE). Selecting `code` on
+   * a userError type that lacks the field is a GraphQL error, so it is added
+   * per-mutation, never blanket.
+   */
+  code?: string | null;
 }
 
 /** Thrown whenever a mutation payload carries non-empty `userErrors`. */
 export class ShopifyUserError extends Error {
-  errors: Array<{ field?: string[] | null; message: string }>;
+  errors: Array<{ field?: string[] | null; message: string; code?: string | null }>;
 
   constructor(payloadPath: string, errors: UserError[]) {
     const detail = errors

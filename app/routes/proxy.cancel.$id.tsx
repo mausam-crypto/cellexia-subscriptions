@@ -45,7 +45,11 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const ctx = await requireCancelContext(request, params.id);
   const { shop, contract, locale } = ctx;
   const to = (step?: string) =>
-    withLocale(cancelPublicPath(contract.id, step), locale);
+    withLocale(
+      cancelPublicPath(contract.id, step),
+      locale,
+      ctx.portalSession.previewToken,
+    );
 
   if (contract.status === "CANCELLED") return redirect(to("done"));
 
@@ -80,6 +84,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     copyVariant: copyVariantFor(contract.id),
     pauseMonths: Math.min(cancelFlow.pauseSuggestMonths, pauseSettings.maxMonths),
     showError: new URL(request.url).searchParams.has("error"),
+    previewToken: ctx.portalSession.previewToken,
   }));
 };
 
@@ -90,6 +95,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     withLocale(
       `${cancelPublicPath(contract.id, step)}${error ? "?error=1" : ""}`,
       locale,
+      ctx.portalSession.previewToken,
     );
 
   if (contract.status === "CANCELLED") return redirect(to("done"));

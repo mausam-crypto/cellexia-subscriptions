@@ -445,7 +445,7 @@ block wins and the embed stays dormant — you never get two widgets.
    proof the proxy works (after go-live the same URL renders the portal login,
    email → OTP). If you get a 404 or signature error, see Troubleshooting (§11).
 3. **Buy-box design is configured in the app, not the theme**: the admin
-   **Buy box designer** page picks one of six design presets and customizes
+   **Buy box designer** page picks one of eight design presets and customizes
    layout, style, placement and per-locale text, publishing to a shop
    metafield both install shapes read — so this one-time enable is the only
    theme change ever needed. Until you publish a design, the widget renders

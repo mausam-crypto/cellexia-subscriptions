@@ -17,11 +17,12 @@
  *     resolvable payment method are reported as SKIPPED, never half-imported.
  *
  * Behavior:
- *   - Rows are grouped by email + interval_weeks → one contract per group,
- *     one line per distinct variant (duplicate variants merge quantities).
+ *   - Rows are grouped by email + cadence (interval_unit + interval_count when
+ *     filled, else interval_weeks) → one contract per group, one line per
+ *     distinct variant (duplicate variants merge quantities).
  *   - Idempotent: an email that already has a non-terminal (ACTIVE or PAUSED —
- *     i.e. any status this importer can create) local contract with the same
- *     interval is reported SKIPPED_DUPLICATE and left untouched, so fixing the
+ *     i.e. any status this importer can create) local contract at the same
+ *     cadence is reported SKIPPED_DUPLICATE and left untouched, so fixing the
  *     reported rows and re-running the same file never duplicates contracts.
  *   - --dry-run performs every read/validation (including Shopify lookups)
  *     but no mutation anywhere (no Shopify writes, no DB writes).
@@ -32,9 +33,24 @@ import { parseArgs } from "node:util";
 import { z } from "zod";
 import { loadDotEnv } from "./lib/env";
 import { parseCsv } from "./lib/csv";
-// Pure module, no server deps — safe to import before loadDotEnv resolves
+// Pure modules, no server deps — safe to import before loadDotEnv resolves
 // (scripts import from app, never the reverse).
 import { parseCsvDate } from "../app/lib/csv-date";
+import {
+  buildAcquisitionCapture,
+  sanitizeUtmValue,
+  truncateAcqField,
+} from "../app/lib/acquisition/sanitize";
+import {
+  FREQUENCY_COUNT_LIMITS,
+  FREQUENCY_UNITS,
+  approxWeeks,
+  contractFrequency,
+  frequencyLabelEn,
+  frequencyToken,
+  type Frequency,
+  type FrequencyUnit,
+} from "../app/lib/frequency";
 
 loadDotEnv();
 
@@ -79,6 +95,8 @@ const REQUIRED_COLUMNS = [
   "variant_id",
   "quantity",
   "interval_weeks",
+  "interval_unit",
+  "interval_count",
   "next_charge_date",
   "status",
   "price_cents",
@@ -92,6 +110,30 @@ const REQUIRED_COLUMNS = [
   "payment_method_id",
   "origin",
 ] as const;
+
+/**
+ * The interval columns are alternatives, not all-required: a header passes
+ * with the legacy `interval_weeks` column, with the v1.8.0 `interval_unit` +
+ * `interval_count` pair, or with all three (per row, a filled unit+count pair
+ * wins — see rowSchema's superRefine). Everything else in REQUIRED_COLUMNS
+ * must be present.
+ */
+const INTERVAL_COLUMNS = ["interval_weeks", "interval_unit", "interval_count"] as const;
+
+function missingRequiredColumns(headers: string[]): string[] {
+  const missing: string[] = REQUIRED_COLUMNS.filter(
+    (c) =>
+      !(INTERVAL_COLUMNS as readonly string[]).includes(c) &&
+      !headers.includes(c),
+  );
+  const hasWeeks = headers.includes("interval_weeks");
+  const hasPair =
+    headers.includes("interval_unit") && headers.includes("interval_count");
+  if (!hasWeeks && !hasPair) {
+    missing.push("interval_weeks (or interval_unit + interval_count)");
+  }
+  return missing;
+}
 
 /**
  * OPTIONAL acquisition passthrough columns (docs/DATA_FOUNDATION.md). When a
@@ -146,6 +188,33 @@ const requiredInt = (label: string, min: number, max: number) =>
       .max(max, `${label} must be <= ${max}`),
   );
 
+const optionalInt = (label: string, min: number, max: number) =>
+  z.preprocess(
+    (v) => {
+      if (typeof v !== "string") return v;
+      const t = v.trim();
+      if (t === "") return undefined;
+      return /^-?\d+$/.test(t) ? Number(t) : t;
+    },
+    z
+      .number({ invalid_type_error: `${label} must be an integer` })
+      .int()
+      .min(min, `${label} must be >= ${min}`)
+      .max(max, `${label} must be <= ${max}`)
+      .optional(),
+  );
+
+/**
+ * Per-unit interval_count bounds. WEEK allows up to 52 — the full historical
+ * interval_weeks import range — rather than FREQUENCY_COUNT_LIMITS' 26-week
+ * merchant-offering cap; DAY and MONTH use the shared limits.
+ */
+const IMPORT_COUNT_LIMITS: Record<FrequencyUnit, { min: number; max: number }> =
+  {
+    ...FREQUENCY_COUNT_LIMITS,
+    WEEK: { min: 1, max: 52 },
+  };
+
 // next_charge_date parsing is the shared strict helper in app/lib/csv-date —
 // see that module for what is accepted and the billing defects a lenient
 // `new Date(v)` fallback caused here.
@@ -187,7 +256,22 @@ const rowSchema = z.object({
     (v) => (typeof v === "string" && v.trim() === "" ? "1" : v),
     requiredInt("quantity", 1, 999),
   ),
-  interval_weeks: requiredInt("interval_weeks", 1, 52),
+  // The cadence comes in two row shapes: legacy interval_weeks alone, or the
+  // v1.8.0 interval_unit + interval_count pair (which wins when both are
+  // filled). The cross-field rules live in the superRefine below.
+  interval_weeks: optionalInt("interval_weeks", 1, 52),
+  interval_unit: z.preprocess(
+    (v) =>
+      typeof v === "string" && v.trim() !== ""
+        ? v.trim().toUpperCase()
+        : undefined,
+    z
+      .enum(FREQUENCY_UNITS, {
+        errorMap: () => ({ message: "interval_unit must be DAY, WEEK or MONTH" }),
+      })
+      .optional(),
+  ),
+  interval_count: optionalInt("interval_count", 1, 999),
   next_charge_date: z
     .string()
     .trim()
@@ -249,6 +333,26 @@ const rowSchema = z.object({
       .optional(),
   ),
   origin: optionalString,
+  // The original signup date on the source platform. Optional — but when
+  // provided it becomes firstChargeAt, so every arrival/cohort surface books
+  // the subscriber on their real signup date instead of import day (a
+  // migrated book without it arrives as one giant import-day cohort). Must
+  // be a real past instant: a future or malformed value would silently
+  // corrupt the cohort triangle, so it is a row error, not a warning.
+  subscribed_since: z.preprocess(
+    emptyToUndefined,
+    z
+      .string()
+      .refine(
+        (v) => parseCsvDate(v) !== null,
+        "subscribed_since must be YYYY-MM-DD or an ISO-8601 timestamp with timezone (e.g. 2024-03-17 or 2024-03-17T10:00:00Z)",
+      )
+      .refine((v) => {
+        const parsed = parseCsvDate(v);
+        return parsed == null || parsed.getTime() < Date.now();
+      }, "subscribed_since must be in the past")
+      .optional(),
+  ),
   // Optional acquisition passthrough (see ACQ_COLUMNS above). All lenient:
   // an absent/empty value is undefined, never a row error.
   acq_source: optionalString,
@@ -269,9 +373,48 @@ const rowSchema = z.object({
         : undefined,
     z.string().optional(),
   ),
+}).superRefine((row, ctx) => {
+  // Half a unit+count pair is always a row error — never guess the other half.
+  if ((row.interval_unit == null) !== (row.interval_count == null)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: [row.interval_unit == null ? "interval_unit" : "interval_count"],
+      message: "interval_unit and interval_count must be provided together",
+    });
+    return;
+  }
+  if (row.interval_unit != null && row.interval_count != null) {
+    const limits = IMPORT_COUNT_LIMITS[row.interval_unit];
+    if (row.interval_count < limits.min || row.interval_count > limits.max) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["interval_count"],
+        message: `interval_count must be between ${limits.min} and ${limits.max} for ${row.interval_unit}`,
+      });
+    }
+  } else if (row.interval_weeks == null) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["interval_weeks"],
+      message:
+        "row must specify interval_weeks, or interval_unit + interval_count",
+    });
+  }
 });
 
 type ImportRow = z.infer<typeof rowSchema> & { line: number };
+
+/**
+ * The frequency a row asks for: the exact unit+count pair when filled, else
+ * the legacy weeks column as a WEEK frequency (superRefine guarantees one of
+ * the two shapes is present on every valid row).
+ */
+function rowFrequency(row: ImportRow): Frequency {
+  if (row.interval_unit != null && row.interval_count != null) {
+    return { unit: row.interval_unit, count: row.interval_count };
+  }
+  return { unit: "WEEK", count: row.interval_weeks ?? 1 };
+}
 
 interface RowError {
   line: number;
@@ -282,6 +425,8 @@ interface RowError {
 interface ContractGroup {
   key: string;
   email: string;
+  frequency: Frequency;
+  /** approxWeeks(frequency) — the legacy intervalWeeks mirror + display compat. */
   intervalWeeks: number;
   rows: ImportRow[];
   warnings: string[];
@@ -312,7 +457,12 @@ type GroupStatus =
 interface GroupResult {
   rows: string; // source line numbers, e.g. "2,3"
   email: string;
+  /** approxWeeks mirror — kept in the persisted batch JSON (additive shape). */
   intervalWeeks: number;
+  intervalUnit: FrequencyUnit;
+  intervalCount: number;
+  /** English cadence label ("Every 10 days") — what the report table shows. */
+  frequencyLabel: string;
   lineCount: number;
   status: GroupStatus;
   detail: string;
@@ -663,13 +813,15 @@ async function resolveSyncContractFn(): Promise<SyncContractFn | null> {
 function groupRows(rows: ImportRow[]): ContractGroup[] {
   const groups = new Map<string, ContractGroup>();
   for (const row of rows) {
-    const key = `${row.email}::${row.interval_weeks}`;
+    const frequency = rowFrequency(row);
+    const key = `${row.email}::${frequencyToken(frequency)}`;
     let group = groups.get(key);
     if (!group) {
       group = {
         key,
         email: row.email,
-        intervalWeeks: row.interval_weeks,
+        frequency,
+        intervalWeeks: approxWeeks(frequency.unit, frequency.count),
         rows: [],
         warnings: [],
       };
@@ -681,6 +833,9 @@ function groupRows(rows: ImportRow[]): ContractGroup[] {
       if (row.currency !== first.currency) diffs.push("currency");
       if (row.next_charge_date !== first.next_charge_date) {
         diffs.push("next_charge_date");
+      }
+      if ((row.subscribed_since ?? "") !== (first.subscribed_since ?? "")) {
+        diffs.push("subscribed_since");
       }
       if ((row.payment_method_id ?? "") !== (first.payment_method_id ?? "")) {
         diffs.push("payment_method_id");
@@ -782,12 +937,12 @@ function buildAtomicInput(args: {
       status: first.status,
       paymentMethodId: args.paymentMethodId,
       billingPolicy: {
-        interval: "WEEK",
-        intervalCount: args.group.intervalWeeks,
+        interval: args.group.frequency.unit,
+        intervalCount: args.group.frequency.count,
       },
       deliveryPolicy: {
-        interval: "WEEK",
-        intervalCount: args.group.intervalWeeks,
+        interval: args.group.frequency.unit,
+        intervalCount: args.group.frequency.count,
       },
       deliveryMethod: { shipping: { address } },
       note: first.origin
@@ -840,7 +995,10 @@ async function mirrorContractLocally(
       lastName: first.last_name ?? null,
       status: first.status,
       currencyCode: first.currency,
+      // Exact cadence + the week approximation (rollback safety).
       intervalWeeks: args.group.intervalWeeks,
+      billingIntervalUnit: args.group.frequency.unit,
+      billingIntervalCount: args.group.frequency.count,
       nextBillingDate: args.nextBillingDate,
       paymentMethodId: args.paymentMethodId,
       deliveryAddress: deliveryAddress as object,
@@ -898,11 +1056,14 @@ async function processGroup(
     rows: group.rows.map((r) => r.line).join(","),
     email: group.email,
     intervalWeeks: group.intervalWeeks,
+    intervalUnit: group.frequency.unit,
+    intervalCount: group.frequency.count,
+    frequencyLabel: frequencyLabelEn(group.frequency),
     lineCount: group.rows.length,
   };
 
-  // Idempotency: skip emails that already have a local contract with the same
-  // interval in ANY status this importer can create (ACTIVE or PAUSED —
+  // Idempotency: skip emails that already have a local contract at the same
+  // exact cadence in ANY status this importer can create (ACTIVE or PAUSED —
   // IMPORTABLE_STATUSES). Matching only ACTIVE here would re-create every
   // PAUSED group on the prescribed "fix rows, re-run" pass, leaving paused
   // subscribers with two live Shopify contracts that both bill on resume.
@@ -914,20 +1075,35 @@ async function processGroup(
   // VERBATIM — mixed case survives. A case-sensitive equality silently
   // missed every subscriber whose stored email has an uppercase letter, so
   // the re-run created a second live contract that double-billed them.
-  const duplicate = await ctx.prisma.subscriptionContract.findFirst({
+  //
+  // The cadence comparison happens in JS, not the where: it must go through
+  // contractFrequency so a pre-v1.8.0 mirror (week approximation only) and a
+  // post-v1.8.0 mirror (exact unit+count) both compare correctly. Same email
+  // at a DIFFERENT cadence is a different subscription, never a duplicate.
+  const groupToken = frequencyToken(group.frequency);
+  const candidates = await ctx.prisma.subscriptionContract.findMany({
     where: {
       shopId: ctx.shop.id,
       email: { equals: group.email, mode: "insensitive" },
-      intervalWeeks: group.intervalWeeks,
       status: { in: [...IMPORTABLE_STATUSES] },
     },
-    select: { id: true, shopifyContractId: true, status: true },
+    select: {
+      id: true,
+      shopifyContractId: true,
+      status: true,
+      intervalWeeks: true,
+      billingIntervalUnit: true,
+      billingIntervalCount: true,
+    },
   });
+  const duplicate = candidates.find(
+    (candidate) => frequencyToken(contractFrequency(candidate)) === groupToken,
+  );
   if (duplicate) {
     return {
       ...base,
       status: "SKIPPED_DUPLICATE",
-      detail: `${duplicate.status.toLowerCase()} local contract ${duplicate.id} already exists at ${group.intervalWeeks}w`,
+      detail: `${duplicate.status.toLowerCase()} local contract ${duplicate.id} already exists at ${frequencyLabelEn(group.frequency).toLowerCase()}`,
     };
   }
 
@@ -1039,53 +1215,97 @@ async function processGroup(
   // also unambiguously OURS: this script created the contract. The sync mirror
   // can only ever call an imported contract UNKNOWN (atomicCreate carries no
   // selling plan) and UNKNOWN is never billed, so stamp it here — the one
-  // place with positive evidence.
-  if (!local.grandfatheredPricing || local.ownership !== "OURS") {
+  // place with positive evidence. subscribed_since lands here too: imported
+  // contracts have no origin order, so the origin-date backfill can never fill
+  // firstChargeAt, and a null firstChargeAt makes every arrival/cohort surface
+  // book the subscriber on import day (`firstChargeAt ?? createdAt`). Never
+  // overwrites an existing stamp — re-runs and already-renewed contracts keep
+  // their earlier instant.
+  const subscribedSince = first.subscribed_since
+    ? parseCsvDate(first.subscribed_since)
+    : null;
+  const needsFirstCharge =
+    subscribedSince != null && local.firstChargeAt == null;
+  if (
+    !local.grandfatheredPricing ||
+    local.ownership !== "OURS" ||
+    needsFirstCharge
+  ) {
     local = await ctx.prisma.subscriptionContract.update({
       where: { id: local.id },
-      data: { grandfatheredPricing: true, ownership: "OURS" },
+      data: {
+        grandfatheredPricing: true,
+        ownership: "OURS",
+        ...(needsFirstCharge ? { firstChargeAt: subscribedSince } : {}),
+      },
     });
   }
 
-  // Acquisition passthrough (docs/DATA_FOUNDATION.md): optional acq_* CSV
-  // columns land in the additive acquisition columns, sanitized by the SAME
-  // pure sanitizer the webhooks use. Applied only when at least one explicit
-  // acq_* value is present AND the mirror has no captured bundle yet —
-  // imported contracts have no origin order, so nothing else ever fills them.
-  const hasAcqData = ACQ_COLUMNS.some(
-    (col) => (first as Record<string, unknown>)[col] != null,
-  );
-  if (hasAcqData && local.acqRaw == null) {
+  // Acquisition capture (docs/DATA_FOUNDATION.md): every imported contract
+  // gets its first-order shape (units, order total, value band) computed from
+  // the CSV quantities + prices — the migrated-cadence approximation of the
+  // true first order, flagged importPassthrough — because imported contracts
+  // have no origin order and nothing else can ever fill these columns.
+  // Optional acq_* columns ride along, sanitized through the SAME pure
+  // sanitizer entry points (and caps) the webhooks use. They are read from
+  // the first row in the group that carries any (they describe the
+  // subscriber, not a line); later rows carrying acq_* data are warned about.
+  if (local.acqRaw == null) {
     try {
-      const { buildAcquisitionCapture } = await import(
-        "../app/lib/acquisition/sanitize"
+      const acqRows = group.rows.filter((row) =>
+        ACQ_COLUMNS.some((col) => (row as Record<string, unknown>)[col] != null),
       );
+      const acqRow = acqRows[0] ?? null;
+      for (const dropped of acqRows.slice(1)) {
+        group.warnings.push(
+          `line ${dropped.line}: acq_* values ignored — using line ${acqRows[0].line}'s acquisition data`,
+        );
+      }
       const capture = buildAcquisitionCapture({
-        referringSite: first.acq_referring_site,
-        landingSite: first.acq_landing_site,
-        sourceName: first.acq_source,
+        referringSite: acqRow?.acq_referring_site,
+        landingSite: acqRow?.acq_landing_site,
+        sourceName: acqRow?.acq_source,
         // Geo falls back to the delivery address columns already on the row.
-        countryCode: first.acq_country_code ?? first.country_code,
-        city: first.acq_city ?? first.city,
-        provinceCode: first.acq_province_code ?? first.province_code,
+        countryCode: acqRow?.acq_country_code ?? first.country_code,
+        city: acqRow?.acq_city ?? first.city,
+        provinceCode: acqRow?.acq_province_code ?? first.province_code,
+        unitsFirstOrder: mergedLines.reduce((sum, l) => sum + l.quantity, 0),
+        orderTotalCents: mergedLines.reduce(
+          (sum, l) => sum + l.priceCents * l.quantity,
+          0,
+        ),
+        orderCurrencyCode: first.currency,
       });
-      // CSV columns beat URL-derived UTM; the sanitizer's extraction stands
-      // in when the export has URLs but no split-out columns.
+      // Split-out CSV columns beat URL-derived UTM; the sanitizer's extraction
+      // stands in when the export has URLs but no split-out columns. Each CSV
+      // value goes through the same scrub + cap as every webhook utm value.
       const csvUtm = {
-        source: first.acq_utm_source ?? null,
-        medium: first.acq_utm_medium ?? null,
-        campaign: first.acq_utm_campaign ?? null,
-        term: first.acq_utm_term ?? null,
-        content: first.acq_utm_content ?? null,
+        source: sanitizeUtmValue(acqRow?.acq_utm_source),
+        medium: sanitizeUtmValue(acqRow?.acq_utm_medium),
+        campaign: sanitizeUtmValue(acqRow?.acq_utm_campaign),
+        term: sanitizeUtmValue(acqRow?.acq_utm_term),
+        content: sanitizeUtmValue(acqRow?.acq_utm_content),
       };
       const utm = Object.values(csvUtm).some((v) => v != null)
         ? csvUtm
         : capture.acqUtm;
+      // The recompute reserve (acqRaw.rawUtm): capped ONLY, no scrub — same
+      // contract as the webhook bundle.
+      const csvRawUtm = {
+        source: truncateAcqField(acqRow?.acq_utm_source),
+        medium: truncateAcqField(acqRow?.acq_utm_medium),
+        campaign: truncateAcqField(acqRow?.acq_utm_campaign),
+        term: truncateAcqField(acqRow?.acq_utm_term),
+        content: truncateAcqField(acqRow?.acq_utm_content),
+      };
+      const rawUtm = Object.values(csvRawUtm).some((v) => v != null)
+        ? csvRawUtm
+        : (capture.acqRaw.rawUtm ?? null);
       const deviceType =
-        first.acq_device_type === "mobile" ||
-        first.acq_device_type === "desktop" ||
-        first.acq_device_type === "tablet"
-          ? first.acq_device_type
+        acqRow?.acq_device_type === "mobile" ||
+        acqRow?.acq_device_type === "desktop" ||
+        acqRow?.acq_device_type === "tablet"
+          ? acqRow.acq_device_type
           : null;
       await ctx.prisma.subscriptionContract.update({
         where: { id: local.id },
@@ -1098,13 +1318,25 @@ async function processGroup(
           acqCity: capture.acqCity,
           acqProvinceCode: capture.acqProvinceCode,
           acqDeviceType: deviceType,
+          acqUnitsFirstOrder: capture.acqUnitsFirstOrder,
+          acqOrderValueBand: capture.acqOrderValueBand,
           acqRaw: JSON.parse(
             JSON.stringify({
               ...capture.acqRaw,
               utm,
+              rawUtm,
               deviceType,
+              // Shape parity with the webhook bundle: keys always present,
+              // null where an import cannot know them (no Shopify customer
+              // read happens here).
+              customerCreatedAt: null,
+              customerNumberOfOrders: null,
+              timeToPurchaseSeconds: null,
               importedFrom: first.origin ?? null,
               importPassthrough: true,
+              // Audit trail for the firstChargeAt stamp above — the raw CSV
+              // value, additive alongside the importPassthrough marker.
+              importSubscribedSince: first.subscribed_since ?? null,
             }),
           ) as object,
         },
@@ -1128,7 +1360,11 @@ async function processGroup(
       shopifyContractId: created.id,
       importBatchId: ctx.importBatchId,
       origin: first.origin ?? null,
+      // intervalWeeks stays the week approximation (additive payload contract);
+      // the exact cadence rides alongside.
       intervalWeeks: group.intervalWeeks,
+      intervalUnit: group.frequency.unit,
+      intervalCount: group.frequency.count,
       status: first.status,
       lineCount: mergedLines.length,
       priceCentsTotal: mergedLines.reduce(
@@ -1137,6 +1373,9 @@ async function processGroup(
       ),
       currency: first.currency,
       grandfatheredPricing: true,
+      // The source platform's signup date (verbatim CSV value) — additive
+      // audit alongside the firstChargeAt stamp; null when not provided.
+      subscribedSince: first.subscribed_since ?? null,
       sourceLines: group.rows.map((r) => r.line),
     },
   });
@@ -1180,7 +1419,7 @@ async function main(): Promise<void> {
   }
 
   const { headers, records } = parseCsv(fs.readFileSync(filePath, "utf8"));
-  const missingColumns = REQUIRED_COLUMNS.filter((c) => !headers.includes(c));
+  const missingColumns = missingRequiredColumns(headers);
   if (missingColumns.length > 0) {
     fail(
       `CSV is missing required column(s): ${missingColumns.join(", ")}\n` +
@@ -1295,6 +1534,9 @@ async function main(): Promise<void> {
             rows: group.rows.map((r) => r.line).join(","),
             email: group.email,
             intervalWeeks: group.intervalWeeks,
+            intervalUnit: group.frequency.unit,
+            intervalCount: group.frequency.count,
+            frequencyLabel: frequencyLabelEn(group.frequency),
             lineCount: group.rows.length,
             status: "ERROR",
             detail: errorMessage(err),
@@ -1302,7 +1544,7 @@ async function main(): Promise<void> {
         }
         results.push(result);
         console.log(
-          `[import] ${result.email} (${result.intervalWeeks}w): ${result.status}` +
+          `[import] ${result.email} (${result.frequencyLabel.toLowerCase()}): ${result.status}` +
             (result.status === "ERROR" ? ` — ${result.detail}` : ""),
         );
         await sleep(200); // stay well inside API rate limits
@@ -1356,7 +1598,7 @@ async function main(): Promise<void> {
         results.map((r) => [
           r.rows,
           r.email,
-          `${r.intervalWeeks}w`,
+          r.frequencyLabel,
           String(r.lineCount),
           r.status,
           truncate(r.detail),
@@ -1366,7 +1608,11 @@ async function main(): Promise<void> {
 
     const groupWarnings = groups
       .filter((g) => g.warnings.length > 0)
-      .flatMap((g) => g.warnings.map((w) => `${g.email} (${g.intervalWeeks}w): ${w}`));
+      .flatMap((g) =>
+        g.warnings.map(
+          (w) => `${g.email} (${frequencyLabelEn(g.frequency).toLowerCase()}): ${w}`,
+        ),
+      );
     if (groupWarnings.length > 0) {
       console.log("\nWarnings:");
       for (const warning of groupWarnings) console.log(`  - ${warning}`);

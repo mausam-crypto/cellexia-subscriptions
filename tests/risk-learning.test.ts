@@ -48,6 +48,13 @@ const mocks = vi.hoisted(() => {
     eventFindMany: vi.fn(async (_a?: unknown): Promise<unknown[]> => []),
     dunningCaseFindMany: vi.fn(async (_a?: unknown): Promise<unknown[]> => []),
     jobRunFindFirst: vi.fn(async (): Promise<unknown> => null),
+    // Predicted-empty-date plumbing (FR-5): anchor groupBy, windowed success
+    // list for observed gaps, cadence rows, chunked update transactions.
+    billingAttemptGroupBy: vi.fn(async (_a?: unknown): Promise<unknown[]> => []),
+    billingAttemptFindMany: vi.fn(async (_a?: unknown): Promise<unknown[]> => []),
+    productCadenceFindMany: vi.fn(async (_a?: unknown): Promise<unknown[]> => []),
+    contractUpdate: vi.fn((args: unknown) => args),
+    transaction: vi.fn(async (ops: unknown[]) => ops),
     settingFindUnique: vi.fn(async (args: { where: Record<string, unknown> }) => {
       return settingStore.get(keyOf(args.where)) ?? null;
     }),
@@ -80,11 +87,18 @@ vi.mock("~/db.server", () => ({
     subscriptionContract: {
       findMany: mocks.contractFindMany,
       updateMany: mocks.contractUpdateMany,
+      update: mocks.contractUpdate,
     },
     subscriberEvent: { findMany: mocks.eventFindMany },
     dunningCase: { findMany: mocks.dunningCaseFindMany },
+    billingAttempt: {
+      groupBy: mocks.billingAttemptGroupBy,
+      findMany: mocks.billingAttemptFindMany,
+    },
+    productCadence: { findMany: mocks.productCadenceFindMany },
     setting: { findUnique: mocks.settingFindUnique, upsert: mocks.settingUpsert },
     jobRun: { findFirst: mocks.jobRunFindFirst },
+    $transaction: mocks.transaction,
   },
 }));
 
@@ -97,6 +111,7 @@ import {
   PROMOTION_AUC_MARGIN,
   RISK_FEATURE_NAMES,
   SNAPSHOT_EPOCH_MS,
+  SNAPSHOT_EVENT_TYPES,
   SNAPSHOT_INTERVAL_DAYS,
   SNAPSHOT_LOOKBACK_DAYS,
   buildRiskSnapshots,
@@ -112,7 +127,12 @@ import {
   type SnapshotContractRow,
   type SnapshotEventRow,
 } from "~/lib/analytics/learning.server";
-import { getRiskModelStatus, runChurnRiskScoring } from "~/lib/analytics/risk.server";
+import {
+  blendedDaysToEmpty,
+  getRiskModelStatus,
+  runChurnRiskScoring,
+  runPredictedEmptyDates,
+} from "~/lib/analytics/risk.server";
 import { getSetting } from "~/lib/settings/settings.server";
 
 const DAY = 86_400_000;
@@ -212,6 +232,9 @@ beforeEach(() => {
   mocks.eventFindMany.mockResolvedValue([]);
   mocks.dunningCaseFindMany.mockResolvedValue([]);
   mocks.jobRunFindFirst.mockResolvedValue(null);
+  mocks.billingAttemptGroupBy.mockResolvedValue([]);
+  mocks.billingAttemptFindMany.mockResolvedValue([]);
+  mocks.productCadenceFindMany.mockResolvedValue([]);
 });
 
 // ── Sanity on the synthetic grid ─────────────────────────────────────────────
@@ -573,6 +596,84 @@ describe("buildRiskSnapshots — no label leakage", () => {
   });
 });
 
+// ── buildRiskSnapshots: involuntary episodes survive recovery (FR-8) ─────────
+
+describe("buildRiskSnapshots — a won-back FAILED episode still labels churn", () => {
+  // Recovery clears failedAt (dunning reactivation, admin resume, win-back
+  // all null it), so the live column alone would label the historical FAILED
+  // span 0 AND sample feature rows while the contract was dead. The event
+  // log is the durable record: dunning.exhausted labels the window, and the
+  // exhaustion→recovery span produces no snapshots.
+  const T = GRID[5];
+  const arrival = new Date(T - 100 * DAY);
+
+  const event = (type: string, atMs: number): SnapshotEventRow => ({
+    contractId: "wb1",
+    customerId: null,
+    email: null,
+    type,
+    createdAt: new Date(atMs),
+  });
+
+  function wonBackSnaps(events: SnapshotEventRow[]) {
+    return buildRiskSnapshots({
+      contracts: [
+        // failedAt: null — the win-back already cleared it (the bug's setup).
+        contractRow("wb1", {
+          createdAt: arrival,
+          firstChargeAt: arrival,
+          failedAt: null,
+        }),
+      ],
+      events,
+      now: NOW,
+    });
+  }
+
+  const at = (snaps: ReturnType<typeof buildRiskSnapshots>, t: number) =>
+    snaps.find((s) => s.snapshotAt.getTime() === t);
+
+  it("labels the exhaustion window 1 from the event log despite failedAt being null", () => {
+    const snaps = wonBackSnaps([
+      event("dunning.exhausted", T + 2 * DAY),
+      event("billing.attempt_succeeded", T + 30 * DAY),
+    ]);
+    // The window (T, T+60d] contains the exhaustion → involuntary churn,
+    // exactly what the rollup counted on the failedAt day.
+    expect(at(snaps, T)!.label).toBe(1);
+  });
+
+  it("produces no feature rows inside the dead span, and resumes after recovery with label 0", () => {
+    const snaps = wonBackSnaps([
+      event("dunning.exhausted", T + 2 * DAY),
+      event("billing.attempt_succeeded", T + 30 * DAY),
+    ]);
+    // GRID[6] = T + 28d: exhausted, not yet recovered — dead, no snapshot
+    // (mirrors the failedMs skip for a still-failed contract).
+    expect(at(snaps, GRID[6])).toBeUndefined();
+    // GRID[7] = T + 56d: recovered — the contract is scored again, the
+    // episode is over (no exhaustion in this window), and the exhausted
+    // case no longer reads as open.
+    const post = at(snaps, GRID[7])!;
+    expect(post).toBeDefined();
+    expect(post.label).toBe(0);
+    expect(post.input.openDunning).toBe(false);
+  });
+
+  it("contract.activated (dunning/win-back reactivation) also closes the dead span", () => {
+    const snaps = wonBackSnaps([
+      event("dunning.exhausted", T + 2 * DAY),
+      event("contract.activated", T + 20 * DAY),
+    ]);
+    expect(at(snaps, GRID[6])).toBeDefined();
+  });
+
+  it("SNAPSHOT_EVENT_TYPES fetches the reactivation event the reconstruction relies on", () => {
+    expect(SNAPSHOT_EVENT_TYPES).toContain("dunning.exhausted");
+    expect(SNAPSHOT_EVENT_TYPES).toContain("contract.activated");
+  });
+});
+
 // ── buildRiskSnapshots: the import boundary ──────────────────────────────────
 
 describe("buildRiskSnapshots — import boundary (pre-install history is never fabricated)", () => {
@@ -875,6 +976,133 @@ describe("getRiskModelStatus", () => {
     expect(status.positives).toBe(run.positives);
     expect(status.auc).toBe(run.aucLearned);
     expect(status.outcomesNeeded).toBe(MIN_POSITIVE_OUTCOMES + MIN_NEGATIVE_OUTCOMES);
+  });
+});
+
+// ── Predicted empty dates: the observed-consumption blend (FR-5) ─────────────
+
+describe("blendedDaysToEmpty", () => {
+  it("no observations → exactly the cadence prior (pre-blend behavior)", () => {
+    expect(blendedDaysToEmpty({ cadenceDays: 56, observedGapsDays: [] })).toBe(56);
+  });
+
+  it("shrinks toward the observed mean as gaps accumulate (hand-computed weights)", () => {
+    // 1 gap: weight 1/5 → 0.2·70 + 0.8·56 = 58.8.
+    expect(
+      blendedDaysToEmpty({ cadenceDays: 56, observedGapsDays: [70] }),
+    ).toBeCloseTo(58.8, 10);
+    // 4 gaps: weight 1/2 → 63. 12 gaps: weight 3/4 → 66.5.
+    expect(
+      blendedDaysToEmpty({ cadenceDays: 56, observedGapsDays: [70, 70, 70, 70] }),
+    ).toBe(63);
+    expect(
+      blendedDaysToEmpty({
+        cadenceDays: 56,
+        observedGapsDays: new Array<number>(12).fill(70),
+      }),
+    ).toBeCloseTo(66.5, 10);
+  });
+
+  it("is symmetric: a faster demonstrated rhythm pulls the prediction earlier", () => {
+    expect(
+      blendedDaysToEmpty({ cadenceDays: 56, observedGapsDays: [28, 28, 28, 28] }),
+    ).toBe(42);
+  });
+
+  it("drops artifact gaps — same-day double settlements and dormant re-awakenings", () => {
+    // Only artifacts → fall back to the prior entirely.
+    expect(
+      blendedDaysToEmpty({ cadenceDays: 56, observedGapsDays: [0.1, 400] }),
+    ).toBe(56);
+    // Mixed: the artifact carries no weight at all.
+    expect(
+      blendedDaysToEmpty({ cadenceDays: 56, observedGapsDays: [0.1, 70] }),
+    ).toBe(blendedDaysToEmpty({ cadenceDays: 56, observedGapsDays: [70] }));
+  });
+});
+
+describe("runPredictedEmptyDates — the prediction learns from real cycle gaps", () => {
+  const line = {
+    productId: "gid://shopify/Product/1",
+    variantId: "gid://shopify/ProductVariant/11",
+    quantity: 1,
+    isGift: false,
+  };
+
+  function emptyDateContract(id: string) {
+    return {
+      id,
+      firstChargeAt: new Date(NOW.getTime() - 300 * DAY),
+      predictedEmptyDate: null,
+      lines: [line],
+    };
+  }
+
+  /** predictedEmptyDate written per contract id, from the chunked tx updates. */
+  function writtenEmptyDates(): Map<string, Date | null> {
+    const byId = new Map<string, Date | null>();
+    for (const call of mocks.contractUpdate.mock.calls) {
+      const args = call[0] as {
+        where: { id: string };
+        data: { predictedEmptyDate: Date | null };
+      };
+      byId.set(args.where.id, args.data.predictedEmptyDate);
+    }
+    return byId;
+  }
+
+  it("with no observed gaps the cadence default (56d) times the prediction", async () => {
+    mocks.contractFindMany.mockResolvedValue([emptyDateContract("c1")]);
+    const last = new Date(NOW.getTime() - 10 * DAY);
+    mocks.billingAttemptGroupBy.mockResolvedValue([
+      { contractId: "c1", _max: { completedAt: last } },
+    ]);
+    // A single success in the window yields no gap — prior only.
+    mocks.billingAttemptFindMany.mockResolvedValue([
+      { contractId: "c1", completedAt: last },
+    ]);
+
+    const result = await runPredictedEmptyDates(SHOP, NOW);
+    expect(result.updated).toBe(1);
+    expect(writtenEmptyDates().get("c1")).toEqual(
+      new Date(last.getTime() + 56 * DAY),
+    );
+  });
+
+  it("a demonstrated slower rhythm (skips lengthen real gaps) pushes the prediction later", async () => {
+    // 5 successes 70 days apart — the subscriber skips often enough that
+    // deliveries actually land every 70d, not the cadence's 56d. 4 gaps at
+    // weight 4/(4+4) → blended 0.5·70 + 0.5·56 = 63 days after the last
+    // charge. The old prediction fired win-back a week early, forever.
+    mocks.contractFindMany.mockResolvedValue([emptyDateContract("c1")]);
+    const successes = [0, 1, 2, 3, 4].map(
+      (i) => new Date(NOW.getTime() - (300 - i * 70) * DAY),
+    );
+    const last = successes[4];
+    mocks.billingAttemptGroupBy.mockResolvedValue([
+      { contractId: "c1", _max: { completedAt: last } },
+    ]);
+    mocks.billingAttemptFindMany.mockResolvedValue(
+      successes.map((completedAt) => ({ contractId: "c1", completedAt })),
+    );
+
+    await runPredictedEmptyDates(SHOP, NOW);
+    expect(writtenEmptyDates().get("c1")).toEqual(
+      new Date(last.getTime() + 63 * DAY),
+    );
+  });
+
+  it("gift-only contracts still get stale predictions cleared", async () => {
+    mocks.contractFindMany.mockResolvedValue([
+      {
+        id: "g1",
+        firstChargeAt: new Date(NOW.getTime() - 100 * DAY),
+        predictedEmptyDate: new Date(NOW.getTime() + 30 * DAY),
+        lines: [{ ...line, isGift: true }],
+      },
+    ]);
+    await runPredictedEmptyDates(SHOP, NOW);
+    expect(writtenEmptyDates().get("g1")).toBeNull();
   });
 });
 

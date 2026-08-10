@@ -32,6 +32,20 @@ import {
   Tooltip,
 } from "@shopify/polaris";
 import { z } from "zod";
+import {
+  type Frequency,
+  approxWeeks,
+  frequencyInputText,
+  frequencyLabelEn,
+  frequencyRangeError,
+  frequencySchema,
+  frequencyToken,
+  normalizeFrequencies,
+  parseConfigDefaultFrequency,
+  parseConfigFrequencies,
+  parseFrequencyInput,
+  parseFrequencyToken,
+} from "~/lib/frequency";
 import prisma from "~/db.server";
 import { authenticate } from "~/shopify.server";
 import { getPrimaryShop } from "~/lib/shop/install.server";
@@ -70,8 +84,8 @@ interface PlanView {
   name: string;
   productIds: string[];
   productTitles: string[];
-  frequenciesWeeks: number[];
-  defaultFrequencyWeeks: number;
+  frequencies: Frequency[];
+  defaultFrequency: Frequency;
   allowFrequencyChoice: boolean;
   firstOrderDiscountPct: number;
   ongoingDiscountPct: number;
@@ -145,16 +159,14 @@ const planSchema = z
     productIds: z
       .array(z.string().regex(/^gid:\/\/shopify\/Product\/\d+$/))
       .min(1, "Pick at least one product"),
-    frequenciesWeeks: z
-      .array(
-        z
-          .number()
-          .int("Frequencies must be whole weeks")
-          .min(1, "Frequencies must be between 1 and 26 weeks")
-          .max(26, "Frequencies must be between 1 and 26 weeks"),
-      )
-      .min(1, "At least one frequency is required"),
-    defaultFrequencyWeeks: z.number().int().min(1).max(26),
+    frequencies: z
+      .array(frequencySchema)
+      .min(1, "At least one frequency is required")
+      // Shopify caps selling plans per group (and the sync reads
+      // sellingPlans(first: 50)); 20 cadences + optional prepaid stays far
+      // inside both, and no real buy box wants more choices than that.
+      .max(20, "Offer at most 20 frequencies"),
+    defaultFrequency: frequencySchema,
     allowFrequencyChoice: z.boolean(),
     firstOrderDiscountPct: z
       .number()
@@ -183,10 +195,22 @@ const planSchema = z
     active: z.boolean(),
   })
   .superRefine((value, ctx) => {
-    if (!value.frequenciesWeeks.includes(value.defaultFrequencyWeeks)) {
+    for (const freq of value.frequencies) {
+      const rangeError = frequencyRangeError(freq);
+      if (rangeError) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["frequencies"],
+          message: rangeError,
+        });
+        break;
+      }
+    }
+    const tokens = value.frequencies.map(frequencyToken);
+    if (!tokens.includes(frequencyToken(value.defaultFrequency))) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        path: ["defaultFrequencyWeeks"],
+        path: ["defaultFrequency"],
         message: "Default frequency must be one of the offered frequencies",
       });
     }
@@ -195,15 +219,9 @@ const planSchema = z
 type PlanFormValues = z.infer<typeof planSchema>;
 
 const stringArraySchema = z.array(z.string());
-const intArraySchema = z.array(z.number().int());
 
 function parseJsonStringArray(value: unknown): string[] {
   const parsed = stringArraySchema.safeParse(value);
-  return parsed.success ? parsed.data : [];
-}
-
-function parseJsonIntArray(value: unknown): number[] {
-  const parsed = intArraySchema.safeParse(value);
   return parsed.success ? parsed.data : [];
 }
 
@@ -257,16 +275,23 @@ function parsePlanForm(formData: FormData): {
     errors.productIds = "Invalid product selection";
   }
 
-  const frequencies: number[] = [];
-  const freqText = String(formData.get("frequenciesWeeks") ?? "");
+  const frequencies: Frequency[] = [];
+  const freqText = String(formData.get("frequencies") ?? "");
   for (const part of freqText.split(",").map((s) => s.trim()).filter(Boolean)) {
-    if (!/^\d+$/.test(part)) {
-      errors.frequenciesWeeks = `"${part}" is not a whole number of weeks`;
+    const freq = parseFrequencyInput(part);
+    if (!freq) {
+      errors.frequencies = `"${part}" is not a frequency — use a week count ("6") or add a unit ("10d", "1m")`;
       break;
     }
-    frequencies.push(Number(part));
+    frequencies.push(freq);
   }
-  const uniqueFrequencies = [...new Set(frequencies)].sort((a, b) => a - b);
+
+  const defaultFrequency = parseFrequencyToken(
+    String(formData.get("defaultFrequency") ?? ""),
+  );
+  if (!defaultFrequency && !errors.frequencies) {
+    errors.defaultFrequency = "Pick a default frequency";
+  }
 
   const giftRaw = String(formData.get("firstOrderGiftVariantId") ?? "").trim();
   const badgeRaw = String(formData.get("badgeText") ?? "").trim();
@@ -274,8 +299,8 @@ function parsePlanForm(formData: FormData): {
   const candidate = {
     name: String(formData.get("name") ?? ""),
     productIds,
-    frequenciesWeeks: uniqueFrequencies,
-    defaultFrequencyWeeks: intFrom(formData, "defaultFrequencyWeeks"),
+    frequencies: normalizeFrequencies(frequencies),
+    defaultFrequency: defaultFrequency ?? { unit: "WEEK" as const, count: 8 },
     allowFrequencyChoice: boolFrom(formData, "allowFrequencyChoice"),
     firstOrderDiscountPct: intFrom(formData, "firstOrderDiscountPct"),
     ongoingDiscountPct: intFrom(formData, "ongoingDiscountPct"),
@@ -322,7 +347,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const parsedConfigs = configs.map((c) => ({
     config: c,
     productIds: parseJsonStringArray(c.productIds),
-    frequenciesWeeks: parseJsonIntArray(c.frequenciesWeeks),
+    frequencies: parseConfigFrequencies(c),
   }));
 
   // Best-effort title enrichment from Shopify — a lookup failure must never
@@ -383,13 +408,13 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     console.error("[plans] foreign selling plan group scan failed", err);
   }
 
-  const plans: PlanView[] = parsedConfigs.map(({ config, productIds, frequenciesWeeks }) => ({
+  const plans: PlanView[] = parsedConfigs.map(({ config, productIds, frequencies }) => ({
     id: config.id,
     name: config.name,
     productIds,
     productTitles: productIds.map((id) => titleById.get(id) ?? id),
-    frequenciesWeeks,
-    defaultFrequencyWeeks: config.defaultFrequencyWeeks,
+    frequencies,
+    defaultFrequency: parseConfigDefaultFrequency(config),
     allowFrequencyChoice: config.allowFrequencyChoice,
     firstOrderDiscountPct: config.firstOrderDiscountPct,
     ongoingDiscountPct: config.ongoingDiscountPct,
@@ -539,11 +564,22 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
 
     const planId = String(formData.get("planId") ?? "");
+    // Legacy week columns are kept written as approximations of the
+    // multi-unit truth so a rollback to a pre-v1.8.0 build still sees a
+    // coherent (week-only) view of this config.
+    const legacyWeeks = [
+      ...new Set(values.frequencies.map((f) => approxWeeks(f.unit, f.count))),
+    ].sort((a, b) => a - b);
     const data = {
       name: values.name,
       productIds: values.productIds,
-      frequenciesWeeks: values.frequenciesWeeks,
-      defaultFrequencyWeeks: values.defaultFrequencyWeeks,
+      frequencies: values.frequencies,
+      defaultFrequency: values.defaultFrequency,
+      frequenciesWeeks: legacyWeeks,
+      defaultFrequencyWeeks: approxWeeks(
+        values.defaultFrequency.unit,
+        values.defaultFrequency.count,
+      ),
       allowFrequencyChoice: values.allowFrequencyChoice,
       firstOrderDiscountPct: values.firstOrderDiscountPct,
       ongoingDiscountPct: values.ongoingDiscountPct,
@@ -593,7 +629,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         planConfigId: saved.id,
         name: saved.name,
         productCount: values.productIds.length,
-        frequenciesWeeks: values.frequenciesWeeks,
+        frequencies: values.frequencies.map(frequencyToken),
+        frequenciesWeeks: legacyWeeks,
         firstOrderDiscountPct: values.firstOrderDiscountPct,
         ongoingDiscountPct: values.ongoingDiscountPct,
         prepaidEnabled: values.prepaidEnabled,
@@ -635,6 +672,15 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       let syncStatus = "SYNCED";
       let syncError: string | null = null;
       let missingProductIds: string[] = [];
+      if (result.productReconcileError) {
+        // The plans mutated but attaching/detaching products failed (dead
+        // product GID in the config, another app's sync interfering). The
+        // allow-list below is still recorded and republished against the
+        // LIVE plans — that keeps the widget rendering wherever the group IS
+        // attached; this status tells the merchant to fix the product list.
+        syncStatus = "ATTACH_FAILED";
+        syncError = `Plans synced, but attaching products failed: ${result.productReconcileError}. Check that every product in this plan still exists, then re-sync.`;
+      }
       try {
         missingProductIds = await findProductsMissingFromGroup(
           admin,
@@ -842,6 +888,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         action: "product_cogs_override_updated",
         productId,
         unitCostCentsOverride,
+        // Cost-model parameter history: the override feeds LTGP directly, so
+        // every edit records where the value moved FROM — without it a
+        // margin shift in the analytics could never be traced back to "the
+        // COGS override changed that day, from X to Y".
+        previous: existing?.unitCostCentsOverride ?? null,
+        next: unitCostCentsOverride,
       },
     });
     return json<ActionData>({
@@ -947,6 +999,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         recommendedWeeks,
         substituteVariantId,
         stockoutPolicy,
+        // Parameter history for the forecast inputs: estDaysToEmpty drives
+        // win-back timing and the recommended cadence, so a change must be
+        // datable and reversible from the event stream alone.
+        previous: existing?.estDaysToEmpty ?? null,
+        next: estDaysToEmpty,
       },
     });
     return json<ActionData>({ intent, ok: true, toast: "Cadence saved" });
@@ -1186,10 +1243,10 @@ function PlanFormModal({
       : [],
   );
   const [freqText, setFreqText] = useState(
-    plan ? plan.frequenciesWeeks.join(", ") : "4, 6, 8, 10, 12",
+    plan ? frequencyInputText(plan.frequencies) : "4, 6, 8, 10, 12",
   );
   const [defaultFreq, setDefaultFreq] = useState(
-    String(plan?.defaultFrequencyWeeks ?? 8),
+    frequencyToken(plan?.defaultFrequency ?? { unit: "WEEK", count: 8 }),
   );
   const [allowChoice, setAllowChoice] = useState(
     plan?.allowFrequencyChoice ?? true,
@@ -1222,18 +1279,18 @@ function PlanFormModal({
   );
   const [active, setActive] = useState(plan?.active ?? true);
 
+  // Mirrors the server parser (parseFrequencyInput + normalizeFrequencies) so
+  // the default-frequency Select always lists exactly what would be saved.
   const parsedFrequencies = useMemo(
     () =>
-      [
-        ...new Set(
-          freqText
-            .split(",")
-            .map((s) => s.trim())
-            .filter((s) => /^\d+$/.test(s))
-            .map(Number)
-            .filter((n) => n >= 1 && n <= 26),
-        ),
-      ].sort((a, b) => a - b),
+      normalizeFrequencies(
+        freqText
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .map(parseFrequencyInput)
+          .filter((f): f is Frequency => f !== null && !frequencyRangeError(f)),
+      ),
     [freqText],
   );
 
@@ -1250,8 +1307,8 @@ function PlanFormModal({
     if (plan) fd.set("planId", plan.id);
     fd.set("name", name);
     fd.set("productIds", JSON.stringify(selectedProducts.map((p) => p.id)));
-    fd.set("frequenciesWeeks", freqText);
-    fd.set("defaultFrequencyWeeks", defaultFreq);
+    fd.set("frequencies", freqText);
+    fd.set("defaultFrequency", defaultFreq);
     fd.set("allowFrequencyChoice", String(allowChoice));
     fd.set("firstOrderDiscountPct", firstPct);
     fd.set("ongoingDiscountPct", ongoingPct);
@@ -1299,26 +1356,26 @@ function PlanFormModal({
             Delivery frequency
           </Text>
           <TextField
-            label="Offered frequencies (weeks, comma-separated)"
+            label="Offered frequencies (comma-separated)"
             autoComplete="off"
             value={freqText}
             onChange={setFreqText}
-            error={errors.frequenciesWeeks}
-            helpText="Whole weeks between 1 and 26, e.g. 4, 6, 8, 10, 12. Real cadences beat arbitrary monthly."
+            error={errors.frequencies}
+            helpText='Bare numbers are weeks ("4, 6, 8"); add a unit for days or months ("10d", "1m") and mix freely, e.g. "10d, 2, 6, 1m". Days 1–90, weeks 1–26, months 1–12. Real cadences beat arbitrary monthly.'
           />
           <Select
             label="Default frequency"
             options={
               parsedFrequencies.length > 0
-                ? parsedFrequencies.map((w) => ({
-                    label: `Every ${w} weeks`,
-                    value: String(w),
+                ? parsedFrequencies.map((f) => ({
+                    label: frequencyLabelEn(f),
+                    value: frequencyToken(f),
                   }))
                 : [{ label: "Add frequencies first", value: defaultFreq }]
             }
             value={defaultFreq}
             onChange={setDefaultFreq}
-            error={errors.defaultFrequencyWeeks}
+            error={errors.defaultFrequency}
             helpText="Preselected in the buy box — match it to the product's real days-to-empty."
           />
           <Checkbox
@@ -1759,7 +1816,9 @@ export default function PlansPage() {
     >
       <Text as="span">{String(plan.productIds.length)}</Text>
     </Tooltip>,
-    plan.frequenciesWeeks.map((w) => `${w}w`).join(" / "),
+    plan.frequencies
+      .map((f) => `${f.count}${f.unit === "WEEK" ? "w" : f.unit === "DAY" ? "d" : "mo"}`)
+      .join(" / "),
     `${plan.firstOrderDiscountPct}% → ${plan.ongoingDiscountPct}%`,
     plan.prepaidEnabled ? (
       <Badge key={`${plan.id}-prepaid`} tone="info">

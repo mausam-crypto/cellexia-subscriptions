@@ -7,7 +7,7 @@ import {
   localeFromRequest,
   portalPage,
   resolveToast,
-  setupGatePage,
+  closedPortalPage,
   withLocale,
   type PortalToast,
 } from "~/lib/portal/layout.server";
@@ -67,7 +67,7 @@ export async function requireCancelContext(
   // Launch gate: while the app is in setup mode the portal is closed to the
   // public — only admin preview sessions pass through.
   if (!portalSession.isPreview && (await isSetupMode(shop.id))) {
-    throw (liquid as unknown as LiquidFn)(setupGatePage(locale), {
+    throw (liquid as unknown as LiquidFn)(closedPortalPage(request, locale), {
       headers: { "X-Robots-Tag": "noindex" },
     });
   }
@@ -135,6 +135,7 @@ export function renderCancelPage(
       backLabel: opts?.backLabel,
       toast: ctx.previewToast,
       isPreview: ctx.portalSession.isPreview,
+      previewToken: ctx.portalSession.previewToken,
     }),
   );
 }

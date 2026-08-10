@@ -9,7 +9,8 @@ import { adminClientForShop } from "~/shopify.server";
 import { getPrimaryShop } from "~/lib/shop/install.server";
 import { logEvent } from "~/lib/events/log.server";
 import { getSetting } from "~/lib/settings/settings.server";
-import { addDaysTz, addWeeksTz } from "~/lib/dates.server";
+import { addDaysTz, addIntervalTz } from "~/lib/dates.server";
+import { contractFrequency } from "~/lib/frequency";
 import {
   hasSentForCycle,
   sendNotification,
@@ -109,11 +110,8 @@ function estimateCycleDate(
   const upcomingOrderNumber = contract.ordersCount + 1;
   const delta = orderNumber - upcomingOrderNumber;
   if (delta === 0) return contract.nextBillingDate;
-  return addWeeksTz(
-    contract.nextBillingDate,
-    delta * Math.max(1, contract.intervalWeeks),
-    tz,
-  );
+  const freq = contractFrequency(contract);
+  return addIntervalTz(contract.nextBillingDate, freq.unit, freq.count, tz, delta);
 }
 
 /**
@@ -146,11 +144,9 @@ function ruleMatchesCycle(
       return false;
     }
     const milestone = addDaysTz(contract.firstChargeAt, rule.daysSubscribed, tz);
-    const windowStart = addWeeksTz(
-      cycleDate,
-      -Math.max(1, contract.intervalWeeks),
-      tz,
-    );
+    // Window start = one billing interval before this cycle's date.
+    const freq = contractFrequency(contract);
+    const windowStart = addIntervalTz(cycleDate, freq.unit, freq.count, tz, -1);
     return (
       milestone.getTime() > windowStart.getTime() &&
       milestone.getTime() <= cycleDate.getTime()
@@ -526,9 +522,27 @@ export async function ensureGiftsForUpcomingCycle(
           // Retire this one — left ADDED it would keep the shared isGift
           // mirror "live" forever (clearShippedGiftMirrors protects variants
           // with SCHEDULED/ADDED grants) even after the duplicate ships.
+          // Status (and removedAt) only: shippedAt, if a lost-flip repair
+          // ever stamped it, is history and survives every REMOVED flip.
           await prisma.giftGrant.update({
             where: { id: grant.id },
             data: { status: "REMOVED", removedAt: new Date() },
+          });
+          await logEvent({
+            shopId: shop.id,
+            contractId: contract.id,
+            customerId: contract.customerId,
+            email: contract.email,
+            type: "cycle.gift_removed",
+            source: "SYSTEM",
+            actor: "gift_engine",
+            payload: {
+              grantIds: [grant.id],
+              cycleIndexes: [grant.cycleIndex],
+              variantId: grant.variantId,
+              supersededByGrantId: duplicate.id,
+              reason: "superseded_by_target_cycle_grant",
+            },
           });
         }
         continue;
@@ -584,6 +598,22 @@ export async function ensureGiftsForUpcomingCycle(
         continue;
       }
       result.rulesMatched += 1;
+
+      // An anniversary fires ONCE per (contract, rule). The cycle window is
+      // (previous cycle date, cycle date] with the previous date computed by
+      // a calendar step back — and a MONTH step back from a clamped
+      // month-end (Feb 28 → Jan 28) reaches PAST the real previous cycle
+      // date (Jan 31), so a milestone in the overlap would match two
+      // consecutive cycles. The rule-scoped guard makes that impossible; a
+      // grant parked on a skipped cycle is re-anchored by the pending-grant
+      // machinery above, never re-created here.
+      if (rule.trigger === "DAYS_SUBSCRIBED") {
+        const priorForRule = await prisma.giftGrant.findFirst({
+          where: { contractId: contract.id, ruleId: rule.id },
+          select: { id: true },
+        });
+        if (priorForRule) continue;
+      }
 
       // Unique-ish guard: one grant per (contract, cycle, variant) — any
       // existing grant (whatever its status) means this gift was handled.
@@ -732,28 +762,34 @@ export async function clearShippedGiftMirrors(
       where: { id: { in: mirrorLines.map((l) => l.id) } },
     });
   }
+  // Status (and removedAt) only: shippedAt is the durable "this gift left
+  // the building" fact — the REMOVED flip is mirror hygiene and must never
+  // erase it (analytics count gift COGS by it).
   await prisma.giftGrant.updateMany({
     where: { id: { in: shippedGrants.map((g) => g.id) } },
     data: { status: "REMOVED", removedAt: now },
   });
 
-  if (mirrorLines.length > 0) {
-    await logEvent({
-      shopId: contract.shopId,
-      contractId: contract.id,
-      customerId: contract.customerId,
-      email: contract.email,
-      type: "cycle.gift_removed",
-      source: "SYSTEM",
-      actor: "gift_engine",
-      payload: {
-        grantIds: shippedGrants.map((g) => g.id),
-        cycleIndexes: shippedGrants.map((g) => g.cycleIndex),
-        titles: mirrorLines.map((l) => l.title),
-        reason: "shipped_cycle_scoped_edit_expired",
-      },
-    });
-  }
+  // Logged whenever grants flipped, not only when a mirror line came off:
+  // a variant whose mirror was kept alive by a still-live grant (or whose
+  // mirror was already gone) still transitions SHIPPED→REMOVED here, and a
+  // silent status flip would break the every-mutation-logs-an-event rule.
+  await logEvent({
+    shopId: contract.shopId,
+    contractId: contract.id,
+    customerId: contract.customerId,
+    email: contract.email,
+    type: "cycle.gift_removed",
+    source: "SYSTEM",
+    actor: "gift_engine",
+    payload: {
+      grantIds: shippedGrants.map((g) => g.id),
+      cycleIndexes: shippedGrants.map((g) => g.cycleIndex),
+      titles: mirrorLines.map((l) => l.title),
+      mirrorLinesCleared: mirrorLines.length,
+      reason: "shipped_cycle_scoped_edit_expired",
+    },
+  });
 
   return mirrorLines.length;
 }

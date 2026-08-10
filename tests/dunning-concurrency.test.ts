@@ -53,15 +53,18 @@ const mocks = vi.hoisted(() => ({
   attemptUpdateMany: vi.fn(async (_a?: unknown) => ({ count: 1 })),
   attemptCount: vi.fn(async (_a?: unknown) => 0),
   notificationLogFindFirst: vi.fn(async (_a?: unknown): Promise<unknown> => null),
+  dunningCaseUpdateMany: vi.fn(async (_a?: unknown) => ({ count: 1 })),
+  subscriberEventFindFirst: vi.fn(async (_a?: unknown): Promise<unknown> => null),
 }));
 
-vi.mock("~/db.server", () => ({
-  default: {
+vi.mock("~/db.server", () => {
+  const db: Record<string, unknown> = {
     dunningCase: {
       findMany: mocks.dunningCaseFindMany,
       findFirst: mocks.dunningCaseFindFirst,
       create: mocks.dunningCaseCreate,
       update: mocks.dunningCaseUpdate,
+      updateMany: mocks.dunningCaseUpdateMany,
     },
     subscriptionContract: { update: mocks.contractUpdate },
     billingAttempt: {
@@ -72,8 +75,13 @@ vi.mock("~/db.server", () => ({
       count: mocks.attemptCount,
     },
     notificationLog: { findFirst: mocks.notificationLogFindFirst },
-  },
-}));
+    subscriberEvent: { findFirst: mocks.subscriberEventFindFirst },
+  };
+  // The engine's marker+counter transaction runs against the same client, so
+  // every model spy observes exactly what commits with the marker.
+  db.$transaction = async (fn: (tx: unknown) => Promise<unknown>) => fn(db);
+  return { default: db };
+});
 
 vi.mock("~/lib/events/log.server", () => ({ logEvent: mocks.logEvent }));
 vi.mock("~/lib/settings/settings.server", () => ({ getSetting: mocks.getSetting }));
@@ -188,7 +196,9 @@ describe("onBillingAttemptFailed entry claim", () => {
   it("claims the attempt with declineCategory-null + lease gates BEFORE any engine work", async () => {
     await onBillingAttemptFailed("att_h1");
 
-    expect(mocks.attemptUpdateMany).toHaveBeenCalledTimes(1);
+    // Two guarded updateMany writes bracket the engine: the entry claim
+    // first, the processing-complete marker last.
+    expect(mocks.attemptUpdateMany).toHaveBeenCalledTimes(2);
     const claim = mocks.attemptUpdateMany.mock.calls[0][0] as {
       where: Record<string, unknown>;
       data: Record<string, unknown>;
@@ -210,6 +220,62 @@ describe("onBillingAttemptFailed entry claim", () => {
     // The claim won → the engine actually ran.
     expect(mocks.dunningCaseCreate).toHaveBeenCalledTimes(1);
     expect(mocks.contractUpdate).toHaveBeenCalledTimes(1);
+
+    // The marker is written LAST, guarded on still being unset — the write
+    // whose success authorizes the failure-counter increment.
+    const marker = mocks.attemptUpdateMany.mock.calls[1][0] as {
+      where: Record<string, unknown>;
+      data: Record<string, unknown>;
+    };
+    expect(marker.where).toEqual({ id: "att_h1", declineCategory: null });
+    expect(marker.data).toEqual({ declineCategory: "HARD" });
+  });
+
+  it("consecutiveFailures moves ONLY with the marker — a redrive that loses the marker race never double-counts", async () => {
+    // Crash-redrive shape: the lease expired and a redelivery re-runs the
+    // whole engine, but ANOTHER carrier stamped declineCategory in between —
+    // the marker updateMany matches nothing, so the increment must not run.
+    mocks.attemptUpdateMany.mockImplementation(async (args?: unknown) => {
+      const data = (args as { data: Record<string, unknown> }).data;
+      return { count: data.declineCategory !== undefined ? 0 : 1 };
+    });
+
+    await onBillingAttemptFailed("att_h1");
+
+    // The engine ran (case handling is idempotent by design)…
+    expect(mocks.dunningCaseCreate).toHaveBeenCalledTimes(1);
+    // …but the streak did not move a second time.
+    expect(mocks.contractUpdate).not.toHaveBeenCalled();
+  });
+
+  it("dunning.retry_failed is attemptId-deduped across redrives (the immutable-event-log guard)", async () => {
+    mocks.attemptFindUnique.mockImplementation(async (args: unknown) => {
+      const where = (args as { where?: { id?: string } })?.where;
+      return where?.id === "att_h1"
+        ? attemptFixture({ attemptNumber: 2 })
+        : null;
+    });
+
+    // First processing: no prior event → logged once.
+    await onBillingAttemptFailed("att_h1");
+    const retryFailed = () =>
+      mocks.logEvent.mock.calls
+        .map((c) => c[0] as { type: string })
+        .filter((e) => e.type === "dunning.retry_failed");
+    expect(retryFailed()).toHaveLength(1);
+
+    // Crash-redrive: the event already exists → NOT logged again.
+    mocks.logEvent.mockClear();
+    mocks.subscriberEventFindFirst.mockResolvedValue({ id: "evt_1" });
+    await onBillingAttemptFailed("att_h1");
+    expect(retryFailed()).toHaveLength(0);
+    const dedupe = mocks.subscriberEventFindFirst.mock.calls.at(-1)![0] as {
+      where: Record<string, unknown>;
+    };
+    expect(dedupe.where).toMatchObject({
+      type: "dunning.retry_failed",
+      payload: { path: ["attemptId"], equals: "att_h1" },
+    });
   });
 
   it("the losing invocation does NOTHING — the sweep/webhook race is closed", async () => {

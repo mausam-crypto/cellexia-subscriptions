@@ -58,16 +58,20 @@ const mocks = vi.hoisted(() => ({
   // The failure engine's atomic entry claim (dunningClaimedAt lease): the
   // single-invocation default is a won claim.
   attemptUpdateMany: vi.fn(async (_a?: unknown) => ({ count: 1 })),
+  // The pinned cursor/count commit (ladderCursor + emailsSent).
+  dunningCaseUpdateMany: vi.fn(async (_a?: unknown) => ({ count: 1 })),
   notificationLogFindFirst: vi.fn(async (_a?: unknown): Promise<unknown> => null),
+  subscriberEventFindFirst: vi.fn(async (_a?: unknown): Promise<unknown> => null),
 }));
 
-vi.mock("~/db.server", () => ({
-  default: {
+vi.mock("~/db.server", () => {
+  const db: Record<string, unknown> = {
     dunningCase: {
       findMany: mocks.dunningCaseFindMany,
       findFirst: mocks.dunningCaseFindFirst,
       create: mocks.dunningCaseCreate,
       update: mocks.dunningCaseUpdate,
+      updateMany: mocks.dunningCaseUpdateMany,
     },
     subscriptionContract: { update: mocks.contractUpdate },
     billingAttempt: {
@@ -77,8 +81,12 @@ vi.mock("~/db.server", () => ({
       updateMany: mocks.attemptUpdateMany,
     },
     notificationLog: { findFirst: mocks.notificationLogFindFirst },
-  },
-}));
+    subscriberEvent: { findFirst: mocks.subscriberEventFindFirst },
+  };
+  // The engine's marker+counter transaction runs against the same client.
+  db.$transaction = async (fn: (tx: unknown) => Promise<unknown>) => fn(db);
+  return { default: db };
+});
 
 vi.mock("~/lib/events/log.server", () => ({ logEvent: mocks.logEvent }));
 vi.mock("~/lib/settings/settings.server", () => ({ getSetting: mocks.getSetting }));
@@ -222,11 +230,17 @@ function sentDedupeKeys(): Array<string | undefined> {
   );
 }
 
-/** Cursor commits: dunningCase.update calls that advance emailsSent. */
+/**
+ * Cursor commits: guarded dunningCase.updateMany calls that advance the
+ * notification-ladder cursor (ladderCursor, migration 0016). The TRUE
+ * sent-count (emailsSent) rides the same write as `{ increment: 1 }` only
+ * when an email was actually accounted — the cursor/count split the old
+ * `emailsSent: Math.max(1, …)` conflation hid.
+ */
 function cursorWrites(): Array<Record<string, unknown>> {
-  return mocks.dunningCaseUpdate.mock.calls
+  return mocks.dunningCaseUpdateMany.mock.calls
     .map((call) => (call[0] as { data: Record<string, unknown> }).data)
-    .filter((data) => data.emailsSent !== undefined);
+    .filter((data) => data.ladderCursor !== undefined);
 }
 
 beforeEach(() => {
@@ -263,7 +277,7 @@ describe("HARD failure notification (handleHardFailure via onBillingAttemptFaile
     );
   });
 
-  it("first processing sends payment_failed_1 with the ladder rung-0 key and advances the cursor", async () => {
+  it("first processing sends payment_failed_1 with the ladder rung-0 key and advances cursor + count", async () => {
     await onBillingAttemptFailed("att_h1");
 
     expect(sentDedupeKeys()).toEqual(["case_new:EMAIL:0"]);
@@ -274,11 +288,13 @@ describe("HARD failure notification (handleHardFailure via onBillingAttemptFaile
 
     const cursors = cursorWrites();
     expect(cursors).toHaveLength(1);
-    expect(cursors[0].emailsSent).toBe(1);
+    // Rung 0 consumed AND one real email counted.
+    expect(cursors[0].ladderCursor).toBe(1);
+    expect(cursors[0].emailsSent).toEqual({ increment: 1 });
     expect(cursors[0].lastNotifiedAt).toBeInstanceOf(Date);
   });
 
-  it("crash-window replay (SENT row exists, cursor missing) advances the cursor WITHOUT a second send", async () => {
+  it("crash-window replay (SENT row exists, cursor missing) advances cursor + count WITHOUT a second send", async () => {
     sentKeys.add("case_new:EMAIL:0"); // the pre-crash send's NotificationLog row
 
     await onBillingAttemptFailed("att_h1");
@@ -286,7 +302,10 @@ describe("HARD failure notification (handleHardFailure via onBillingAttemptFaile
     expect(mocks.sendNotification).not.toHaveBeenCalled();
     const cursors = cursorWrites();
     expect(cursors).toHaveLength(1);
-    expect(cursors[0].emailsSent).toBe(1);
+    expect(cursors[0].ladderCursor).toBe(1);
+    // The pre-crash send was real but its count died with the cursor write —
+    // the DUPLICATE with rung 0 unconsumed takes it now.
+    expect(cursors[0].emailsSent).toEqual({ increment: 1 });
   });
 });
 
@@ -301,7 +320,14 @@ describe("sweep day-0 rung vs webhook send (mutual dedupe)", () => {
     expect(stats.emailsSent).toBe(0); // DUPLICATE is not a send
     const cursors = cursorWrites();
     expect(cursors).toHaveLength(1);
-    expect(cursors[0].emailsSent).toBe(1);
+    expect(cursors[0].ladderCursor).toBe(1);
+    // The write is pinned on the cursor fields AS READ: if the webhook path
+    // had already advanced them, this updateMany matches nothing instead of
+    // double-counting the same email.
+    const pin = mocks.dunningCaseUpdateMany.mock.calls[0][0] as {
+      where: Record<string, unknown>;
+    };
+    expect(pin.where).toMatchObject({ id: "case_1", emailsSent: 0 });
   });
 
   it("without a prior SENT row the sweep sends rung 0 exactly once, stamped with the shared key", async () => {
@@ -317,7 +343,7 @@ describe("sweep day-0 rung vs webhook send (mutual dedupe)", () => {
     // A second sweep racing past the cursor (crash before the write): the
     // SENT row recorded above turns it into a cursor advance.
     mocks.sendNotification.mockClear();
-    mocks.dunningCaseUpdate.mockClear();
+    mocks.dunningCaseUpdateMany.mockClear();
     mocks.dunningCaseFindMany.mockResolvedValue([openCaseFixture()]); // stale cursor
     const second = await runDunningSweep(NOW);
     expect(mocks.sendNotification).not.toHaveBeenCalled();
@@ -376,7 +402,8 @@ describe("3DS: fallback link and real challenge link", () => {
     expect(mocks.sendNotification).not.toHaveBeenCalled();
     const cursors = cursorWrites();
     expect(cursors).toHaveLength(1);
-    expect(cursors[0].emailsSent).toBe(1);
+    expect(cursors[0].ladderCursor).toBe(1);
+    expect(cursors[0].emailsSent).toEqual({ increment: 1 });
   });
 
   it("a NEW attempt challenged later in the same case still gets its own fresh link", async () => {
@@ -389,5 +416,28 @@ describe("3DS: fallback link and real challenge link", () => {
     await onBillingAttemptChallenged("att_a2", "https://bank.example/3ds-2");
 
     expect(sentDedupeKeys()).toEqual(["case_a:THREEDS:challenge:att_a2"]);
+  });
+
+  it("a second challenge email past rung 0 still increments the TRUE sent-count (cursor stays)", async () => {
+    // The case already consumed rung 0 with attempt #1's link and counted it.
+    wireAuthAttempt("att_a2", { attemptNumber: 2 });
+    sentKeys.add("case_a:THREEDS:challenge:att_a1");
+    mocks.dunningCaseFindFirst.mockResolvedValue(
+      openCaseFixture({
+        id: "case_a",
+        state: "AWAITING_3DS",
+        emailsSent: 1,
+        ladderCursor: 1,
+      }),
+    );
+
+    await onBillingAttemptChallenged("att_a2", "https://bank.example/3ds-2");
+
+    // A real fresh email went out — the old Math.max(1, …) write dropped
+    // exactly this send from the count; the split columns keep it.
+    const cursors = cursorWrites();
+    expect(cursors).toHaveLength(1);
+    expect(cursors[0].ladderCursor).toBe(1); // rung position unchanged
+    expect(cursors[0].emailsSent).toEqual({ increment: 1 });
   });
 });

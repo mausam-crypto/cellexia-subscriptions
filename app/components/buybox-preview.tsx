@@ -1,5 +1,5 @@
 /**
- * BuyBoxPreview — pure-React replica of the seven storefront buy-box presets,
+ * BuyBoxPreview — pure-React replica of the eight storefront buy-box presets,
  * for the admin "Buy box designer" ONLY (never rendered on the storefront).
  *
  * Mirrors extensions/cellexia-buy-box (blocks/buy-box.liquid + buy-box.css):
@@ -162,11 +162,13 @@ export function BuyBoxPreview({
     fallback: string,
   ) => fillTemplate(resolveDesignText(cfg, locale, key, fallback));
 
-  // subscription_max: no "choose your option" framing — the heading DEFAULTS
-  // to empty (a config text override still wins, like in any preset).
+  // subscription_max family: no "choose your option" framing — the heading
+  // DEFAULTS to empty (a config text override still wins, like in any preset).
   const heading = txt(
     "heading",
-    cfg.preset === "subscription_max" ? "" : EN.heading,
+    cfg.preset === "subscription_max" || cfg.preset === "subscription_ultra_max"
+      ? ""
+      : EN.heading,
   );
   const subheading = txt("subheading", "");
   const subLabel = txt(
@@ -608,6 +610,75 @@ export function BuyBoxPreview({
           </div>
           <div
             className={`cx-buybox__submax-onetime${!isSub ? " is-selected" : ""}`}
+          >
+            {isSub ? (
+              <span className="cx-buybox__submax-link">{oneTimeLink}</span>
+            ) : (
+              <>
+                <span className="cx-buybox__submax-picked">
+                  {check}
+                  <span className="cx-buybox__submax-picked-label">
+                    {oneTimeLabel}
+                  </span>
+                  <span
+                    className="cx-buybox__submax-picked-sep"
+                    aria-hidden="true"
+                  >
+                    —
+                  </span>
+                  <span className="cx-buybox__submax-picked-price">
+                    {SAMPLE.oneTime}
+                  </span>
+                </span>
+                <span className="cx-buybox__submax-switchback">
+                  {EN.switchBack}
+                </span>
+              </>
+            )}
+          </div>
+        </div>
+      );
+      break;
+    }
+
+    case "subscription_ultra_max": {
+      // subscription_max taken to its logical end: the card carries NO offer
+      // chrome (border/tint stripped by the ultramax-card CSS) so the
+      // subscription price reads as the product's plain price, and the quiet
+      // one-time line renders BELOW a mock of the theme's buy area — on the
+      // storefront buy-box.js relocates the real line under the theme's
+      // quantity + Add to cart + guarantees block (.pdp__grey).
+      const ultraSavings = layout.showSavings ? (
+        <span className="cx-buybox__save cx-buybox__save--quiet">
+          {saveStr}
+        </span>
+      ) : null;
+      body = (
+        <div className="cx-buybox__group cx-buybox__group--submax cx-buybox__group--ultramax">
+          <div
+            className={`cx-buybox__option cx-buybox__option--sub cx-buybox__submax-card cx-buybox__ultramax-card${isSub ? " is-selected" : ""}`}
+          >
+            {badgePill}
+            <span className="cx-buybox__card">
+              <span className="cx-buybox__card-body cx-buybox__card-body--stack">
+                <span className="cx-buybox__card-main">
+                  <span className="cx-buybox__title-row">
+                    <span className="cx-buybox__title">{subLabel}</span>
+                    {ultraSavings}
+                  </span>
+                  {priceBlock({})}
+                </span>
+              </span>
+            </span>
+            {freqControl}
+            {reassuranceLine}
+            {showBenefits ? benefitList(benefits) : null}
+          </div>
+          <div className="cx-buybox__ultramax-theme-hint" aria-hidden="true">
+            Quantity · Add to cart · guarantees (your theme)
+          </div>
+          <div
+            className={`cx-buybox__submax-onetime cx-buybox__ultramax-satellite${!isSub ? " is-selected" : ""}`}
           >
             {isSub ? (
               <span className="cx-buybox__submax-link">{oneTimeLink}</span>
@@ -1378,6 +1449,37 @@ const PREVIEW_CSS = `
   color: var(--cx-muted);
   text-decoration: underline;
   text-underline-offset: 2px;
+}
+
+/* subscription_ultra_max — the card sheds every piece of offer chrome so
+   the subscription price reads as the product's plain price, and the quiet
+   one-time line sits below a dashed mock of the theme's own buy area (on
+   the storefront, buy-box.js relocates the real line under the theme's
+   quantity + Add to cart + guarantees block). */
+.cx-buybox__ultramax-card,
+.cx-buybox__ultramax-card.is-selected {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.cx-buybox__ultramax-card .cx-buybox__card {
+  padding: 0;
+}
+
+.cx-buybox__ultramax-theme-hint {
+  margin-block-start: 12px;
+  padding: 14px 16px;
+  border: 1px dashed var(--cx-border, rgba(29, 29, 27, 0.25));
+  border-radius: var(--cx-radius, 0px);
+  font-size: calc(12px * var(--cx-font-scale, 1));
+  color: var(--cx-muted);
+  text-align: center;
+}
+
+.cx-buybox__ultramax-satellite {
+  margin-block-start: 4px;
 }
 
 .cx-buybox__planner-label {

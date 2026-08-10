@@ -126,6 +126,7 @@ const BILLING_ATTEMPT_CREATE_MUTATION = `#graphql
       userErrors {
         field
         message
+        code
       }
     }
   }

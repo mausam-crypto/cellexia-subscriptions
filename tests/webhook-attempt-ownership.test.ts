@@ -61,6 +61,9 @@ vi.mock("~/db.server", () => {
       update: mocks.attemptUpdate,
       updateMany: mocks.attemptUpdateMany,
       findUniqueOrThrow: mocks.attemptFindUniqueOrThrow,
+      // Reconstruction numbers the attempt after the cycle's real history
+      // (max attemptNumber + 1); an empty cycle yields attemptNumber 1.
+      aggregate: async () => ({ _max: { attemptNumber: null } }),
     },
     subscriptionContract: {
       findUnique: mocks.contractFindUnique,

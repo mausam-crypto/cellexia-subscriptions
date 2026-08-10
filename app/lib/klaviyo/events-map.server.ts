@@ -6,6 +6,7 @@ import {
   buildPortalUrl,
 } from "~/lib/magiclinks/builder.server";
 import { formatShopDate } from "~/lib/dates.server";
+import { contractFrequency } from "~/lib/frequency";
 import { formatMoney } from "~/lib/money";
 import { enqueue } from "./outbox.server";
 import { isBillableOwnership } from "~/lib/ownership/ownership.server";
@@ -46,6 +47,13 @@ const EVENT_METRIC_MAP: Record<string, string> = {
   "winback.perk_offered": "Cellexia Winback Perk",
   "winback.discount_offered": "Cellexia Winback Discount",
   "winback.reactivated": "Cellexia Winback Reactivated",
+  // The campaign's terminal signal — the winback engine promises "Klaviyo
+  // suppression keys off winback.sunset", so it must actually cross the feed
+  // boundary (a merchant filtering on this metric otherwise builds a segment
+  // that never populates). Ownership/demo sunsets are refused below like
+  // every other event; the customer opt-out travels as its own event.
+  "winback.sunset": "Cellexia Winback Sunset",
+  "winback.opted_out": "Cellexia Winback Opted Out",
   "lifecycle.milestone_reached": "Cellexia Milestone Reached",
   "lifecycle.rewards_unlocked": "Cellexia Rewards Unlocked",
   "lifecycle.gift_scheduled": "Cellexia Gift Scheduled",
@@ -95,10 +103,16 @@ function payloadString(
 export function contractProfileAttrs(
   contract: ContractWithLines,
 ): Record<string, unknown> {
+  // cellexia_interval_weeks stays the week approximation (additive property
+  // contract); unit/count are the exact cadence, WEEK/intervalWeeks when the
+  // contract has no mirror columns yet.
+  const freq = contractFrequency(contract);
   const attrs: Record<string, unknown> = {
     cellexia_subscription_status: contract.status,
     cellexia_orders_count: contract.ordersCount,
     cellexia_interval_weeks: contract.intervalWeeks,
+    cellexia_interval_unit: freq.unit,
+    cellexia_interval_count: freq.count,
   };
   if (contract.firstName) attrs.first_name = contract.firstName;
   if (contract.lastName) attrs.last_name = contract.lastName;
@@ -129,11 +143,16 @@ export async function contractSnapshotProperties(
   tz: string,
 ): Promise<Record<string, unknown>> {
   const activeLines = contract.lines.filter((l) => !l.isGift);
+  // interval_weeks stays the week approximation (additive property contract);
+  // unit/count are the exact cadence, WEEK/intervalWeeks when no mirror.
+  const freq = contractFrequency(contract);
   const props: Record<string, unknown> = {
     contract_id: contract.id,
     shopify_contract_id: contract.shopifyContractId,
     contract_status: contract.status,
     interval_weeks: contract.intervalWeeks,
+    interval_unit: freq.unit,
+    interval_count: freq.count,
     orders_count: contract.ordersCount,
     currency: contract.currencyCode,
     is_prepaid: contract.isPrepaid,

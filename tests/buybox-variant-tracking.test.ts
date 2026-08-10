@@ -140,6 +140,13 @@ function buildPage(
     /** "select" renders the theme's field as a <select name="id"> with one
         <option> per jar — the dropdown-picker theme shape. Default input. */
     fieldKind?: "input" | "select";
+    /** v1.11.0, the SECOND live Sleepify shape: NO [name="id"] anywhere.
+        The pills carry data-val-id (jar 2's value is padded with trailing
+        whitespace, exactly like the live page) and the theme marks the
+        selected one with class "active"; a bystander widget's row OUTSIDE
+        the picker carries data-variant-id for the current variant and
+        updates on its own schedule. Ignores withForm/fieldKind. */
+    markerTheme?: boolean;
     mutate?: (source: string) => string;
   },
 ): Page {
@@ -182,21 +189,36 @@ function buildPage(
           .join("") +
         "</select>"
       : `<input type="hidden" name="id" value="${mainValue}">`;
-  const idField = options.withForm
-    ? '<form action="/cart/add" method="post">' +
-      mainField +
-      '<button type="submit">Add to cart</button>' +
-      "</form>"
-    : mainField;
+  const idField = options.markerTheme
+    ? ""
+    : options.withForm
+      ? '<form action="/cart/add" method="post">' +
+        mainField +
+        '<button type="submit">Add to cart</button>' +
+        "</form>"
+      : mainField;
+  const packs = options.markerTheme
+    ? '<div class="pdp__packs">' +
+      `<button type="button" class="btn pdp__pack-pill active" data-val-id="${JAR1}">1 Jar</button>` +
+      `<button type="button" class="btn pdp__pack-pill" data-val-id="${JAR2}\n      ">2 Jars - 15% Off</button>` +
+      `<button type="button" class="btn pdp__pack-pill" data-val-id="${JAR3}">3 Jars - 20% Off</button>` +
+      "</div>"
+    : '<div class="pdp__packs">' +
+      '<button type="button" class="pdp__pack-pill">2 Jars - 15% Off</button>' +
+      "</div>";
   parseHtml(
     '<main><div class="shopify-section"><div class="pdp__info">' +
       idField +
-      '<div class="pdp__packs">' +
-      '<button type="button" class="pdp__pack-pill">2 Jars - 15% Off</button>' +
-      "</div>" +
+      packs +
       '<div class="pdp__grey"><div class="pdp__actions"><div class="action--atc">' +
       '<button class="btn btn--primary btn--atc">ADD TO CART - CHF 64.00</button>' +
       "</div></div></div>" +
+      (options.markerTheme
+        ? '<div class="rec-rail">' +
+          `<div class="rec-rail__row" data-variant-id="${JAR1}">Sleep Jar</div>` +
+          '<div class="rec-rail__row" data-variant-id="9999999999901">Serum</div>' +
+          "</div>"
+        : "") +
       "</div></div></main>",
     body,
   );
@@ -668,8 +690,8 @@ describe("<select name=id> pickers — the dropdown-theme shape", () => {
 
   const cutSelectScan = (source: string): string =>
     source.replace(
-      "'input[name=\"id\"], select[name=\"id\"]'",
-      "'input[name=\"id\"]'",
+      "'input[name=\"id\"], select[name=\"id\"], [data-variant-id], [data-val-id], [data-variant]'",
+      "'input[name=\"id\"], [data-variant-id], [data-val-id], [data-variant]'",
     );
 
   it("MUTATION CHECK: with the scan's select half cut, the dropdown theme is missed", () => {
@@ -740,8 +762,8 @@ describe("MUTATION CHECK: the disagreement rules are load-bearing", () => {
   const cutDisagreementRules = (source: string): string =>
     source
       .replace(
-        "if (changedKnown !== null && !changedConflict) {",
-        "if (false && changedKnown !== null && !changedConflict) {",
+        "if (changedField !== null && !changedFieldConflict) {",
+        "if (false && changedField !== null && !changedFieldConflict) {",
       )
       .replace(
         "if (sectionValue !== null && !sectionConflict) {",
@@ -810,5 +832,199 @@ describe("MUTATION CHECK: the poll backstop is load-bearing", () => {
     themeSwitches(page, JAR2, M.jar2.oneTime, { click: true });
     page.flush();
     expect(page.state()).toMatchObject({ variantId: JAR2 });
+  });
+});
+
+/**
+ * v1.11.0 — THE SECOND LIVE SLEEPIFY DEFECT (the one-click-behind widget).
+ *
+ * The client's PDP changed shape: there is NO [name="id"] field anywhere any
+ * more. The size pills carry the variant id only as a data-val-id ATTRIBUTE
+ * (one of them padded with trailing whitespace, verbatim from the live
+ * page), the theme paints the selection by moving an "active" class between
+ * the pills, and the only other page-level signal is a bystander widget's
+ * recommendation row whose data-variant-id tracks the current variant — on
+ * ITS OWN schedule.
+ *
+ * Observed live: the widget followed that bystander row through a one-shot
+ * re-read that raced its update, so every pill click left the widget quoting
+ * the PREVIOUS variant's prices — "select 1 jar, see 2 jars' subscription
+ * price" — with nothing ever correcting it. The fix teaches the scan the
+ * marker vocabulary (data-variant-id / data-val-id / data-variant, trimmed)
+ * and ranks the evidence: a value that CHANGED since the last read, then
+ * real [name=id] fields, then the theme's own active-selection paint, then
+ * passive bystander markers — and an unpicked swatch is never evidence at
+ * all. These tests drive the REAL buy-box.js over that exact page shape.
+ */
+describe("marker theme (data-val-id pills + bystander row) — v1.11.0", () => {
+  function pills(page: Page): ElementNode[] {
+    return page.document.querySelectorAll(".pdp__pack-pill");
+  }
+
+  function bystanderRow(page: Page): ElementNode {
+    return page.document.querySelector(".rec-rail__row") as ElementNode;
+  }
+
+  const JAR_KEYS = ["jar1", "jar2", "jar3"] as const;
+
+  /** The theme's click, exactly as the live page performs it: the active
+      class moves and the theme rewrites its OWN button label synchronously
+      in its own handler; the bystander row follows ~100ms later (its own
+      AJAX/render cycle). */
+  function themePillClick(
+    page: Page,
+    index: number,
+    options: { bystanderDelayMs?: number | null; bystanderTo?: string } = {},
+  ): void {
+    const all = pills(page);
+    for (const pill of all) {
+      pill.setAttribute("class", "btn pdp__pack-pill");
+    }
+    all[index].setAttribute("class", "btn pdp__pack-pill active");
+    page.atcText.nodeValue = `ADD TO CART - ${M[JAR_KEYS[index]].oneTime}`;
+    const delay = options.bystanderDelayMs;
+    if (delay !== null) {
+      const to =
+        options.bystanderTo ??
+        (all[index].getAttribute("data-val-id") ?? "").trim();
+      scheduleTimer(() => {
+        bystanderRow(page).setAttribute("data-variant-id", to);
+      }, delay ?? 100);
+    }
+    all[index].dispatchEvent(new EventShim("click", { bubbles: true }));
+  }
+
+  it("boots on jar 1 with the poll armed, agreeing with the active pill", () => {
+    const page = buildPage(CLASSIC_MARKUP, { withForm: false, markerTheme: true });
+    expect(page.state()).toMatchObject({ variantId: JAR1 });
+    expectClassicPrices(page, "jar1");
+    expect(page.intervalDelays()).toContain(600);
+  });
+
+  it("the ACTIVE pill drives the widget — and the padded data-val-id is trimmed", () => {
+    const page = buildPage(CLASSIC_MARKUP, { withForm: false, markerTheme: true });
+    // Jar 2's pill ships its id with trailing whitespace inside the
+    // attribute, verbatim from the live page.
+    expect(pills(page)[1].getAttribute("data-val-id")).not.toBe(JAR2);
+    expect((pills(page)[1].getAttribute("data-val-id") ?? "").trim()).toBe(JAR2);
+
+    themePillClick(page, 1);
+    page.flush();
+    expect(page.state()).toMatchObject({ variantId: JAR2 });
+    expectClassicPrices(page, "jar2");
+  });
+
+  it("a selection painted with NO interaction at all is caught by the poll", () => {
+    const page = buildPage(CLASSIC_MARKUP, { withForm: false, markerTheme: true });
+    const all = pills(page);
+    for (const pill of all) pill.setAttribute("class", "btn pdp__pack-pill");
+    all[2].setAttribute("class", "btn pdp__pack-pill active");
+    page.atcText.nodeValue = `ADD TO CART - ${M.jar3.oneTime}`;
+    page.pollTick();
+    expect(page.state()).toMatchObject({ variantId: JAR3 });
+    expectClassicPrices(page, "jar3");
+  });
+
+  it("THE DEFECT, fixed: a stale bystander row never drags the widget one click behind", () => {
+    const page = buildPage(CLASSIC_MARKUP, { withForm: false, markerTheme: true });
+
+    // Select 2 jars; the bystander row still says jar 1 until +100ms.
+    themePillClick(page, 1, { bystanderDelayMs: 100 });
+    page.flush();
+    expect(page.state()).toMatchObject({ variantId: JAR2 });
+    expectClassicPrices(page, "jar2");
+
+    // …and back to 1 jar; the row still says jar 2 until +100ms. This is
+    // the exact click sequence observed live ("select 1 jar, see the 2-jar
+    // subscription price").
+    themePillClick(page, 0, { bystanderDelayMs: 100 });
+    page.flush();
+    expect(page.state()).toMatchObject({ variantId: JAR1 });
+    expectClassicPrices(page, "jar1");
+  });
+
+  it("a bystander settling LATE to the PREVIOUS variant cannot yank the widget back", () => {
+    // The review-confirmed residual of the one-behind defect: quick clicks
+    // pill 2 → pill 3, and the bystander row — which still remembered jar 1 —
+    // settles to jar 2 (the PREVIOUS selection) long after the click
+    // re-reads ran. Its change is the only "changed" signal at the next
+    // poll, but a change competes only within its own tier: the unchanged
+    // active pill (jar 3) the shopper is looking at must win.
+    const page = buildPage(CLASSIC_MARKUP, { withForm: false, markerTheme: true });
+
+    themePillClick(page, 1, { bystanderDelayMs: null });
+    page.flush();
+    expect(page.state()).toMatchObject({ variantId: JAR2 });
+
+    themePillClick(page, 2, { bystanderDelayMs: 1500, bystanderTo: JAR2 });
+    page.flush();
+    expect(page.state()).toMatchObject({ variantId: JAR3 });
+
+    page.pollTick();
+    expect(page.state()).toMatchObject({ variantId: JAR3 });
+    expectClassicPrices(page, "jar3");
+  });
+
+  it("a bystander row alone (no active paint) is still honoured as weakest evidence", () => {
+    const page = buildPage(CLASSIC_MARKUP, { withForm: false, markerTheme: true });
+    // A theme variant with no is-active convention: nothing is painted.
+    for (const pill of pills(page)) {
+      pill.setAttribute("class", "btn pdp__pack-pill");
+    }
+    // The row moves to jar 3 (a carousel, a bundle preview, …).
+    bystanderRow(page).setAttribute("data-variant-id", JAR3);
+    page.pollTick();
+    expect(page.state()).toMatchObject({ variantId: JAR3 });
+  });
+
+  it("a bystander row switching to an unknown numeric id can NEVER park the widget", () => {
+    const page = buildPage(CLASSIC_MARKUP, { withForm: false, markerTheme: true });
+    // The row previously held one of OUR ids; now it names a variant the
+    // island has no row for (another product, or the bystander reshuffling).
+    // A FIELD doing this parks the widget (un-synced variant); a mere marker
+    // must not — it is not evidence about this product's catalogue.
+    bystanderRow(page).setAttribute("data-variant-id", "9999999999902");
+    page.pollTick();
+    expect(page.widget.getAttribute("data-cellexia-unsynced")).toBeNull();
+    expect(page.widget.hasAttribute("hidden")).toBe(false);
+    expect(page.state()).toMatchObject({ variantId: JAR1 });
+  });
+
+  const neuterActivePaint = (source: string): string =>
+    source.replace(
+      "function markerActive(el) {",
+      "function markerActive(el) { if (1) return false;",
+    );
+
+  const cutSecondClickReRead = (source: string): string =>
+    source.replace(
+      /window\.setTimeout\(function \(\) \{\n\s*reReadVariant\(true\);\n\s*\}, 350\);/,
+      "",
+    );
+
+  it("MUTATION CHECK: with the active tier + late re-read cut, the live defect returns", () => {
+    const page = buildPage(CLASSIC_MARKUP, {
+      withForm: false,
+      markerTheme: true,
+      mutate: (source) => cutSecondClickReRead(neuterActivePaint(source)),
+    });
+    expect(page.sourceChanged).toBe(true);
+
+    themePillClick(page, 1, { bystanderDelayMs: 100 });
+    page.flush();
+    // One click behind: the only evidence left at re-read time was the
+    // stale bystander row — exactly what the live store showed.
+    expect(page.state()).toMatchObject({ variantId: JAR1 });
+
+    // …and even in the mutant, the 600ms poll eventually catches the row's
+    // own change: the layers are independent nets, not one mechanism.
+    page.pollTick();
+    expect(page.state()).toMatchObject({ variantId: JAR2 });
+  });
+
+  it("MUTATION CHECK: both mutations rewrite the source they claim to rewrite", () => {
+    const original = readFileSync(BUY_BOX_JS, "utf8");
+    expect(neuterActivePaint(original)).not.toBe(original);
+    expect(cutSecondClickReRead(original)).not.toBe(original);
   });
 });

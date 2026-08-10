@@ -755,6 +755,8 @@ interface ReclassifyRow {
   id: string;
   ownership: string;
   shopifyContractId: string;
+  customerId: string;
+  email: string;
   lines: Array<{ sellingPlanId: string | null }>;
 }
 
@@ -762,6 +764,9 @@ const RECLASSIFY_SELECT = {
   id: true,
   ownership: true,
   shopifyContractId: true,
+  // Identity fields for the reclassification audit event only.
+  customerId: true,
+  email: true,
   lines: { select: { sellingPlanId: true } },
 } as const;
 
@@ -774,6 +779,7 @@ type SyncContractFn = (
 /** Mutable state shared by every contract in one run. */
 interface ReclassifyPass {
   shopDomain: string;
+  shopId: string;
   evidence: OwnPlanIdEvidence;
   fetchMissing: boolean;
   result: ReclassifyResult;
@@ -849,6 +855,27 @@ async function reclassifyOne(
       data: { ownership: next },
     });
     pass.result.changed += 1;
+    // Ownership decides COUNTABLE_CONTRACT membership — the population of
+    // every metric — so a repair pass moving a contract in or out must leave
+    // the same audit trail every other ownership writer does (the sync's
+    // synced_from_shopify payload, claimContracts' claim event). Without it
+    // a reclassify run retroactively shifted MRR/churn/funnel with nothing
+    // in the event stream to explain the step.
+    await logEvent({
+      shopId: pass.shopId,
+      contractId: contract.id,
+      customerId: contract.customerId,
+      email: contract.email,
+      type: "contract.updated",
+      source: "SYSTEM",
+      actor: "system",
+      payload: {
+        action: "ownership_reclassified",
+        shopifyContractId: contract.shopifyContractId,
+        ownership: next,
+        previousOwnership: contract.ownership,
+      },
+    });
   }
 }
 
@@ -912,6 +939,7 @@ export async function reclassifyContracts(
 
   const pass: ReclassifyPass = {
     shopDomain,
+    shopId,
     evidence: await getOwnPlanIdEvidence(shopId),
     fetchMissing: options.fetchMissing ?? true,
     result: emptyResult(),
@@ -977,6 +1005,7 @@ export async function reclassifyAllContracts(
 
   const pass: ReclassifyPass = {
     shopDomain,
+    shopId,
     evidence: await getOwnPlanIdEvidence(shopId),
     fetchMissing: options.fetchMissing ?? true,
     result: emptyResult(),

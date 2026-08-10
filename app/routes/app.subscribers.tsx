@@ -34,6 +34,7 @@ import { authenticate } from "~/shopify.server";
 import { getPrimaryShop } from "~/lib/shop/install.server";
 import { logEvent } from "~/lib/events/log.server";
 import { csvEscape } from "~/lib/csv.server";
+import { contractFrequency, frequencyLabelEn } from "~/lib/frequency";
 import { formatMoney } from "~/lib/money";
 import {
   CREATED_ID_ASC,
@@ -107,6 +108,9 @@ interface SubscriberRow {
   status: string;
   itemsSummary: string;
   intervalWeeks: number;
+  /** Exact cadence mirror — null on rows predating v1.8.0 (contractFrequency falls back to intervalWeeks). */
+  billingIntervalUnit: string | null;
+  billingIntervalCount: number | null;
   nextBillingDate: string | null;
   ordersCount: number;
   lifetimeRevenue: string;
@@ -250,6 +254,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       status: c.status,
       itemsSummary: itemsSummary || "No items",
       intervalWeeks: c.intervalWeeks,
+      billingIntervalUnit: c.billingIntervalUnit,
+      billingIntervalCount: c.billingIntervalCount,
       nextBillingDate: c.nextBillingDate ? c.nextBillingDate.toISOString() : null,
       ordersCount: c.ordersCount,
       lifetimeRevenue: formatMoney(c.lifetimeRevenueCents, c.currencyCode),
@@ -569,6 +575,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         "ownership",
         "items",
         "createdAt",
+        // Additive export contract: intervalWeeks stays exactly where it was;
+        // the exact cadence mirror is appended at the end (empty pre-v1.8.0).
+        "billingIntervalUnit",
+        "billingIntervalCount",
       ];
       const lines = contracts.map((c) =>
         [
@@ -586,6 +596,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           c.ownership,
           c.lines.map((l) => `${l.quantity}x ${l.title}`).join("; "),
           c.createdAt.toISOString(),
+          c.billingIntervalUnit ?? "",
+          c.billingIntervalCount ?? "",
         ]
           .map(csvEscape)
           .join(","),
@@ -1034,7 +1046,7 @@ export default function SubscribersPage() {
                     {row.itemsSummary}
                   </Text>
                 </IndexTable.Cell>
-                <IndexTable.Cell>Every {row.intervalWeeks} wk</IndexTable.Cell>
+                <IndexTable.Cell>{frequencyLabelEn(contractFrequency(row))}</IndexTable.Cell>
                 <IndexTable.Cell>{formatDate(row.nextBillingDate)}</IndexTable.Cell>
                 <IndexTable.Cell>{row.ordersCount}</IndexTable.Cell>
                 <IndexTable.Cell>{row.lifetimeRevenue}</IndexTable.Cell>

@@ -76,6 +76,9 @@ vi.mock("~/db.server", () => {
       update: mocks.attemptUpdate,
       updateMany: mocks.attemptUpdateMany,
       findUniqueOrThrow: mocks.attemptFindUniqueOrThrow,
+      // Reconstruction numbers the attempt after the cycle's real history
+      // (max attemptNumber + 1); an empty cycle yields attemptNumber 1.
+      aggregate: async () => ({ _max: { attemptNumber: null } }),
     },
     subscriptionContract: {
       findUnique: mocks.contractFindUnique,
@@ -305,10 +308,11 @@ describe("a reconstructed billing attempt on a cycle-diverged contract", () => {
         OR: [{ addonCycleIndex: 5 }, { addonCycleIndex: null }],
       },
     });
-    // Same space for the gift ADDED → SHIPPED flip.
+    // Same space for the gift ADDED → SHIPPED flip; the flip stamps
+    // shippedAt so the ship fact survives later REMOVED hygiene (SP-12).
     expect(mocks.giftUpdateMany).toHaveBeenCalledWith({
       where: { contractId: "c_1", cycleIndex: 5, status: "ADDED" },
-      data: { status: "SHIPPED" },
+      data: { status: "SHIPPED", shippedAt: expect.any(Date) },
     });
   });
 

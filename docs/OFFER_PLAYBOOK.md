@@ -65,18 +65,25 @@ math so analytics stay honest).
 
 Arbitrary monthly billing is the silent churn machine: ship faster than the
 customer empties the jar and you *manufacture* "too much product" cancels.
-Default cadence is **8 weeks** because that is the honest empty date of our
-hero SKUs — not because a calendar month is tidy.
+Since v1.8.0 a cadence can be expressed in **days, weeks or months** — and one
+plan group can mix them — but the unit is presentation, not policy: pick every
+cadence from the real days-to-empty, never from calendar tidiness. Default
+cadence is **8 weeks** because that is the honest empty date of our hero SKUs.
+"Every 1 month" is now expressible exactly (month cadences bill on the same
+calendar day each month, clamped at month-end, instead of drifting like
+4-weekly) — use it *only* for a product that genuinely empties in ~30 days,
+not because the number looks tidy on a spreadsheet.
 
 Fill this table per product and enter it on the cadence config
 (`ProductCadence`; drives the recommended frequency, the buy-box default, and
 win-back timing):
 
-| Product | Size | Daily-use dose | Est. days to empty | Recommended weeks |
+| Product | Size | Daily-use dose | Est. days to empty | Recommended cadence |
 |---|---|---|---|---|
-| (e.g. Renewal Serum) | 30 ml | 0.5 ml AM | ~60 | 8 |
-| (e.g. Night Cream) | 50 ml | 1 g PM | ~50 | 7 → offer 6 or 8 |
-| (e.g. Cleanser) | 150 ml | 2× daily | ~75 | 10 |
+| (e.g. Renewal Serum) | 30 ml | 0.5 ml AM | ~60 | 8 weeks (or 2 months) |
+| (e.g. Night Cream) | 50 ml | 1 g PM | ~50 | 7 weeks → offer 6 or 8 |
+| (e.g. Ampoule kit) | 10 × 2 ml | 1 per day | ~10 | 10 days |
+| (e.g. Cleanser) | 150 ml | 2× daily | ~75 | 10 weeks |
 | … | | | | |
 
 Rules of thumb: round the frequency **up** (slightly late beats slightly early —
@@ -223,7 +230,7 @@ Run one at a time; judge on take-rate × cycle-3 survival × LTGP, not clicks.
 
 <a name="buy-box-design"></a>
 
-The admin **Buy box designer** offers seven PDP presets. All share the same
+The admin **Buy box designer** offers eight PDP presets. All share the same
 selling-plan wiring and pricing truth (savings always computed from the real
 selling-plan allocation); they differ only in persuasion architecture. "Risk"
 below is risk to **overall PDP conversion**, not to take-rate — heavier
@@ -239,6 +246,7 @@ persuasion modules can lift take-rate while costing cold-traffic conversions.
 | **value_stack** — Value stack | Headline price plus a check-mark benefit list (first-order discount, ongoing discount, milestone gift, cancel anytime), with one-time demoted to a quiet "or buy once for {amount}" text link. Highest expected take-rate on warm, high-consideration traffic — but demoting one-time is a real CVR risk on cold traffic that never intended to subscribe. Measure CVR, not just take-rate. | medium |
 | **planner** — Routine planner | Frequency chips first (with a "Recommended" tag on the plan default) and per-delivery pricing — sells the cadence, not the discount, framing the subscription as a routine decision. Engaging for consumables with a well-understood usage rhythm, but the chips ask for a decision that can stall shoppers with no idea of their cadence. | medium |
 | **subscription_max** — Subscription max (v1.6.0) | The subscription card *is* the buy box: one clear way to buy, zero decision fatigue. One-time stays real, priced and one tap away as a quiet underlined link below the card. Purely presentational — no extra perks or discounts implied. Highest take-rate posture; demoting one-time is a real CVR risk on cold traffic. See the dedicated section below. | medium |
+| **subscription_ultra_max** — Subscription ultra max (v1.11.0) | Subscription max taken to its logical end: the card loses every piece of offer chrome — no border, no tint, no badge, no savings pill, no reassurance line by default — so the subscription price reads exactly like the product's price, not like a special plan being sold. The recurring cadence line stays visible (recurrence disclosure is never optional), and the priced one-time link stays one tap away — relocated below the entire buy area, where only a shopper actively looking for it will find it. Maximum posture means maximum accountability: watch PDP conversion AND refund/cancel quality, not just take-rate. See the dedicated section below. | medium |
 
 **Recommended path.** Start with **classic** (your measured baseline) or
 **toggle** (compact, low risk, mobile-native). If you will not risk a single
@@ -370,6 +378,34 @@ you preselect the subscription, keep it visually first, keep the full
 recurring terms ("then X every Y weeks") and the reassurance line visible
 before add-to-cart, and keep cancellation at ≤3 steps — see the cancel-flow
 compliance note in [§6](#save-ladder-ethics).
+
+### Subscription Ultra Max — the plain-buy-box posture
+
+<a name="subscription-ultra-max"></a>
+
+**What it is.** Subscription Max taken to its logical end (v1.11.0): the
+card loses every piece of offer chrome — no border, no tint, no badge, no
+savings pill, no reassurance line by default (each re-enableable in the
+designer) — so the subscription price reads exactly like the product's
+price, not like a special plan being sold. The recurring "then {price}
+every {frequency}" line always stays: recurrence disclosure is never
+optional. The one-time option stays real, **priced in the link before
+selection** and reachable in one tap — relocated below the entire buy area
+(quantity, add to cart, guarantees), where only a shopper actively looking
+for it will find it. That is the compliance boundary holding: quiet ≠
+hidden, exactly as in Subscription Max.
+
+**When to use it.** Warm traffic on a hero product where subscription *is*
+the intended default and one-time is the exception — typically a market
+where Subscription Max already performs. It is never an opening move on
+cold acquisition.
+
+**The accountability warning.** Maximum posture means maximum
+accountability: watch PDP conversion **and refund/cancel quality**, not
+just take-rate — shoppers who did not understand they subscribed are
+expensive (refunds, cycle-1 cancels, support load, trust). Roll it out per
+market with the Subscription Max methodology above, and judge per §7 on
+cohort LTGP.
 
 ## 10. Reading your analytics — the weekly review
 

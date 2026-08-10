@@ -66,7 +66,7 @@ assign cx_cfg = shop.metafields.cellexia.buybox_design.value
 assign cx_source = design_source | default: 'app'
 assign cx_preset = 'classic'
 assign cx_use_cfg = false
-assign cx_known_presets = 'classic toggle tiles inline value_stack planner subscription_max' | split: ' '
+assign cx_known_presets = 'classic toggle tiles inline value_stack planner subscription_max subscription_ultra_max' | split: ' '
 if cx_source != blank and cx_source != 'app'
 assign cx_preset = cx_source
 elsif cx_cfg and cx_cfg.preset
@@ -170,10 +170,14 @@ assign cx_show_reassurance = show_reassurance
 assign cx_show_benefits = false
 assign cx_benefit_count = 4
 assign cx_show_freq = show_frequency_selector
-# subscription_max defaults (v1.6.0): quiet — badge and frequency selector OFF unless the config re-enables them.
-if cx_preset == 'subscription_max'
+# subscription_max defaults (v1.6.0): quiet — badge and frequency selector OFF unless the config re-enables them. subscription_ultra_max (v1.11.0) goes further: savings and reassurance quiet too, so the card reads as the plain, normal way of buying (the recurring then-line stays — recurrence disclosure is not optional).
+if cx_preset == 'subscription_max' or cx_preset == 'subscription_ultra_max'
 assign cx_show_badge = false
 assign cx_show_freq = false
+endif
+if cx_preset == 'subscription_ultra_max'
+assign cx_show_savings = false
+assign cx_show_reassurance = false
 endif
 if cx_use_cfg and cx_cfg.layout
 assign cx_l = cx_cfg.layout
@@ -201,6 +205,8 @@ assign cx_show_badge = true
 endif
 if cx_l.showSavings == false
 assign cx_show_savings = false
+elsif cx_l.showSavings == true
+assign cx_show_savings = true
 endif
 if cx_l.showPerDelivery == false
 assign cx_show_pd = false
@@ -250,6 +256,13 @@ assign cx_sub_checked = false
 endif
 if cx_cfg.behavior.animation == false
 assign cx_anim = false
+endif
+endif
+# subscription_ultra_max preselects the subscription unless the config explicitly asks for one_time: the card IS the normal way of buying.
+if cx_preset == 'subscription_ultra_max'
+assign cx_sub_checked = true
+if cx_use_cfg and cx_cfg.behavior and cx_cfg.behavior.preselect == 'one_time'
+assign cx_sub_checked = false
 endif
 endif
 if product.requires_selling_plan
@@ -325,6 +338,19 @@ assign cx_lc_reassurance_raw = 'reassurance' | t | replace: '&lt;', '<' | replac
 assign cx_lc_freq_label_raw = 'frequency_label' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
 assign cx_lc_delivery_every_raw = 'delivery_every' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
 assign cx_lc_weeks_raw = 'weeks' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign cx_lc_week_raw = 'week' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign cx_lc_days_raw = 'days' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign cx_lc_day_raw = 'day' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign cx_lc_months_raw = 'months' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign cx_lc_month_raw = 'month' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+# Full every-phrases carry their own determiner per unit so gendered or case-marked languages stay grammatical (French tous vs toutes); numbers substitute into the inert marker after the single unescape.
+assign cx_lc_every_day_raw = 'every_day' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign cx_lc_every_days_raw = 'every_days' | t: count: '{n}' | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign cx_lc_every_week_raw = 'every_week' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign cx_lc_every_weeks_raw = 'every_weeks' | t: count: '{n}' | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign cx_lc_every_month_raw = 'every_month' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign cx_lc_every_months_raw = 'every_months' | t: count: '{n}' | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
+assign cx_lc_delivery_freq_raw = 'delivery_freq' | t: frequency: '{f}' | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
 assign cx_lc_first_order_raw = 'first_order' | t | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
 assign cx_lc_buy_once_raw = 'or_buy_once' | t: amount: '{amount}' | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
 assign cx_lc_buy_once_quiet_raw = 'or_buy_once_quiet' | t: amount: '{amount}' | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
@@ -337,39 +363,60 @@ assign cx_lc_benefits_raw = cx_lc_benefits_joined | replace: '&lt;', '<' | repla
 # SAFE locale strings printed as-is.
 assign cx_lc_per_delivery = 'per_delivery' | t
 assign cx_recommended_label = 'recommended_tag' | t
-# Frequency label for the SELECTED plan (was cx-freq-label): week count from options, else name; month plans and week-count 1 keep the raw plan name. RAW in, RAW out.
-assign cx_fl_weeks = 0
-for cx_fl_opt in cx_selected_plan.options
-assign cx_fl_val = cx_fl_opt.value | downcase
-if cx_fl_val contains 'week'
-assign cx_fl_cand = cx_fl_val | split: ' ' | first | plus: 0
-if cx_fl_cand > 0
-assign cx_fl_weeks = cx_fl_cand
-break
+# Frequency label for the SELECTED plan (was cx-freq-label): count + localized unit noun parsed from options/name ("Every 10 days" / "Every 2 weeks" / "Every 1 month" — the app's own plan vocabulary, see planOptionValue in app/lib/frequency.ts); unparseable plans keep the raw plan name. RAW in, RAW out.
+assign cx_fl_n = 0
+assign cx_fl_noun = ''
+assign cx_fl_noun1 = ''
+assign cx_fl_ph1 = ''
+assign cx_fl_phn = ''
+assign cx_fl_src = cx_selected_plan.options | map: 'value' | join: ' ' | append: ' ' | append: cx_selected_plan.name | downcase
+if cx_fl_src contains 'prepay'
+# prepaid keeps its raw plan name: a bare "8 weeks" label would be indistinguishable from the plain plan of the same cadence
+elsif cx_fl_src contains 'week'
+assign cx_fl_noun = cx_lc_weeks_raw
+assign cx_fl_noun1 = cx_lc_week_raw
+assign cx_fl_ph1 = cx_lc_every_week_raw
+assign cx_fl_phn = cx_lc_every_weeks_raw
+elsif cx_fl_src contains 'day'
+assign cx_fl_noun = cx_lc_days_raw
+assign cx_fl_noun1 = cx_lc_day_raw
+assign cx_fl_ph1 = cx_lc_every_day_raw
+assign cx_fl_phn = cx_lc_every_days_raw
+elsif cx_fl_src contains 'month'
+assign cx_fl_noun = cx_lc_months_raw
+assign cx_fl_noun1 = cx_lc_month_raw
+assign cx_fl_ph1 = cx_lc_every_month_raw
+assign cx_fl_phn = cx_lc_every_months_raw
 endif
-endif
-endfor
-if cx_fl_weeks == 0
-assign cx_fl_name = cx_selected_plan.name | downcase
-if cx_fl_name contains 'week'
-assign cx_fl_tokens = cx_fl_name | split: ' '
-for cx_fl_tok in cx_fl_tokens
+if cx_fl_noun != ''
+assign cx_fl_toks = cx_fl_src | split: ' '
+for cx_fl_tok in cx_fl_toks
 assign cx_fl_cand = cx_fl_tok | plus: 0
 if cx_fl_cand > 0
-assign cx_fl_weeks = cx_fl_cand
+assign cx_fl_n = cx_fl_cand
 break
 endif
 endfor
 endif
+if cx_fl_n == 1
+assign cx_fl_noun = cx_fl_noun1
 endif
-if cx_fl_weeks > 1
-assign cx_freq_raw = cx_fl_weeks | append: ' ' | append: cx_lc_weeks_raw
-assign cx_freq_full_raw = cx_lc_delivery_every_raw | append: ' ' | append: cx_freq_raw
+# cx_freq_raw stays the BARE "10 days" (the merchant-template frequency placeholder contract); cx_freq_every_raw is the full localized every-phrase used wherever the label sits inside a sentence.
+if cx_fl_n > 0
+assign cx_freq_raw = cx_fl_n | append: ' ' | append: cx_fl_noun
+if cx_fl_n == 1
+assign cx_freq_every_raw = cx_fl_ph1
+else
+assign cx_freq_every_raw = cx_fl_phn | replace: '{n}', cx_fl_n
+endif
+assign cx_freq_full_raw = cx_lc_delivery_freq_raw | replace: '{f}', cx_freq_every_raw
 else
 assign cx_freq_raw = cx_selected_plan.name
+assign cx_freq_every_raw = cx_selected_plan.name
 assign cx_freq_full_raw = cx_selected_plan.name
 endif
 assign cx_freq = cx_freq_raw | escape
+assign cx_freq_every = cx_freq_every_raw | escape
 assign cx_freq_full = cx_freq_full_raw | escape
 # Template values for the percent, amount and frequency placeholders — all three inject into SAFE strings AFTER the single escape.
 assign cx_save_cents = cx_variant.price | minus: cx_first
@@ -387,7 +434,7 @@ assign cx_then = ''
 if cx_ongoing != cx_first
 assign cx_ongoing_fmt = cx_ongoing | money | strip_html
 assign cx_then = 'then_price' | t: price: '{price}', frequency: '{frequency}'
-assign cx_then = cx_then | replace: '{price}', cx_ongoing_fmt | replace: '{frequency}', cx_freq | strip
+assign cx_then = cx_then | replace: '{price}', cx_ongoing_fmt | replace: '{frequency}', cx_freq_every | strip
 endif
 # "Save X" for the current allocation (SAFE); a percentage rounding below 1% degrades to the absolute amount.
 assign cx_savings_format = savings_format | default: 'percent'
@@ -424,15 +471,21 @@ assign cx_money_sub = ''
 if cx_alloc
 assign cx_money_sub = cx_first | money | strip_html | replace: '"', '&quot;'
 endif
-# Feature flag + optional selector (config themeSync); a missing key means ON.
+# Feature flags + optional selectors (config themeSync); a missing key means ON. syncMainPrice (v1.11.0) extends the same swap to the theme's main price display.
 assign cx_price_sync = true
+assign cx_price_sync_main = true
 assign cx_price_selector_raw = ''
+assign cx_main_selector_raw = ''
 if cx_use_cfg and cx_cfg.themeSync
 if cx_cfg.themeSync.syncAddToCartPrice == false
 assign cx_price_sync = false
 endif
+if cx_cfg.themeSync.syncMainPrice == false
+assign cx_price_sync_main = false
+endif
 # Server-sanitized (sanitizePlacementSelector); replaces are an idempotent belt.
 assign cx_price_selector_raw = cx_cfg.themeSync.priceSelector | default: '' | replace: '<', '' | replace: '>', '' | replace: '"', '' | replace: "'", '' | strip
+assign cx_main_selector_raw = cx_cfg.themeSync.mainPriceSelector | default: '' | replace: '<', '' | replace: '>', '' | replace: '"', '' | replace: "'", '' | strip
 endif
 # Config text lookup tables (locale, then en, then default)
 assign cx_t_loc = false
@@ -450,8 +503,8 @@ endif
 if cx_heading_raw == blank and cx_t_en
 assign cx_heading_raw = cx_t_en.heading | default: '' | strip
 endif
-if cx_heading_raw == blank and cx_preset != 'subscription_max'
-# subscription_max skips the block-setting fallback: its heading defaults to empty (config override still wins).
+if cx_heading_raw == blank and cx_preset != 'subscription_max' and cx_preset != 'subscription_ultra_max'
+# subscription_max and subscription_ultra_max skip the block-setting fallback: their heading defaults to empty (config override still wins).
 assign cx_heading_raw = heading | default: ''
 endif
 assign cx_heading = cx_heading_raw | escape | replace: '{percent}', cx_pct | replace: '{amount}', cx_amount | replace: '{frequency}', cx_freq | replace: '  ', ' ' | strip
@@ -567,7 +620,7 @@ assign cx_first_line_raw = cx_lc_first_order_raw
 endif
 assign cx_first_line = cx_first_line_raw | escape | replace: '{percent}', cx_pct | replace: '{amount}', cx_amount | replace: '{frequency}', cx_freq | replace: '  ', ' ' | strip
 # oneTimeLinkLabel — value_stack escape hatch and subscription_max quiet line; the default embeds the amount so the one-time price is visible BEFORE selection (compliance guardrail).
-if cx_preset == 'subscription_max'
+if cx_preset == 'subscription_max' or cx_preset == 'subscription_ultra_max'
 assign cx_onetime_link_default_raw = cx_lc_buy_once_quiet_raw
 else
 assign cx_onetime_link_default_raw = cx_lc_buy_once_raw
@@ -606,32 +659,37 @@ endif
 {%- for p in cx_group.selling_plans -%}
 {%- liquid
 # cx-freq-label (inlined) — see the selected-plan copy above.
-assign cx_fl_weeks = 0
-for cx_fl_opt in p.options
-assign cx_fl_val = cx_fl_opt.value | downcase
-if cx_fl_val contains 'week'
-assign cx_fl_cand = cx_fl_val | split: ' ' | first | plus: 0
-if cx_fl_cand > 0
-assign cx_fl_weeks = cx_fl_cand
-break
+assign cx_fl_n = 0
+assign cx_fl_noun = ''
+assign cx_fl_noun1 = ''
+assign cx_fl_src = p.options | map: 'value' | join: ' ' | append: ' ' | append: p.name | downcase
+if cx_fl_src contains 'prepay'
+# prepaid keeps its raw plan name: a bare "8 weeks" label would be indistinguishable from the plain plan of the same cadence
+elsif cx_fl_src contains 'week'
+assign cx_fl_noun = cx_lc_weeks_raw
+assign cx_fl_noun1 = cx_lc_week_raw
+elsif cx_fl_src contains 'day'
+assign cx_fl_noun = cx_lc_days_raw
+assign cx_fl_noun1 = cx_lc_day_raw
+elsif cx_fl_src contains 'month'
+assign cx_fl_noun = cx_lc_months_raw
+assign cx_fl_noun1 = cx_lc_month_raw
 endif
-endif
-endfor
-if cx_fl_weeks == 0
-assign cx_fl_name = p.name | downcase
-if cx_fl_name contains 'week'
-assign cx_fl_tokens = cx_fl_name | split: ' '
-for cx_fl_tok in cx_fl_tokens
+if cx_fl_noun != ''
+assign cx_fl_toks = cx_fl_src | split: ' '
+for cx_fl_tok in cx_fl_toks
 assign cx_fl_cand = cx_fl_tok | plus: 0
 if cx_fl_cand > 0
-assign cx_fl_weeks = cx_fl_cand
+assign cx_fl_n = cx_fl_cand
 break
 endif
 endfor
 endif
+if cx_fl_n == 1
+assign cx_fl_noun = cx_fl_noun1
 endif
-if cx_fl_weeks > 1
-assign cx_chip_raw = cx_fl_weeks | append: ' ' | append: cx_lc_weeks_raw
+if cx_fl_n > 0
+assign cx_chip_raw = cx_fl_n | append: ' ' | append: cx_fl_noun
 else
 assign cx_chip_raw = p.name
 endif
@@ -661,34 +719,40 @@ data-cellexia-freq-chip
 <select id="cx-freq-{{ uid }}" class="cx-buybox__freq-select" data-cellexia-freq>
 {%- for p in cx_group.selling_plans -%}
 {%- liquid
-# cx-freq-label (inlined), 'select' variant: full sentence.
-assign cx_fl_weeks = 0
-for cx_fl_opt in p.options
-assign cx_fl_val = cx_fl_opt.value | downcase
-if cx_fl_val contains 'week'
-assign cx_fl_cand = cx_fl_val | split: ' ' | first | plus: 0
-if cx_fl_cand > 0
-assign cx_fl_weeks = cx_fl_cand
-break
+# cx-freq-label (inlined), 'select' variant: full sentence via the every-phrase (unit-correct grammar in gendered languages).
+assign cx_fl_n = 0
+assign cx_fl_ph1 = ''
+assign cx_fl_phn = ''
+assign cx_fl_src = p.options | map: 'value' | join: ' ' | append: ' ' | append: p.name | downcase
+if cx_fl_src contains 'prepay'
+# prepaid keeps its raw plan name: a bare "8 weeks" label would be indistinguishable from the plain plan of the same cadence
+elsif cx_fl_src contains 'week'
+assign cx_fl_ph1 = cx_lc_every_week_raw
+assign cx_fl_phn = cx_lc_every_weeks_raw
+elsif cx_fl_src contains 'day'
+assign cx_fl_ph1 = cx_lc_every_day_raw
+assign cx_fl_phn = cx_lc_every_days_raw
+elsif cx_fl_src contains 'month'
+assign cx_fl_ph1 = cx_lc_every_month_raw
+assign cx_fl_phn = cx_lc_every_months_raw
 endif
-endif
-endfor
-if cx_fl_weeks == 0
-assign cx_fl_name = p.name | downcase
-if cx_fl_name contains 'week'
-assign cx_fl_tokens = cx_fl_name | split: ' '
-for cx_fl_tok in cx_fl_tokens
+if cx_fl_ph1 != ''
+assign cx_fl_toks = cx_fl_src | split: ' '
+for cx_fl_tok in cx_fl_toks
 assign cx_fl_cand = cx_fl_tok | plus: 0
 if cx_fl_cand > 0
-assign cx_fl_weeks = cx_fl_cand
+assign cx_fl_n = cx_fl_cand
 break
 endif
 endfor
 endif
+if cx_fl_n > 0
+if cx_fl_n == 1
+assign cx_opt_ph = cx_fl_ph1
+else
+assign cx_opt_ph = cx_fl_phn | replace: '{n}', cx_fl_n
 endif
-if cx_fl_weeks > 1
-assign cx_opt_raw = cx_fl_weeks | append: ' ' | append: cx_lc_weeks_raw
-assign cx_opt_raw = cx_lc_delivery_every_raw | append: ' ' | append: cx_opt_raw
+assign cx_opt_raw = cx_lc_delivery_freq_raw | replace: '{f}', cx_opt_ph
 else
 assign cx_opt_raw = p.name
 endif
@@ -769,6 +833,8 @@ data-cellexia-money-onetime="{{ cx_money_onetime }}"
 data-cellexia-money-sub="{{ cx_money_sub }}"
 data-cellexia-price-sync="{% if cx_price_sync %}true{% else %}false{% endif %}"
 data-cellexia-price-selector="{{ cx_price_selector_raw | escape }}"
+data-cellexia-price-sync-main="{% if cx_price_sync_main %}true{% else %}false{% endif %}"
+data-cellexia-main-selector="{{ cx_main_selector_raw | escape }}"
 {%- if render_context == 'section' %}
 data-section-id="{{ section_id }}"{% endif %}
 {%- unless cx_live %}
@@ -898,6 +964,28 @@ cx_freq_control: cx_freq_control,
 cx_benefits_html: cx_benefits_html,
 cx_reassurance_html: cx_reassurance_html
 -%}
+{%- when 'subscription_ultra_max' -%}
+{%- render 'cx-preset-subscription_ultra_max',
+uid: uid,
+product: product,
+cx_variant: cx_variant,
+cx_sub_checked: cx_sub_checked,
+cx_show_badge: cx_show_badge,
+cx_badge: cx_badge,
+cx_sub_label: cx_sub_label,
+cx_sub_label_raw: cx_sub_label_raw,
+cx_onetime_label: cx_onetime_label,
+cx_onetime_link: cx_onetime_link,
+cx_onetime_link_raw: cx_onetime_link_raw,
+cx_show_savings: cx_show_savings,
+cx_save: cx_save,
+cx_save_tpl_raw: cx_save_tpl_raw,
+cx_show_reassurance: cx_show_reassurance,
+cx_price_block: cx_price_block,
+cx_freq_control: cx_freq_control,
+cx_benefits_html: cx_benefits_html,
+cx_reassurance_html: cx_reassurance_html
+-%}
 {%- when 'subscription_max' -%}
 {%- render 'cx-preset-subscription_max',
 uid: uid,
@@ -975,34 +1063,54 @@ data-cellexia-selling-plan
 {%- if a.selling_plan_group_id == cx_group.id -%}
 {%- liquid
 # cx-freq-label (inlined) for this allocation's plan.
-assign a_weeks = 0
-for a_opt in a.selling_plan.options
-assign a_opt_val = a_opt.value | downcase
-if a_opt_val contains 'week'
-assign a_cand = a_opt_val | split: ' ' | first | plus: 0
-if a_cand > 0
-assign a_weeks = a_cand
-break
+assign a_n = 0
+assign a_noun = ''
+assign a_noun1 = ''
+assign a_ph1 = ''
+assign a_phn = ''
+assign a_src = a.selling_plan.options | map: 'value' | join: ' ' | append: ' ' | append: a.selling_plan.name | downcase
+if a_src contains 'prepay'
+# prepaid keeps its raw plan name, same rule as the label sites above
+elsif a_src contains 'week'
+assign a_noun = cx_lc_weeks_raw
+assign a_noun1 = cx_lc_week_raw
+assign a_ph1 = cx_lc_every_week_raw
+assign a_phn = cx_lc_every_weeks_raw
+elsif a_src contains 'day'
+assign a_noun = cx_lc_days_raw
+assign a_noun1 = cx_lc_day_raw
+assign a_ph1 = cx_lc_every_day_raw
+assign a_phn = cx_lc_every_days_raw
+elsif a_src contains 'month'
+assign a_noun = cx_lc_months_raw
+assign a_noun1 = cx_lc_month_raw
+assign a_ph1 = cx_lc_every_month_raw
+assign a_phn = cx_lc_every_months_raw
 endif
-endif
-endfor
-if a_weeks == 0
-assign a_plan_name = a.selling_plan.name | downcase
-if a_plan_name contains 'week'
-assign a_tokens = a_plan_name | split: ' '
-for a_tok in a_tokens
+if a_noun != ''
+assign a_toks = a_src | split: ' '
+for a_tok in a_toks
 assign a_cand = a_tok | plus: 0
 if a_cand > 0
-assign a_weeks = a_cand
+assign a_n = a_cand
 break
 endif
 endfor
 endif
+if a_n == 1
+assign a_noun = a_noun1
 endif
-if a_weeks > 1
-assign a_freq_raw = a_weeks | append: ' ' | append: cx_lc_weeks_raw
+# a_freq_raw stays BARE for the island (merchant-template contract); a_freq_every_raw feeds the then-sentence.
+if a_n > 0
+assign a_freq_raw = a_n | append: ' ' | append: a_noun
+if a_n == 1
+assign a_freq_every_raw = a_ph1
+else
+assign a_freq_every_raw = a_phn | replace: '{n}', a_n
+endif
 else
 assign a_freq_raw = a.selling_plan.name
+assign a_freq_every_raw = a.selling_plan.name
 endif
 # "then price every frequency" — locale sentence un-escaped ONCE to RAW, then RAW label and money substituted in.
 assign a_adj_count = a.price_adjustments | size
@@ -1017,7 +1125,7 @@ assign a_then_raw = ''
 if a_ongoing != a.price
 assign a_then = 'then_price' | t: price: '{price}', frequency: '{frequency}'
 assign a_then_raw = a_then | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&'
-assign a_then_raw = a_then_raw | replace: '{price}', a_ongoing_fmt | replace: '{frequency}', a_freq_raw | strip
+assign a_then_raw = a_then_raw | replace: '{price}', a_ongoing_fmt | replace: '{frequency}', a_freq_every_raw | strip
 endif
 # "Save X" — locale sentence un-escaped to RAW, then the RAW amount substituted in.
 assign a_save_cents = v.price | minus: a.price

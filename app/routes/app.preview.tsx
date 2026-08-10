@@ -53,7 +53,12 @@ import {
 } from "~/lib/launch/doctor.server";
 import { PORTAL_PROXY_BASE } from "~/lib/portal/proxy-path";
 import { createDemoContract } from "~/lib/portal/demo.server";
-import { buildMagicUrl } from "~/lib/magiclinks/builder.server";
+import { buildPortalUrl } from "~/lib/magiclinks/builder.server";
+import {
+  PORTAL_PREVIEW_TTL_SECONDS,
+  PREVIEW_TOKEN_PARAM,
+  mintPreviewToken,
+} from "~/lib/portal/previewToken.server";
 import { isKlaviyoConfigured } from "~/lib/klaviyo/client.server";
 import {
   getProducts,
@@ -83,8 +88,32 @@ import {
  */
 
 const SCHEDULER_HEALTHY_WINDOW_MS = 10 * 60 * 1000;
-const PORTAL_PREVIEW_TTL_SECONDS = 3600;
 const SEARCH_MIN_CHARS = 2;
+
+/**
+ * Direct, cookie-less portal preview URL: store-domain portal home carrying a
+ * signed 1-hour ?cx_pp= token. This replaced the magic-link LOGIN hop —
+ * Shopify's app proxy strips Set-Cookie, so the hand-off cookie the old flow
+ * minted could never reach a browser on a live store and every preview
+ * dead-ended at the setup gate. The token is stateless, multi-use within its
+ * TTL, and opens a view-only session (mutations are intercepted).
+ */
+async function buildPortalPreviewUrl(
+  shopId: string,
+  contract: { id: string; customerId: string; email: string },
+): Promise<string> {
+  const token = mintPreviewToken(
+    {
+      shopId,
+      customerId: contract.customerId,
+      contractId: contract.id,
+      email: contract.email,
+    },
+    PORTAL_PREVIEW_TTL_SECONDS,
+  );
+  const base = await buildPortalUrl(shopId, "/");
+  return `${base}?${PREVIEW_TOKEN_PARAM}=${token}`;
+}
 
 // ── Shared view types ────────────────────────────────────────────────────────
 
@@ -724,15 +753,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           where: { id: contractId },
         });
       }
-      const url = await buildMagicUrl({
-        action: "LOGIN",
-        contractId: contract.id,
-        customerId: contract.customerId,
-        email: contract.email,
-        params: { preview: true },
-        ttlSeconds: PORTAL_PREVIEW_TTL_SECONDS,
-        createdVia: "ADMIN",
-      });
+      const url = await buildPortalPreviewUrl(shop.id, contract);
       await markPreviewed(shop.id, "previewedPortal", actor);
       await logEvent({
         shopId: shop.id,
@@ -743,6 +764,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         payload: {
           action: "portal_preview_created",
           mode: "demo",
+          via: "cx_pp",
           contractId: contract.id,
           checklistPreviewedPortal: true,
         },
@@ -787,15 +809,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       );
     }
     try {
-      const url = await buildMagicUrl({
-        action: "LOGIN",
-        contractId: contract.id,
-        customerId: contract.customerId,
-        email: contract.email,
-        params: { preview: true },
-        ttlSeconds: PORTAL_PREVIEW_TTL_SECONDS,
-        createdVia: "ADMIN",
-      });
+      const url = await buildPortalPreviewUrl(shop.id, contract);
       await markPreviewed(shop.id, "previewedPortal", actor);
       await logEvent({
         shopId: shop.id,
@@ -808,6 +822,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         payload: {
           action: "portal_preview_created",
           mode: "subscriber",
+          via: "cx_pp",
           contractId: contract.id,
           checklistPreviewedPortal: true,
         },
@@ -1704,7 +1719,7 @@ export default function PreviewPage() {
                   <PreviewLinkFallback
                     url={demoFetcher.data?.ok ? demoFetcher.data.url : undefined}
                     label="Demo portal preview link"
-                    helpText="Valid for 1 hour."
+                    helpText="Opens directly on your live store. Valid for 1 hour; every action is disabled, so it's safe to share with your staff."
                   />
                 </BlockStack>
               </Box>
@@ -1791,7 +1806,7 @@ export default function PreviewPage() {
                         : undefined
                     }
                     label="Subscriber portal preview link"
-                    helpText="Valid for 1 hour. Read-only — nothing you click changes their subscription."
+                    helpText="Opens directly on your live store. Valid for 1 hour. Read-only — nothing you click changes their subscription, so it's safe to share with your staff."
                   />
                 </BlockStack>
               </Box>

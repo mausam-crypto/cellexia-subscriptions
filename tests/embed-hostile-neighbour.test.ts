@@ -42,11 +42,32 @@ import { renderEmbed } from "./liquid/harness";
  *      wrapper never left the end of <body>: [hidden], 0px tall, an invisible
  *      buy box on the one store this app has to work on.
  *
+ * THE SECOND LIVE DEFECT (v1.11.0) — ONE CLICK BEHIND
+ * ---------------------------------------------------
+ * The same page later grew two more hostile facts, verified in a real
+ * browser on the live PDP:
+ *   - the size pills moved to `data-val-id` (NOT data-variant-id), the
+ *     ACTIVE pill wears class "active", and one pill ships its id with
+ *     TRAILING WHITESPACE inside the attribute value;
+ *   - yet another vendor's frequently-bought-together widget renders
+ *     <li class="cx-az-fbt__row" data-variant-id=…> rows after .pdp__grey,
+ *     and its FIRST row tracks the theme's current variant — updating on
+ *     ITS OWN SCHEDULE, ~100ms after the click.
+ * There is still NO input[name="id"] anywhere. The pre-fix re-read raced
+ * that bystander row: 60ms after every pill click it read the row's STALE
+ * id and pushed the PREVIOUS variant — a widget permanently one click
+ * behind the shopper, quoting one price while the cart charged another.
+ * The fix is layered (data-val-id in the marker vocabulary + immediate
+ * push, active-signal tiers above passive bystanders, staggered re-reads
+ * that make a late bystander update corrective instead of corruptive), and
+ * the mutation check below cuts every layer and watches the one-behind
+ * defect return.
+ *
  * WHAT THIS SUITE MEASURES
  * ------------------------
  * The real page, not a paraphrase of it: the theme's real structure (no
  * <form action="/cart/add"> — their add-to-cart is a jQuery XHR), the foreign
- * widget in its real position, the foreign script ids, and OUR OWN
+ * widgets in their real positions, the foreign script ids, and OUR OWN
  * server-rendered markup straight out of the Liquid harness. Then the REAL
  * assets/buy-box.js and assets/buy-box-embed.js are run over it, and:
  *
@@ -61,11 +82,19 @@ import { renderEmbed } from "./liquid/harness";
  *      foreign widget's identical price string is left alone;
  *   f. the cart request the theme fires by XHR carries the selling plan and
  *      the _cellexia_design attribution — and is byte-identical when the
- *      shopper chose one-time.
+ *      shopper chose one-time;
+ *   g. a pill click lands on the CLICKED variant even while the bystander
+ *      FBT row still names the previous one — and the dirty, whitespace-
+ *      padded pill id is trimmed before it reaches the widget;
+ *   h. the theme's MAIN price display (.pdp__price) shows the subscription
+ *      money while subscription is selected, touching ONLY the current-price
+ *      span — compare-at and per-unit strings stay byte-identical — and
+ *      gives the theme its exact text back on one-time.
  *
- * Two VACUITY GUARDS re-introduce the defect (the bare, pre-rename lookup;
- * then the same lookup with the ownership assertion neutered) and prove the
- * assertions above depend on the fix rather than on the fixture.
+ * VACUITY GUARDS and MUTATION CHECKS re-introduce both live defects (the
+ * bare pre-rename lookup, then the ownership assertion neutered; then the
+ * variant-tracking layers cut) and prove the assertions above depend on the
+ * fixes rather than on the fixture.
  */
 
 const ASSETS_DIR = fileURLToPath(
@@ -76,19 +105,38 @@ const EMBED_JS = join(ASSETS_DIR, "buy-box-embed.js");
 
 const ONE_TIME_MONEY = "CHF 64.00";
 const SUB_MONEY = "CHF 51.20";
+/** The island's one-time money for the OTHER (50 ml) variant. */
+const OTHER_ONE_TIME_MONEY = "CHF 98.00";
+const COMPARE_MONEY = "CHF 80.00";
+const PER_UNIT_TEXT = "CHF 32.00 / per unit";
 const OUR_VARIANT = "4411100011101";
 const OTHER_VARIANT = "4411100011102";
 const FOREIGN_VARIANT = "9999999999999";
+/** The FBT widget's second row: another product entirely, never ours. */
+const FBT_FOREIGN_VARIANT = "9999999999901";
 const PLAN_ID = "6881100003";
 const ATC_LABEL = `Add to cart - ${ONE_TIME_MONEY}`;
+/**
+ * The OTHER pill's data-val-id EXACTLY as the live page ships it: the id
+ * followed by a newline and indentation spaces, inside the attribute value.
+ * Everything that reads it must trim, or the widget compares
+ * "4411100011102\n      " against the island keys and finds nothing.
+ */
+const DIRTY_OTHER_VARIANT = `${OTHER_VARIANT}\n      `;
 
 /**
- * The client's PDP, minus our app embed. Everything here is theirs: the
- * foreign cx-namespace widget FIRST inside the buy column (earlier in the DOM
- * than our body-end wrapper, exactly as observed live), that vendor's config
- * script ids, their .sm-rc-widget, the size picker, and the grey panel whose
- * button prints the one-time price. There is deliberately NO
- * <form action="/cart/add"> — on this theme add-to-cart is a jQuery XHR.
+ * The client's PDP, minus our app embed — the CURRENT live shape, verified
+ * in a real browser. Everything here is theirs: the foreign cx-namespace
+ * widget FIRST inside the buy column (earlier in the DOM than our body-end
+ * wrapper), that vendor's config script ids, their .sm-rc-widget, the main
+ * price block (current price + struck compare-at + per-unit) ABOVE the
+ * options, the size pills carrying data-val-id (one of them whitespace-
+ * padded, the active one wearing class "active"), the grey panel whose
+ * button prints the one-time price, and — after the grey panel — a THIRD
+ * vendor's frequently-bought-together rows, the first of which tracks the
+ * theme's current variant on its own schedule. There is deliberately NO
+ * <form action="/cart/add"> and NO input[name="id"] — on this theme
+ * add-to-cart is a jQuery XHR.
  */
 const THEME_PAGE = `
 <main class="pdp">
@@ -101,9 +149,16 @@ const THEME_PAGE = `
       </div>
     </div>
     <h1 class="pdp__title">Cellexia Serum</h1>
+    <div class="pdp__price">
+      <span sm-rc-current-price="">${ONE_TIME_MONEY}</span>
+      <span class="price__discount" sm-rc-compare-price="">${COMPARE_MONEY}</span>
+      <div class="unit-wrap"><span class="per-unit">${PER_UNIT_TEXT}</span></div>
+    </div>
     <div class="pdp__options">
-      <button type="button" class="pdp__swatch is-active" data-variant-id="${OUR_VARIANT}">30 ml</button>
-      <button type="button" class="pdp__swatch" data-variant-id="${OTHER_VARIANT}">50 ml</button>
+      <div class="option__wrap option__wrap--buttons" data-option="sm-rc-option1-selector">
+        <button data-units="1" data-cans="${ONE_TIME_MONEY}" data-val="30 ml" data-val-id="${OUR_VARIANT}" class="btn btn--outline btn--flex active">30 ml</button>
+        <button data-units="1" data-cans="${OTHER_ONE_TIME_MONEY}" data-val="50 ml" data-val-id="${DIRTY_OTHER_VARIANT}" class="btn btn--outline btn--flex">50 ml</button>
+      </div>
     </div>
     <div class="pdp__grey">
       <div class="pdp__qty"><input type="number" class="pdp__qty-input" value="1"></div>
@@ -113,6 +168,10 @@ const THEME_PAGE = `
         </div>
       </div>
     </div>
+    <ul class="cx-az-fbt">
+      <li class="cx-az-fbt__row" data-variant-id="${OUR_VARIANT}"><span class="cx-az-fbt__name">Cellexia Serum</span></li>
+      <li class="cx-az-fbt__row" data-variant-id="${FBT_FOREIGN_VARIANT}"><span class="cx-az-fbt__name">Night Cream</span></li>
+    </ul>
   </div>
 </main>
 <div class="sm-rc-widget"><span class="sm-rc-widget__stars">4.8</span></div>
@@ -171,14 +230,18 @@ interface Page {
   sent: SentRequest[];
   xhrPost: (body: unknown, url?: string) => unknown;
   flush: () => void;
-  /** True only when `mutate` actually rewrote a source (the vacuity guard). */
+  /** True only when `mutateEmbed` actually rewrote the source (vacuity guard). */
   sourceChanged: boolean;
+  /** True only when `mutateBuyBox` actually rewrote buy-box.js. */
+  buyBoxSourceChanged: boolean;
 }
 
 interface BuildOptions {
   launchStatus?: "live" | "setup";
   /** Rewrite buy-box-embed.js before it runs — used only by the vacuity guards. */
   mutateEmbed?: (source: string) => string;
+  /** Rewrite buy-box.js before it runs — the one-behind mutation check. */
+  mutateBuyBox?: (source: string) => string;
   /**
    * false leaves the page exactly as the server sent it, with neither asset
    * evaluated. The shim self-tests use it so they measure the PARSER and not
@@ -304,6 +367,10 @@ function buildPage(options: BuildOptions = {}): Page {
   };
   vm.createContext(sandbox);
 
+  const buyBoxOriginal = readFileSync(BUY_BOX_JS, "utf8");
+  const buyBoxSource = options.mutateBuyBox
+    ? options.mutateBuyBox(buyBoxOriginal)
+    : buyBoxOriginal;
   const embedOriginal = readFileSync(EMBED_JS, "utf8");
   const embedSource = options.mutateEmbed
     ? options.mutateEmbed(embedOriginal)
@@ -311,7 +378,7 @@ function buildPage(options: BuildOptions = {}): Page {
 
   if (options.runAssets !== false) {
     // Load order is the shipped one: buy-box.js first, then its companion.
-    vm.runInContext(readFileSync(BUY_BOX_JS, "utf8"), sandbox, {
+    vm.runInContext(buyBoxSource, sandbox, {
       filename: "buy-box.js",
     });
     vm.runInContext(embedSource, sandbox, { filename: "buy-box-embed.js" });
@@ -343,6 +410,7 @@ function buildPage(options: BuildOptions = {}): Page {
     xhrPost,
     flush: () => flushTimers(),
     sourceChanged: embedSource !== embedOriginal,
+    buyBoxSourceChanged: buyBoxSource !== buyBoxOriginal,
   };
 }
 
@@ -402,6 +470,34 @@ describe("hostile-page DOM shim", () => {
       "Bundle & save",
     );
     expect(page.atcButton.textContent).toBe(ATC_LABEL);
+    // The size pills, exactly as the live page ships them: data-val-id (NOT
+    // data-variant-id), the ACTIVE pill wearing class "active" — and the
+    // OTHER pill's id padded with a trailing newline + spaces, preserved
+    // byte-for-byte by the parser so the trim tests below are non-vacuous.
+    const pills = page.document.querySelectorAll(".option__wrap [data-val-id]");
+    expect(pills).toHaveLength(2);
+    expect(pills[0].getAttribute("data-val-id")).toBe(OUR_VARIANT);
+    expect(pills[0].classList.contains("active")).toBe(true);
+    expect(pills[0].hasAttribute("data-variant-id")).toBe(false);
+    expect(pills[1].getAttribute("data-val-id")).toBe(DIRTY_OTHER_VARIANT);
+    expect(pills[1].getAttribute("data-val-id")).not.toBe(OTHER_VARIANT);
+    expect(pills[1].classList.contains("active")).toBe(false);
+    // The theme's main price block, above the options.
+    expect(
+      page.document.querySelector(".pdp__price [sm-rc-current-price]")
+        ?.textContent,
+    ).toBe(ONE_TIME_MONEY);
+    expect(
+      page.document.querySelector(".pdp__price .price__discount")?.textContent,
+    ).toBe(COMPARE_MONEY);
+    // The bystander FBT rows, after the grey panel: the first tracks OUR
+    // current variant, the second names another product entirely.
+    const fbtRows = page.document.querySelectorAll(".cx-az-fbt__row");
+    expect(fbtRows).toHaveLength(2);
+    expect(fbtRows[0].getAttribute("data-variant-id")).toBe(OUR_VARIANT);
+    expect(fbtRows[1].getAttribute("data-variant-id")).toBe(
+      FBT_FOREIGN_VARIANT,
+    );
     // The client's theme has no product form — the whole reason the cart
     // request patch exists.
     expect(page.document.querySelectorAll('form[action*="/cart/add"]')).toEqual(
@@ -425,9 +521,18 @@ describe("hostile-page DOM shim", () => {
     expect(() =>
       doc.querySelectorAll("form[action*='/cart/add'] [type='submit']"),
     ).not.toThrow();
-    expect(doc.querySelectorAll('input[name="id"], [data-variant-id]')).toHaveLength(
-      2,
-    );
+    // The variant-signal vocabulary both modules scan, on the CURRENT page
+    // shape: 2 size pills carry data-val-id, 2 bystander FBT rows carry
+    // data-variant-id, and there is NO [name="id"] field anywhere — nothing
+    // of ours contributes a match (our namespace is data-cellexia-*).
+    expect(
+      doc.querySelectorAll(
+        'input[name="id"], [data-variant-id], [data-val-id]',
+      ),
+    ).toHaveLength(4);
+    expect(doc.querySelectorAll('input[name="id"]')).toEqual([]);
+    expect(doc.querySelectorAll("[data-val-id]")).toHaveLength(2);
+    expect(doc.querySelectorAll("[data-variant-id]")).toHaveLength(2);
     // Comma list with tag / #id / [attr] parts (PRICE_SYNC_EXCLUDED).
     expect(
       page.atcButton.closest("header, [role=\"dialog\"], #cart-drawer, .cart-drawer"),
@@ -496,6 +601,38 @@ function selectMode(page: Page, mode: "subscription" | "one_time"): void {
 function currentState(page: Page): Record<string, unknown> | null {
   const getState = page.subs.getState as () => Record<string, unknown> | null;
   return getState();
+}
+
+/** The two size pills, document order: [our 30 ml pill, the dirty 50 ml pill]. */
+function sizePills(page: Page): { current: ElementNode; other: ElementNode } {
+  const pills = page.document.querySelectorAll(".option__wrap [data-val-id]");
+  return { current: pills[0], other: pills[1] };
+}
+
+/** The bystander FBT widget's first row — the one tracking the theme. */
+function fbtTrackerRow(page: Page): ElementNode {
+  return page.document.querySelector(".cx-az-fbt__row") as ElementNode;
+}
+
+/**
+ * A pill click EXACTLY as the live page performs it:
+ *   1. the theme's own click handler moves class "active" from the current
+ *      pill to the clicked one, synchronously, before anything else runs;
+ *   2. the bystander FBT widget re-points its first row at the new variant
+ *      ~100ms later, ON ITS OWN SCHEDULE — inside the sandbox's virtual
+ *      clock (scheduleTimer IS the page's window.setTimeout), so it races
+ *      our 60ms re-read exactly as observed live;
+ *   3. the click bubbles up from the pill.
+ */
+function clickOtherPill(page: Page): void {
+  const pills = sizePills(page);
+  pills.current.setAttribute("class", "btn btn--outline btn--flex");
+  pills.other.setAttribute("class", "btn btn--outline btn--flex active");
+  scheduleTimer(() => {
+    fbtTrackerRow(page).setAttribute("data-variant-id", OTHER_VARIANT);
+  }, 100);
+  pills.other.dispatchEvent(new EventShim("click", { bubbles: true }));
+  page.flush();
 }
 
 // ── a + b: our wrapper mounts, and the launch gate still decides ─────────────
@@ -622,6 +759,228 @@ describe("the other vendor's element", () => {
     selectMode(page, "one_time");
     expect(page.atcButton.textContent).toBe(ATC_LABEL);
     expect(foreignPrice.textContent).toBe(ONE_TIME_MONEY);
+  });
+});
+
+// ── g: the size pills and the bystander that updates late ────────────────────
+
+/**
+ * THE ONE-CLICK-BEHIND DEFECT, measured on the markup that produced it.
+ *
+ * On the live PDP a pill click leaves THREE generations of variant evidence
+ * on the page at once: the clicked pill's own data-val-id (correct,
+ * immediately), the theme's "active" class (correct, painted synchronously
+ * by the theme's click handler), and the bystander FBT widget's first row
+ * (STALE for ~100ms, then correct). The pre-fix re-read fired once at 60ms
+ * and took the first match in document order — the stale bystander row —
+ * so the widget pushed the PREVIOUS variant after every click and stayed
+ * one behind forever. These tests drive the REAL files over that exact
+ * race, and the mutation check at the end cuts the fix's layers and
+ * watches the one-behind defect return.
+ */
+describe("the size pills (data-val-id) and the racing bystander marker", () => {
+  it("a pill click drives the widget to the CLICKED variant despite a stale bystander row", () => {
+    const page = buildPage();
+    expect(currentState(page)).toMatchObject({ variantId: OUR_VARIANT });
+
+    clickOtherPill(page);
+
+    // The widget followed the SHOPPER, not the bystander's stale row: the
+    // clicked pill's id (and the theme's own "active" paint) outrank a
+    // passive marker that was still naming the previous variant when the
+    // 60ms re-read fired.
+    expect(currentState(page)).toMatchObject({ variantId: OTHER_VARIANT });
+    // …and the theme's button still shows a coherent money string. The
+    // fixture theme never repaints its own button (a real Sleepify prints
+    // the new variant's price itself), so the only honest display is the
+    // theme's OWN text — the island's small-variant subscription price
+    // (CHF 51.20) must be gone, never left stale beside a 50 ml selection.
+    expect(page.atcButton.textContent).toBe(ATC_LABEL);
+    expect(page.atcButton.textContent).not.toContain(SUB_MONEY);
+  });
+
+  it("the dirty (whitespace-padded) pill id is trimmed", () => {
+    const page = buildPage();
+    const pills = sizePills(page);
+    // Non-vacuous: the attribute really is padded on the pill we click.
+    expect(pills.other.getAttribute("data-val-id")).toBe(DIRTY_OTHER_VARIANT);
+
+    clickOtherPill(page);
+
+    // The widget landed on the CLEAN id: an untrimmed read would have
+    // compared "4411100011102\n      " against the island keys, found
+    // nothing, and left the widget frozen on the 30 ml variant.
+    const state = currentState(page) as Record<string, unknown>;
+    expect(state.variantId).toBe(OTHER_VARIANT);
+  });
+
+  it("one-time keeps the theme's button text after a pill switch", () => {
+    const page = buildPage();
+    selectMode(page, "one_time");
+    expect(page.atcButton.textContent).toBe(ATC_LABEL);
+
+    clickOtherPill(page);
+
+    // The variant followed the click, but with one-time selected the theme's
+    // button is not ours to rewrite — its own text stays, byte-identical.
+    expect(currentState(page)).toMatchObject({
+      mode: "one_time",
+      variantId: OTHER_VARIANT,
+    });
+    expect(page.atcButton.textContent).toBe(ATC_LABEL);
+  });
+
+  /* ── MUTATION CHECK: cut every fix layer, watch one-behind return ─────────
+     The fix is layered across BOTH files, and each cut below removes one
+     layer from the shipped source (each replacement is asserted to really
+     change it):
+       a. markerId() loses the data-val-id vocabulary — the pills' ids
+          become invisible to the embed's click handler and DOM re-read;
+       b. markerActiveSignal() (embed) and markerActive() (buy-box.js) are
+          neutered — the theme's own "active" paint stops outranking the
+          bystander row, in both files' tier lists;
+       c. the staggered re-reads that let a LATE bystander update be
+          corrective are removed: the embed's 350ms/900ms passes, and the
+          same layer in buy-box.js's click delegation (its second, +350ms
+          pass — the one that would re-read AFTER the bystander settles).
+     What remains is exactly the pre-fix behavior: one 60ms re-read racing
+     a bystander that updates at 100ms. */
+
+  const CUT_PILL_VOCABULARY = (source: string): string =>
+    source.replace("el.getAttribute('data-val-id') ||\n", "");
+
+  const NEUTER_EMBED_ACTIVE_SIGNAL = (source: string): string =>
+    source.replace(
+      "function markerActiveSignal(el) {",
+      "function markerActiveSignal(el) { if (1) return false;",
+    );
+
+  const CUT_EMBED_RE_READS = (source: string): string =>
+    source
+      .replace("window.setTimeout(reReadVariant, 350);", "")
+      .replace("window.setTimeout(reReadVariant, 900);", "");
+
+  const NEUTER_BUYBOX_ACTIVE_SIGNAL = (source: string): string =>
+    source.replace(
+      "function markerActive(el) {",
+      "function markerActive(el) { if (1) return false;",
+    );
+
+  const CUT_BUYBOX_LATE_RE_READ = (source: string): string =>
+    source.replace(
+      "window.setTimeout(function () {\n        reReadVariant(true);\n      }, 350);",
+      "",
+    );
+
+  const MUTATE_EMBED = (source: string): string =>
+    CUT_EMBED_RE_READS(NEUTER_EMBED_ACTIVE_SIGNAL(CUT_PILL_VOCABULARY(source)));
+
+  const MUTATE_BUY_BOX = (source: string): string =>
+    CUT_BUYBOX_LATE_RE_READ(NEUTER_BUYBOX_ACTIVE_SIGNAL(source));
+
+  it("MUTATION CHECK: with the fix layers cut, the same click lands ONE BEHIND", () => {
+    // Every cut really rewrites the file it claims to rewrite (vacuity).
+    const embedOriginal = readFileSync(EMBED_JS, "utf8");
+    expect(CUT_PILL_VOCABULARY(embedOriginal)).not.toBe(embedOriginal);
+    expect(NEUTER_EMBED_ACTIVE_SIGNAL(embedOriginal)).not.toBe(embedOriginal);
+    expect(CUT_EMBED_RE_READS(embedOriginal)).not.toBe(embedOriginal);
+    const buyBoxOriginal = readFileSync(BUY_BOX_JS, "utf8");
+    expect(NEUTER_BUYBOX_ACTIVE_SIGNAL(buyBoxOriginal)).not.toBe(buyBoxOriginal);
+    expect(CUT_BUYBOX_LATE_RE_READ(buyBoxOriginal)).not.toBe(buyBoxOriginal);
+
+    const page = buildPage({
+      mutateEmbed: MUTATE_EMBED,
+      mutateBuyBox: MUTATE_BUY_BOX,
+    });
+    expect(page.sourceChanged).toBe(true);
+    expect(page.buyBoxSourceChanged).toBe(true);
+    expect(currentState(page)).toMatchObject({ variantId: OUR_VARIANT });
+
+    clickOtherPill(page);
+
+    // The live defect, reproduced: with the pill vocabulary cut the click
+    // itself carries no id; with the active tiers cut and the late re-reads
+    // gone, the only remaining evidence is the bystander row — read at 60ms,
+    // 40ms BEFORE it updates. The widget is one click behind the shopper:
+    // it still answers with the 30 ml variant after a 50 ml click, which is
+    // exactly the wrong selling plan and the wrong price at the cart. The
+    // green tests above therefore depend on the fix layers, not the fixture.
+    expect(currentState(page)).toMatchObject({ variantId: OUR_VARIANT });
+  });
+});
+
+// ── h: the theme's MAIN price display ────────────────────────────────────────
+
+/**
+ * The price under the product title (.pdp__price) is the FIRST price a
+ * shopper reads, and before v1.11.0 it kept quoting the one-time price while
+ * the widget (subscription preselected) and the cart charged the
+ * subscription price — two different numbers on one screen. The sync swaps
+ * the exact one-time money string for the subscription one, and ONLY that:
+ * the struck compare-at and the per-unit line are not the one-time string
+ * and must stay byte-identical (this module never computes money), and the
+ * other vendor's copy of the SAME string is not a target at all.
+ */
+describe("theme main price display", () => {
+  it("shows the subscription money in the current-price span after boot", () => {
+    // Byte-level baselines, captured from the page as the server sent it.
+    const raw = buildPage({ runAssets: false });
+    const rawDiscount = serialize(
+      raw.document.querySelector(".pdp__price .price__discount") as ElementNode,
+    );
+    const rawUnitWrap = serialize(
+      raw.document.querySelector(".pdp__price .unit-wrap") as ElementNode,
+    );
+
+    const page = buildPage();
+    // Subscription is preselected (classic default), so the headline price
+    // must agree with the widget and the cart…
+    expect(
+      page.document.querySelector(".pdp__price [sm-rc-current-price]")
+        ?.textContent,
+    ).toBe(SUB_MONEY);
+    // …while the struck compare-at and the per-unit line — inside the SAME
+    // synced block — are byte-for-byte what the server sent.
+    expect(
+      serialize(
+        page.document.querySelector(
+          ".pdp__price .price__discount",
+        ) as ElementNode,
+      ),
+    ).toBe(rawDiscount);
+    expect(
+      serialize(
+        page.document.querySelector(".pdp__price .unit-wrap") as ElementNode,
+      ),
+    ).toBe(rawUnitWrap);
+    // The other vendor's identical money string is not a target.
+    expect(page.foreign.querySelector(".cx__price")?.textContent).toBe(
+      ONE_TIME_MONEY,
+    );
+  });
+
+  it("returns the theme's exact original text when the shopper picks one-time", () => {
+    const page = buildPage();
+    expect(
+      page.document.querySelector(".pdp__price [sm-rc-current-price]")
+        ?.textContent,
+    ).toBe(SUB_MONEY);
+
+    selectMode(page, "one_time");
+
+    // The theme owns its price again — headline and button both restored to
+    // the byte-exact strings it printed, nothing else disturbed.
+    expect(
+      page.document.querySelector(".pdp__price [sm-rc-current-price]")
+        ?.textContent,
+    ).toBe(ONE_TIME_MONEY);
+    expect(page.atcButton.textContent).toBe(ATC_LABEL);
+    expect(
+      page.document.querySelector(".pdp__price .price__discount")?.textContent,
+    ).toBe(COMPARE_MONEY);
+    expect(
+      page.document.querySelector(".pdp__price .per-unit")?.textContent,
+    ).toBe(PER_UNIT_TEXT);
   });
 });
 
@@ -846,6 +1205,51 @@ describe("cart requests from a theme with no product form", () => {
       String(page.xhrPost(`id=${OTHER_VARIANT}&quantity=1`)),
     );
     expect(out.get("selling_plan")).toBe(PLAN_ID);
+  });
+
+  /**
+   * Some theme JS reads the widget's selection into a hand-built payload:
+   * the adopted selling_plan field travels, the properties input does not.
+   * The order would be perfectly right and the design attribution silently
+   * gone — a per-theme hole in take-rate-by-design that nothing else can
+   * see (checkout.subscribable and the contract still count). So the
+   * patcher completes such a line instead of skipping it: the design is
+   * stamped, the theme's own plan value is untouched, and a plan id that is
+   * not ours keeps the byte-identical pass-through.
+   */
+  it("completes a body that already carries OUR selling plan with the design", () => {
+    const page = buildPage();
+    const original =
+      `items%5B0%5D%5Bid%5D=${OUR_VARIANT}&items%5B0%5D%5Bquantity%5D=1` +
+      `&items%5B0%5D%5Bselling_plan%5D=${PLAN_ID}`;
+    const out = new URLSearchParams(String(page.xhrPost(original)));
+
+    expect(out.get("items[0][properties][_cellexia_design]")).toBe("classic");
+    // Completed, not rewritten: the theme's plan value survives, exactly once.
+    expect(out.getAll("items[0][selling_plan]")).toEqual([PLAN_ID]);
+    expect(out.get("items[0][id]")).toBe(OUR_VARIANT);
+    expect(out.get("items[0][quantity]")).toBe("1");
+    expect(String(page.sent[page.sent.length - 1].body)).not.toContain(
+      "_cx_design",
+    );
+  });
+
+  it("leaves a body carrying another app's selling plan byte-identical", () => {
+    const page = buildPage();
+    const original =
+      `items%5B0%5D%5Bid%5D=${OUR_VARIANT}&items%5B0%5D%5Bselling_plan%5D=123`;
+    expect(page.xhrPost(original)).toBe(original);
+  });
+
+  it("never stamps a design once the shopper picked one-time, even over our plan id", () => {
+    const page = buildPage();
+    selectMode(page, "one_time");
+    // A stale plan the theme kept serializing is not provably this page
+    // view's choice once one-time is selected — and stripping it is not the
+    // patcher's job either.
+    const original =
+      `items%5B0%5D%5Bid%5D=${OUR_VARIANT}&items%5B0%5D%5Bselling_plan%5D=${PLAN_ID}`;
+    expect(page.xhrPost(original)).toBe(original);
   });
 
   it("passes another vendor's add-to-cart through byte-identical", () => {

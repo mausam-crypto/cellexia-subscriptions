@@ -31,7 +31,7 @@
  *    `properties[_cellexia_design]` = the wrapper's data-cellexia-preset, so the
  *    ORDERS_CREATE webhook can attribute take-rate per design. The property
  *    is disabled (not submitted) whenever one-time purchase is selected.
- *  - Drive all seven design presets from the same state machine:
+ *  - Drive all eight design presets from the same state machine:
  *    radios (classic/tiles/value_stack/planner/subscription_max), role=tab
  *    toggle buttons (with arrow-key keyboard support), the inline checkbox,
  *    and frequency chips — every control funnels into setMode()/render().
@@ -103,6 +103,11 @@
   var OWN_WIDGET = '.cx-buybox[data-cellexia-buybox]';
   var OWN_WRAPPER = '.cx-buybox-embed[data-cellexia-embed]';
   var OWN_GATED = '.cx-buybox[data-cellexia-gated]';
+  /* The subscription_ultra_max preset's relocated one-time line (the
+     "satellite" module inside init()): OUR markup that legitimately lives
+     OUTSIDE the widget root once mounted, so every scan that skips "ours"
+     must skip it too, and every mutation of it asserts this class first. */
+  var OWN_SATELLITE = '.cx-buybox-satellite[data-cellexia-satellite]';
   /* The marker the Liquid leaves when this product carries selling plans but
      none of them are ours (another subscription app owns every group on it).
      It is an empty, hidden <template>: invisible to a shopper by definition,
@@ -567,6 +572,23 @@
     '.btn--atc'
   ].join(', ');
 
+  /* The theme's MAIN price display (v1.11.0) — the price under the product
+     title, which otherwise keeps quoting the one-time price while the
+     subscription is selected: the first entry is the client's Sleepify
+     theme (.pdp__price with the current price, the struck compare-at and a
+     per-unit line inside), the rest cover Dawn / OS 2.0 and the common
+     third-party patterns. Same exact-string swap as the button: the struck
+     compare-at and per-unit strings are deliberately NOT touched (they are
+     not the one-time money string, and this module never computes money).
+     A merchant-set themeSync.mainPriceSelector replaces this list. */
+  var PRICE_SYNC_MAIN_SELECTORS = [
+    '.pdp__price',
+    '.product__price',
+    '.price__regular',
+    '.product-price',
+    '[data-product-price]'
+  ].join(', ');
+
   /* Regions whose buttons are never THIS product's add-to-cart. A candidate
      inside one of these is dropped no matter which lookup found it: a false
      negative here costs nothing (the module simply does nothing), while a
@@ -584,7 +606,8 @@
     'header, [role="banner"], nav, footer, [role="dialog"], ' +
     '.site-header, .header, .mini-cart, .cart-drawer, cart-drawer, ' +
     '[data-cart-drawer], #cart-drawer, ' +
-    '.cx-buybox[data-cellexia-buybox], .cx-buybox-embed[data-cellexia-embed]';
+    '.cx-buybox[data-cellexia-buybox], .cx-buybox-embed[data-cellexia-embed], ' +
+    '.cx-buybox-satellite[data-cellexia-satellite]';
 
   var PRICE_SYNC_MAX_TARGETS = 8;
   var PRICE_SYNC_MAX_TEXT_NODES = 200;
@@ -636,15 +659,40 @@
    *   subMoney()        the first-order subscription money string, '' when
    *                     the current variant has no allocation
    */
-  function createPriceSync(root, api) {
+  /**
+   * One PER-SURFACE price-sync instance. v1.11.0 runs TWO of these — the
+   * add-to-cart button surface and the theme's main price display — as
+   * fully independent instances rather than one instance with a combined
+   * selector, and each independence is load-bearing:
+   *  - resolveTargets() stops at the FIRST ancestor level containing any
+   *    match, so a combined selector would let the nearer surface shadow
+   *    the farther one (on Dawn-family embeds the wrapper mounts inside
+   *    the /cart/add form, whose button would end the walk before the
+   *    out-of-form price block is ever reachable — and vice versa for
+   *    placements near the price block);
+   *  - the permanent kill switch (`dead`) must only take down ITS OWN
+   *    surface: a merchant-typed main-price selector that fails to parse
+   *    must not silently disable the button sync that was working;
+   *  - the records/write-budget bookkeeping stays per surface, so one
+   *    noisy surface cannot evict the other from the target cap.
+   *
+   * `selectorOverride` selects the surface: absent = the add-to-cart
+   * surface with its pre-v1.11.0 semantics byte-for-byte (config flag
+   * data-cellexia-price-sync, merchant data-cellexia-price-selector, built-in button
+   * list); present = the caller resolved the surface's selector itself and
+   * the instance starts alive.
+   */
+  function createPriceSync(root, api, selectorOverride) {
     var custom = (root.getAttribute('data-cellexia-price-selector') || '').replace(
       /^\s+|\s+$/g,
       ''
     );
-    var selector = custom || PRICE_SYNC_SELECTORS;
+    var selector = selectorOverride || custom || PRICE_SYNC_SELECTORS;
     /* Off by config, and the permanent kill switch for anything that goes
        wrong later (invalid selector, runaway theme, thrown exception). */
-    var dead = root.getAttribute('data-cellexia-price-sync') !== 'true';
+    var dead = selectorOverride
+      ? false
+      : root.getAttribute('data-cellexia-price-sync') !== 'true';
     var targets = [];
     var observers = [];
     /* { node, original, written } for every text node we rewrote. */
@@ -869,13 +917,21 @@
           disconnect();
           return;
         }
+        var recordsBefore = records.length;
+        var recordsKept = dropStaleRecords();
         if (
           want &&
           from === appliedFrom &&
           to === appliedTo &&
-          dropStaleRecords() > 0
+          recordsKept > 0 &&
+          recordsKept === recordsBefore
         ) {
-          /* Already showing exactly this and nobody has touched it. */
+          /* Already showing exactly this and NOTHING was touched. The count
+             comparison is load-bearing: "some record survived" is not
+             enough once a surface spans several nodes — a theme rewriting
+             ONE of them (a currency app, a per-unit refresh) must fall
+             through to the full re-apply below, or that node stays showing
+             the theme's one-time text while the rest show ours. */
           connect();
           return;
         }
@@ -1245,12 +1301,12 @@
       }
     }
 
-    /* Theme add-to-cart price sync — see the module above. Reads the money
-       strings from the JSON island (the same values the widget itself
-       displays), falling back to the server-rendered root attributes for the
-       initial variant/plan. Both are Liquid-formatted with the shop's
-       money_format, so they are byte-identical to what the theme printed. */
-    var priceSync = createPriceSync(root, {
+    /* Theme price sync — see the module above. Reads the money strings from
+       the JSON island (the same values the widget itself displays), falling
+       back to the server-rendered root attributes for the initial
+       variant/plan. Both are Liquid-formatted with the shop's money_format,
+       so they are byte-identical to what the theme printed. */
+    var priceSyncApi = {
       isHidden: function () {
         return widgetHidden();
       },
@@ -1274,14 +1330,204 @@
         }
         return root.getAttribute('data-cellexia-money-sub') || '';
       }
-    });
+    };
+    /* Two INDEPENDENT surfaces (see createPriceSync's header for why they
+       must not share a selector, a walk, records or a kill switch): the
+       add-to-cart button (pre-v1.11.0 semantics, internal flag), and the
+       theme's main price display (v1.11.0, its own flag + selector; absent
+       attributes on pre-v1.11.0 cached markup keep it off). */
+    var priceSyncs = [createPriceSync(root, priceSyncApi)];
+    if (root.getAttribute('data-cellexia-price-sync-main') === 'true') {
+      var customMain = (
+        root.getAttribute('data-cellexia-main-selector') || ''
+      ).replace(/^\s+|\s+$/g, '');
+      priceSyncs.push(
+        createPriceSync(root, priceSyncApi, customMain || PRICE_SYNC_MAIN_SELECTORS)
+      );
+    }
+
+    /* ── subscription_ultra_max satellite (v1.11.0) ──────────────────────────
+       The preset's quiet one-time line must sit ALL THE WAY UNDER the
+       theme's buy area — below quantity, Add to cart and the trust content
+       (.pdp__grey on the client's PDP) — not inside the widget. The Liquid
+       renders it INSIDE the widget root (so no-JS and launch-gated pages
+       are exactly as safe as subscription_max), and this module relocates
+       that one element after the theme's buy area while the widget is
+       visible. Every radio/wrap/price collection below was taken at init,
+       while the satellite was still inside the root, so the existing state
+       machine keeps driving it by reference after the move.
+
+       INVARIANTS, each load-bearing:
+        - the launch gate is an ANCESTOR [hidden]: outside the root that
+          ancestry is gone, so the satellite's own hidden attribute mirrors
+          widgetHidden() on every sync — a gated/parked/ghost widget never
+          leaves a visible one-time line behind;
+        - ownership is asserted (isOwnSatellite) before anything is moved
+          or removed — the same rule as every other own-markup mutation;
+        - a relocated radio must never JOIN the theme's form (it would
+          submit a stray cx-purchase field), so its form attribute points
+          at a non-existent id whenever a FORM ancestor appears;
+        - a theme re-render that destroys the satellite's host brings it
+          home (we hold the reference, like the embed's mountedWrapper),
+          and a predecessor root's stray satellite is removed at init. */
+
+    function isOwnSatellite(node) {
+      if (!node) {
+        return false;
+      }
+      try {
+        if (node.classList && typeof node.classList.contains === 'function') {
+          return node.classList.contains('cx-buybox-satellite');
+        }
+        var names = typeof node.className === 'string' ? node.className : '';
+        return (' ' + names + ' ').indexOf(' cx-buybox-satellite ') !== -1;
+      } catch (err) {
+        return false;
+      }
+    }
+
+    var satellite =
+      preset === 'subscription_ultra_max'
+        ? root.querySelector(OWN_SATELLITE)
+        : null;
+    if (satellite && !isOwnSatellite(satellite)) {
+      satellite = null;
+    }
+    /* The group div the satellite came from — its home when no anchor
+       exists or the widget hides while detached from its host. */
+    var satelliteHome = satellite ? satellite.parentNode : null;
+
+    if (satellite) {
+      try {
+        /* A predecessor widget for this same block (theme-editor section
+           re-render) may have left ITS relocated line in the page. */
+        var strays = document.querySelectorAll(OWN_SATELLITE);
+        for (var st = 0; st < strays.length; st++) {
+          var stray = strays[st];
+          if (
+            stray !== satellite &&
+            isOwnSatellite(stray) &&
+            !root.contains(stray) &&
+            stray.getAttribute('data-cellexia-for') ===
+              root.getAttribute('data-block-id') &&
+            stray.parentNode
+          ) {
+            stray.parentNode.removeChild(stray);
+          }
+        }
+      } catch (err) {
+        /* stray cleanup is a nicety — never break init over it */
+      }
+    }
+
+    /**
+     * The element the satellite lands AFTER: the theme's whole buy area.
+     * Walk UP from the widget and take the first .pdp__grey an ancestor
+     * contains (the client's PDP: quantity + Add to cart + badges +
+     * guarantee + reviews), else the bound /cart/add form (generic themes:
+     * the form ends with the buy buttons), else nothing — the line simply
+     * stays where the Liquid put it, which is the subscription_max layout.
+     */
+    function satelliteAnchor() {
+      var node = root.parentNode;
+      while (node && node.nodeType === 1 && node !== document.body) {
+        var grey = null;
+        try {
+          grey = node.querySelector('.pdp__grey');
+        } catch (err) {
+          grey = null;
+        }
+        if (grey && !grey.contains(root) && grey.parentNode) {
+          return grey;
+        }
+        node = node.parentNode;
+      }
+      if (form && inDocument(form) && form.parentNode && !form.contains(root)) {
+        return form;
+      }
+      return null;
+    }
+
+    /** Keep the relocated radio out of any THEME form's radio group. */
+    function syncSatelliteFormOwner() {
+      var inForm = false;
+      var walk = satellite.parentNode;
+      while (walk && walk.nodeType === 1) {
+        if (walk.nodeName === 'FORM') {
+          inForm = true;
+          break;
+        }
+        walk = walk.parentNode;
+      }
+      var inputs = satellite.querySelectorAll('input');
+      for (var ii = 0; ii < inputs.length; ii++) {
+        if (inForm) {
+          inputs[ii].setAttribute('form', 'cx-no-form-' + preset);
+        } else {
+          inputs[ii].removeAttribute('form');
+        }
+      }
+    }
+
+    function syncSatellite() {
+      if (!satellite || !isOwnSatellite(satellite)) {
+        return;
+      }
+      try {
+        if (!inDocument(root)) {
+          /* Ghost: the widget's markup was replaced. Its satellite must not
+             survive it — the successor renders (and mounts) its own. */
+          if (inDocument(satellite) && satellite.parentNode) {
+            satellite.parentNode.removeChild(satellite);
+          }
+          return;
+        }
+        var hidden = widgetHidden();
+        if (hidden) {
+          satellite.setAttribute('hidden', 'hidden');
+        } else {
+          satellite.removeAttribute('hidden');
+        }
+        if (!inDocument(satellite)) {
+          /* The theme re-rendered the area the satellite lived in: bring it
+             home first, so it is never lost, then (below) re-mount. */
+          if (satelliteHome && inDocument(satelliteHome)) {
+            satelliteHome.appendChild(satellite);
+          } else {
+            root.appendChild(satellite);
+          }
+        }
+        if (!hidden && root.contains(satellite)) {
+          var anchor = satelliteAnchor();
+          if (
+            anchor &&
+            anchor.parentNode &&
+            !satellite.contains(anchor) &&
+            anchor !== satellite
+          ) {
+            anchor.parentNode.insertBefore(satellite, anchor.nextSibling);
+          }
+        }
+        syncSatelliteFormOwner();
+      } catch (err) {
+        /* placement is presentation — never break the widget over it */
+      }
+    }
 
     /** Never let a display concern break the widget. */
     function syncThemePrice() {
+      for (var ps = 0; ps < priceSyncs.length; ps++) {
+        try {
+          priceSyncs[ps].sync();
+        } catch (err) {
+          /* the module already fails closed; this is the outer belt —
+             and one surface's failure must not cost the other its sync */
+        }
+      }
       try {
-        priceSync.sync();
+        syncSatellite();
       } catch (err) {
-        /* the module already fails closed; this is the outer belt */
+        /* same rule for the ultra_max satellite */
       }
     }
 
@@ -1526,6 +1772,16 @@
       }
       var subAvailable = !!plan;
       root.classList.toggle('cx-buybox--no-sub', !subAvailable);
+      if (satellite) {
+        try {
+          /* The relocated satellite has no .cx-buybox--no-sub ancestor out
+             there, so it carries its own copy of the state class (the CSS
+             hides its switch-back label on a no-sub variant off this). */
+          satellite.classList.toggle('cx-buybox--no-sub', !subAvailable);
+        } catch (err) {
+          /* class toggle is presentation — never break a repaint */
+        }
+      }
 
       els.oneTime.forEach(function (el) {
         el.textContent = variant.oneTime;
@@ -1972,19 +2228,26 @@
 
          1. readThemeVariant() — the authoritative re-read: the theme's
             [name="id"] input-or-select (our bound form first, then a
-            READ-ONLY document-wide scan that skips our own markup). Then
-            ?variant=, else keep the current variant. A page can carry
-            SEVERAL such fields for this product (quick-buy modal, sticky
-            add-to-cart bar, featured-product section), so when island-known
-            values DISAGREE the scan settles on evidence instead of document
-            order: the field whose value actually CHANGED since the last
-            read (the one the shopper is driving) wins, then a field inside
-            the widget's own section, else keep the current variant — a
-            stale duplicate can never freeze or flip the widget. A numeric
-            id the island does NOT know, appearing in our bound form or in a
-            field we watched hold our own ids, is CONCLUSIVE: the product
-            gained a variant after plan sync, and the widget parks (below)
-            rather than quote another variant's prices;
+            READ-ONLY document-wide scan that skips our own markup), and —
+            v1.11.0, from the SECOND live Sleepify defect — elements that
+            carry a variant id only as an ATTRIBUTE (data-variant-id /
+            data-val-id / data-variant): the client's pills moved to
+            data-val-id, the page has NO [name="id"] field at all, and the
+            only other signal is another vendor's product rows updating on
+            their own schedule, which a naive read raced into a widget
+            permanently one click behind. Then ?variant=, else keep the
+            current variant. A page can carry SEVERAL such signals for this
+            product (quick-buy modal, sticky add-to-cart bar, bystander
+            widgets), so when island-known values DISAGREE the scan settles
+            on evidence instead of document order — see readThemeVariant's
+            tier list: changed-value first, then fields (with the
+            own-section tiebreak), then the theme's own active-selection
+            paint, then passive markers; an unpicked swatch is never
+            evidence. A numeric id the island does NOT know, appearing in
+            our bound form or in a FIELD we watched hold our own ids, is
+            CONCLUSIVE: the product gained a variant after plan sync, and
+            the widget parks (below) rather than quote another variant's
+            prices — a mere marker can never park it;
          2. click delegation over the product area (host section, else the
             bound form, else the whole page): any click schedules a re-read
             on the next macrotask and again at +350ms, because themes update
@@ -2010,15 +2273,104 @@
       );
     }
 
+    /* Attribute names a theme (or another widget on the page) uses to carry
+       a variant id on an element that is not a form field. data-val-id is
+       the client's CURRENT Sleepify size-pill vocabulary (v1.11.0, observed
+       live — the pills moved off data-variant-id, and one pill ships its id
+       with trailing whitespace, so every read below is trimmed). */
+    var VARIANT_ID_ATTRS = ['data-variant-id', 'data-val-id', 'data-variant'];
+
+    function trimId(value) {
+      return String(value == null ? '' : value).replace(/^\s+|\s+$/g, '');
+    }
+
+    /** First variant-id attribute present on the element, trimmed. */
+    function markerValue(el) {
+      if (!el.getAttribute) {
+        return '';
+      }
+      for (var i = 0; i < VARIANT_ID_ATTRS.length; i++) {
+        var value = el.getAttribute(VARIANT_ID_ATTRS[i]);
+        if (value != null && trimId(value) !== '') {
+          return trimId(value);
+        }
+      }
+      return '';
+    }
+
+    /** A [name="id"] input/select — the theme's canonical variant field. */
+    function isThemeField(el) {
+      return !!el.getAttribute && el.getAttribute('name') === 'id';
+    }
+
+    /**
+     * Does the theme currently RENDER this element as the selected option?
+     * (Checked input, aria-selected/pressed/checked, or an active/selected/
+     * current class token.) A picker paints this synchronously in its own
+     * click handler, which makes it the earliest — and on the client's
+     * field-less theme the ONLY trustworthy — evidence of a variant change.
+     */
+    function markerActive(el) {
+      try {
+        if (el.checked === true) {
+          return true;
+        }
+        if (!el.getAttribute) {
+          return false;
+        }
+        if (
+          el.getAttribute('aria-selected') === 'true' ||
+          el.getAttribute('aria-pressed') === 'true' ||
+          el.getAttribute('aria-checked') === 'true'
+        ) {
+          return true;
+        }
+        var cls = el.getAttribute('class') || '';
+        return /(^|[\s_-])(active|selected|current)([\s_-]|$)/.test(cls);
+      } catch (err) {
+        return false;
+      }
+    }
+
+    /**
+     * One swatch among several, not the current selection: a control-shaped
+     * carrier (button/label/link/option, radio/checkbox input) or one inside
+     * an option-picker container, WITHOUT the active signal. Its id names an
+     * OPTION the shopper could pick — reading it as "the current variant" is
+     * how a widget freezes on the first pill in the row.
+     */
+    function markerIsUnpickedOption(el) {
+      if (markerActive(el)) {
+        return false;
+      }
+      var tag = el.nodeName;
+      if (tag === 'BUTTON' || tag === 'LABEL' || tag === 'OPTION' || tag === 'A') {
+        return true;
+      }
+      if (tag === 'INPUT') {
+        var type = (el.getAttribute('type') || '').toLowerCase();
+        return type === 'radio' || type === 'checkbox';
+      }
+      try {
+        return !!(el.closest && el.closest('.pdp__options, [data-option]'));
+      } catch (err) {
+        return false;
+      }
+    }
+
     var THEME_FIELDS_MAX_AGE = 10;
     var themeFields = null;
     var themeFieldsAge = 0;
 
     /**
-     * The THEME's [name="id"] fields — strictly read-only, foreign by
-     * design (it is the theme's state we are after): skip anything of ours.
+     * The THEME's variant signals — strictly read-only, foreign by design
+     * (it is the theme's state we are after): skip anything of ours. Two
+     * shapes are collected: [name="id"] fields (the canonical form state)
+     * and elements carrying a variant-id ATTRIBUTE (v1.11.0 — swatch pills,
+     * current-variant markers, another vendor's product rows; which of them
+     * count, and how much, is decided per read in readThemeVariant).
      * `fresh` forces the document-wide query; otherwise the previous list is
-     * reused while every field in it is still connected and the list is
+     * reused while every element in it is still connected and the list is
      * younger than THEME_FIELDS_MAX_AGE polls, so the widget's lifetime poll
      * does not pay a document-wide querySelectorAll per tick.
      */
@@ -2039,7 +2391,7 @@
       var fields;
       try {
         fields = document.querySelectorAll(
-          'input[name="id"], select[name="id"]'
+          'input[name="id"], select[name="id"], [data-variant-id], [data-val-id], [data-variant]'
         );
       } catch (err) {
         themeFields = null;
@@ -2050,7 +2402,9 @@
         var field = fields[j];
         if (
           field.closest &&
-          (field.closest(OWN_WIDGET) || field.closest(OWN_WRAPPER))
+          (field.closest(OWN_WIDGET) ||
+            field.closest(OWN_WRAPPER) ||
+            field.closest(OWN_SATELLITE))
         ) {
           continue;
         }
@@ -2080,13 +2434,43 @@
      * island-known variant id or null; `unsynced: true` is the CONCLUSIVE
      * "this product now sells a variant the island has no row for" verdict
      * (see the section comment) — never raised from a value that could
-     * belong to another product's form.
+     * belong to another product's form, and (v1.11.0) never from a mere
+     * marker ATTRIBUTE: another widget's rows reshuffling to a variant we
+     * never sold is not evidence this product changed, so only a real
+     * [name="id"] field may park the widget.
+     *
+     * Evidence tiers, strongest first (v1.11.0 — from the live Sleepify
+     * defect where the ONLY page-level signals were the pills' data-val-id
+     * attributes and another vendor's data-variant-id rows that update on
+     * their own schedule; a one-shot read of those rows put the widget
+     * permanently one click behind the shopper):
+     *   1. the bound form's [name="id"] — conclusive, as before;
+     *   2. a FIELD whose value CHANGED since the last read (the one the
+     *      shopper is driving — a laggy field self-corrects here the
+     *      moment it catches up);
+     *   3. [name="id"] fields, unanimous, then the own-section tiebreak —
+     *      the canonical form state stays above any mere marker, so a
+     *      foreign element wearing a "selected" class can never override
+     *      it;
+     *   4. the theme's own "this is selected" paint: active-signal carriers
+     *      (checked radio, aria-selected/pressed, active/selected class),
+     *      changed first then unanimous — also the fallback when fields
+     *      disagree beyond the section tiebreak;
+     *   5. passive current-variant markers (another widget's row naming one
+     *      of OUR variants), changed first then unanimous, and only when no
+     *      field and no active carrier said anything — the weakest evidence
+     *      never overrides the theme's own state. Changes compete only
+     *      WITHIN their tier: a bystander row settling late (to the
+     *      previous click's variant) must never outrank the unchanged
+     *      active pill the shopper is looking at.
+     * Unpicked options (a swatch without the active signal) are never
+     * evidence: each pill permanently names its OWN variant.
      */
     function readThemeVariant(fresh) {
       if (form && inDocument(form)) {
         var idInput = form.querySelector('[name="id"]');
         if (idInput) {
-          var formValue = idInput.value == null ? '' : String(idInput.value);
+          var formValue = trimId(idInput.value);
           if (knownVariant(formValue)) {
             return { id: formValue, unsynced: false };
           }
@@ -2098,72 +2482,137 @@
         }
       }
       var fields = scanThemeFields(fresh);
-      var known = [];
-      var distinct = [];
-      var changedKnown = null;
-      var changedConflict = false;
+      var ownSection = null;
+      try {
+        ownSection = root.closest('.shopify-section');
+      } catch (err) {
+        ownSection = null;
+      }
+      var fieldKnown = [];
+      var fieldDistinct = [];
+      var activeDistinct = [];
+      var passiveDistinct = [];
+      /* Changed-since-last-read signals, PER TIER. One flat "any change
+         wins" bucket would let a changed PASSIVE bystander outrank the
+         theme's own unchanged active paint — the exact shape of the
+         one-behind defect on a quick second click, when the bystander
+         settles late to the PREVIOUS variant. A change only ever competes
+         within its own trust tier. */
+      var changedField = null;
+      var changedFieldConflict = false;
+      var changedActive = null;
+      var changedActiveConflict = false;
+      var changedPassive = null;
+      var changedPassiveConflict = false;
       var changedUnsynced = false;
       var memory = [];
       for (var i = 0; i < fields.length; i++) {
         var field = fields[i];
-        var value = field.value == null ? '' : String(field.value);
+        var isField = isThemeField(field);
+        var value = isField ? trimId(field.value) : markerValue(field);
+        if (!isField && markerIsUnpickedOption(field)) {
+          /* One swatch among several: its id names an option, not the
+             current selection. Remember nothing and let the active one
+             speak — a memory entry here would make the pill row read as a
+             wall of "changed" signals the moment a theme re-renders it. */
+          continue;
+        }
         var last = rememberedValue(field);
         memory.push({ field: field, value: value });
         if (knownVariant(value)) {
-          known.push({ field: field, value: value });
-          if (distinct.indexOf(value) === -1) {
-            distinct.push(value);
+          var isActive = !isField && markerActive(field);
+          if (isField) {
+            fieldKnown.push({ field: field, value: value });
+            if (fieldDistinct.indexOf(value) === -1) {
+              fieldDistinct.push(value);
+            }
+          } else if (isActive) {
+            if (activeDistinct.indexOf(value) === -1) {
+              activeDistinct.push(value);
+            }
+          } else if (passiveDistinct.indexOf(value) === -1) {
+            passiveDistinct.push(value);
           }
           if (last !== null && last !== value) {
-            if (changedKnown === null) {
-              changedKnown = value;
-            } else if (changedKnown !== value) {
-              changedConflict = true;
+            if (isField) {
+              if (changedField === null) {
+                changedField = value;
+              } else if (changedField !== value) {
+                changedFieldConflict = true;
+              }
+            } else if (isActive) {
+              if (changedActive === null) {
+                changedActive = value;
+              } else if (changedActive !== value) {
+                changedActiveConflict = true;
+              }
+            } else if (changedPassive === null) {
+              changedPassive = value;
+            } else if (changedPassive !== value) {
+              changedPassiveConflict = true;
             }
           }
         } else if (
+          isField &&
           /^\d+$/.test(value) &&
           last !== null &&
-          knownVariant(last)
+          knownVariant(last) &&
+          (!ownSection || !ownSection.contains || ownSection.contains(field))
         ) {
-          /* A field we watched hold OUR ids now holds a numeric id the
-             island does not know — an un-synced variant of this product. */
+          /* A FIELD we watched hold OUR ids now holds a numeric id the
+             island does not know — an un-synced variant of this product.
+             Scoped to the widget's own section (when one exists): a shared
+             quick-add/bundle field elsewhere on the page being retargeted
+             from our product to another's must not park a widget whose own
+             section still agrees with the island. */
           changedUnsynced = true;
         }
       }
       fieldMemory = memory;
-      if (changedKnown !== null && !changedConflict) {
-        return { id: changedKnown, unsynced: false };
+      if (changedField !== null && !changedFieldConflict) {
+        return { id: changedField, unsynced: false };
       }
       if (changedUnsynced) {
         return { id: null, unsynced: true };
       }
-      if (distinct.length === 1) {
-        return { id: distinct[0], unsynced: false };
+      if (fieldDistinct.length === 1) {
+        return { id: fieldDistinct[0], unsynced: false };
       }
-      if (distinct.length > 1) {
-        var section = null;
-        try {
-          section = root.closest('.shopify-section');
-        } catch (err) {
-          section = null;
-        }
-        if (section && section.contains) {
+      if (fieldDistinct.length > 1) {
+        if (ownSection && ownSection.contains) {
           var sectionValue = null;
           var sectionConflict = false;
-          for (var k = 0; k < known.length; k++) {
-            if (!section.contains(known[k].field)) {
+          for (var k = 0; k < fieldKnown.length; k++) {
+            if (!ownSection.contains(fieldKnown[k].field)) {
               continue;
             }
             if (sectionValue === null) {
-              sectionValue = known[k].value;
-            } else if (sectionValue !== known[k].value) {
+              sectionValue = fieldKnown[k].value;
+            } else if (sectionValue !== fieldKnown[k].value) {
               sectionConflict = true;
             }
           }
           if (sectionValue !== null && !sectionConflict) {
             return { id: sectionValue, unsynced: false };
           }
+        }
+        /* Fields disagree and the section cannot arbitrate: fall through to
+           the theme's own selection paint rather than freezing forever. */
+      }
+      if (changedActive !== null && !changedActiveConflict) {
+        return { id: changedActive, unsynced: false };
+      }
+      if (activeDistinct.length === 1) {
+        return { id: activeDistinct[0], unsynced: false };
+      }
+      if (fieldDistinct.length === 0 && activeDistinct.length === 0) {
+        /* Passive bystander markers: the weakest evidence, consulted only
+           when neither a field nor the theme's own paint said anything. */
+        if (changedPassive !== null && !changedPassiveConflict) {
+          return { id: changedPassive, unsynced: false };
+        }
+        if (passiveDistinct.length === 1) {
+          return { id: passiveDistinct[0], unsynced: false };
         }
       }
       return { id: null, unsynced: false };
@@ -2294,7 +2743,9 @@
         if (!inDocument(root)) {
           /* Detached (theme-editor section re-render). The app embed can
              re-insert this same widget, and resync() re-arms the poll then;
-             a widget that never comes back must not tick forever. */
+             a widget that never comes back must not tick forever — and its
+             relocated satellite must not outlive it either. */
+          syncSatellite();
           stopVariantPoll();
           return;
         }

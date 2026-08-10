@@ -232,3 +232,55 @@ describe("the migrations build the schema the app is compiled against", () => {
     expect(built.get("ContractLine")).toContain("sellingPlanName");
   });
 });
+
+/**
+ * MIGRATED BOOKS MUST NOT COHORT ON IMPORT DAY.
+ *
+ * Every arrival/cohort surface anchors on `firstChargeAt ?? createdAt`.
+ * Imported contracts have no origin order, so nothing backfills
+ * firstChargeAt for them — without a signup-date column in the CSV, an
+ * entire migrated book lands as one giant import-day cohort (newSubscribers
+ * spike, wrong cohort triangle, accountAgeDays = days-since-import), and the
+ * real signup date exists ONLY in the source platform's export at import
+ * time: skip collecting it once and it is gone forever. These are text-level
+ * pins (same technique as the chain replay above): both importers must keep
+ * accepting `subscribed_since` and writing it into `firstChargeAt`, and the
+ * cohort anchors must keep reading that column.
+ */
+describe("imported subscribers cohort on subscribed_since, not import day", () => {
+  const importers = [
+    "scripts/import-subscribers.ts",
+    "app/routes/app.import.tsx",
+  ] as const;
+
+  it("both importers accept subscribed_since and write firstChargeAt", () => {
+    for (const rel of importers) {
+      const source = read(rel);
+      expect(source, `${rel} lost the subscribed_since column`).toContain(
+        "subscribed_since",
+      );
+      expect(source, `${rel} no longer writes firstChargeAt`).toContain(
+        "firstChargeAt: subscribedSince",
+      );
+      // Idempotency: an already-stamped instant (re-run, first renewal) is
+      // never overwritten by a CSV value.
+      expect(source).toContain("local.firstChargeAt == null");
+    }
+  });
+
+  it("the migration chain has storage for the anchor column", () => {
+    expect(built.get("SubscriptionContract")).toContain("firstChargeAt");
+  });
+
+  it("the cohort/arrival anchors read the column the importers fill", () => {
+    for (const rel of [
+      "app/lib/analytics/cohorts.server.ts",
+      "app/lib/analytics/rollup.server.ts",
+      "app/lib/analytics/queries.server.ts",
+    ]) {
+      expect(read(rel), `${rel} no longer anchors on firstChargeAt`).toContain(
+        "firstChargeAt",
+      );
+    }
+  });
+});

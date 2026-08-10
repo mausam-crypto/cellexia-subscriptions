@@ -30,10 +30,13 @@ conversion; minimise voluntary and involuntary churn.**
   selling plan into JS-driven cart requests — so it works even on themes whose
   product section takes no app blocks (a section app block remains available
   for themes that do).
-- **Buy box designer** — seven PDP design presets (classic cards, toggle
-  tabs, comparison tiles, inline upgrade, value stack, routine planner, and
+- **Buy box designer** — eight PDP design presets (classic cards, toggle
+  tabs, comparison tiles, inline upgrade, value stack, routine planner,
   subscription max — the subscription card *is* the buy box, with one-time
-  demoted to a quiet priced link that stays one tap away) with deep
+  demoted to a quiet priced link that stays one tap away — and subscription
+  ultra max, which sheds all offer chrome so subscribing reads as the plain
+  way of buying, with the priced one-time link relocated below the whole
+  buy area) with deep
   layout/style/per-locale text customization, **per-Shopify-Market preset
   selection** (each market can run its own preset, everything else inherited
   from the main design), preview, revision history with one-click restore,

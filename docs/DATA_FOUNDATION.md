@@ -73,6 +73,20 @@ written later can trust that a column has always meant the same thing.
   partially reflected in the captured current total (item refunds reduce it),
   which is the honest money-kept figure; money-only refunds predating capture
   are the one case revenue can read slightly high — accepted and documented.
+- **Post-capture order edits (accepted error)**: a captured amount — origin
+  or renewal (`BillingAttempt.amountCents`) — is never rewritten, and the app
+  does not subscribe `orders/edited`. DOWNWARD money movement after capture
+  flows through `REFUNDS_CREATE` (tracked in the refunded counters), and an
+  order cancellation is recorded capture-only by `orders/cancelled`
+  (`billing.order_cancelled` — no money mutation, refunds settle the money);
+  an UPWARD edit (merchant adds an item / raises the total after our
+  capture) is invisible — revenue reads low by the added amount for exactly
+  that order. Accepted: upward-edited subscription orders are vanishingly
+  rare, the immutability rule is what protects every refund-netting
+  invariant above, and an `orders/edited` leg would need its own event
+  vocabulary and replay guards for a case with no observed volume. Revisit
+  only with evidence (an `orders/edited` subscription capturing the delta
+  additively would be the shape).
 
 ---
 
@@ -107,7 +121,7 @@ ignores the stamp, so a genuinely late order webhook still lands its bundle.
 | `acqReferringSite` | `String?` | order `referring_site` | URL sanitizer (below). Where the buyer came from. |
 | `acqLandingSite` | `String?` | order `landing_site` | URL sanitizer. First page hit on the store. |
 | `acqSourceName` | `String?` | order `source_name` | Truncated 64. Shopify channel ("web", "shopify_draft_order", app ids…). |
-| `acqUtm` | `Json?` | utm params of landing (fallback referring) URL | `{source, medium, campaign, term, content}`, each PII-scrubbed + truncated; null when no UTM at all. Extracted BEFORE the URL sanitizer strips params, so no signal is lost. |
+| `acqUtm` | `Json?` | utm params of landing (fallback referring) URL | `{source, medium, campaign, term, content}`, each PII-scrubbed + truncated; null when no UTM at all. Extracted BEFORE the URL sanitizer strips params, so no signal is lost. The scrub preserves campaign VALUES (kebab/snake slugs, date-stamped names, pure-digit ad-platform ids) — see the token rules below; the capped-only originals ride in `acqRaw.rawUtm` so the edge can always be recomputed. |
 | `acqCountryCode` | `String?` | shipping (fallback billing) address | Uppercased, ≤8 chars. |
 | `acqCity` | `String?` | shipping (fallback billing) address | Truncated 64. |
 | `acqProvinceCode` | `String?` | shipping (fallback billing) address | Uppercased, ≤16 chars. |
@@ -115,7 +129,7 @@ ignores the stamp, so a genuinely late order webhook still lands its bundle.
 | `acqTimeToPurchaseSeconds` | `Int?` | customer `createdAt` → origin order `processedAt` | Browse-to-buy latency, clamped ≥ 0. Needs the Shopify customer read; null when unavailable. |
 | `acqUnitsFirstOrder` | `Int?` | Σ line-item quantities | First-order basket size. |
 | `acqOrderValueBand` | `String?` | order total | Decile-friendly label (`"0_25"` … `"200_plus"`, major units, edges in `ORDER_VALUE_BAND_EDGES`). A presentation convenience — the raw total is kept in `acqRaw.orderTotalCents`, so bands can be recomputed with different edges without losing data. |
-| `acqRaw` | `Json?` | whole sanitized bundle | Everything above plus `orderId`, `orderTotalCents`, `orderCurrencyCode`, `orderProcessedAt`, `customerCreatedAt`, `customerNumberOfOrders` (and `importedFrom`/`importPassthrough` for CSV imports). **Future-mining surface**: new ingest may add keys here without a migration. |
+| `acqRaw` | `Json?` | whole sanitized bundle | Everything above plus `orderId`, `orderTotalCents`, `orderCurrencyCode`, `orderProcessedAt`, `customerCreatedAt`, `customerNumberOfOrders` (and `importedFrom`/`importPassthrough`/`importSubscribedSince` for CSV imports). **Future-mining surface**: new ingest may add keys here without a migration. Additive keys so far: `rawUtm` — the five utm values length-capped ONLY, no scrub (the recompute reserve: scrub-heuristic changes can rebuild `acqUtm` instead of losing the dimension; it may hold what a scrub would catch, and lives inside `acqRaw` precisely so CUSTOMERS_REDACT clears it) — and the order-payload extras `discountCodes` (capped code list), `checkoutLocale`, `presentmentCurrencyCode`, `presentmentTotalCents`, `appId`, `sourceIdentifier` (scrubbed), `buyerAcceptsMarketing`, `orderTags` (capped list); each is null when its ingest cannot supply it. |
 
 ### Sanitization rules (pure module: `app/lib/acquisition/sanitize.ts`)
 
@@ -128,6 +142,15 @@ Enforced in one exported, unit-testable place so no caller can forget them:
   every other query param is dropped (checkout tokens, session ids, gclid,
   email-in-query…). Free-text parts are scrubbed of emails, phone-length
   digit runs and token-shaped strings, then hard-capped (512 chars).
+- **Token vs slug** (the scrub must not destroy the campaign dimension):
+  a 20+ char alnum run is redacted only when it is machine-shaped —
+  mixed-case WITH digits (base64 entropy), a separator-less letter+digit
+  fusion (hex-ish checkout/cart tokens), or longer than 64 chars. Human
+  slugs survive: `black-friday-2025-conversion`, `20260801_summer_sale`,
+  product handles in paths. Inside `utm_*` values and slug-shaped path
+  segments, pure-digit runs are ad-platform campaign/ad ids and are KEPT
+  (`sanitizeUtmValue`); genuinely free text (unparseable input, non-slug
+  path segments) still phone-scrubs digit runs.
 - **Every field is length-capped** so a hostile payload cannot balloon a row.
 - Ownership: capture persists onto **OURS** contracts only (another app's
   subscriber is not ours to profile; UNKNOWN fails safe).
@@ -152,9 +175,19 @@ personal data).
   first-order units.
 - **Klaviyo**: profile attributes `cellexia_acq_source` /
   `cellexia_acq_country`, synced on every contract-scoped event when present.
-- **Import script** (`scripts/import-subscribers.ts`): optional `acq_*` CSV
-  columns pass through the same sanitizer into the same columns (geo falls
-  back to the delivery-address columns).
+- **Importers** (`scripts/import-subscribers.ts` CLI + `/app/import` admin):
+  every imported contract gets its first-order shape — `acqUnitsFirstOrder`,
+  `acqOrderValueBand`, `acqRaw.orderTotalCents` — computed from the CSV
+  quantities + prices (the migrated-cadence approximation of the true first
+  order, flagged `acqRaw.importPassthrough`), plus geo from the
+  delivery-address columns. The CLI's optional `acq_*` columns pass through
+  the same sanitizer entry points and caps as the webhook path
+  (`sanitizeUtmValue` per utm value; the capped-only originals land in
+  `acqRaw.rawUtm`), read from the first row in the group carrying any. The
+  optional `subscribed_since` column (strict `parseCsvDate`, past-only, both
+  importers) becomes `firstChargeAt`, so a migrated book cohorts on its real
+  signup dates instead of arriving as one giant import-day cohort; the raw
+  value is kept in `acqRaw.importSubscribedSince`.
 
 ### What it unlocks later (why we collect now)
 

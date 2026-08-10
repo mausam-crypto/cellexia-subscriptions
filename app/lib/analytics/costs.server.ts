@@ -160,6 +160,145 @@ export function perCycleLineCosts(
   return { cogsCents, estimatedCogsCents, linesEstimated };
 }
 
+// ── Per-charge cost snapshot (migration 0016) ────────────────────────────────
+
+/** Contract shape computeChargeCostSnapshot needs (subset of SubscriptionContract). */
+export interface ContractWithLines {
+  deliveryPriceCents: number;
+  isPrepaid: boolean;
+  prepaidDeliveriesPerCharge: number | null;
+  lines: LineForCogs[];
+}
+
+/** One resolved non-gift line inside a stored ChargeCostSnapshot. */
+export interface ChargeCostSnapshotLine {
+  variantId: string;
+  quantity: number;
+  /** currentPriceCents at snapshot time (the price the cost was resolved against). */
+  priceCents: number;
+  /** Resolved per-UNIT cost at snapshot time. */
+  unitCostCents: number;
+  /** True when the value came from the percentage-of-price fallback. */
+  estimated: boolean;
+}
+
+/**
+ * The cost basis of ONE charge, frozen at settlement into
+ * BillingAttempt.costSnapshot so gross-profit history stops being repriced by
+ * later cost-setting edits (the nightly cohort rebuild used to re-resolve all
+ * history with today's costs).
+ *
+ * All *Cents totals are per CHARGE — already multiplied by deliveriesPerCharge
+ * (prepaid: one charge ships N deliveries) — so readers add them directly.
+ * Payment fees are deliberately ABSENT: they depend on the charged
+ * amountCents, which lives on the attempt row, so the reader computes them at
+ * read time (fee settings are a merchant-wide config, not a per-line basis).
+ * Gift lines are excluded entirely (totals AND lines[]): gift COGS is booked
+ * once per GiftGrant, never per charge — the same accounting split both
+ * gross-profit surfaces already apply.
+ */
+export interface ChargeCostSnapshot {
+  v: 1;
+  cogsCents: number;
+  /** Portion of cogsCents that came from the percentage fallback. */
+  estimatedCogsCents: number;
+  /** Carrier cost leg of the shipment cost (per charge). */
+  shippingCostCents: number;
+  /** Merchant-side fulfillment leg (per charge). */
+  fulfillmentCostCents: number;
+  deliveriesPerCharge: number;
+  lines: ChargeCostSnapshotLine[];
+}
+
+/**
+ * Resolve a charge's full cost basis through the shared cost model, in the
+ * exact shape stored on BillingAttempt.costSnapshot. Called by the settlement
+ * paths (success webhook + stale-attempt sweep) with the contract as mirrored
+ * at settlement; pure over its inputs so it is safely testable.
+ *
+ * `opts.deliveriesPerCharge` overrides the contract-derived shipment count for
+ * callers that already resolved it (defaults to the same prepaid rule the
+ * live readers use).
+ */
+export function computeChargeCostSnapshot(
+  ctx: CostContext,
+  contract: ContractWithLines,
+  opts: { deliveriesPerCharge?: number } = {},
+): ChargeCostSnapshot {
+  const deliveries = Math.max(
+    1,
+    opts.deliveriesPerCharge ??
+      (contract.isPrepaid ? (contract.prepaidDeliveriesPerCharge ?? 1) : 1),
+  );
+
+  let cogsCents = 0;
+  let estimatedCogsCents = 0;
+  const lines: ChargeCostSnapshotLine[] = [];
+  for (const line of contract.lines) {
+    if (line.isGift) continue; // booked per GiftGrant — see interface doc
+    const resolved = resolveLineCogs(line, ctx);
+    const lineTotal = resolved.unitCostCents * line.quantity;
+    cogsCents += lineTotal;
+    if (resolved.estimated) estimatedCogsCents += lineTotal;
+    lines.push({
+      variantId: line.variantId,
+      quantity: line.quantity,
+      priceCents: line.currentPriceCents,
+      unitCostCents: resolved.unitCostCents,
+      estimated: resolved.estimated,
+    });
+  }
+
+  // Split the perShipmentCostCents legs so the snapshot stays inspectable
+  // (which part was carrier cost vs fulfillment) — readers sum both.
+  const shippingPerShipment =
+    ctx.costModel.shippingCostPerShipmentCents.mode === "charged"
+      ? Math.max(0, contract.deliveryPriceCents)
+      : ctx.costModel.shippingCostPerShipmentCents.flatCents;
+
+  return {
+    v: 1,
+    cogsCents: cogsCents * deliveries,
+    estimatedCogsCents: estimatedCogsCents * deliveries,
+    shippingCostCents: shippingPerShipment * deliveries,
+    fulfillmentCostCents:
+      ctx.costModel.fulfillmentCostPerShipmentCents * deliveries,
+    deliveriesPerCharge: deliveries,
+    lines,
+  };
+}
+
+/**
+ * Validate a BillingAttempt.costSnapshot Json value back into a typed
+ * snapshot, or null when absent/unrecognized. Readers (rollup + cohorts)
+ * PREFER a parsed snapshot and fall back to live cost resolution when this
+ * returns null — pre-0016 attempts carry no snapshot and keep the historical
+ * live-model semantics (repriced by today's cost settings, the documented
+ * approximation they always had). An unknown version fails closed to the
+ * fallback rather than misreading a future shape.
+ */
+export function parseChargeCostSnapshot(
+  value: unknown,
+): ChargeCostSnapshot | null {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const snap = value as Record<string, unknown>;
+  if (snap.v !== 1) return null;
+  for (const field of [
+    "cogsCents",
+    "estimatedCogsCents",
+    "shippingCostCents",
+    "fulfillmentCostCents",
+    "deliveriesPerCharge",
+  ] as const) {
+    if (typeof snap[field] !== "number" || !Number.isFinite(snap[field])) {
+      return null;
+    }
+  }
+  return snap as unknown as ChargeCostSnapshot;
+}
+
 /** Payment processing fee for one successful charge, per the cost model. */
 export function paymentFeeCents(
   amountCents: number,

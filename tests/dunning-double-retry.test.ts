@@ -295,6 +295,48 @@ describe("fireRetry reuses the un-started PENDING row (the collision guard)", ()
     expect(mocks.createBillingAttempt).toHaveBeenCalledTimes(1); // still once
   });
 
+  it("a permanent refusal parks the case AND keeps the structured reason on the EXPIRED row", async () => {
+    mocks.dunningCaseFindMany.mockResolvedValue([dueCase()]);
+    wireAttemptLookups(PENDING_ROW);
+    // Shopify refuses the create with a machine-readable code (the GraphQL
+    // layer surfaces it on ShopifyUserError.errors once its userErrors
+    // selection carries `code`).
+    const { ShopifyUserError } = await import("~/lib/graphql/index.server");
+    const refusal = new ShopifyUserError("refused", []);
+    (refusal as unknown as { errors: unknown }).errors = [
+      { field: null, message: "Contract is paused", code: "contract_paused" },
+    ];
+    mocks.createBillingAttempt.mockRejectedValueOnce(refusal);
+
+    const stats = await runDunningSweep(NOW);
+    expect(stats.retriesScheduled).toBe(0);
+
+    // The terminal row itself carries the refusal reason — a bare EXPIRED
+    // reads as an unknown outcome and categorizeDeclineCode(null) files it
+    // under UNKNOWN/SOFT in every analytics surface.
+    expect(mocks.attemptUpdateMany).toHaveBeenCalledWith({
+      where: { id: "att_pending", shopifyAttemptId: null, startedAt: null },
+      data: {
+        status: "EXPIRED",
+        completedAt: NOW,
+        errorCode: "CONTRACT_PAUSED",
+        errorMessage: expect.stringContaining("refused"),
+      },
+    });
+    // Case parked for the customer window, reason in the audit event too.
+    expect(mocks.dunningCaseUpdate).toHaveBeenCalledWith({
+      where: { id: "case_1" },
+      data: { state: "AWAITING_CUSTOMER", nextRetryAt: null },
+    });
+    const awaiting = mocks.logEvent.mock.calls
+      .map((c) => c[0])
+      .find((e) => e.type === "dunning.awaiting_customer");
+    expect(awaiting?.payload).toMatchObject({
+      reason: "attempt_create_failed_permanently",
+      errorCode: "CONTRACT_PAUSED",
+    });
+  });
+
   it("a transient Shopify error backs off and the SAME key is reused on the next pass", async () => {
     mocks.dunningCaseFindMany.mockResolvedValue([dueCase()]);
     wireAttemptLookups(PENDING_ROW);

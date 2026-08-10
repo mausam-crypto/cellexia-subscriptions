@@ -131,13 +131,16 @@ function whereOfCall(index: number): Where {
   return args?.where ?? {};
 }
 
-/** Answer the two arm queries by their status filter. */
+/** Answer the three arm queries by their status/amount filters. */
 function primeAttempts({
   success = [] as Array<{ id: string }>,
   failed = [] as Array<{ id: string }>,
+  trueup = [] as Array<Record<string, unknown>>,
 }) {
   mocks.attemptFindMany.mockImplementation(async (args?: unknown) => {
     const where = (args as { where?: Where })?.where ?? {};
+    // Third arm: SUCCESS rows filtered on amountCents null (the true-up).
+    if (where.status === "SUCCESS" && "amountCents" in where) return trueup;
     if (where.status === "SUCCESS") return success;
     if (where.status === "FAILED") return failed;
     return [];

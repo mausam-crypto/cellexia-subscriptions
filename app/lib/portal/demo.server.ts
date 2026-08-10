@@ -142,7 +142,11 @@ async function createFreshDemoContract(
       status: "ACTIVE",
       locale: "en",
       currencyCode: shop.currencyCode,
+      // Week cadence with its exact unit/count mirror (v1.8.0) — the portal
+      // reads the mirror first via contractFrequency.
       intervalWeeks: DEMO_INTERVAL_WEEKS,
+      billingIntervalUnit: "WEEK",
+      billingIntervalCount: DEMO_INTERVAL_WEEKS,
       nextBillingDate: addDaysTz(now, DEMO_NEXT_BILLING_DAYS, tz),
       firstChargeAt: addDaysTz(now, -DEMO_FIRST_CHARGE_DAYS_AGO, tz),
       ordersCount: DEMO_ORDERS_COUNT,
@@ -243,6 +247,16 @@ export async function createDemoContract(
 export async function resetDemoContract(
   shopId: string,
 ): Promise<{ contractId: string }> {
+  // Events FIRST: SubscriberEvent.contractId is onDelete: SetNull, so
+  // deleting the contract alone would orphan its demo events as
+  // contractId-NULL rows — provenance lost forever, and every contract-less
+  // surface (the audit page/CSV, any future contract-less counter) would
+  // have no way to filter them (the deletion invariant documented in
+  // ARCHITECTURE.md's demo passage: demo contracts are the ONLY contracts
+  // ever deleted, and their events die with them).
+  await prisma.subscriberEvent.deleteMany({
+    where: { shopId, contract: { is: { isDemo: true } } },
+  });
   await prisma.subscriptionContract.deleteMany({
     where: { shopId, isDemo: true },
   });

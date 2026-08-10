@@ -762,8 +762,8 @@ describe("migration 0003 backfills fail-SAFE and stays additive", () => {
     // columns exist, not what they default to. Drift here is invisible until a
     // `create()` without ownership lands on a real database.
     const schema = read("prisma/schema.prisma");
-    expect(schema).toContain('ownership                   String    @default("UNKNOWN")');
-    expect(schema).not.toContain('ownership                   String    @default("OURS")');
+    expect(schema).toContain('ownership                       String    @default("UNKNOWN")');
+    expect(schema).not.toContain('ownership                       String    @default("OURS")');
 
     const migrationDefault = /"ownership" TEXT NOT NULL DEFAULT '(\w+)'/.exec(sql);
     const schemaDefault = /ownership\s+String\s+@default\("(\w+)"\)/.exec(schema);
@@ -808,6 +808,8 @@ describe("migration 0003 backfills fail-SAFE and stays additive", () => {
       "0012_addon_cycle_index",
       "0013_reactivation_cycle_release",
       "0014_challenged_attempt_marker_repair",
+      "0015_multi_unit_frequencies",
+      "0016_data_collection_audit",
     ]);
   });
 });
@@ -1243,6 +1245,92 @@ describe("migration 0014 (challenged-attempt marker repair) stays additive and l
     expect(sql).toMatch(/SET "declineCategory" = NULL/);
     expect(sql).toMatch(/"status" = 'CHALLENGED'/);
     expect(sql).toMatch(/"declineCategory" = 'AUTH_REQUIRED'/);
+  });
+
+  it("never touches the ownership column or its default", () => {
+    expect(sql).not.toMatch(/ownership/i);
+    expect(sql).not.toMatch(/SET DEFAULT/i);
+  });
+});
+
+describe("migration 0015 (multi-unit frequencies) stays additive and leaves ownership alone", () => {
+  const sql = read(
+    "prisma/migrations/0015_multi_unit_frequencies/migration.sql",
+  )
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("is additive only — no destructive verb anywhere in it", () => {
+    for (const verb of [
+      /\bDROP\b/i,
+      /\bTRUNCATE\b/i,
+      /\bDELETE\s+FROM\b/i,
+      /\bUPDATE\s+"/i,
+      /\bRENAME\b/i,
+      /\bALTER\s+TYPE\b/i,
+      /\bALTER\s+COLUMN\s+"\w+"\s+TYPE\b/i,
+    ]) {
+      expect(sql, String(verb)).not.toMatch(verb);
+    }
+  });
+
+  it("adds only the two nullable multi-unit frequency columns", () => {
+    // Nullable on purpose: configs saved before v1.8.0 carry NULL until their
+    // next save and every reader falls back to the legacy week columns
+    // (parseConfigFrequencies) — a NOT NULL DEFAULT would stamp a fake
+    // frequency list on every existing plan config instead.
+    const adds = sql.match(/ADD COLUMN [^;]+/g) ?? [];
+    expect(adds).toHaveLength(2);
+    expect(sql).toMatch(
+      /ALTER TABLE "SellingPlanConfig" ADD COLUMN "frequencies" JSONB;/,
+    );
+    expect(sql).toMatch(
+      /ALTER TABLE "SellingPlanConfig" ADD COLUMN "defaultFrequency" JSONB;/,
+    );
+    expect(sql).not.toMatch(/NOT NULL/);
+  });
+
+  it("never touches the ownership column or its default", () => {
+    expect(sql).not.toMatch(/ownership/i);
+    expect(sql).not.toMatch(/SET DEFAULT/i);
+  });
+});
+
+describe("migration 0016 (data-collection audit) stays additive and leaves ownership alone", () => {
+  const sql = read(
+    "prisma/migrations/0016_data_collection_audit/migration.sql",
+  )
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("is additive only — no destructive verb anywhere in it", () => {
+    for (const verb of [
+      /\bDROP\b/i,
+      /\bTRUNCATE\b/i,
+      /\bDELETE\s+FROM\b/i,
+      /\bUPDATE\s+"/i,
+      /\bRENAME\b/i,
+      /\bALTER\s+TYPE\b/i,
+      /\bALTER\s+COLUMN\s+"\w+"\s+TYPE\b/i,
+    ]) {
+      expect(sql, String(verb)).not.toMatch(verb);
+    }
+  });
+
+  it("every added column is nullable or defaults to the true historical value", () => {
+    // Null means "not captured yet" for the capture-at-the-moment columns;
+    // the only NOT NULL DEFAULTs are counters/flags whose default IS the
+    // honest pre-0016 value (0 merchant skips, 0 excluded cents, false
+    // fabricated) — never a fabricated fact stamped onto existing rows.
+    const adds = sql.match(/ADD COLUMN [^,;]+/g) ?? [];
+    expect(adds.length).toBeGreaterThan(0);
+    for (const add of adds) {
+      if (/NOT NULL/.test(add)) {
+        expect(add, add).toMatch(/NOT NULL DEFAULT/);
+      }
+    }
   });
 
   it("never touches the ownership column or its default", () => {

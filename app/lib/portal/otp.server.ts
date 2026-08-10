@@ -109,6 +109,19 @@ export async function requestOtp(
     where: { email: emailNorm, createdAt: { gte: hourAgo } },
   });
   if (recent >= portalSettings.otpRequestsPerHour) {
+    // Telemetry only — the response stays byte-identical to every other
+    // requestOtp outcome (anti-enumeration), and the timing floor already
+    // dwarfs this one extra write. Email-keyed; never any code material.
+    await logEvent({
+      shopId: contract.shopId,
+      contractId: contract.id,
+      customerId: contract.customerId,
+      email: contract.email,
+      type: "portal.otp_throttled",
+      source: "CUSTOMER_PORTAL",
+      actor: "customer",
+      payload: { recentRequests: recent, limit: portalSettings.otpRequestsPerHour },
+    });
     return timingFloor(started, { ok: true as const, ttlMinutes: neutralTtl });
   }
 
@@ -201,6 +214,19 @@ export async function verifyOtp(
     await prisma.otpCode.updateMany({
       where: { id: { in: candidates.map((c) => c.id) } },
       data: { attempts: { increment: 1 } },
+    });
+    // Telemetry only — same { ok: false } as every other failure path, timed
+    // by the same floor. Email-keyed; the guessed code (and its hash) never
+    // enters the event stream.
+    await logEvent({
+      shopId: contract.shopId,
+      contractId: contract.id,
+      customerId: contract.customerId,
+      email: contract.email,
+      type: "portal.login_failed",
+      source: "CUSTOMER_PORTAL",
+      actor: "customer",
+      payload: { reason: "code_mismatch", liveCodes: candidates.length },
     });
     return timingFloor(started, { ok: false as const });
   }

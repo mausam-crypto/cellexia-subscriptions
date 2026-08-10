@@ -57,12 +57,18 @@ const mocks = vi.hoisted(() => ({
   giftUpdateMany: vi.fn(
     async (_args?: unknown): Promise<unknown> => ({ count: 0 }),
   ),
+  cadenceFindMany: vi.fn(async (_args?: unknown): Promise<unknown[]> => []),
   gql: vi.fn(async (): Promise<unknown> => ({})),
   getOrderSummarySweep: vi.fn(async (): Promise<unknown> => ({
     totalCents: 5760,
     currencyCode: "CHF",
     name: "#1042",
     createdAt: new Date(Date.now() - 3 * 3_600_000),
+    processedAt: new Date(Date.now() - 3 * 3_600_000),
+    discountsCents: 300,
+    taxCents: 410,
+    shippingCents: 500,
+    subtotalCents: 5050,
   })),
   syncContractFromShopify: vi.fn(async (): Promise<unknown> => ({})),
   onBillingAttemptSucceeded: vi.fn(async (): Promise<void> => {}),
@@ -96,6 +102,9 @@ vi.mock("~/db.server", () => {
     },
     giftGrant: {
       updateMany: mocks.giftUpdateMany,
+    },
+    productCadence: {
+      findMany: mocks.cadenceFindMany,
     },
   };
 
@@ -146,8 +155,13 @@ vi.mock("~/lib/shop/install.server", () => ({
 
 vi.mock("~/lib/events/log.server", () => ({ logEvent: mocks.logEvent }));
 
+// Real registry defaults: the sweep reads settings.dunning (CHALLENGED
+// re-query window) and settings.costModel (cost snapshot at settlement).
 vi.mock("~/lib/settings/settings.server", () => ({
-  getSetting: vi.fn(async () => ({})),
+  getSetting: vi.fn(async (_shopId: string, key: string) => {
+    const { defaultFor } = await import("~/lib/settings/registry.server");
+    return defaultFor(key as never);
+  }),
 }));
 
 vi.mock("~/lib/i18n/i18n.server", () => ({
@@ -236,6 +250,9 @@ function contractRow() {
     currencyCode: "CHF",
     locale: "en",
     status: "ACTIVE",
+    deliveryPriceCents: 500,
+    isPrepaid: false,
+    prepaidDeliveriesPerCharge: null,
   };
 }
 
@@ -296,10 +313,27 @@ beforeEach(() => {
       order: { id: ORDER_GID, name: "#1042" },
     },
   });
-  // The cycle had a staged one-time add-on riding along.
-  mocks.lineFindMany.mockResolvedValue([
-    { id: "line_addon_1", title: "Collagen Boost", isOneTimeAddon: true },
-  ]);
+  // Two line reads run per settled attempt: the pre-claim cost-snapshot
+  // resolution (all lines) and the claim transaction's add-on consumption
+  // (isOneTimeAddon filter) — route on the filter so each sees its shape.
+  mocks.lineFindMany.mockImplementation(async (args?: unknown) => {
+    const where = (args as { where?: Record<string, unknown> })?.where ?? {};
+    if (where.isOneTimeAddon) {
+      return [
+        { id: "line_addon_1", title: "Collagen Boost", isOneTimeAddon: true },
+      ];
+    }
+    return [
+      {
+        productId: "gid://shopify/Product/10",
+        variantId: "gid://shopify/ProductVariant/11",
+        quantity: 2,
+        currentPriceCents: 2400,
+        unitCostCents: 900,
+        isGift: false,
+      },
+    ];
+  });
   vi.spyOn(console, "error").mockImplementation(() => {});
 });
 
@@ -345,12 +379,14 @@ describe("a sweep-resolved SUCCESS runs the webhook's full settlement", () => {
     });
   });
 
-  it("flips this cycle's gift grants ADDED → SHIPPED", async () => {
+  it("flips this cycle's gift grants ADDED → SHIPPED (stamping shippedAt)", async () => {
     await sweepStalePendingAttempts(2);
 
+    // shippedAt rides the flip: analytics count gift COGS by "shipped or
+    // ever-shipped", so a later REMOVED flip must not erase the evidence.
     expect(mocks.giftUpdateMany).toHaveBeenCalledWith({
       where: { contractId: "c_1", cycleIndex: 5, status: "ADDED" },
-      data: { status: "SHIPPED" },
+      data: { status: "SHIPPED", shippedAt: expect.any(Date) },
     });
   });
 
@@ -459,5 +495,181 @@ describe("the sweep's crash contract", () => {
     expect(mocks.syncContractFromShopify).not.toHaveBeenCalled();
     expect(mocks.logEvent).not.toHaveBeenCalled();
     expect(mocks.attemptUpdate).not.toHaveBeenCalled();
+  });
+});
+
+describe("settlement money capture (cost snapshot + order breakdown)", () => {
+  /** The claim write of the first settled attempt. */
+  function claimData(): Record<string, unknown> {
+    return (
+      mocks.attemptUpdateMany.mock.calls[0][0] as {
+        data: Record<string, unknown>;
+      }
+    ).data;
+  }
+
+  it("freezes the charge's cost basis and order money breakdown into the claim", async () => {
+    await sweepStalePendingAttempts(2);
+
+    const data = claimData();
+    // The renewal-order money breakdown rides the settlement (same capture
+    // the webhook path performs), so rollup/cohorts stop estimating tax and
+    // discount spend for sweep-settled charges.
+    expect(data).toMatchObject({
+      amountCents: 5760,
+      currencyCode: "CHF",
+      discountCents: 300,
+      taxCents: 410,
+      shippingCents: 500,
+      subtotalCents: 5050,
+    });
+    expect(data.orderProcessedAt).toBeInstanceOf(Date);
+
+    // The cost basis is frozen through the shared cost model: 2 × 900 known
+    // unit cost, nothing estimated, one delivery per charge.
+    expect(data.costSnapshot).toMatchObject({
+      v: 1,
+      cogsCents: 1800,
+      estimatedCogsCents: 0,
+      deliveriesPerCharge: 1,
+    });
+    expect(
+      (data.costSnapshot as { lines: unknown[] }).lines,
+    ).toHaveLength(1);
+
+    // lifetimeDiscountCents gains its renewals-only writer alongside
+    // lifetimeRevenueCents, inside the same claim transaction.
+    const counterWrite = mocks.contractUpdate.mock.calls
+      .map((c) => (c[0] as { data: Record<string, unknown> }).data)
+      .find((d) => d.ordersCount !== undefined);
+    expect(counterWrite).toMatchObject({
+      lifetimeRevenueCents: { increment: 5760 },
+      lifetimeDiscountCents: { increment: 300 },
+    });
+  });
+
+  it("scopes the frozen cost basis to the settling cycle — a future-cycle add-on mirror is excluded", async () => {
+    // A lost success webhook settled by the sweep on a contract holding an
+    // add-on staged for the NEXT cycle: that add-on's COGS belongs to ITS
+    // cycle's charge (it books when cycle 6 settles), so freezing it into
+    // cycle 5's snapshot would double-book the same units — the exact
+    // cycle-scope rule the webhook path's snapshot and the add-on
+    // consumption below already apply.
+    mocks.lineFindMany.mockImplementation(async (args?: unknown) => {
+      const where = (args as { where?: Record<string, unknown> })?.where ?? {};
+      if (where.isOneTimeAddon) {
+        return [
+          { id: "line_addon_1", title: "Collagen Boost", isOneTimeAddon: true },
+        ];
+      }
+      return [
+        {
+          productId: "gid://shopify/Product/10",
+          variantId: "gid://shopify/ProductVariant/11",
+          quantity: 2,
+          currentPriceCents: 2400,
+          unitCostCents: 900,
+          isGift: false,
+          isOneTimeAddon: false,
+          addonCycleIndex: null,
+        },
+        {
+          // Staged for cycle 6 during the stale window — must NOT enter
+          // cycle 5's frozen basis.
+          productId: "gid://shopify/Product/20",
+          variantId: "gid://shopify/ProductVariant/21",
+          quantity: 1,
+          currentPriceCents: 1500,
+          unitCostCents: 400,
+          isGift: false,
+          isOneTimeAddon: true,
+          addonCycleIndex: 6,
+        },
+        {
+          // Staged for the settling cycle — the customer paid for it on this
+          // order, so it belongs to this charge's cost basis.
+          productId: "gid://shopify/Product/30",
+          variantId: "gid://shopify/ProductVariant/31",
+          quantity: 1,
+          currentPriceCents: 1200,
+          unitCostCents: 350,
+          isGift: false,
+          isOneTimeAddon: true,
+          addonCycleIndex: 5,
+        },
+      ];
+    });
+
+    await sweepStalePendingAttempts(2);
+
+    const data = claimData();
+    // 2 × 900 recurring + 350 this-cycle add-on; the 400-cent future add-on
+    // stays out of both the totals and the line list.
+    expect(data.costSnapshot).toMatchObject({
+      v: 1,
+      cogsCents: 2150,
+      estimatedCogsCents: 0,
+    });
+    expect(
+      (data.costSnapshot as { lines: Array<{ variantId: string }> }).lines.map(
+        (l) => l.variantId,
+      ),
+    ).toEqual([
+      "gid://shopify/ProductVariant/11",
+      "gid://shopify/ProductVariant/31",
+    ]);
+  });
+
+  it("re-arms the prepaid delivery allotment — sweep parity with the webhook claim", async () => {
+    const prepaidContract = {
+      ...contractRow(),
+      isPrepaid: true,
+      prepaidDeliveriesPerCharge: 3,
+      prepaidDeliveriesRemaining: 0, // exhausted by the old per-charge decrement
+    };
+    mocks.attemptFindMany.mockResolvedValue([
+      { ...staleAttemptRow(), contract: prepaidContract },
+    ]);
+
+    await sweepStalePendingAttempts(2);
+
+    // A successful prepaid charge pays for a fresh allotment; a sweep-settled
+    // charge must not leave the cockpit badge on "Prepaid (0 left)".
+    const counterWrite = mocks.contractUpdate.mock.calls
+      .map((c) => (c[0] as { data: Record<string, unknown> }).data)
+      .find((d) => d.ordersCount !== undefined);
+    expect(counterWrite?.prepaidDeliveriesRemaining).toBe(3);
+  });
+
+  it("a cost-model failure never blocks the settlement — snapshot omitted, charge recorded", async () => {
+    mocks.cadenceFindMany.mockRejectedValueOnce(new Error("db hiccup"));
+
+    const stats = await sweepStalePendingAttempts(2);
+
+    expect(stats.succeeded).toBe(1);
+    const data = claimData();
+    expect(data.costSnapshot).toBeUndefined();
+    // The money still lands — readers fall back to live cost resolution.
+    expect(data).toMatchObject({ amountCents: 5760 });
+  });
+
+  it("an order-summary failure settles with NO amount or breakdown (the true-up sweep's case)", async () => {
+    mocks.getOrderSummarySweep.mockRejectedValueOnce(new Error("throttled"));
+
+    const stats = await sweepStalePendingAttempts(2);
+
+    expect(stats.succeeded).toBe(1);
+    const data = claimData();
+    expect(data.amountCents).toBeUndefined();
+    expect(data.discountCents).toBeUndefined();
+    // No amount read ⇒ amountCents stays NULL, which is exactly the marker
+    // sweepUnsettledAttempts' null-amount arm keys on to true the money up.
+    const counterWrite = mocks.contractUpdate.mock.calls
+      .map((c) => (c[0] as { data: Record<string, unknown> }).data)
+      .find((d) => d.ordersCount !== undefined);
+    expect(counterWrite).toMatchObject({
+      lifetimeRevenueCents: { increment: 0 },
+    });
+    expect(counterWrite?.lifetimeDiscountCents).toBeUndefined();
   });
 });

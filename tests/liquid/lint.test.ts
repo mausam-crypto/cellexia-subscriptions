@@ -30,10 +30,10 @@ import {
  *      pulls those markers into a STRING, and the next escape filter prints
  *      them on the page. This is the exact production bug.
  *   2. Renders happen ONLY in direct-output markup position (v1.7.0, when the
- *      seven preset partials were extracted from the core for the platform's
+ *      preset partials were extracted from the core for the platform's
  *      per-file size limit): no render token inside any capture span, and no
  *      render as a bare line inside a liquid block. The snippet set is pinned
- *      — cx-buybox-core.liquid plus the seven cx-preset-*.liquid partials —
+ *      — cx-buybox-core.liquid plus the eight cx-preset-*.liquid partials —
  *      and a preset partial renders nothing further: snippets never return
  *      values, all string/value computation stays in the consumer.
  *   3. Never escape the output of `| t`: it is already HTML-escaped, so a
@@ -516,9 +516,9 @@ describe("no captured renders (the v1.2.0 storefront bug)", () => {
   it("sees the capture blocks and the renders it is checking", () => {
     /* Vacuity guard: if liquidTags ever stops parsing this extension the
        three rules above would pass by finding nothing at all. The counts
-       reflect the v1.7.0 shape: the core keeps its five markup captures
+       reflect the v1.11.0 shape: the core keeps its five markup captures
        (frequency control, benefit list, reassurance, the two price-block
-       variants) and dispatches the seven preset partials; the partials add
+       variants) and dispatches the eight preset partials; the partials add
        their own pure-markup captures; each block file renders the core. */
     const snippet = read(join(SNIPPETS_DIR, "cx-buybox-core.liquid"));
     expect(captureRanges(snippet).length, "capture blocks found").toBeGreaterThan(
@@ -532,7 +532,7 @@ describe("no captured renders (the v1.2.0 storefront bug)", () => {
     const coreRenders = liquidTags(snippet).filter(
       (tag) => tag.name === "render",
     );
-    expect(coreRenders.length, "preset renders found in the core").toBe(7);
+    expect(coreRenders.length, "preset renders found in the core").toBe(8);
     const blockRenders = readdirSync(BLOCKS_DIR)
       .filter((name) => name.endsWith(".liquid"))
       .flatMap((name) =>
@@ -600,19 +600,20 @@ describe("no captured renders (the v1.2.0 storefront bug)", () => {
 // ── 2. Renders only in direct-output markup position; the snippet set is
 //       pinned ────────────────────────────────────────────────────────────────
 
-/** The seven design presets, one partial each, dispatched by the core. */
+/** The eight design presets, one partial each, dispatched by the core. */
 const PRESET_NAMES = [
   "classic",
   "inline",
   "planner",
   "subscription_max",
+  "subscription_ultra_max",
   "tiles",
   "toggle",
   "value_stack",
 ] as const;
 
 describe("snippet surface", () => {
-  it("ships exactly the core snippet plus the seven preset partials", () => {
+  it("ships exactly the core snippet plus the eight preset partials", () => {
     /* Pinned, not counted: a stray snippet is a review event, because every
        new render target is a new set of app-snippet comment markers and a
        new opportunity to stringify one. */
@@ -660,7 +661,7 @@ describe("snippet surface", () => {
     }
   });
 
-  it("the core renders exactly the seven preset partials, once each", () => {
+  it("the core renders exactly the eight preset partials, once each", () => {
     /* The dispatch is pinned both ways: every branch of the {% case %}
        reaches a preset partial, and no render targets anything else — a
        renamed partial, a helper snippet or a second render of the same
@@ -1142,6 +1143,13 @@ describe("attribute namespace", () => {
       // (.cx-buybox-nogroup[data-cellexia-no-owned-group]), and it is only
       // ever read — never marked, moved or unhidden.
       "OWN_NO_GROUP",
+      // v1.11.0 subscription_ultra_max: the relocated one-time line — OUR
+      // markup legitimately living outside the widget root once mounted.
+      // Reviewed: class + attribute qualified
+      // (.cx-buybox-satellite[data-cellexia-satellite]); the document-level
+      // query serves the predecessor-stray cleanup at init, and every
+      // mutation behind it asserts isOwnSatellite() first.
+      "OWN_SATELLITE",
       "selector",
     ]);
     const seen = new Set<string>();

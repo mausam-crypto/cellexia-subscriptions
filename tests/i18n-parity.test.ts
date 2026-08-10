@@ -33,7 +33,8 @@ describe("master catalog (en)", () => {
   });
 
   it("every key is namespaced to a known prefix", () => {
-    const allowed = /^(portal|magic|email|sms|cancel|common)\./;
+    // freq.* is the v1.8.0 frequency-phrase family (freq.{every|option}.{unit}.{one|other}).
+    const allowed = /^(portal|magic|email|sms|cancel|common|freq)\./;
     const offenders = Object.keys(en).filter((k) => !allowed.test(k));
     expect(
       offenders,

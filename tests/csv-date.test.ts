@@ -124,3 +124,48 @@ describe("both importers share the strict parser — no drift possible", () => {
     });
   }
 });
+
+describe("subscribed_since rides the same strict parser in both importers", () => {
+  // The original signup date carries the whole cohort anchor for a migrated
+  // book (SM-02): a leniently parsed value would shift every historical
+  // cohort, and a FUTURE value would book arrivals that never happened — so
+  // both importers must validate it through parseCsvDate AND reject
+  // non-past instants as a row error.
+  for (const file of [
+    "app/routes/app.import.tsx",
+    "scripts/import-subscribers.ts",
+  ] as const) {
+    it(`${file} validates subscribed_since via parseCsvDate, past-only`, () => {
+      const source = read(file);
+      expect(source).toContain("subscribed_since");
+      expect(source).toContain("subscribed_since must be in the past");
+      expect(source).toMatch(
+        /subscribed_since must be YYYY-MM-DD or an ISO-8601 timestamp with timezone/,
+      );
+    });
+  }
+});
+
+describe("both importers share the frequency module — no local cadence math", () => {
+  // Same drift hazard as the date parser, higher stakes: a local re-creation
+  // of the token/approximation helpers in one importer would let the two
+  // surfaces disagree on what counts as a duplicate cadence.
+  for (const [file, spec] of [
+    ["app/routes/app.import.tsx", '"~/lib/frequency"'],
+    ["scripts/import-subscribers.ts", '"../app/lib/frequency"'],
+  ] as const) {
+    it(`${file} imports the shared frequency helpers and defines no local copy`, () => {
+      const source = read(file);
+      expect(source).toContain(`} from ${spec}`);
+      for (const helper of [
+        "contractFrequency",
+        "frequencyToken",
+        "frequencyLabelEn",
+        "approxWeeks",
+      ] as const) {
+        expect(source).toContain(helper);
+        expect(source).not.toMatch(new RegExp(`function ${helper}`));
+      }
+    });
+  }
+});

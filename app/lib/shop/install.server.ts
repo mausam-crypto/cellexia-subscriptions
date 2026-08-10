@@ -58,7 +58,10 @@ export async function onAppInstalled(shopDomain: string): Promise<void> {
           contactEmail: info.contactEmail ?? undefined,
           primaryDomain: info.primaryDomain?.host ?? undefined,
           enabledLocales: (body.data?.shopLocales ?? []) as object,
-          lastFullSyncAt: new Date(),
+          // lastFullSyncAt is deliberately NOT written here: metadata sync is
+          // not a contract sync. backfillAllContracts stamps it on completion
+          // (the only writer), which is what makes the backfill gate below
+          // retry-safe.
         },
       });
     }
@@ -70,7 +73,8 @@ export async function onAppInstalled(shopDomain: string): Promise<void> {
       payload: { domain: shopDomain },
     });
   } catch (err) {
-    // Install must not fail because metadata sync failed; jobs re-sync later.
+    // Install must not fail because metadata sync failed; the shop/update
+    // webhook re-syncs currency/timezone/locales when the shop changes them.
     console.error("[install] shop metadata sync failed", err);
   }
 
@@ -87,6 +91,46 @@ export async function onAppInstalled(shopDomain: string): Promise<void> {
     await syncLaunchMetafield(shopDomain, launch.mode);
   } catch (err) {
     console.error("[install] launch metafield sync failed", err);
+  }
+
+  try {
+    // ── Initial contract backfill ────────────────────────────────────────────
+    // Contracts that exist BEFORE install never fire a webhook, so without a
+    // full sweep they are invisible to billing and analytics until some later
+    // webhook happens to touch them. Fire-and-forget on purpose: an
+    // established shop takes minutes to page through and afterAuth must
+    // answer the OAuth callback promptly — the sweep's own per-contract sync
+    // events are the audit trail, and its completion stamp is the gate.
+    // Gated on lastFullSyncAt, which ONLY backfillAllContracts writes (on
+    // completion): a re-auth never re-runs the sweep, while a crash mid-sweep
+    // leaves the stamp null and the next auth retries it. Shops installed
+    // before the gate existed carry a metadata-time stamp and are covered by
+    // the daily full_sync_reconcile job instead. Lazy import: the contracts
+    // module imports requireShop from this file.
+    const current = await prisma.shop.findUnique({
+      where: { id: shop.id },
+      select: { lastFullSyncAt: true },
+    });
+    if (!current?.lastFullSyncAt) {
+      const { backfillAllContracts } = await import(
+        "~/lib/contracts/sync.server"
+      );
+      void backfillAllContracts(shopDomain)
+        .then((result) => {
+          console.log(
+            "[install] initial contract backfill finished",
+            shopDomain,
+            `total=${result.total} synced=${result.synced} failed=${result.failed}`,
+          );
+        })
+        .catch((err) => {
+          // Contained: a failed backfill must never break install — the gate
+          // stays null, so the next auth (or the daily job) retries.
+          console.error("[install] initial contract backfill failed", err);
+        });
+    }
+  } catch (err) {
+    console.error("[install] initial contract backfill launch failed", err);
   }
 }
 

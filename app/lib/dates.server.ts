@@ -1,5 +1,6 @@
 import { fromZonedTime, toZonedTime, format } from "date-fns-tz";
-import { addDays, addWeeks, startOfDay } from "date-fns";
+import { addDays, addMonths, addWeeks, addYears, startOfDay } from "date-fns";
+import type { IntervalUnit } from "~/lib/frequency";
 
 /**
  * Timezone-safe scheduling helpers. All persisted timestamps are UTC.
@@ -23,6 +24,38 @@ export function addDaysTz(date: Date, days: number, tz: string): Date {
 export function addWeeksTz(date: Date, weeks: number, tz: string): Date {
   const zoned = toZonedTime(date, tz);
   return fromZonedTime(addWeeks(zoned, weeks), tz);
+}
+
+/** Add N months, anchored to the shop-timezone calendar (month-end clamps). */
+export function addMonthsTz(date: Date, months: number, tz: string): Date {
+  const zoned = toZonedTime(date, tz);
+  return fromZonedTime(addMonths(zoned, months), tz);
+}
+
+/**
+ * Advance a date by `intervals` billing intervals of `{unit, count}` in the
+ * shop timezone — the one place cadence-unit date math lives. MONTH steps are
+ * calendar months (Jan 31 + 1 month = Feb 28/29), matching how Shopify walks
+ * a MONTH billing policy; negative `intervals` steps backwards.
+ */
+export function addIntervalTz(
+  date: Date,
+  unit: IntervalUnit,
+  count: number,
+  tz: string,
+  intervals = 1,
+): Date {
+  const zoned = toZonedTime(date, tz);
+  const steps = Math.max(1, count) * intervals;
+  const advanced =
+    unit === "DAY"
+      ? addDays(zoned, steps)
+      : unit === "WEEK"
+        ? addWeeks(zoned, steps)
+        : unit === "MONTH"
+          ? addMonths(zoned, steps)
+          : addYears(zoned, steps);
+  return fromZonedTime(advanced, tz);
 }
 
 /** Same calendar day in the shop timezone? */

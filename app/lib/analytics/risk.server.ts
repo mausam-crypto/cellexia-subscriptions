@@ -38,6 +38,26 @@ const DEFAULT_DAYS_TO_EMPTY = 56;
 /** Skip re-writing predictedEmptyDate when it moved by less than this. */
 const EMPTY_DATE_WRITE_TOLERANCE_MS = 6 * 60 * 60 * 1000; // 6h
 
+/**
+ * How far back successful charges feed the observed-consumption blend. ~18
+ * months covers ≥6 inter-charge gaps at the longest common cadence (8-week
+ * intervals with occasional skips) while keeping the fetch bounded.
+ */
+const OBSERVED_GAP_LOOKBACK_DAYS = 540;
+
+/**
+ * Shrinkage prior for the observed-consumption blend: the merchant/default
+ * cadence estimate counts as this many pseudo-observations, so one odd gap
+ * cannot yank the prediction but a steady demonstrated rhythm overrides the
+ * guess. observedWeight = gaps / (gaps + PRIOR): 1 gap → 20% observed,
+ * 4 gaps → 50%, 12 gaps → 75%.
+ */
+const OBSERVED_GAP_PRIOR_STRENGTH = 4;
+
+/** Observed gaps outside this band are artifacts (same-day double settlement / year-long dormancy), not consumption. */
+const OBSERVED_GAP_MIN_DAYS = 1;
+const OBSERVED_GAP_MAX_DAYS = 365;
+
 const DAY_MS = 86_400_000;
 
 /**
@@ -311,16 +331,63 @@ export async function getRiskModelStatus(shopId: string): Promise<RiskModelStatu
 // ── Predicted empty dates ─────────────────────────────────────────────────────
 
 /**
+ * Blend the cadence-derived days-to-empty (the merchant's guess, or the
+ * 56-day default) with the contract's OWN demonstrated consumption rhythm —
+ * the learning loop the cadence estimate never had: estDaysToEmpty is
+ * written only by the Plans-page form and nothing ever calibrated it from
+ * observed behavior, so every un-tuned product ran win-back on an arbitrary
+ * 56-day clock forever.
+ *
+ * The observation is the contract's real inter-charge gaps (successful
+ * settlements): skips, merchant delays and date pushes all lengthen the gap,
+ * so it already encodes "net of skips/delays" — a subscriber who skips every
+ * other cycle demonstrably consumes at half speed, and their win-back/
+ * replenishment touches should fire accordingly later. Gaps outside
+ * [OBSERVED_GAP_MIN_DAYS, OBSERVED_GAP_MAX_DAYS] are dropped as artifacts
+ * (same-day double settlements, dormant re-awakenings).
+ *
+ * Shrinkage, not replacement: observedWeight = gaps / (gaps +
+ * OBSERVED_GAP_PRIOR_STRENGTH), so sparse histories stay close to the
+ * cadence prior (0 gaps = exactly the pre-blend behavior) and rich histories
+ * are dominated by demonstrated rhythm. Deterministic — same inputs, same
+ * date, no RNG.
+ */
+export function blendedDaysToEmpty(opts: {
+  /** Cadence-derived days (MIN over supply lines × quantity) — the prior. */
+  cadenceDays: number;
+  /** The contract's inter-charge gaps in days, any order. */
+  observedGapsDays: number[];
+}): number {
+  const usable = opts.observedGapsDays.filter(
+    (gap) =>
+      Number.isFinite(gap) &&
+      gap >= OBSERVED_GAP_MIN_DAYS &&
+      gap <= OBSERVED_GAP_MAX_DAYS,
+  );
+  if (usable.length === 0) return opts.cadenceDays;
+  const observedMean = usable.reduce((s, gap) => s + gap, 0) / usable.length;
+  const observedWeight =
+    usable.length / (usable.length + OBSERVED_GAP_PRIOR_STRENGTH);
+  return (
+    observedWeight * observedMean + (1 - observedWeight) * opts.cadenceDays
+  );
+}
+
+/**
  * predictedEmptyDate per contract, written to
  * SubscriptionContract.predictedEmptyDate.
  *
- * Formula: anchor + minDays where
+ * Formula: anchor + blendedDaysToEmpty({ cadenceDays: minDays, observedGaps })
+ * where
  * - anchor = latest successful BillingAttempt.completedAt
  *   ?? firstChargeAt ?? now (the last time product shipped);
  * - minDays = MIN over non-gift lines of
  *   (ProductCadence.estDaysToEmpty for the variant, falling back to the
  *   product-level row, else 56) × max(1, quantity) — quantity > 1 means the
- *   customer has proportionally more supply.
+ *   customer has proportionally more supply;
+ * - observedGaps = the contract's inter-charge gaps over the last
+ *   OBSERVED_GAP_LOOKBACK_DAYS (see blendedDaysToEmpty — the self-improving
+ *   half of the prediction).
  *
  * MIN, not max: this date times win-back touches and replenishment prompts,
  * and the operative moment is when the FIRST product runs out — a cleanser
@@ -339,49 +406,66 @@ export async function runPredictedEmptyDates(
   shopId: string,
   now: Date = new Date(),
 ): Promise<{ scanned: number; updated: number }> {
-  const [contracts, cadences, lastSuccessGroups] = await Promise.all([
-    prisma.subscriptionContract.findMany({
-      where: {
-        shopId,
-        ...COUNTABLE_CONTRACT,
-        OR: [
-          { status: { in: ["ACTIVE", "PAUSED"] } },
-          {
-            status: "CANCELLED",
-            cancelledAt: { gte: subDays(now, CANCELLED_LOOKBACK_DAYS) },
-          },
-        ],
-      },
-      select: {
-        id: true,
-        firstChargeAt: true,
-        predictedEmptyDate: true,
-        lines: {
-          select: {
-            productId: true,
-            variantId: true,
-            quantity: true,
-            isGift: true,
+  const [contracts, cadences, lastSuccessGroups, recentSuccesses] =
+    await Promise.all([
+      prisma.subscriptionContract.findMany({
+        where: {
+          shopId,
+          ...COUNTABLE_CONTRACT,
+          OR: [
+            { status: { in: ["ACTIVE", "PAUSED"] } },
+            {
+              status: "CANCELLED",
+              cancelledAt: { gte: subDays(now, CANCELLED_LOOKBACK_DAYS) },
+            },
+          ],
+        },
+        select: {
+          id: true,
+          firstChargeAt: true,
+          predictedEmptyDate: true,
+          lines: {
+            select: {
+              productId: true,
+              variantId: true,
+              quantity: true,
+              isGift: true,
+            },
           },
         },
-      },
-    }),
-    prisma.productCadence.findMany({
-      where: { shopId },
-      select: { productId: true, variantId: true, estDaysToEmpty: true },
-    }),
-    prisma.billingAttempt.groupBy({
-      by: ["contractId"],
-      where: {
-        contract: { shopId, ...COUNTABLE_CONTRACT },
-        status: "SUCCESS",
-        completedAt: { not: null },
-      },
-      _max: { completedAt: true },
-    }),
-  ]);
+      }),
+      prisma.productCadence.findMany({
+        where: { shopId },
+        select: { productId: true, variantId: true, estDaysToEmpty: true },
+      }),
+      prisma.billingAttempt.groupBy({
+        by: ["contractId"],
+        where: {
+          contract: { shopId, ...COUNTABLE_CONTRACT },
+          status: "SUCCESS",
+          completedAt: { not: null },
+        },
+        _max: { completedAt: true },
+      }),
+      // Inter-charge gaps for the observed-consumption blend. Windowed
+      // (bounded fetch) and separate from the anchor groupBy above, which
+      // deliberately has NO window — a contract whose last success predates
+      // the lookback must keep its true anchor.
+      prisma.billingAttempt.findMany({
+        where: {
+          contract: { shopId, ...COUNTABLE_CONTRACT },
+          status: "SUCCESS",
+          completedAt: { gte: subDays(now, OBSERVED_GAP_LOOKBACK_DAYS) },
+        },
+        select: { contractId: true, completedAt: true },
+        orderBy: { completedAt: "asc" },
+      }),
+    ]);
 
-  // Variant-level cadence rows override product-level rows.
+  // Variant-level cadence rows override product-level rows. NOTE: no writer
+  // creates variant rows yet (the Plans page always saves variantId: null),
+  // so this lookup is dormant by design — it stays so a future variant-level
+  // cadence editor (30ml vs 100ml sizes) becomes live without engine changes.
   const cadenceByVariant = new Map<string, number>();
   const cadenceByProduct = new Map<string, number>();
   for (const cadence of cadences) {
@@ -399,6 +483,21 @@ export async function runPredictedEmptyDates(
     if (g._max.completedAt) {
       lastSuccessByContract.set(g.contractId, g._max.completedAt);
     }
+  }
+  // Per-contract inter-charge gaps in days (rows arrive completedAt-ascending;
+  // artifact filtering happens inside blendedDaysToEmpty).
+  const gapsByContract = new Map<string, number[]>();
+  const lastSeenSuccess = new Map<string, number>();
+  for (const attempt of recentSuccesses) {
+    if (!attempt.completedAt) continue;
+    const at = attempt.completedAt.getTime();
+    const prev = lastSeenSuccess.get(attempt.contractId);
+    if (prev != null) {
+      const gaps = gapsByContract.get(attempt.contractId) ?? [];
+      gaps.push((at - prev) / DAY_MS);
+      gapsByContract.set(attempt.contractId, gaps);
+    }
+    lastSeenSuccess.set(attempt.contractId, at);
   }
 
   const updates: { id: string; predictedEmptyDate: Date | null }[] = [];
@@ -422,9 +521,18 @@ export async function runPredictedEmptyDates(
       minDays = Math.min(minDays, estDays * Math.max(1, line.quantity));
     }
 
+    // Cadence prior blended with the contract's demonstrated reorder rhythm
+    // (see blendedDaysToEmpty) — the observed gap bounds the binding
+    // (first-empty) line's effective supply: the subscriber tolerated that
+    // spacing between deliveries without running out or leaving.
+    const days = blendedDaysToEmpty({
+      cadenceDays: minDays,
+      observedGapsDays: gapsByContract.get(contract.id) ?? [],
+    });
+
     const anchor =
       lastSuccessByContract.get(contract.id) ?? contract.firstChargeAt ?? now;
-    const predicted = new Date(anchor.getTime() + minDays * DAY_MS);
+    const predicted = new Date(anchor.getTime() + days * DAY_MS);
 
     const stored = contract.predictedEmptyDate;
     if (

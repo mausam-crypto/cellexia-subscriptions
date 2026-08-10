@@ -19,19 +19,26 @@ Subscriptions) unless a shell command is shown.
    (+ recovered this month), each with a week-over-week delta; below them the
    90-day MRR trend, the 12-week new-vs-churned chart, the forecast teaser
    (with its accuracy grade chip) and the top open failed payments.
-2. **Alerts** — unresolved alerts (`BILLING_RUN_FAILED`, `WEBHOOK_FAILURES`,
+2. **Debug** — the self-check verdict chip should read **Healthy**. The same
+   28 checks re-run automatically every 30 minutes (`selfcheck_run`, also in
+   setup mode); a **Broken** verdict raises one CRITICAL `SELF_CHECK_FAILED`
+   alert (emailed to Settings → alerts → `emailTo`) and every failing row on
+   the page carries a named fix. The alert auto-resolves when a later run
+   comes back clean — the checks page, not the alert row, is the live truth.
+3. **Alerts** — unresolved alerts (`BILLING_RUN_FAILED`, `WEBHOOK_FAILURES`,
    `ORIGIN_BACKFILL_FAILURES`, `STUCK_CONTRACTS`, `FAILURE_SPIKE`,
    `CHURN_SPIKE`, `FAST_SHIPPING_SKIPS`, `STOCKOUT_RENEWALS`,
-   `FOREIGN_CONTRACTS`, `KLAVIYO_OUTBOX_BACKLOG`). Triage per the runbooks below;
+   `FOREIGN_CONTRACTS`, `KLAVIYO_OUTBOX_BACKLOG`, `SELF_CHECK_FAILED`).
+   Triage per the runbooks below;
    resolve when handled. Critical alerts also email everyone in Settings →
    alerts → `emailTo`. `FOREIGN_CONTRACTS` (severity WARNING, raised while any
    contract on the store belongs to another subscription app or is still
    unattributed) is informational — see §18; it is not an incident.
-3. **Dunning** — open cases, sorted by next retry. Sanity-check the queue size
+4. **Dunning** — open cases, sorted by next retry. Sanity-check the queue size
    against yesterday (see §5).
-4. **Audit** — skim the event stream for anything unusual (bursts of
+5. **Audit** — skim the event stream for anything unusual (bursts of
    `billing.attempt_failed`, `notification.failed`, webhook failures).
-5. External: your uptime monitor on `/api/health` (§12) should be green.
+6. External: your uptime monitor on `/api/health` (§12) should be green.
 
 ## 2. Runbook — "Billing run failed" alert
 
@@ -183,7 +190,7 @@ a price increase properly:
 
 | Secret | Effect of rotating | Procedure |
 |---|---|---|
-| `APP_SIGNING_SECRET` | **Invalidates every outstanding magic link, portal session and pending OTP immediately.** Links already sitting in customers' inboxes (skip links in upcoming-order emails, card-update links in dunning emails) will show "link expired". | Rotate only on suspicion of compromise or scheduled hygiene. Do it at a low-traffic hour: set the new value, restart. Then **send fresh links**: Bulk ops → re-send card-update links for all open dunning cases, and accept that pre-rotation upcoming-order emails will route customers to portal login (OTP) instead — that path always works. |
+| `APP_SIGNING_SECRET` | **Invalidates every outstanding magic link, portal preview link (`?cx_pp=`), portal session and pending OTP immediately.** Links already sitting in customers' inboxes (skip links in upcoming-order emails, card-update links in dunning emails) will show "link expired". | Rotate only on suspicion of compromise or scheduled hygiene. Do it at a low-traffic hour: set the new value, restart. Then **send fresh links**: Bulk ops → re-send card-update links for all open dunning cases, and accept that pre-rotation upcoming-order emails will route customers to the portal login instead — store-account sign-in always works. |
 | `CRON_SECRET` | External cron gets 401s until updated. | Set new value on host **and** in the cron service in the same minute. Internal-scheduler installs: no urgency. |
 | `SHOPIFY_API_SECRET` | Webhook HMACs + app-proxy signatures fail → webhooks rejected, portal 401s. | Rotate in the Partner Dashboard, update the host secret immediately, redeploy. Verify a webhook arrives and `/apps/cellexia-subs` loads. |
 | SMTP / Klaviyo keys | Notifications fail (contained — billing unaffected). With the Klaviyo key absent, lifecycle **emails** fall back to plain direct-SMTP delivery, **SMS is not sent at all**, and outbox rows are aged out (DEAD) after 24h rather than fired late; a stalled/dying outbox raises `KLAVIYO_OUTBOX_BACKLOG`. | Update, restart, confirm the outbox drains and `notification.sent` events resume; resolve the `KLAVIYO_OUTBOX_BACKLOG` alert once it stops re-raising. |
@@ -234,6 +241,15 @@ them) but loses the extension state.
 
 `GET /api/health` returns 200 with a JSON body covering DB reachability and
 scheduler liveness (last job tick); it returns non-200 when a subsystem is down.
+
+The admin **Debug** page is the wide companion to this endpoint: where
+`/api/health` answers "is the process alive" for an external monitor, the
+Debug self-check probes 28 feature-level facts on the live store (billing
+pipeline shapes, dunning cases, the portal fetched through the real app
+proxy, webhook delivery evidence, granted API scopes, secrets, Klaviyo
+outbox, settings integrity) every 30 minutes and emails on a broken verdict
+via the `SELF_CHECK_FAILED` alert. Use `/api/health` for paging, the Debug
+page for diagnosis.
 
 UptimeRobot setup: **Add monitor** → type *HTTP(s)* → URL
 `https://<app-host>/api/health` → interval 5 minutes → alert contacts = the same
@@ -290,9 +306,22 @@ tokens valid **7 days** and are never consumed — the same link works across
 PDP/cart visits for its lifetime. When one expires, re-generate it from the
 Preview & launch page (also the fix for a link that was shared too widely:
 old links die at their TTL; there is nothing to revoke server-side ahead of
-that, so treat them as private). Portal preview sessions are shorter-lived
-(the link is valid 1 hour; the session persists in that browser) and are
-read-only by construction — every mutating action is intercepted.
+that, so treat them as private). Portal preview links (`?cx_pp=…`, since
+v1.7.0) work the same way on the portal side: a signed, stateless token valid
+**1 hour**, multi-use within that hour, opening the portal directly on the
+store domain. The token in the URL *is* the session — Shopify's app proxy
+strips cookies, so nothing is stored in the browser — and it is read-only by
+construction: every mutating action is intercepted server-side. An expired
+link shows a named "this preview link has expired" page; re-generate from
+Preview & launch.
+
+**Portal sign-in on a live store.** Customers sign in with their **store
+account** (`/account/login` → back to the portal): the app proxy appends
+Shopify's signed `logged_in_customer_id` to every proxied request, which the
+portal accepts as the customer identity — no app cookie is ever involved.
+The email → OTP-code flow depends on cookies the app proxy strips in both
+directions, so it can never work on a real store; it survives only for the
+local dev harness behind `PORTAL_COOKIE_DEV=1` (see `.env.example`).
 
 **Preview opened but the widget is not there?** That is the
 [§20 "Widget not showing?" runbook](#20-runbook--widget-not-showing): run the
@@ -428,20 +457,25 @@ puts the theme's own text back the instant one-time is selected (or the widget
 is hidden, launch-gated or unmounted). It never changes what is added to the
 cart — the cart line is decided by the `selling_plan` field, not by button
 copy — and it re-applies automatically when the theme rewrites the label on a
-variant change.
+variant change. Since v1.11.0 the same swap also covers the theme's **main
+price display** — the price under the product title, which otherwise keeps
+quoting the one-time price while the subscription is selected. Struck-through
+compare-at prices and per-unit lines are deliberately left untouched.
 
-**Where to switch it on/off:** Buy box designer → **Theme integration** →
-"Match the theme's Add to cart price to the selected option" (published with
-the rest of the design, so no theme edit or redeploy). It is **on by default**,
-including for shops that never published a design.
+**Where to switch it on/off:** Buy box designer → **Theme integration** —
+two checkboxes: "Match the theme's Add to cart price to the selected option"
+and (v1.11.0) "Match the theme's main price display to the selected option"
+(published with the rest of the design, so no theme edit or redeploy). Both
+are **on by default**, including for shops that never published a design and
+for designs published before v1.11.0 (a missing key means on).
 
 **It is silent by design.** The swap only ever happens when the button's text
 literally contains the one-time money string, formatted with the shop's own
 `money_format`. A theme whose button reads just "Add to cart" is left
 untouched, with no warning and no console noise — there is nothing to fix.
 
-**The button's price is not updating** (it still shows the one-time price with
-subscription selected):
+**The button's (or the main display's) price is not updating** (it still
+shows the one-time price with subscription selected):
 
 1. Confirm the toggle above is on and the design is **published** (not just
    saved as a draft).
@@ -456,7 +490,11 @@ subscription selected):
    add-to-cart button (and nothing else). `.pdp__actions .btn--atc` is the
    correct value for the Sleepify theme on cellexialabs.com; the built-in list
    also covers `button[name="add"]`, `.product-form__submit`,
-   `[data-add-to-cart]` and `.btn--atc` (Dawn / OS 2.0 and most themes).
+   `[data-add-to-cart]` and `.btn--atc` (Dawn / OS 2.0 and most themes). The
+   main price display has its own escape hatch right below — "Main price
+   selector" — with the same rules; its built-in list is `.pdp__price` (the
+   Sleepify value on cellexialabs.com), `.product__price`, `.price__regular`,
+   `.product-price` and `[data-product-price]`.
 4. Re-check after any theme redesign, exactly like the embed's placement
    anchor (§16) — renamed CSS classes invalidate a custom selector.
 
@@ -508,7 +546,7 @@ no configuration on your part:
 | **Emails and SMS** — reminders, dunning, card-expiry, win-back, cancel-save. `send.server` refuses to message a contract that is not `OURS`, so a Joy subscriber can never receive a Cellexia email about their Joy subscription. | **Checkout and order emails** are Shopify's, shared by both apps as usual. |
 | **Klaviyo** — nothing is enqueued for a contract that is not `OURS`, so no flow can fire at another app's customer. | **Reporting outside the app** (Shopify's own subscription reports, your BI) counts both apps together unless you split it yourself. |
 | **Analytics** — rollups, cohorts, LTGP, survival, churn risk, forecast, take rate and every dashboard tile count `OURS` only, so their subscribers never inflate your numbers. | **Inventory and fulfilment** are shared — both apps create real orders on the same stock. |
-| **Customer portal** — a subscriber whose contracts are all the other app's cannot log in: the OTP screen shows the same neutral "if that email has a subscription, a code is on its way" copy and **no code is sent**. Send them to the other app's portal. | |
+| **Customer portal** — a subscriber whose contracts are all the other app's sees nothing here: they can sign in with their store account (that is Shopify's login, not ours to refuse), but the portal lists `OURS` contracts only, so it shows the empty "no subscriptions yet" state. Send them to the other app's portal. | |
 | **Support cockpit and bulk ops** — every action on a `FOREIGN`/`UNKNOWN` contract is refused server-side, including *Charge now*. | |
 
 **What going live does to the other app's subscribers: nothing.** Go-live flips

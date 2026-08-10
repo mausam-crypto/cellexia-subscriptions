@@ -8,6 +8,7 @@
 
 export {
   categorizeDeclineCode,
+  structuredUserErrorCode,
   DECLINE_CODES,
   DECLINE_CODE_TABLE,
   UNKNOWN_DECLINE,

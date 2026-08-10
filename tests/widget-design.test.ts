@@ -319,6 +319,8 @@ describe("themeSync", () => {
     expect(DEFAULT_DESIGN_CONFIG.themeSync).toEqual({
       syncAddToCartPrice: true,
       priceSelector: "",
+      syncMainPrice: true,
+      mainPriceSelector: "",
     });
   });
 
@@ -331,6 +333,8 @@ describe("themeSync", () => {
     expect(parseOk(config).themeSync).toEqual({
       syncAddToCartPrice: true,
       priceSelector: "",
+      syncMainPrice: true,
+      mainPriceSelector: "",
     });
   });
 
@@ -347,6 +351,8 @@ describe("themeSync", () => {
     expect(parseOk(config).themeSync).toEqual({
       syncAddToCartPrice: false,
       priceSelector: "",
+      syncMainPrice: true,
+      mainPriceSelector: "",
     });
   });
 
@@ -359,7 +365,33 @@ describe("themeSync", () => {
     expect(parseOk(config).themeSync).toEqual({
       syncAddToCartPrice: false,
       priceSelector: ".pdp__actions .btn--atc",
+      syncMainPrice: true,
+      mainPriceSelector: "",
     });
+  });
+
+  it("fills field-level defaults for the v1.11.0 main-price pair, and keeps explicit values", () => {
+    const config = looseConfig();
+    config.themeSync = {
+      syncAddToCartPrice: true,
+      priceSelector: "",
+      syncMainPrice: false,
+      mainPriceSelector: ".pdp__price",
+    };
+    expect(parseOk(config).themeSync).toEqual({
+      syncAddToCartPrice: true,
+      priceSelector: "",
+      syncMainPrice: false,
+      mainPriceSelector: ".pdp__price",
+    });
+  });
+
+  it("sanitizes mainPriceSelector exactly like priceSelector", () => {
+    const config = looseConfig();
+    config.themeSync = {
+      mainPriceSelector: ' .pdp__price >"x"< ',
+    };
+    expect(parseOk(config).themeSync.mainPriceSelector).toBe(".pdp__price x");
   });
 
   it("rejects a non-boolean flag", () => {
@@ -760,9 +792,9 @@ describe("resolveDesignBenefits", () => {
 // ── PRESET_META ──────────────────────────────────────────────────────────────
 
 describe("PRESET_META", () => {
-  it("covers exactly the seven preset keys", () => {
+  it("covers exactly the eight preset keys", () => {
     expect(Object.keys(PRESET_META).sort()).toEqual([...PRESET_KEYS].sort());
-    expect(PRESET_KEYS).toHaveLength(7);
+    expect(PRESET_KEYS).toHaveLength(8);
   });
 
   for (const key of PRESET_KEYS) {

@@ -1,5 +1,10 @@
 import { t } from "~/lib/i18n/i18n.server";
 import { formatMoney } from "~/lib/money";
+import {
+  formatFrequency,
+  frequencyToken,
+  type Frequency,
+} from "~/lib/frequency";
 import { formatShopDate } from "~/lib/dates.server";
 import { escapeHtml as esc, withLocale } from "~/lib/portal/layout.server";
 import {
@@ -61,8 +66,9 @@ function stepAction(
   contractId: string,
   step: string | undefined,
   locale: string,
+  preview?: string | null,
 ): string {
-  return withLocale(cancelPublicPath(contractId, step), locale);
+  return withLocale(cancelPublicPath(contractId, step), locale, preview);
 }
 
 // ── Step 1: before you go ────────────────────────────────────────────────────
@@ -77,8 +83,11 @@ export function pageIntro(args: {
   copyVariant: "a" | "b";
   pauseMonths: number;
   showError: boolean;
+  /** Preview session's raw cx_pp token — carried on every link/form URL. */
+  previewToken?: string | null;
 }): PageContent {
   const { locale, csrf, contractId, summary, tz, copyVariant } = args;
+  const preview = args.previewToken ?? null;
   const name = args.firstName?.trim() || t(locale, "cancel.common.friend");
 
   const lossItems: string[] = [];
@@ -124,20 +133,20 @@ ${errorHtml(locale, args.showError)}
 ${nextDateLine}
 <div class="cxc-stack">
 ${postForm(
-  stepAction(contractId, undefined, locale),
+  stepAction(contractId, undefined, locale, preview),
   { intent: "pause", months: String(args.pauseMonths), _csrf: csrf },
   t(locale, "cancel.intro.pause_cta", { months: args.pauseMonths }),
   true,
 )}
 <p class="cxc-hint">${esc(t(locale, "cancel.intro.pause_hint"))}</p>
 ${postForm(
-  stepAction(contractId, undefined, locale),
+  stepAction(contractId, undefined, locale, preview),
   { intent: "continue", _csrf: csrf },
   t(locale, "cancel.intro.continue_cta"),
   false,
 )}
 </div>
-<a class="cxc-center" href="${esc(withLocale(portalPublicPath(), locale))}">${esc(
+<a class="cxc-center" href="${esc(withLocale(portalPublicPath(), locale, preview))}">${esc(
     t(locale, "cancel.intro.keep_cta"),
   )}</a>`;
 
@@ -156,8 +165,11 @@ export function pageReason(args: {
   selectedReason: CancelReason | null;
   detail: string | null;
   showError: boolean;
+  /** Preview session's raw cx_pp token — carried on every link/form URL. */
+  previewToken?: string | null;
 }): PageContent {
   const { locale, contractId } = args;
+  const preview = args.previewToken ?? null;
 
   const radios = REASONS.map((r) => {
     const checked = args.selectedReason === r.key ? " checked" : "";
@@ -169,7 +181,7 @@ export function pageReason(args: {
   const body = `${EXTRA_STYLE}
 ${errorHtml(locale, args.showError, "cancel.reason.required_error")}
 <p class="cx-muted">${esc(t(locale, "cancel.reason.sub"))}</p>
-<form method="post" action="${esc(stepAction(contractId, "reason", locale))}">
+<form method="post" action="${esc(stepAction(contractId, "reason", locale, preview))}">
 <input type="hidden" name="intent" value="reason_submit">
 <input type="hidden" name="_csrf" value="${esc(args.csrf)}">
 ${radios}
@@ -181,10 +193,10 @@ ${radios}
     t(locale, "cancel.reason.continue"),
   )}</button>
 </form>
-<a class="cxc-center" href="${esc(stepAction(contractId, "confirm", locale))}">${esc(
+<a class="cxc-center" href="${esc(stepAction(contractId, "confirm", locale, preview))}">${esc(
     t(locale, "cancel.reason.skip"),
   )}</a>
-<a class="cxc-center" href="${esc(withLocale(portalPublicPath(), locale))}">${esc(
+<a class="cxc-center" href="${esc(withLocale(portalPublicPath(), locale, preview))}">${esc(
     t(locale, "cancel.intro.keep_cta"),
   )}</a>`;
 
@@ -205,9 +217,12 @@ export function pageSaves(args: {
    * beyond this page is only presented with the customer's affirmative
    * consent — the decline button below always completes immediately). */
   finalOfferEligible?: boolean;
+  /** Preview session's raw cx_pp token — carried on every link/form URL. */
+  previewToken?: string | null;
 }): PageContent {
   const { locale, csrf, contractId, tz } = args;
-  const savesAction = stepAction(contractId, "saves", locale);
+  const preview = args.previewToken ?? null;
+  const savesAction = stepAction(contractId, "saves", locale, preview);
 
   const cards = args.offers
     .map((offer) =>
@@ -217,7 +232,7 @@ export function pageSaves(args: {
 
   const finalOptIn = args.finalOfferEligible
     ? `<a class="cx-btn cx-btn--ghost cx-btn--full" href="${esc(
-        stepAction(contractId, "final", locale),
+        stepAction(contractId, "final", locale, preview),
       )}" style="margin-bottom:10px">${esc(t(locale, "cancel.final.see_offer"))}</a>`
     : "";
 
@@ -227,12 +242,12 @@ ${errorHtml(locale, args.showError)}
 ${cards}
 <hr class="cx-divider">
 ${finalOptIn}${postForm(
-  stepAction(contractId, "confirm", locale),
+  stepAction(contractId, "confirm", locale, preview),
   { intent: "confirm_cancel", _csrf: csrf },
   t(locale, "cancel.saves.decline"),
   false,
 )}
-<a class="cxc-center" href="${esc(withLocale(portalPublicPath(), locale))}">${esc(
+<a class="cxc-center" href="${esc(withLocale(portalPublicPath(), locale, preview))}">${esc(
     t(locale, "cancel.intro.keep_cta"),
   )}</a>`;
 
@@ -264,12 +279,25 @@ function offerCard(
           true,
         ),
       );
-    case "FREQUENCY":
+    case "FREQUENCY": {
+      // Offers persisted before v1.8.0 carry only the week fields — they
+      // were week cadences by construction, so WEEK is the exact fallback.
+      const current: Frequency =
+        offer.currentUnit != null && offer.currentCount != null
+          ? { unit: offer.currentUnit, count: offer.currentCount }
+          : { unit: "WEEK", count: offer.currentWeeks };
+      const suggested: Frequency =
+        offer.suggestedUnit != null && offer.suggestedCount != null
+          ? { unit: offer.suggestedUnit, count: offer.suggestedCount }
+          : { unit: "WEEK", count: offer.suggestedWeeks };
+      const tt = (key: string, vars?: Record<string, string | number>) =>
+        t(locale, key, vars);
+      const frequency = formatFrequency(tt, "every", suggested);
       return card(
         t(locale, "cancel.saves.frequency.title"),
         t(locale, "cancel.saves.frequency.desc", {
-          weeks: offer.suggestedWeeks,
-          currentWeeks: offer.currentWeeks,
+          frequency,
+          currentFrequency: formatFrequency(tt, "every", current),
           date: fmtDate(offer.estNextDate),
         }),
         postForm(
@@ -277,13 +305,17 @@ function offerCard(
           {
             intent: "accept_save",
             kind: "FREQUENCY",
+            frequency: frequencyToken(suggested),
+            // Legacy field — kept through the transition window so a page
+            // rendered by the previous build still accepts cleanly.
             weeks: String(offer.suggestedWeeks),
             _csrf: csrf,
           },
-          t(locale, "cancel.saves.frequency.cta", { weeks: offer.suggestedWeeks }),
+          t(locale, "cancel.saves.frequency.cta", { frequency }),
           true,
         ),
       );
+    }
     case "PAUSE":
       return card(
         t(locale, "cancel.saves.pause.title", { months: offer.months }),
@@ -401,8 +433,11 @@ export function pageFinal(args: {
   cycles: number;
   copyVariant: "a" | "b";
   showError: boolean;
+  /** Preview session's raw cx_pp token — carried on every link/form URL. */
+  previewToken?: string | null;
 }): PageContent {
   const { locale, csrf, contractId, percent, cycles } = args;
+  const preview = args.previewToken ?? null;
 
   const body = `${EXTRA_STYLE}
 ${errorHtml(locale, args.showError)}
@@ -411,14 +446,14 @@ ${card(
   t(locale, "cancel.final.card_title", { percent, cycles }),
   t(locale, "cancel.final.card_desc"),
   postForm(
-    stepAction(contractId, "final", locale),
+    stepAction(contractId, "final", locale, preview),
     { intent: "accept_final", _csrf: csrf },
     t(locale, "cancel.final.accept", { percent }),
     true,
   ),
 )}
 ${postForm(
-  stepAction(contractId, "confirm", locale),
+  stepAction(contractId, "confirm", locale, preview),
   { intent: "confirm_cancel", _csrf: csrf },
   t(locale, "cancel.final.decline"),
   false,
@@ -436,8 +471,11 @@ export function pageConfirm(args: {
   showError: boolean;
   /** Opt-in link to the final offer — never auto-interjected (FTC). */
   finalOfferEligible?: boolean;
+  /** Preview session's raw cx_pp token — carried on every link/form URL. */
+  previewToken?: string | null;
 }): PageContent {
   const { locale, csrf, contractId } = args;
+  const preview = args.previewToken ?? null;
   const points = [
     "cancel.confirm.point_no_charges",
     "cancel.confirm.point_no_shipments",
@@ -449,7 +487,7 @@ export function pageConfirm(args: {
 
   const finalOptIn = args.finalOfferEligible
     ? `<a class="cxc-center" href="${esc(
-        stepAction(contractId, "final", locale),
+        stepAction(contractId, "final", locale, preview),
       )}">${esc(t(locale, "cancel.final.see_offer"))}</a>`
     : "";
 
@@ -458,13 +496,13 @@ ${errorHtml(locale, args.showError)}
 <p class="cx-muted">${esc(t(locale, "cancel.confirm.what_happens"))}</p>
 <ul class="cxc-list">${points}</ul>
 ${postForm(
-  stepAction(contractId, "confirm", locale),
+  stepAction(contractId, "confirm", locale, preview),
   { intent: "confirm_cancel", _csrf: csrf },
   t(locale, "cancel.confirm.cta"),
   true,
 )}
 <a class="cx-btn cx-btn--ghost cx-btn--full" href="${esc(
-    withLocale(portalPublicPath(), locale),
+    withLocale(portalPublicPath(), locale, preview),
   )}">${esc(t(locale, "cancel.confirm.keep"))}</a>
 ${finalOptIn}`;
 
@@ -479,8 +517,11 @@ export function pageDone(args: {
    * customer who changes their mind must never hit a dead-end). */
   contractId?: string;
   csrf?: string;
+  /** Preview session's raw cx_pp token — carried on every link/form URL. */
+  previewToken?: string | null;
 }): PageContent {
   const { locale } = args;
+  const preview = args.previewToken ?? null;
 
   // One-tap reactivation straight from the goodbye page — posts to the portal
   // reactivate action (winback engine's reactivateFromWinback under the hood,
@@ -488,7 +529,7 @@ export function pageDone(args: {
   const restart =
     args.contractId && args.csrf
       ? `<form method="post" action="${esc(
-          withLocale(`${PROXY_PUBLIC_BASE}/api/reactivate`, locale),
+          withLocale(`${PROXY_PUBLIC_BASE}/api/reactivate`, locale, preview),
         )}"><input type="hidden" name="contractId" value="${esc(args.contractId)}"><input type="hidden" name="_csrf" value="${esc(args.csrf)}"><input type="hidden" name="return_to" value="/"><button type="submit" class="cx-btn cx-btn--ghost cx-btn--full" style="margin-top:10px">${esc(
           t(locale, "cancel.done.restart_cta"),
         )}</button></form>`
@@ -498,7 +539,7 @@ export function pageDone(args: {
 <p>${esc(t(locale, "cancel.done.no_charges"))}</p>
 <p>${esc(t(locale, "cancel.done.resume"))}</p>
 <p class="cx-muted cx-small">${esc(t(locale, "cancel.done.winback_seed"))}</p>
-<a class="cx-btn cx-btn--full" href="${esc(withLocale(portalPublicPath(), locale))}">${esc(
+<a class="cx-btn cx-btn--full" href="${esc(withLocale(portalPublicPath(), locale, preview))}">${esc(
     t(locale, "cancel.done.portal_cta"),
   )}</a>
 ${restart}`;
@@ -514,8 +555,11 @@ export function pageSaved(args: {
   messageVars: Record<string, string | number>;
   showEducationLinks: boolean;
   showSupportLink: boolean;
+  /** Preview session's raw cx_pp token — carried on every link/form URL. */
+  previewToken?: string | null;
 }): PageContent {
   const { locale, contractId } = args;
+  const preview = args.previewToken ?? null;
 
   let extras = "";
   if (args.showEducationLinks) {
@@ -534,10 +578,10 @@ export function pageSaved(args: {
   const body = `${EXTRA_STYLE}
 <p>${esc(t(locale, args.messageKey, args.messageVars))}</p>
 ${extras}
-<a class="cx-btn cx-btn--full" href="${esc(withLocale(portalPublicPath(), locale))}">${esc(
+<a class="cx-btn cx-btn--full" href="${esc(withLocale(portalPublicPath(), locale, preview))}">${esc(
     t(locale, "cancel.saved.portal_cta"),
   )}</a>
-<a class="cxc-center" href="${esc(withLocale(cancelPublicPath(contractId), locale))}">${esc(
+<a class="cxc-center" href="${esc(withLocale(cancelPublicPath(contractId), locale, preview))}">${esc(
     t(locale, "cancel.saved.cancel_link"),
   )}</a>`;
 

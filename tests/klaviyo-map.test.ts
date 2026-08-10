@@ -137,6 +137,23 @@ describe("metricForEventType (pure map)", () => {
       "Cellexia Payment Recovered",
     );
   });
+
+  it("winback terminal signals cross the feed boundary (suppression keys off them)", () => {
+    // The engine promises "Klaviyo suppression keys off winback.sunset" —
+    // an unmapped type would silently drop it at enqueueKlaviyoForEvent.
+    expect(metricForEventType("winback.sunset")).toBe(
+      "Cellexia Winback Sunset",
+    );
+    expect(metricForEventType("winback.opted_out")).toBe(
+      "Cellexia Winback Opted Out",
+    );
+  });
+
+  it("winback.discount_skipped stays a local plumbing event", () => {
+    // Mapping it to the discount metric would fire the discount flow for an
+    // offer that was deliberately NOT made (zero stacking headroom).
+    expect(metricForEventType("winback.discount_skipped")).toBeUndefined();
+  });
 });
 
 describe("enqueueKlaviyoForEvent", () => {

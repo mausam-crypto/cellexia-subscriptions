@@ -9,6 +9,8 @@ import {
   ongoingDiscountPctByProduct,
 } from "~/lib/portal/catalog.server";
 import { addDaysTz, formatShopDate } from "~/lib/dates.server";
+import { contractFrequency, formatFrequency } from "~/lib/frequency";
+import { t } from "~/lib/i18n/i18n.server";
 import { applyDiscountPct, formatMoney } from "~/lib/money";
 import {
   hasSentForCycle,
@@ -251,6 +253,11 @@ export async function runUpcomingOrderReminders(
       // `addon_url` magic link (ADD_TO_NEXT) into the Klaviyo link bundle.
       const addon = pickAddonForContract(addonCandidates, contract.lines);
 
+      // Cadence vars: frequency_weeks stays the week approximation (additive
+      // Klaviyo contract); `frequency` is the localized phrase the {frequency}
+      // template placeholders render, in the same locale the send resolves.
+      const freq = contractFrequency(contract);
+
       const result = await sendNotification({
         shopId: shop.id,
         contractId: contract.id,
@@ -269,6 +276,13 @@ export async function runUpcomingOrderReminders(
           next_date: formatShopDate(nextBillingDate, tz, contract.locale),
           next_date_iso: nextBillingDate.toISOString(),
           frequency_weeks: contract.intervalWeeks,
+          frequency_unit: freq.unit,
+          frequency_count: freq.count,
+          frequency: formatFrequency(
+            (key, fvars) => t(contract.locale, key, fvars),
+            "every",
+            freq,
+          ),
           ...(grant ? { discount_percent: grant.percent } : {}),
           ...(addon
             ? {
@@ -392,6 +406,10 @@ export async function runPauseAutoResume(
       });
       if (alreadySent) continue;
 
+      // email.resume_reminder.body renders {frequency} — the localized phrase
+      // is required; frequency_weeks stays alongside (additive contract).
+      const freq = contractFrequency(contract);
+
       const result = await sendNotification({
         shopId: shop.id,
         contractId: contract.id,
@@ -401,6 +419,13 @@ export async function runPauseAutoResume(
           resume_date: formatShopDate(resumeAt, tz, contract.locale),
           resume_date_iso: resumeAt.toISOString(),
           frequency_weeks: contract.intervalWeeks,
+          frequency_unit: freq.unit,
+          frequency_count: freq.count,
+          frequency: formatFrequency(
+            (key, fvars) => t(contract.locale, key, fvars),
+            "every",
+            freq,
+          ),
         },
       });
       if (result.status === "SENT") stats.remindersSent += 1;

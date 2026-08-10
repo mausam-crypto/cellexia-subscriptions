@@ -257,7 +257,17 @@ export interface DashboardStats {
     newSubscribers: number[];
     churned: number[];
   };
-  /** Σ DunningCase.recoveredCents resolved RECOVERED or CUSTOMER_FIXED this shop-tz calendar month. */
+  /**
+   * Σ DunningCase.recoveredCents over cases resolved this shop-tz calendar
+   * month that carry money (recoveredCents non-null) — THE "recovered"
+   * definition, shared with DailyRollup.recoveredCents: money actually
+   * collected on a case that had a failure, regardless of resolution kind.
+   * The engine stamps recoveredCents on RECOVERED and on same-cycle
+   * CUSTOMER_FIXED (e.g. a 3DS challenge the customer completes on attempt
+   * #1 — real money), and null on cross-cycle CUSTOMER_FIXED closes.
+   * Currency-guarded through the recovering attempt, like every other
+   * shop-currency aggregate.
+   */
   recoveredThisMonthCents: number;
 }
 
@@ -289,7 +299,7 @@ export async function getDashboardStats(shopId: string): Promise<DashboardStats>
     openAlerts,
     newContracts,
     cancelledContracts,
-    recoveredAgg,
+    recoveredCases,
   ] = await Promise.all([
     prisma.subscriptionContract.groupBy({
       by: ["status"],
@@ -320,15 +330,46 @@ export async function getDashboardStats(shopId: string): Promise<DashboardStats>
       where: { shopId, ...COUNTABLE_CONTRACT, cancelledAt: { gte: windowStartUtc } },
       select: { cancelledAt: true },
     }),
-    prisma.dunningCase.aggregate({
+    // Money-carrying resolutions only (see recoveredThisMonthCents doc — the
+    // predicate DailyRollup.recoveredCents shares); currency guard joins
+    // through recoveredAttemptId below, after the fetch.
+    prisma.dunningCase.findMany({
       where: {
         contract: { shopId, ...COUNTABLE_CONTRACT },
         resolvedAt: { gte: monthStartUtc },
-        resolution: { in: ["RECOVERED", "CUSTOMER_FIXED"] },
+        recoveredCents: { not: null },
       },
-      _sum: { recoveredCents: true },
+      select: { recoveredCents: true, recoveredAttemptId: true },
     }),
   ]);
+
+  // Currency guard through the recovering attempt (the case row stores no
+  // currency of its own): a recovery charged in a non-shop currency is
+  // excluded, mirroring every shop-currency aggregate; an unprovable currency
+  // (no recoveredAttemptId / attempt without currencyCode) counts — mismatch
+  // must be provable.
+  let recoveredThisMonthCents = 0;
+  {
+    const recoveredAttemptIds = recoveredCases
+      .map((c) => c.recoveredAttemptId)
+      .filter((id): id is string => id != null);
+    const recoveredAttempts = recoveredAttemptIds.length
+      ? await prisma.billingAttempt.findMany({
+          where: { id: { in: recoveredAttemptIds } },
+          select: { id: true, currencyCode: true },
+        })
+      : [];
+    const currencyByAttemptId = new Map(
+      recoveredAttempts.map((a) => [a.id, a.currencyCode]),
+    );
+    for (const kase of recoveredCases) {
+      const currency = kase.recoveredAttemptId
+        ? currencyByAttemptId.get(kase.recoveredAttemptId)
+        : null;
+      if (currency != null && currency !== shop.currencyCode) continue;
+      recoveredThisMonthCents += kase.recoveredCents ?? 0;
+    }
+  }
 
   const countFor = (status: string) =>
     statusGroups.find((g) => g.status === status)?._count._all ?? 0;
@@ -362,7 +403,7 @@ export async function getDashboardStats(shopId: string): Promise<DashboardStats>
       newSubscribers: weeks.map((w) => newByWeek.get(w) ?? 0),
       churned: weeks.map((w) => churnByWeek.get(w) ?? 0),
     },
-    recoveredThisMonthCents: recoveredAgg._sum.recoveredCents ?? 0,
+    recoveredThisMonthCents,
   };
 }
 
@@ -373,7 +414,12 @@ export interface FunnelMetrics {
   /**
    * takeRateNum / takeRateDen summed over DailyRollup rows in range, ×100.
    * null when no denominator data exists (the storefront checkout counter
-   * event isn't being emitted yet).
+   * event isn't being emitted yet). UNIT MISMATCH, documented: the numerator
+   * counts CONTRACTS while the denominator counts ORDERS (one
+   * checkout.subscribable event per order), so a multi-selling-plan checkout
+   * adds several contracts against one order and the ratio can exceed 100%.
+   * The two sides also book on different clocks (den at event-log time, num
+   * on firstChargeAt) — range sums absorb the day skew, single days don't.
    */
   takeRatePct: number | null;
   /** Cancel-flow sessions in range with a recorded reason, by reason. */
@@ -385,7 +431,10 @@ export interface FunnelMetrics {
     saved: number;
     saveRate: number;
   }[];
-  /** cycle.skipped events ÷ contracts cancelled in range; null when no cancels. */
+  /**
+   * cycle.skipped events ÷ contracts cancelled in range (consolidation
+   * merges excluded — the customer stayed); null when no cancels.
+   */
   skipToCancelRatio: number | null;
   /**
    * Of dunning cases resolved in range: (RECOVERED + CUSTOMER_FIXED) ÷ all
@@ -451,8 +500,18 @@ export async function getFunnelMetrics(
         contract: { is: { ...COUNTABLE_CONTRACT } },
       },
     }),
+    // Consolidation merges (reason MERGED, source SYSTEM) are NOT churn —
+    // the customer stayed, their contracts were combined — so they must not
+    // deflate skipToCancelRatio: one dedupe batch would otherwise fire the
+    // "cancelling instead of skipping" reading on churn that never happened
+    // (the same exclusion insight rule 6 and the analytics page apply).
     prisma.subscriptionContract.count({
-      where: { shopId, ...COUNTABLE_CONTRACT, cancelledAt: { gte: cutoff } },
+      where: {
+        shopId,
+        ...COUNTABLE_CONTRACT,
+        cancelledAt: { gte: cutoff },
+        NOT: { cancelReason: "MERGED" },
+      },
     }),
     prisma.dunningCase.groupBy({
       by: ["resolution"],
@@ -650,8 +709,11 @@ export interface FailedPaymentRow {
 
 /**
  * Open dunning cases ordered by next retry (soonest first, unscheduled last),
- * enriched with contract identity and the failed amount from the attempt that
- * opened each case.
+ * enriched with contract identity and the at-risk amount. Failed attempts
+ * never carry amountCents (only the SUCCESS transition stamps it), so the
+ * amount comes from DunningCase.amountAtRiskCents — the cycle estimate
+ * ensureOpenCase persists at case-open. The trigger attempt's amount stays
+ * as a fallback only for pre-0016 cases, whose estimate column is null.
  */
 export async function getFailedPaymentsQueue(
   shopId: string,
@@ -709,8 +771,11 @@ export async function getFailedPaymentsQueue(
       nextRetryAt: c.nextRetryAt,
       emailsSent: c.emailsSent,
       smsSent: c.smsSent,
-      amountCents: attempt?.amountCents ?? null,
-      currencyCode: attempt?.currencyCode ?? c.contract.currencyCode,
+      amountCents: c.amountAtRiskCents ?? attempt?.amountCents ?? null,
+      currencyCode:
+        c.amountAtRiskCurrencyCode ??
+        attempt?.currencyCode ??
+        c.contract.currencyCode,
       cardBrand: c.contract.cardBrand,
       cardLast4: c.contract.cardLast4,
       consecutiveFailures: c.contract.consecutiveFailures,

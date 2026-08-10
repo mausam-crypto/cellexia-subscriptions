@@ -4,6 +4,7 @@ import {
   DECLINE_CODE_TABLE,
   UNKNOWN_DECLINE,
   categorizeDeclineCode,
+  structuredUserErrorCode,
   type CustomerAction,
   type DeclineCategory,
 } from "~/lib/dunning/decline-codes.server";
@@ -130,5 +131,28 @@ describe("FRAUD_SUSPECTED", () => {
     expect(info.category).toBe("HARD");
     // Manual merchant review — the engine must not email the customer either.
     expect(info.customerAction).toBe("NONE");
+  });
+});
+
+describe("structuredUserErrorCode (attempt-create refusal ingest)", () => {
+  it("extracts the first machine-readable code, normalized like decline codes", () => {
+    expect(
+      structuredUserErrorCode([
+        { field: null, message: "no code here" },
+        { field: ["contractId"], message: "paused", code: " contract_paused " },
+        { message: "later", code: "IGNORED_SECOND" },
+      ]),
+    ).toBe("CONTRACT_PAUSED");
+  });
+
+  it("returns null for payloads that don't carry codes yet (selection not extended / legacy)", () => {
+    // The whole point of the structural read: ingest is inert-but-ready
+    // until the GraphQL layer's userErrors selection requests `code`.
+    expect(structuredUserErrorCode([{ field: null, message: "refused" }])).toBeNull();
+    expect(structuredUserErrorCode([])).toBeNull();
+    expect(structuredUserErrorCode(null)).toBeNull();
+    expect(structuredUserErrorCode(undefined)).toBeNull();
+    expect(structuredUserErrorCode([{ code: "" }, { code: "   " }])).toBeNull();
+    expect(structuredUserErrorCode([{ code: 42 }])).toBeNull();
   });
 });

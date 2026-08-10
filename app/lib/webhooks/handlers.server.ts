@@ -1,13 +1,18 @@
 import { Prisma, type SubscriptionContract } from "@prisma/client";
 import prisma from "~/db.server";
 import { adminClientForShop } from "~/shopify.server";
-import { logEvent } from "~/lib/events/log.server";
+import { logEvent, logEventOrThrow } from "~/lib/events/log.server";
 import { getSetting } from "~/lib/settings/settings.server";
 import { requireShop } from "~/lib/shop/install.server";
 import { normalizeLocale } from "~/lib/i18n/i18n.server";
 import { formatMoney } from "~/lib/money";
 import { buildMitEvidence } from "~/lib/billing/mit-evidence.server";
 import { isBillableOwnership } from "~/lib/ownership/ownership.server";
+import {
+  computeChargeCostSnapshot,
+  loadCostContext,
+  type CostContext,
+} from "~/lib/analytics/costs.server";
 import {
   hasSentForCycle,
   sendNotification,
@@ -18,8 +23,10 @@ import {
   getBillingCycleByDate,
   getContract,
   getOrderSummary,
+  gql,
   listCustomerPaymentMethods,
   withContractDraft,
+  type OrderSummary,
 } from "~/lib/graphql/index.server";
 import {
   buildAcquisitionCapture,
@@ -323,13 +330,25 @@ async function resolveBillingAttempt(
     }
   }
 
+  // attemptNumber continues the cycle's real history rather than hardcoding 1:
+  // a reconstructed row can land on a cycle that already holds scheduler or
+  // dunning attempts (that is the common case — an admin retries a failed
+  // cycle from the Shopify admin), and numbering it 1 would mislabel the
+  // recovery position in every event payload and dunning analytic. Superseded
+  // rows still count (history is append-only; idempotency keys already number
+  // past them).
+  const priorAttempts = await prisma.billingAttempt.aggregate({
+    where: { contractId: contract.id, cycleIndex },
+    _max: { attemptNumber: true },
+  });
+
   return prisma.billingAttempt.create({
     data: {
       contractId: contract.id,
       shopifyAttemptId: attemptGid,
       idempotencyKey: idempotencyKey ?? `webhook:${attemptGid ?? webhookId}`,
       cycleIndex,
-      attemptNumber: 1,
+      attemptNumber: (priorAttempts._max.attemptNumber ?? 0) + 1,
       status: "PENDING",
       scheduledFor: new Date(),
       originatingAction: "ADMIN_MANUAL",
@@ -412,22 +431,43 @@ async function handleSubscriptionContractsCreate({
     console.error("[webhooks] customer locale sync failed", contractGid, err);
   }
 
-  await logEvent({
-    ...contractEventBase(shop.id, contract),
-    type: "contract.created",
-    source: "WEBHOOK",
-    payload: {
-      shopifyContractId: contract.shopifyContractId,
-      status: contract.status,
-      intervalWeeks: contract.intervalWeeks,
-      currencyCode: contract.currencyCode,
-      nextBillingDate: contract.nextBillingDate?.toISOString() ?? null,
-      isPrepaid: contract.isPrepaid,
-      lineCount: contract.lines.length,
-      itemTitles: contract.lines.filter((l) => !l.isGift).map((l) => l.title),
-      originOrderId: contract.originOrderId,
+  // Replay guard on the CONTRACT's identity: the route receipt only dedupes
+  // exact webhook-id redeliveries, and a manual redelivery (the documented
+  // recovery after a FAILED receipt) carries a NEW id. The sync above is
+  // idempotent, but the canonical creation event is not — a second
+  // contract.created would double-count the creation moment in timeline
+  // analytics and re-fire the subscription-started Klaviyo flow at the
+  // customer. Same guard family as the order-id and refund-id guards; the
+  // catch-up branch in handleSubscriptionContractsUpdate stamps the same
+  // shopifyContractId key, so a catch-up creation blocks a late replay too.
+  const alreadyCreated = await prisma.subscriberEvent.findFirst({
+    where: {
+      shopId: shop.id,
+      type: "contract.created",
+      payload: { path: ["shopifyContractId"], equals: contract.shopifyContractId },
     },
+    select: { id: true },
   });
+  if (!alreadyCreated) {
+    await logEvent({
+      ...contractEventBase(shop.id, contract),
+      type: "contract.created",
+      source: "WEBHOOK",
+      payload: {
+        shopifyContractId: contract.shopifyContractId,
+        status: contract.status,
+        intervalWeeks: contract.intervalWeeks,
+        billingIntervalUnit: contract.billingIntervalUnit,
+        billingIntervalCount: contract.billingIntervalCount,
+        currencyCode: contract.currencyCode,
+        nextBillingDate: contract.nextBillingDate?.toISOString() ?? null,
+        isPrepaid: contract.isPrepaid,
+        lineCount: contract.lines.length,
+        itemTitles: contract.lines.filter((l) => !l.isGift).map((l) => l.title),
+        originOrderId: contract.originOrderId,
+      },
+    });
+  }
 
   // First-order gift (SellingPlanConfig.firstOrderGiftVariantId): delivered
   // onto the origin (checkout) order as a zero-priced line via order editing;
@@ -608,10 +648,16 @@ export async function consumeCycleOnSuccess(
     });
   }
 
-  // Gifts attached to this cycle have now shipped with the order.
+  // Gifts attached to this cycle have now shipped with the order. shippedAt
+  // rides the flip: later mirror hygiene flips SHIPPED grants REMOVED, and
+  // without the timestamp "shipped then cleaned" and "superseded, never
+  // shipped" become indistinguishable rows — analytics count gift COGS by
+  // status IN (ADDED, SHIPPED) OR shippedAt IS NOT NULL, and the gifts
+  // engine's REMOVED flips write status + removedAt only, so this stamp is
+  // the ship fact's sole durable carrier.
   await tx.giftGrant.updateMany({
     where: { contractId, cycleIndex, status: "ADDED" },
-    data: { status: "SHIPPED" },
+    data: { status: "SHIPPED", shippedAt: new Date() },
   });
 
   return { addonTitles: addonLines.map((l) => l.title) };
@@ -733,6 +779,12 @@ export async function finishSuccessSettlement(
       cycleIndex: updated.cycleIndex,
       attemptNumber: updated.attemptNumber,
       amountCents: updated.amountCents,
+      // Money invariant (integer cents + currencyCode) holds on the STREAM
+      // too: on a Shopify Markets shop attempts settle in foreign presentment
+      // currencies, and a stream-only consumer summing amountCents without
+      // the denomination would mix currencies raw — the same trap the
+      // rollup's shop-currency guard exists for.
+      currencyCode: updated.currencyCode ?? contract.currencyCode,
       orderId: updated.orderId,
       orderName: updated.orderName,
       ...(resolvedBy ? { resolvedBy } : {}),
@@ -812,14 +864,107 @@ async function handleBillingAttemptSuccess({
     }
   };
 
+  const orderGid = toGid(
+    "Order",
+    pick(payload, "admin_graphql_api_order_id", "order_id"),
+  );
+
   if (attempt.status === "SUCCESS") {
     // Manual replay (new webhook id, same already-settled attempt).
-    // amountCents is deliberately NOT re-read from the order here: after a
-    // refund, currentTotalPriceSet is the REDUCED total while refundedCents
-    // is subtracted separately by rollups/cohorts, so overwriting the
-    // originally charged amount would double-count the refund. The charge
-    // history row is immutable once SUCCESS.
-    //
+    // amountCents is immutable ONLY ONCE NON-NULL: after a refund,
+    // currentTotalPriceSet is the REDUCED total while refundedCents is
+    // subtracted separately by rollups/cohorts, so overwriting an amount
+    // that already landed would double-count the refund. A NULL amount is a
+    // different state entirely — the settlement-time order-summary fetch
+    // failed (throttle/outage) and the real charge is booked as ZERO
+    // revenue in every surface (lifetimeRevenueCents, rollup chargedCents,
+    // cohort LTGP), permanently, because nothing else re-reads it. This
+    // redelivery is the repair lane: re-fetch and true-up the amount (plus
+    // the money breakdown from the same summary) while it is still NULL,
+    // claimed row-level so two concurrent replays can only true-up once.
+    // Accepted residual, documented: an item refund recorded between the
+    // zero-booking and this true-up is inside the re-fetched current total
+    // AND in refundedCents — the same reduced-total asymmetry
+    // DATA_FOUNDATION.md accepts for pre-capture origin refunds, and
+    // strictly better than the permanent zero booking it repairs.
+    if (attempt.amountCents == null) {
+      const trueUpOrderGid = attempt.orderId ?? orderGid;
+      if (trueUpOrderGid) {
+        try {
+          const summary = await getOrderSummary(admin, trueUpOrderGid);
+          await prisma.$transaction(async (tx) => {
+            const trued = await tx.billingAttempt.updateMany({
+              where: { id: attempt.id, status: "SUCCESS", amountCents: null },
+              data: {
+                amountCents: summary.totalCents,
+                currencyCode:
+                  summary.currencyCode ?? attempt.contract.currencyCode,
+                orderName: summary.name || attempt.orderName,
+                orderId: trueUpOrderGid,
+                discountCents: summary.discountsCents,
+                taxCents: summary.taxCents,
+                shippingCents: summary.shippingCents,
+                subtotalCents: summary.subtotalCents,
+                orderProcessedAt: summary.processedAt ?? summary.createdAt,
+              },
+            });
+            // The zero-amount claim incremented lifetimeRevenueCents by
+            // `?? 0` — add the missing revenue (and its discount twin) only
+            // when THIS replay won the null→amount claim.
+            if (trued.count > 0) {
+              await tx.subscriptionContract.update({
+                where: { id: attempt.contractId },
+                data: {
+                  lifetimeRevenueCents: { increment: summary.totalCents },
+                  ...(summary.discountsCents > 0
+                    ? {
+                        lifetimeDiscountCents: {
+                          increment: summary.discountsCents,
+                        },
+                      }
+                    : {}),
+                },
+              });
+              // The repair record rides the true-up transaction (same event
+              // the sweep arm logs): the original billing.attempt_succeeded
+              // keeps its null amountCents forever, so without this row the
+              // append-only ledger could never explain why the table and the
+              // event stream disagree on this charge. refundedCentsIncluded
+              // is 0 here — unlike the sweep, this arm books the re-fetched
+              // current total as-is (the documented accepted residual above).
+              await logEvent(
+                {
+                  ...contractEventBase(shop.id, attempt.contract),
+                  type: "billing.attempt_amount_backfilled",
+                  source: "WEBHOOK",
+                  actor: "system",
+                  payload: {
+                    attemptId: attempt.id,
+                    orderId: trueUpOrderGid,
+                    cycleIndex: attempt.cycleIndex,
+                    amountCents: summary.totalCents,
+                    currencyCode:
+                      summary.currencyCode ?? attempt.contract.currencyCode,
+                    refundedCentsIncluded: 0,
+                    resolvedBy: "webhook_redelivery",
+                  },
+                },
+                { tx },
+              );
+            }
+          });
+        } catch (err) {
+          // Transient-tolerant like the original fetch: the row keeps
+          // amountCents NULL (the ATTEMPT_AMOUNT_MISSING alert surfaces it)
+          // and the next redelivery retries the true-up.
+          console.error(
+            "[webhooks] null-amount true-up failed",
+            attempt.id,
+            err,
+          );
+        }
+      }
+    }
     // settledAt set: the original delivery finished every side effect —
     // refresh the Shopify-owned mirror only. settledAt NULL: the process
     // died between the settlement transaction committing and the marker
@@ -833,14 +978,15 @@ async function handleBillingAttemptSuccess({
     return;
   }
 
-  const orderGid = toGid(
-    "Order",
-    pick(payload, "admin_graphql_api_order_id", "order_id"),
-  );
-
   let amountCents = attempt.amountCents;
   let orderName = attempt.orderName;
   let orderCurrency = attempt.currencyCode;
+  // Full summary retained past the destructured basics: the money breakdown
+  // (discount/tax/shipping/subtotal) and the order's real processedAt exist
+  // ONLY at this fetch — the 60-day order-access horizon makes them
+  // unrecoverable later — and rollups otherwise estimate renewal discounts
+  // from drifting mirror lines.
+  let orderSummary: OrderSummary | null = null;
   // The charge instant. The order's createdAt is when Shopify actually
   // charged the card; webhook-arrival time (`now`) is only the fallback.
   // Stamping `now` on a delayed webhook shifts the charge into the NEXT
@@ -849,11 +995,15 @@ async function handleBillingAttemptSuccess({
   // MAX_CHARGE_BACKDATE_MS so the charge's true day is always still inside
   // rollup_run's trailing recompute window — an unbounded backdate (manual
   // redelivery days later) would strand the charge in a closed rollup row
-  // that is never recomputed.
+  // that is never recomputed. The UNCLAMPED instant is not discarded: the
+  // claim below stores the order's real processedAt in
+  // BillingAttempt.orderProcessedAt, so the cap costs day-placement
+  // precision only, never the raw value.
   let chargedAt = now;
   if (orderGid) {
     try {
       const summary = await getOrderSummary(admin, orderGid);
+      orderSummary = summary;
       amountCents = summary.totalCents;
       orderName = summary.name || orderName;
       orderCurrency = summary.currencyCode;
@@ -868,6 +1018,20 @@ async function handleBillingAttemptSuccess({
     }
   }
 
+  // Cost context for the per-charge cost snapshot (I2): loaded OUTSIDE the
+  // claim transaction (one settings read + one query, no Shopify round trip)
+  // and contained — analytics plumbing must never fail a settlement.
+  let costCtx: CostContext | null = null;
+  try {
+    costCtx = await loadCostContext(shop.id);
+  } catch (err) {
+    console.error(
+      "[webhooks] cost context load failed — settling without a cost snapshot",
+      attempt.id,
+      err,
+    );
+  }
+
   // Atomic claim of the → SUCCESS transition PLUS the local accounting it
   // authorises, in ONE transaction. The status guard in the WHERE makes
   // exactly ONE delivery win when the same success arrives twice under two
@@ -879,6 +1043,43 @@ async function handleBillingAttemptSuccess({
   // claim, a process death can never strand a SUCCESS attempt whose
   // accounting is lost forever — the pre-transaction bug this replaces.
   const settled = await prisma.$transaction(async (tx) => {
+    // Per-charge cost snapshot (I2): the cost basis of THIS charge, frozen so
+    // gross-profit history stops being repriced by later cost-setting edits.
+    // Lines are read BEFORE consumeCycleOnSuccess deletes the consumed
+    // add-on mirrors — the customer paid for them on this order, so they
+    // belong to this charge's cost basis. Add-ons staged for OTHER cycles
+    // are excluded with the exact cycle-scope rule the consumption below
+    // applies; gift lines are excluded inside computeChargeCostSnapshot
+    // (gift COGS books once per GiftGrant). Contained: a snapshot failure
+    // settles without one and readers fall back to the live cost model.
+    let costSnapshot: Prisma.InputJsonValue | undefined;
+    if (costCtx) {
+      try {
+        const chargeLines = await tx.contractLine.findMany({
+          where: { contractId: attempt.contractId },
+        });
+        const billedLines = chargeLines.filter(
+          (l) =>
+            !l.isOneTimeAddon ||
+            l.addonCycleIndex == null ||
+            l.addonCycleIndex === attempt.cycleIndex,
+        );
+        costSnapshot = computeChargeCostSnapshot(costCtx, {
+          deliveryPriceCents: attempt.contract.deliveryPriceCents,
+          isPrepaid: attempt.contract.isPrepaid,
+          prepaidDeliveriesPerCharge:
+            attempt.contract.prepaidDeliveriesPerCharge,
+          lines: billedLines,
+        }) as unknown as Prisma.InputJsonValue;
+      } catch (err) {
+        console.error(
+          "[webhooks] cost snapshot computation failed — settling without one",
+          attempt.id,
+          err,
+        );
+      }
+    }
+
     const claimed = await tx.billingAttempt.updateMany({
       where: { id: attempt.id, status: { not: "SUCCESS" } },
       data: {
@@ -889,6 +1090,24 @@ async function handleBillingAttemptSuccess({
         orderName,
         amountCents,
         currencyCode: orderCurrency ?? attempt.contract.currencyCode,
+        // Renewal-order money breakdown + the order's REAL processedAt
+        // (UNCAPPED — completedAt above carries the clamped instant for
+        // rollup day placement; this column preserves the raw truth), from
+        // the summary already in hand. This is the ONLY capture moment:
+        // the 60-day order-access horizon makes a later fetch impossible,
+        // and rollups estimate renewal discounts from drifting mirror lines
+        // whenever these are null.
+        ...(orderSummary
+          ? {
+              discountCents: orderSummary.discountsCents,
+              taxCents: orderSummary.taxCents,
+              shippingCents: orderSummary.shippingCents,
+              subtotalCents: orderSummary.subtotalCents,
+              orderProcessedAt:
+                orderSummary.processedAt ?? orderSummary.createdAt,
+            }
+          : {}),
+        ...(costSnapshot !== undefined ? { costSnapshot } : {}),
       },
     });
     if (claimed.count === 0) return null;
@@ -911,7 +1130,30 @@ async function handleBillingAttemptSuccess({
       data: {
         ordersCount: { increment: 1 },
         lifetimeRevenueCents: { increment: amountCents ?? 0 },
+        // Renewals-only discount twin of lifetimeRevenueCents (origin
+        // discount is mirrored separately in originOrderDiscountCents).
+        ...(orderSummary && orderSummary.discountsCents > 0
+          ? { lifetimeDiscountCents: { increment: orderSummary.discountsCents } }
+          : {}),
         ...(row.contract.firstChargeAt ? {} : { firstChargeAt: chargedAt }),
+        // Prepaid delivery countdown (the cockpit's "N left" badge): each
+        // successful prepaid charge PAYS FOR a fresh per-charge allotment,
+        // so settlement re-arms the counter to the full allotment. Routine
+        // re-syncs must never touch a live value (the sync's seed is
+        // null-guarded); the settlement writer is the one legitimate
+        // resetter, because a new charge is exactly what grants new
+        // deliveries. Charge-level granularity by design — decrementing per
+        // shipped delivery (scheduled fulfillments inside one charge) needs
+        // fulfillment-created webhooks the app does not subscribe yet, and
+        // the old decrement-per-CHARGE reading drove the counter to a
+        // permanent "0 left" on a still-billing contract.
+        ...(row.contract.isPrepaid &&
+        row.contract.prepaidDeliveriesPerCharge != null
+          ? {
+              prepaidDeliveriesRemaining:
+                row.contract.prepaidDeliveriesPerCharge,
+            }
+          : {}),
       },
     });
     return {
@@ -966,7 +1208,6 @@ async function handleBillingAttemptFailure({
   const attempt = await resolveBillingAttempt(shopDomain, payload, webhookId);
   if (!attempt) return;
 
-  const alreadyFailed = attempt.status === "FAILED";
   const now = new Date();
   const errorCode = asString(payload.error_code);
   const errorMessage = asString(payload.error_message);
@@ -983,7 +1224,24 @@ async function handleBillingAttemptFailure({
     include: { contract: true },
   });
 
-  if (!alreadyFailed) {
+  // Event dedupe keyed on the ATTEMPT's event existence — the exact pattern
+  // finishSuccessSettlement uses for billing.attempt_succeeded. Guarding on
+  // the pre-run status ("was it FAILED before this run?") cannot distinguish
+  // "event already logged" from "crashed between the status write above and
+  // the logEvent below": every redelivery would then see FAILED, skip, and
+  // the event — a risk-model training row AND the Klaviyo dunning-open flow
+  // trigger — would be lost forever (the redrive paths re-invoke only the
+  // dunning engine, never this log).
+  const alreadyLogged =
+    (await prisma.subscriberEvent.findFirst({
+      where: {
+        shopId: shop.id,
+        type: "billing.attempt_failed",
+        payload: { path: ["attemptId"], equals: updated.id },
+      },
+      select: { id: true },
+    })) != null;
+  if (!alreadyLogged) {
     await logEvent({
       ...contractEventBase(shop.id, updated.contract),
       type: "billing.attempt_failed",
@@ -994,6 +1252,9 @@ async function handleBillingAttemptFailure({
         cycleIndex: updated.cycleIndex,
         attemptNumber: updated.attemptNumber,
         amountCents: updated.amountCents,
+        // Money invariant on the stream: amountCents never travels without
+        // its denomination (see the success payload's twin comment).
+        currencyCode: updated.currencyCode ?? updated.contract.currencyCode,
         errorCode: updated.errorCode,
         errorMessage: updated.errorMessage,
       },
@@ -1450,6 +1711,11 @@ function acquisitionFromOrderPayload(
   );
   const processedAtRaw = asString(pick(payload, "processed_at", "created_at"));
   const processedAt = processedAtRaw ? new Date(processedAtRaw) : null;
+  // Shopify Markets presentment total — what the customer actually saw at
+  // checkout, alongside the shopMoney total below.
+  const presentmentMoney = asRecord(
+    asRecord(payload.total_price_set)?.presentment_money,
+  );
   return buildAcquisitionCapture({
     referringSite: payload.referring_site,
     landingSite: payload.landing_site,
@@ -1464,6 +1730,19 @@ function acquisitionFromOrderPayload(
     orderCurrencyCode: asString(payload.currency),
     orderProcessedAt:
       processedAt && !Number.isNaN(processedAt.getTime()) ? processedAt : null,
+    // Order-payload extras (all sanitization/caps live in the sanitizer):
+    // which promo acquired the subscriber, checkout locale, Markets
+    // presentment, sales channel, consent snapshot, tags. Raw REST shapes
+    // pass through as-is — the sanitizer accepts {code} objects, strings and
+    // comma-separated tag lists.
+    discountCodes: payload.discount_codes,
+    checkoutLocale: payload.customer_locale ?? clientDetails?.accept_language,
+    presentmentCurrencyCode: payload.presentment_currency,
+    presentmentTotalCents: centsFromAmountString(presentmentMoney?.amount),
+    appId: payload.app_id,
+    sourceIdentifier: payload.source_identifier,
+    buyerAcceptsMarketing: payload.buyer_accepts_marketing,
+    orderTags: payload.tags,
   });
 }
 
@@ -1474,6 +1753,21 @@ function acquisitionFromOrderPayload(
  * fails safe the same way. Enriches with the Shopify customer's createdAt so
  * acqTimeToPurchaseSeconds (account creation → origin payment) can be
  * computed. Returns true when this call performed the write.
+ *
+ * THROWS when the customer enrichment fails TRANSIENTLY (no admin client, or
+ * the customer read errored). The acqRaw-null claim below is the bundle's
+ * only write ever — persisting enrichment nulls on a retryable error would
+ * consume it and permanently forfeit customerCreatedAt/numberOfOrders/
+ * time-to-purchase (churn-model features, DATA_FOUNDATION.md) even though
+ * the Shopify customer record stays fetchable forever, with the missingness
+ * clustered on exactly the API-outage windows that bias a training set.
+ * Every caller contains the throw (acquisition never fails a webhook) and
+ * the retry lanes are already in place: the stash survives in the event log,
+ * and the nightly origin_order_backfill's acqPending pass counts a throw as
+ * acqFailed (retried next run) — it stamps acqPickupExhaustedAt only when NO
+ * stash exists, so a transient error can never retire the row. Enrichment
+ * nulls persist only when they are the TRUTH: no customer on the contract,
+ * or Shopify conclusively answering that the customer does not exist.
  */
 async function applyAcquisitionToContract(
   shopId: string,
@@ -1486,19 +1780,19 @@ async function applyAcquisitionToContract(
 
   let customerCreatedAt: Date | null = null;
   let customerNumberOfOrders: number | null = null;
-  if (admin && contract.customerId) {
-    try {
-      const { getCustomer } = await import("~/lib/graphql/customers.server");
-      const customer = await getCustomer(admin, contract.customerId);
-      customerCreatedAt = customer?.createdAt ?? null;
-      customerNumberOfOrders = customer?.numberOfOrders ?? null;
-    } catch (err) {
-      console.error(
-        "[webhooks] acquisition: customer lookup failed",
-        contract.customerId,
-        err,
+  if (contract.customerId) {
+    if (!admin) {
+      throw new Error(
+        `acquisition enrichment deferred (no admin client) for ${contract.id}`,
       );
     }
+    // A getCustomer failure propagates: transient by definition here (a
+    // deleted/erased customer resolves to null WITHOUT throwing, which
+    // persists honest nulls below).
+    const { getCustomer } = await import("~/lib/graphql/customers.server");
+    const customer = await getCustomer(admin, contract.customerId);
+    customerCreatedAt = customer?.createdAt ?? null;
+    customerNumberOfOrders = customer?.numberOfOrders ?? null;
   }
 
   const rawProcessedAt = capture.acqRaw.orderProcessedAt;
@@ -1565,7 +1859,9 @@ async function applyAcquisitionToContract(
  * path. Both callers beyond handleSubscriptionContractsCreate — the catch-up
  * branch and the daily origin_order_backfill job (sync.server.ts) — reuse
  * this exact pickup so a captured bundle can never be stranded in the event
- * log forever. Returns true when this call persisted the bundle.
+ * log forever. Returns true when this call persisted the bundle; THROWS when
+ * the customer enrichment failed transiently (see applyAcquisitionToContract)
+ * so the backfill counts a retryable failure instead of retiring the row.
  */
 export async function enrichAcquisitionOnContractCreate(
   shopDomain: string,
@@ -1661,10 +1957,12 @@ export async function enrichAcquisitionOnContractCreate(
  *
  * Idempotency: the route layer dedupes exact redeliveries on
  * X-Shopify-Webhook-Id (WebhookReceipt); a manual redelivery carries a NEW
- * webhook id, so this handler additionally skips when an event for this
- * order's id was already logged — one order never counts twice in the
- * take-rate denominator, design attribution or acquisition stash (same
- * pattern as handleRefundsCreate's refund-id guard).
+ * webhook id, so each event family below additionally guards on its OWN
+ * existence for this order's id — one order never counts twice in the
+ * take-rate denominator, design attribution or acquisition stash, while a
+ * redelivery after a partial run (crash or swallowed insert between the
+ * sequential writes) re-completes exactly the missing families instead of
+ * skipping them forever (see the per-family dedupe comment in the body).
  */
 async function handleOrdersCreate({
   shopDomain,
@@ -1693,22 +1991,52 @@ async function handleOrdersCreate({
     ? toGid("Customer", pick(orderCustomer, "admin_graphql_api_id", "id"))
     : null;
 
+  // Shopify test orders (payload.test — test gateway / Bogus): real webhooks
+  // carrying fake money. They must not enter the take-rate denominator, the
+  // design feed or the acquisition stash — a merchant's setup-phase
+  // verification checkout would permanently deflate the reported take-rate,
+  // and the event rows carry no field that could filter them out later
+  // (contrast contracts, which carry isDemo). The skip itself is logged with
+  // test: true so the exclusion stays auditable, guarded on the order id
+  // like every other per-order event.
+  if (payload.test === true) {
+    if (orderGid) {
+      const alreadyMarked = await prisma.subscriberEvent.findFirst({
+        where: {
+          shopId: shop.id,
+          type: "admin.action",
+          AND: [
+            { payload: { path: ["action"], equals: "order_skipped_test" } },
+            { payload: { path: ["orderId"], equals: orderGid } },
+          ],
+        },
+        select: { id: true },
+      });
+      if (!alreadyMarked) {
+        await logEvent({
+          shopId: shop.id,
+          type: "admin.action",
+          source: "WEBHOOK",
+          payload: { action: "order_skipped_test", orderId: orderGid, test: true },
+        });
+      }
+    }
+    return;
+  }
+
   // Idempotency on the ORDER's identity: the route layer only dedupes exact
   // redeliveries (same X-Shopify-Webhook-Id); a manual redelivery carries a
   // NEW webhook id and would otherwise double-count checkout.subscribable
-  // (the take-rate denominator) and widget.design_attributed. Same pattern as
-  // handleRefundsCreate's refund-id guard.
-  if (orderGid) {
-    const already = await prisma.subscriberEvent.findFirst({
-      where: {
-        shopId: shop.id,
-        type: { in: ["checkout.subscribable", "widget.design_attributed"] },
-        payload: { path: ["orderId"], equals: orderGid },
-      },
-      select: { id: true },
-    });
-    if (already) return;
-  }
+  // (the take-rate denominator), widget.design_attributed and the
+  // acquisition stash. Deduped PER EVENT FAMILY, not with one any-event
+  // early-return across all of them: the families are written sequentially,
+  // so a process death (or a swallowed insert — logEvent contains its own
+  // failures) between them leaves a partial order, and an any-event guard
+  // would turn every redelivery into a clean skip — the missing writes
+  // (takeRateDen rows, sibling design keys, the shop's acquisition bundle)
+  // could then never be repaired by ANY path. Each family below re-checks
+  // its own existence instead, so the route's crash-residue re-run and
+  // manual redeliveries re-complete exactly what is missing.
 
   // ── Subscribable detection (marker OR productIds fallback) ────────────────
   // Computed BEFORE the acquisition block because both consumers need it:
@@ -1739,28 +2067,42 @@ async function handleOrdersCreate({
   // the contract mirror already arrived (webhook race: either order). Gated on
   // containsSubscribable — NOT on the selling-plan marker alone — because a
   // subscription-origin order whose REST payload omits the marker would
-  // otherwise never stash a bundle, the contract-create pickup would find
-  // nothing, and (with the order-id idempotency guard above satisfied by the
-  // checkout.subscribable event) no redelivery could ever repair it: the
-  // shop's entire acquisition foundation would silently stay null. Stashing
-  // for a subscribable ONE-TIME order is safe: the pickup handshake applies a
-  // bundle only when contract.originOrderId matches the stashed orderId, so a
-  // non-subscription order's stash is one inert event row. Guarded —
-  // acquisition must never fail order processing.
+  // otherwise never stash a bundle and the contract-create pickup would find
+  // nothing: the shop's entire acquisition foundation would silently stay
+  // null. The stash write dedupes on ITS OWN existence (per-family rule
+  // above), so a first run that lost the stash to a swallowed insert while a
+  // later event landed is repaired by redelivery, and the direct-persist
+  // half re-runs regardless — its atomic acqRaw-null claim makes that free.
+  // Stashing for a subscribable ONE-TIME order is safe: the pickup handshake
+  // applies a bundle only when contract.originOrderId matches the stashed
+  // orderId, so a non-subscription order's stash is one inert event row.
+  // Guarded — acquisition must never fail order processing.
   if (containsSubscribable) {
     try {
       const capture = acquisitionFromOrderPayload(payload, lineItems, orderGid);
-      await logEvent({
-        shopId: shop.id,
-        customerId: orderCustomerGid,
-        email: orderEmail,
-        type: ACQUISITION_EVENT,
-        source: "WEBHOOK",
-        payload: {
-          orderId: orderGid,
-          acquisition: capture as unknown as Record<string, unknown>,
-        },
-      });
+      const hasStash =
+        orderGid != null &&
+        (await prisma.subscriberEvent.findFirst({
+          where: {
+            shopId: shop.id,
+            type: ACQUISITION_EVENT,
+            payload: { path: ["orderId"], equals: orderGid },
+          },
+          select: { id: true },
+        })) != null;
+      if (!hasStash) {
+        await logEvent({
+          shopId: shop.id,
+          customerId: orderCustomerGid,
+          email: orderEmail,
+          type: ACQUISITION_EVENT,
+          source: "WEBHOOK",
+          payload: {
+            orderId: orderGid,
+            acquisition: capture as unknown as Record<string, unknown>,
+          },
+        });
+      }
       if (orderGid) {
         const contract = await prisma.subscriptionContract.findFirst({
           where: { shopId: shop.id, originOrderId: orderGid },
@@ -1776,13 +2118,39 @@ async function handleOrdersCreate({
   }
 
   // ── Design attribution (_cellexia_design hidden line property) ────────────
+  // A line attributes its design when it is a subscription add: a selling-plan
+  // marker proves that directly, and on the marker-less REST payload variant
+  // (the one the containsSubscribable fallback exists for — see the block
+  // comment above) the property itself is the proof, because the widget only
+  // stamps it in the same code paths that inject selling_plan and the theme
+  // widget disables the design input for one-time selections. Gating strictly
+  // on the marker here while the denominator uses the fallback would count
+  // such an order in checkout.subscribable but never in the design feed —
+  // take-rate-by-design silently undercounting conversions for exactly the
+  // payload variant this handler documents as real. Provably one-time lines
+  // (no marker AND the order not subscribable) stay ignored.
   const designKeys = new Set<string>();
   for (const li of lineItems) {
-    if (!hasSellingPlanMarker(li)) continue; // one-time line: not a subscription add
     const designKey = designPropertyOf(li);
-    if (designKey) designKeys.add(designKey);
+    if (!designKey) continue;
+    if (!hasSellingPlanMarker(li) && !containsSubscribable) continue;
+    designKeys.add(designKey);
   }
   for (const designKey of designKeys) {
+    if (orderGid) {
+      const alreadyAttributed = await prisma.subscriberEvent.findFirst({
+        where: {
+          shopId: shop.id,
+          type: "widget.design_attributed",
+          AND: [
+            { payload: { path: ["orderId"], equals: orderGid } },
+            { payload: { path: ["designKey"], equals: designKey } },
+          ],
+        },
+        select: { id: true },
+      });
+      if (alreadyAttributed) continue; // partial run: only the missing keys log
+    }
     await logEvent({
       shopId: shop.id,
       email: orderEmail,
@@ -1794,6 +2162,18 @@ async function handleOrdersCreate({
 
   if (!containsSubscribable) return;
 
+  if (orderGid) {
+    const alreadyCounted = await prisma.subscriberEvent.findFirst({
+      where: {
+        shopId: shop.id,
+        type: "checkout.subscribable",
+        payload: { path: ["orderId"], equals: orderGid },
+      },
+      select: { id: true },
+    });
+    if (alreadyCounted) return;
+  }
+
   await logEvent({
     shopId: shop.id,
     email: orderEmail,
@@ -1803,6 +2183,15 @@ async function handleOrdersCreate({
       orderId: orderGid,
       orderName: asString(payload.name),
       hasSellingPlanLine,
+      // Per-market join context (v1.6.0 serves different design presets per
+      // market concurrently): the presentment currency identifies the market
+      // side of the checkout and designKeys ties the denominator row to the
+      // presets actually shown — without them take-rate-by-design divides
+      // one design's conversions by a denominator polluted with every other
+      // design's traffic, and the data to fix that retroactively was never
+      // collected.
+      presentmentCurrencyCode: asString(payload.presentment_currency),
+      designKeys: [...designKeys].sort(),
     },
   });
 }
@@ -1950,13 +2339,18 @@ async function handleRefundsCreate({
   const refundGid = toGid("Refund", pick(payload, "admin_graphql_api_id", "id"));
 
   /** Replay guard on the refund's identity (route receipts only catch exact
-   * webhook-id redeliveries). */
-  const alreadyRecorded = async (contractId: string): Promise<boolean> => {
+   * webhook-id redeliveries). Deliberately NOT scoped to a contract: refund
+   * ids are globally unique, and the unmatched-refund guard event (logged
+   * when neither branch matches, see below) carries no contractId — a
+   * contract-scoped lookup would miss it, and a manual redelivery arriving
+   * AFTER the attempt/mirror finally exists would net a refund whose
+   * settlement capture already absorbed it (and which the refund_reconcile
+   * job owns from the moment the guard event exists). */
+  const alreadyRecorded = async (): Promise<boolean> => {
     if (!refundGid) return false;
     const already = await prisma.subscriberEvent.findFirst({
       where: {
         shopId: shop.id,
-        contractId,
         type: "admin.action",
         payload: { path: ["refundId"], equals: refundGid },
       },
@@ -1972,7 +2366,7 @@ async function handleRefundsCreate({
   });
   if (attempt) {
     if (!isBillableOwnership(attempt.contract.ownership)) return;
-    if (await alreadyRecorded(attempt.contractId)) return;
+    if (await alreadyRecorded()) return;
 
     const { amountCents, currencyCode } = refundMoneyFromPayload(payload);
     if (amountCents <= 0) return;
@@ -2003,40 +2397,62 @@ async function handleRefundsCreate({
       return;
     }
 
-    await prisma.billingAttempt.update({
-      where: { id: attempt.id },
-      data: { refundedCents: { increment: amountCents } },
-    });
-
-    // Keep the contract's lifetime revenue NET of refunds — the same
-    // semantics rollups/cohorts apply by subtracting refundedCents. Clamped
-    // at zero so a refund recorded against an attempt whose amount never
-    // landed (e.g. a stale-sweep row from before amounts were mirrored)
-    // cannot go negative.
-    const lifetimeDecrement = Math.min(
-      amountCents,
-      Math.max(0, attempt.contract.lifetimeRevenueCents),
-    );
-    if (lifetimeDecrement > 0) {
-      await prisma.subscriptionContract.update({
-        where: { id: attempt.contractId },
-        data: { lifetimeRevenueCents: { decrement: lifetimeDecrement } },
+    // The counter moves and its replay guard arms in ONE transaction — the
+    // refund twin of the success handler's claim transaction. The
+    // refund_recorded event below IS the handler's only replay guard
+    // (alreadyRecorded above): committed separately, a process death between
+    // the increment and the event would leave the counter moved with no
+    // guard, and the crash-residue redelivery (or the documented manual
+    // replay after a FAILED receipt) would net the same refund twice — a
+    // permanent divergence between refundedCents/lifetimeRevenueCents and
+    // the event-derived rollup, with no repair path. logEventOrThrow (not
+    // logEvent) because the event is load-bearing state here: a swallowed
+    // insert would commit the money move unguarded, so the failure must roll
+    // the whole transaction back instead (receipt FAILED → replayable).
+    await prisma.$transaction(async (tx) => {
+      await tx.billingAttempt.update({
+        where: { id: attempt.id },
+        data: { refundedCents: { increment: amountCents } },
       });
-    }
 
-    await logEvent({
-      ...contractEventBase(shop.id, attempt.contract),
-      type: "admin.action",
-      source: "WEBHOOK",
-      payload: {
-        action: "refund_recorded",
-        refundId: refundGid,
-        orderId: orderGid,
-        attemptId: attempt.id,
-        cycleIndex: attempt.cycleIndex,
+      // Keep the contract's lifetime revenue NET of refunds — the same
+      // semantics rollups/cohorts apply by subtracting refundedCents.
+      // Clamped at zero so a refund recorded against an attempt whose
+      // amount never landed (e.g. a stale-sweep row from before amounts
+      // were mirrored) cannot go negative; the clamp reads the row INSIDE
+      // the transaction so a concurrent settlement or refund cannot skew it.
+      const contractRow = await tx.subscriptionContract.findUniqueOrThrow({
+        where: { id: attempt.contractId },
+        select: { lifetimeRevenueCents: true },
+      });
+      const lifetimeDecrement = Math.min(
         amountCents,
-        currencyCode: currencyCode ?? attempt.currencyCode,
-      },
+        Math.max(0, contractRow.lifetimeRevenueCents),
+      );
+      if (lifetimeDecrement > 0) {
+        await tx.subscriptionContract.update({
+          where: { id: attempt.contractId },
+          data: { lifetimeRevenueCents: { decrement: lifetimeDecrement } },
+        });
+      }
+
+      await logEventOrThrow(
+        {
+          ...contractEventBase(shop.id, attempt.contract),
+          type: "admin.action",
+          source: "WEBHOOK",
+          payload: {
+            action: "refund_recorded",
+            refundId: refundGid,
+            orderId: orderGid,
+            attemptId: attempt.id,
+            cycleIndex: attempt.cycleIndex,
+            amountCents,
+            currencyCode: currencyCode ?? attempt.currencyCode,
+          },
+        },
+        { tx },
+      );
     });
     return;
   }
@@ -2045,9 +2461,46 @@ async function handleRefundsCreate({
   const contract = await prisma.subscriptionContract.findFirst({
     where: { shopId: shop.id, originOrderId: orderGid },
   });
-  if (!contract) return; // not one of our orders — nothing to net out
+  if (!contract) {
+    // Neither branch matched. That is EITHER a genuinely foreign order
+    // (another app's renewal, a plain one-time purchase — nothing to net
+    // out) OR one of ours refunded inside an unmatched window: a renewal
+    // order before settlement stamps BillingAttempt.orderId (hours wide
+    // when the success webhook is lost to the stale sweep), or an origin
+    // order before its contract mirror exists. The two are indistinguishable
+    // HERE — so the refund is recorded as an unmatched guard event instead
+    // of dropped: the event (a) arms the refundId replay guard, so a manual
+    // redelivery arriving AFTER settlement/capture cannot net money the
+    // reduced-total capture already absorbed, and (b) feeds the daily
+    // refund_reconcile job (reconcileUnmatchedRefunds below), which
+    // re-attempts the match once the attempt/mirror exists and settles
+    // money-only refunds that would otherwise vanish from refundedCents
+    // forever. Genuinely foreign refunds simply age out of the reconcile
+    // window with the event as audit residue.
+    const { amountCents, currencyCode } = refundMoneyFromPayload(payload);
+    if (amountCents <= 0 || !refundGid) return; // nothing nettable / no identity to reconcile on
+    if (await alreadyRecorded()) return; // redelivery of an already-guarded refund
+    await logEvent({
+      shopId: shop.id,
+      type: "admin.action",
+      source: "WEBHOOK",
+      payload: {
+        action: "refund_unmatched",
+        refundId: refundGid,
+        orderId: orderGid,
+        amountCents,
+        currencyCode,
+        // Item-linked refunds reduce the order's currentTotalPriceSet, so a
+        // LATER settlement/capture stores the already-reduced total — the
+        // reconcile job must not net those a second time. Money-only
+        // refunds leave the total untouched and are the ones it recovers.
+        lineItemRefund: asArray(payload.refund_line_items).length > 0,
+      },
+    });
+    return;
+  }
   if (!isBillableOwnership(contract.ownership)) return;
-  if (await alreadyRecorded(contract.id)) return;
+  if (await alreadyRecorded()) return;
 
   const { amountCents, currencyCode } = refundMoneyFromPayload(payload);
   if (amountCents <= 0) return;
@@ -2064,58 +2517,276 @@ async function handleRefundsCreate({
   // enforced at the row level (updateMany conditioned on a non-null captured
   // total whose currency agrees), never via a prior read, so a capture
   // landing concurrently cannot slip between check and increment.
-  const netted = await prisma.subscriptionContract.updateMany({
+  //
+  // Increment and guard event commit in ONE transaction, exactly like the
+  // attempt branch above: the event is the only replay guard, and a crash
+  // between the two would let a redelivery net the same refund twice.
+  // logEventOrThrow so a refused event insert rolls the increment back
+  // (receipt FAILED → replayable) instead of committing it unguarded.
+  await prisma.$transaction(async (tx) => {
+    const netted = await tx.subscriptionContract.updateMany({
+      where: {
+        id: contract.id,
+        originOrderTotalCents: { not: null },
+        // Null refund currency (sparse payload) nets against any capture —
+        // the same null-tolerant rule refundCurrencyAgrees encodes.
+        ...(currencyCode != null
+          ? {
+              OR: [
+                { originOrderCurrencyCode: null },
+                { originOrderCurrencyCode: currencyCode },
+              ],
+            }
+          : {}),
+      },
+      data: { originOrderRefundedCents: { increment: amountCents } },
+    });
+
+    // Distinguish WHICH gate refused, for the event log only (both skip
+    // events arm the replay guard the same way): re-read AFTER the failed
+    // updateMany — a total that is null now was null when the update ran.
+    let action = "refund_recorded";
+    if (netted.count === 0) {
+      const current = await tx.subscriptionContract.findFirst({
+        where: { id: contract.id },
+        select: { originOrderTotalCents: true },
+      });
+      action =
+        current?.originOrderTotalCents == null
+          ? "refund_skipped_pre_capture"
+          : "refund_skipped_currency_mismatch";
+    }
+
+    // Logged for ALL outcomes: the skip events carry the refundId, so the
+    // replay guard above also blocks a manual redelivery arriving AFTER a
+    // later capture from netting a refund the capture already absorbed.
+    await logEventOrThrow(
+      {
+        ...contractEventBase(shop.id, contract),
+        type: "admin.action",
+        source: "WEBHOOK",
+        payload: {
+          action,
+          refundId: refundGid,
+          orderId: orderGid,
+          originOrder: true,
+          amountCents,
+          currencyCode: currencyCode ?? contract.originOrderCurrencyCode,
+          ...(action === "refund_skipped_currency_mismatch"
+            ? { expectedCurrencyCode: contract.originOrderCurrencyCode }
+            : {}),
+        },
+      },
+      { tx },
+    );
+  });
+}
+
+/**
+ * How far back the refund_reconcile job re-scans unmatched-refund guard
+ * events. The unmatched windows it exists for close within hours (settlement
+ * stamps attempt.orderId; the contract mirror lands with its webhook or the
+ * daily backfill), so 30 days is generous; beyond it, an unmatched event is a
+ * genuinely foreign order's refund and ages out of the scan as audit residue
+ * rather than accumulating rescans forever.
+ */
+const REFUND_RECONCILE_WINDOW_MS = 30 * 86_400_000;
+
+/** Per-run bound on the reconcile scan (oldest first — the window drains). */
+const REFUND_RECONCILE_CAP = 200;
+
+/**
+ * Re-attempt the refund matches handleRefundsCreate had to give up on (the
+ * refund_unmatched guard events): a refund can arrive before the settlement
+ * stamps BillingAttempt.orderId or before the contract mirror exists, and
+ * without this pass its money would be missing from refundedCents forever.
+ * Registered as the daily refund_reconcile job (jobs/runner.server.ts).
+ *
+ * Matching precedence and gates mirror the live handler exactly. What can be
+ * netted is narrower, though, because by construction every capture the
+ * matched row carries happened AFTER the refund:
+ *  - attempt match, MONEY-ONLY refund (no refund line items): netted — the
+ *    order's currentTotalPriceSet was never reduced by it, so the captured
+ *    amountCents (or its later null-amount true-up) contains the money in
+ *    full;
+ *  - attempt match, ITEM-linked refund: the capture stored the already-
+ *    reduced total, so netting again would subtract the same money twice —
+ *    terminal skip (refund_skipped_absorbed_by_capture);
+ *  - origin match: the mirror postdates the refund, so the origin capture is
+ *    pre-capture-refund by construction — the same terminal
+ *    refund_skipped_pre_capture verdict (and documented tolerance,
+ *    DATA_FOUNDATION.md) the live origin branch applies.
+ *
+ * Idempotent via the refundId guard: every verdict is itself an admin.action
+ * event carrying the refundId, and a refund with ANY non-unmatched event is
+ * skipped — so is one the live handler recorded first. `matched` counts
+ * refunds that reached a terminal verdict this run.
+ */
+export async function reconcileUnmatchedRefunds(): Promise<{
+  scanned: number;
+  matched: number;
+}> {
+  const { getPrimaryShop } = await import("~/lib/shop/install.server");
+  const shop = await getPrimaryShop();
+  if (!shop) return { scanned: 0, matched: 0 };
+
+  const unmatched = await prisma.subscriberEvent.findMany({
     where: {
-      id: contract.id,
-      originOrderTotalCents: { not: null },
-      // Null refund currency (sparse payload) nets against any capture —
-      // the same null-tolerant rule refundCurrencyAgrees encodes.
-      ...(currencyCode != null
-        ? {
-            OR: [
-              { originOrderCurrencyCode: null },
-              { originOrderCurrencyCode: currencyCode },
-            ],
-          }
-        : {}),
+      shopId: shop.id,
+      type: "admin.action",
+      createdAt: { gte: new Date(Date.now() - REFUND_RECONCILE_WINDOW_MS) },
+      payload: { path: ["action"], equals: "refund_unmatched" },
     },
-    data: { originOrderRefundedCents: { increment: amountCents } },
+    orderBy: { createdAt: "asc" },
+    take: REFUND_RECONCILE_CAP,
+    select: { id: true, payload: true },
   });
 
-  // Distinguish WHICH gate refused, for the event log only (both skip events
-  // arm the replay guard the same way): re-read AFTER the failed updateMany —
-  // a total that is null now was null when the update ran.
-  let action = "refund_recorded";
-  if (netted.count === 0) {
-    const current = await prisma.subscriptionContract.findFirst({
-      where: { id: contract.id },
-      select: { originOrderTotalCents: true },
+  let matched = 0;
+  for (const evt of unmatched) {
+    const p = (evt.payload ?? {}) as Record<string, unknown>;
+    const refundGid = asString(p.refundId);
+    const orderGid = asString(p.orderId);
+    const amountCents = asNumber(p.amountCents);
+    const currencyCode = asString(p.currencyCode);
+    const lineItemRefund = p.lineItemRefund === true;
+    if (!refundGid || !orderGid || amountCents == null || amountCents <= 0) {
+      continue; // malformed guard event — nothing safe to reconcile
+    }
+
+    // A verdict (or a live-handler record) already exists for this refund.
+    const resolved = await prisma.subscriberEvent.findFirst({
+      where: {
+        shopId: shop.id,
+        type: "admin.action",
+        payload: { path: ["refundId"], equals: refundGid },
+        NOT: { payload: { path: ["action"], equals: "refund_unmatched" } },
+      },
+      select: { id: true },
     });
-    action =
-      current?.originOrderTotalCents == null
-        ? "refund_skipped_pre_capture"
-        : "refund_skipped_currency_mismatch";
+    if (resolved) continue;
+
+    // ── Attempt match (same precedence as the live handler) ─────────────────
+    const attempt = await prisma.billingAttempt.findFirst({
+      where: { orderId: orderGid, contract: { shopId: shop.id } },
+      include: { contract: true },
+    });
+    if (attempt) {
+      if (!isBillableOwnership(attempt.contract.ownership)) continue;
+
+      const attemptCurrency =
+        attempt.currencyCode ?? attempt.contract.currencyCode;
+      if (!refundCurrencyAgrees(currencyCode, attemptCurrency)) {
+        await logEvent({
+          ...contractEventBase(shop.id, attempt.contract),
+          type: "admin.action",
+          source: "SCHEDULER",
+          payload: {
+            action: "refund_skipped_currency_mismatch",
+            refundId: refundGid,
+            orderId: orderGid,
+            attemptId: attempt.id,
+            cycleIndex: attempt.cycleIndex,
+            amountCents,
+            currencyCode,
+            expectedCurrencyCode: attemptCurrency,
+            resolvedBy: "refund_reconcile",
+          },
+        });
+        matched += 1;
+        continue;
+      }
+
+      if (lineItemRefund) {
+        // Item-linked money is inside the (later) capture's reduced total.
+        await logEvent({
+          ...contractEventBase(shop.id, attempt.contract),
+          type: "admin.action",
+          source: "SCHEDULER",
+          payload: {
+            action: "refund_skipped_absorbed_by_capture",
+            refundId: refundGid,
+            orderId: orderGid,
+            attemptId: attempt.id,
+            cycleIndex: attempt.cycleIndex,
+            amountCents,
+            currencyCode: currencyCode ?? attemptCurrency,
+            resolvedBy: "refund_reconcile",
+          },
+        });
+        matched += 1;
+        continue;
+      }
+
+      // Money-only: net it, atomically with its verdict event — the same
+      // one-transaction rule the live attempt branch applies.
+      await prisma.$transaction(async (tx) => {
+        await tx.billingAttempt.update({
+          where: { id: attempt.id },
+          data: { refundedCents: { increment: amountCents } },
+        });
+        const contractRow = await tx.subscriptionContract.findUniqueOrThrow({
+          where: { id: attempt.contractId },
+          select: { lifetimeRevenueCents: true },
+        });
+        const lifetimeDecrement = Math.min(
+          amountCents,
+          Math.max(0, contractRow.lifetimeRevenueCents),
+        );
+        if (lifetimeDecrement > 0) {
+          await tx.subscriptionContract.update({
+            where: { id: attempt.contractId },
+            data: { lifetimeRevenueCents: { decrement: lifetimeDecrement } },
+          });
+        }
+        await logEventOrThrow(
+          {
+            ...contractEventBase(shop.id, attempt.contract),
+            type: "admin.action",
+            source: "SCHEDULER",
+            payload: {
+              action: "refund_recorded",
+              refundId: refundGid,
+              orderId: orderGid,
+              attemptId: attempt.id,
+              cycleIndex: attempt.cycleIndex,
+              amountCents,
+              currencyCode: currencyCode ?? attemptCurrency,
+              resolvedBy: "refund_reconcile",
+            },
+          },
+          { tx },
+        );
+      });
+      matched += 1;
+      continue;
+    }
+
+    // ── Origin match ─────────────────────────────────────────────────────────
+    const contract = await prisma.subscriptionContract.findFirst({
+      where: { shopId: shop.id, originOrderId: orderGid },
+    });
+    if (!contract || !isBillableOwnership(contract.ownership)) {
+      continue; // still unmatched — retried until the window ages it out
+    }
+    await logEvent({
+      ...contractEventBase(shop.id, contract),
+      type: "admin.action",
+      source: "SCHEDULER",
+      payload: {
+        action: "refund_skipped_pre_capture",
+        refundId: refundGid,
+        orderId: orderGid,
+        originOrder: true,
+        amountCents,
+        currencyCode: currencyCode ?? contract.originOrderCurrencyCode,
+        resolvedBy: "refund_reconcile",
+      },
+    });
+    matched += 1;
   }
 
-  // Logged for ALL outcomes: the skip events carry the refundId, so the
-  // replay guard above also blocks a manual redelivery arriving AFTER a later
-  // capture from netting a refund the capture already absorbed.
-  await logEvent({
-    ...contractEventBase(shop.id, contract),
-    type: "admin.action",
-    source: "WEBHOOK",
-    payload: {
-      action,
-      refundId: refundGid,
-      orderId: orderGid,
-      originOrder: true,
-      amountCents,
-      currencyCode: currencyCode ?? contract.originOrderCurrencyCode,
-      ...(action === "refund_skipped_currency_mismatch"
-        ? { expectedCurrencyCode: contract.originOrderCurrencyCode }
-        : {}),
-    },
-  });
+  return { scanned: unmatched.length, matched };
 }
 
 /**
@@ -2124,9 +2795,20 @@ async function handleRefundsCreate({
  * `fulfillments[]` (`tracking_number`, `tracking_numbers[]`, `tracking_url`,
  * `tracking_urls[]`).
  *
+ * Delivery-outcome collection (docs/DATA_FOUNDATION.md collect-now doctrine):
+ * the payload is the ONLY carrier of the charge→ship gap — persisted as
+ * BillingAttempt.fulfilledAt for renewal orders and
+ * SubscriptionContract.originOrderFulfilledAt for origin (checkout) orders,
+ * first fulfillment wins (split shipments keep the earliest instant), plus a
+ * billing.order_fulfilled event with the tracking company (no tracking
+ * number, no PII). Orders older than the 60-day access horizon are
+ * unfetchable later, so dropping this here would start every future
+ * shipping-performance/churn-latency analysis cold.
+ *
  * Only renewal orders billed by this app (matched via BillingAttempt.orderId)
  * get the order_shipped notification — Shopify already notifies checkout
- * orders. Deduped per cycle via hasSentForCycle.
+ * orders. Deduped per cycle via hasSentForCycle; the persistence and event
+ * run BEFORE that dedupe so a redelivery after a half-run still lands them.
  */
 async function handleOrdersFulfilled({
   shopDomain,
@@ -2135,16 +2817,6 @@ async function handleOrdersFulfilled({
   const shop = await requireShop(shopDomain);
   const orderGid = toGid("Order", pick(payload, "admin_graphql_api_id", "id"));
   if (!orderGid) return;
-
-  const attempt = await prisma.billingAttempt.findFirst({
-    where: { orderId: orderGid, contract: { shopId: shop.id } },
-    include: { contract: true },
-  });
-  if (!attempt) return; // not one of our renewal orders
-
-  if (await hasSentForCycle(attempt.contractId, "order_shipped", attempt.cycleIndex)) {
-    return;
-  }
 
   const fulfillment = asArray(payload.fulfillments)
     .map(asRecord)
@@ -2157,18 +2829,361 @@ async function handleOrdersFulfilled({
     ? (asString(fulfillment.tracking_url) ??
       asString(asArray(fulfillment.tracking_urls)[0]))
     : null;
+  const trackingCompany = fulfillment
+    ? asString(fulfillment.tracking_company)
+    : null;
+  // The ship instant: the fulfillment's own created_at when parseable,
+  // webhook arrival otherwise.
+  const fulfilledAtRaw = fulfillment ? asString(fulfillment.created_at) : null;
+  const fulfilledAtParsed = fulfilledAtRaw ? new Date(fulfilledAtRaw) : null;
+  const fulfilledAt =
+    fulfilledAtParsed && !Number.isNaN(fulfilledAtParsed.getTime())
+      ? fulfilledAtParsed
+      : new Date();
 
-  await sendNotification({
-    shopId: shop.id,
-    contractId: attempt.contractId,
-    template: "order_shipped",
-    vars: {
+  /** billing.order_fulfilled, deduped on the order id (manual replays). */
+  const logFulfilledOnce = async (
+    contract: Pick<SubscriptionContract, "id" | "customerId" | "email">,
+    extra: Record<string, unknown>,
+  ): Promise<void> => {
+    const already = await prisma.subscriberEvent.findFirst({
+      where: {
+        shopId: shop.id,
+        type: "billing.order_fulfilled",
+        payload: { path: ["orderId"], equals: orderGid },
+      },
+      select: { id: true },
+    });
+    if (already) return;
+    await logEvent({
+      ...contractEventBase(shop.id, contract),
+      type: "billing.order_fulfilled",
+      source: "WEBHOOK",
+      payload: {
+        orderId: orderGid,
+        fulfilledAt: fulfilledAt.toISOString(),
+        trackingCompany,
+        hasTracking: trackingNumber != null || trackingUrl != null,
+        ...extra,
+      },
+    });
+  };
+
+  const attempt = await prisma.billingAttempt.findFirst({
+    where: { orderId: orderGid, contract: { shopId: shop.id } },
+    include: { contract: true },
+  });
+  if (attempt) {
+    // First fulfillment wins: split shipments must not advance the instant.
+    await prisma.billingAttempt.updateMany({
+      where: { id: attempt.id, fulfilledAt: null },
+      data: { fulfilledAt },
+    });
+    await logFulfilledOnce(attempt.contract, {
+      origin: false,
+      attemptId: attempt.id,
       cycleIndex: attempt.cycleIndex,
-      order_name: attempt.orderName ?? asString(payload.name) ?? "",
-      ...(trackingNumber ? { tracking_number: trackingNumber } : {}),
-      ...(trackingUrl ? { tracking_url: trackingUrl } : {}),
+      orderName: attempt.orderName ?? asString(payload.name),
+    });
+
+    if (
+      await hasSentForCycle(attempt.contractId, "order_shipped", attempt.cycleIndex)
+    ) {
+      return;
+    }
+    await sendNotification({
+      shopId: shop.id,
+      contractId: attempt.contractId,
+      template: "order_shipped",
+      vars: {
+        cycleIndex: attempt.cycleIndex,
+        order_name: attempt.orderName ?? asString(payload.name) ?? "",
+        ...(trackingNumber ? { tracking_number: trackingNumber } : {}),
+        ...(trackingUrl ? { tracking_url: trackingUrl } : {}),
+      },
+    });
+    return;
+  }
+
+  // Origin (checkout) order: no notification — Shopify already sent one —
+  // but the cycle-0 pay→ship gap is collected, owned contracts only (origin
+  // money-mirror rule: another app's checkout is not ours to measure).
+  const contract = await prisma.subscriptionContract.findFirst({
+    where: { shopId: shop.id, originOrderId: orderGid },
+  });
+  if (!contract || !isBillableOwnership(contract.ownership)) return;
+
+  await prisma.subscriptionContract.updateMany({
+    where: { id: contract.id, originOrderFulfilledAt: null },
+    data: { originOrderFulfilledAt: fulfilledAt },
+  });
+  await logFulfilledOnce(contract, {
+    origin: true,
+    orderName: asString(payload.name),
+  });
+}
+
+/**
+ * ORDERS_CANCELLED
+ * Payload: order (REST-shaped) — `id`, `admin_graphql_api_id`, `name`,
+ * `cancel_reason`, `cancelled_at`, `financial_status`, `total_price`,
+ * `currency`.
+ *
+ * CAPTURE-ONLY, deliberately: no money mutation. Captured totals are frozen
+ * at capture (BillingAttempt.amountCents immutable once SUCCESS;
+ * originOrderTotalCents "never rewritten") and REFUNDS_CREATE is the single
+ * post-capture adjustment channel — when a cancellation refunds money, its
+ * refund webhook does the netting. What a cancellation alone changes is the
+ * VOID case: an authorization cancelled without a refund transaction emits no
+ * REFUNDS_CREATE, and before this handler that money silently kept its full
+ * captured total. The event makes the case visible and auditable (which
+ * orders were cancelled, in what financial state, for how much) without
+ * opening a second money-mutation channel that could double-net against a
+ * later refund.
+ *
+ * Matched to our book the same way refunds are (attempt first, then origin
+ * mirror, owned contracts only); foreign orders are ignored. Deduped on the
+ * order id — a cancellation is a one-shot fact.
+ */
+async function handleOrdersCancelled({
+  shopDomain,
+  payload,
+}: WebhookHandlerContext): Promise<void> {
+  const shop = await requireShop(shopDomain);
+  const orderGid = toGid("Order", pick(payload, "admin_graphql_api_id", "id"));
+  if (!orderGid) return;
+
+  const attempt = await prisma.billingAttempt.findFirst({
+    where: { orderId: orderGid, contract: { shopId: shop.id } },
+    include: { contract: true },
+  });
+  const contract =
+    attempt?.contract ??
+    (await prisma.subscriptionContract.findFirst({
+      where: { shopId: shop.id, originOrderId: orderGid },
+    }));
+  if (!contract || !isBillableOwnership(contract.ownership)) return;
+
+  const already = await prisma.subscriberEvent.findFirst({
+    where: {
+      shopId: shop.id,
+      type: "billing.order_cancelled",
+      payload: { path: ["orderId"], equals: orderGid },
+    },
+    select: { id: true },
+  });
+  if (already) return;
+
+  await logEvent({
+    ...contractEventBase(shop.id, contract),
+    type: "billing.order_cancelled",
+    source: "WEBHOOK",
+    payload: {
+      orderId: orderGid,
+      orderName: asString(payload.name),
+      origin: attempt == null,
+      ...(attempt
+        ? { attemptId: attempt.id, cycleIndex: attempt.cycleIndex }
+        : {}),
+      cancelReason: asString(payload.cancel_reason),
+      cancelledAt: asString(payload.cancelled_at),
+      totalCents: centsFromAmountString(payload.total_price),
+      currencyCode: asString(payload.currency),
+      financialStatus: asString(payload.financial_status),
     },
   });
+}
+
+// ── Shop & customer identity mirrors ─────────────────────────────────────────
+
+/** The shopLocales half of the shop-metadata refresh (not in the payload). */
+const SHOP_LOCALES_QUERY = `#graphql
+  query CellexiaShopLocales {
+    shopLocales {
+      locale
+      primary
+      published
+    }
+  }
+`;
+
+/**
+ * SHOP_UPDATE
+ * Payload: shop (REST-shaped) — `name`, `currency`, `iana_timezone`,
+ * `customer_email` / `email`, `domain`.
+ *
+ * The Shop metadata mirror (currency, timezone, name, contact email, primary
+ * domain, enabled locales) was previously written ONLY by onAppInstalled on
+ * OAuth afterAuth: a merchant changing the store timezone or currency in the
+ * Shopify admin left the mirror stale indefinitely, silently corrupting every
+ * shop-day window (rollup day bucketing, cohort month keys, scheduler day
+ * math) and every "same currency as the shop" analytics guard from that
+ * moment on. This handler keeps the mirror live; a currency/timezone change
+ * additionally logs an admin.action event, because day-bucketed history
+ * BEFORE the change was computed under the old values — the event dates the
+ * boundary for anyone reading those numbers later.
+ */
+async function handleShopUpdate({
+  shopDomain,
+  payload,
+}: WebhookHandlerContext): Promise<void> {
+  const shop = await prisma.shop.findUnique({ where: { domain: shopDomain } });
+  if (!shop) {
+    console.warn("[webhooks] SHOP_UPDATE for unknown shop", shopDomain);
+    return;
+  }
+
+  const name = asString(payload.name);
+  const currencyCode = asString(payload.currency);
+  const ianaTimezone = asString(payload.iana_timezone);
+  const contactEmail = asString(pick(payload, "customer_email", "email"));
+  const primaryDomain = asString(payload.domain);
+
+  // Locales are not in the REST payload — refreshed via GraphQL, contained
+  // (a locale-fetch hiccup must not lose the currency/timezone refresh).
+  let enabledLocales: object | undefined;
+  try {
+    const admin = await getAdmin(shopDomain);
+    const data = await gql<{
+      shopLocales?: Array<{ locale: string; primary: boolean; published: boolean }>;
+    }>(admin, SHOP_LOCALES_QUERY);
+    if (data.shopLocales) enabledLocales = data.shopLocales as object;
+  } catch (err) {
+    console.error("[webhooks] shop locales refresh failed", shopDomain, err);
+  }
+
+  await prisma.shop.update({
+    where: { id: shop.id },
+    data: {
+      name: name ?? undefined,
+      currencyCode: currencyCode ?? undefined,
+      ianaTimezone: ianaTimezone ?? undefined,
+      contactEmail: contactEmail ?? undefined,
+      primaryDomain: primaryDomain ?? undefined,
+      ...(enabledLocales !== undefined ? { enabledLocales } : {}),
+    },
+  });
+
+  const currencyChanged =
+    currencyCode != null && currencyCode !== shop.currencyCode;
+  const timezoneChanged =
+    ianaTimezone != null && ianaTimezone !== shop.ianaTimezone;
+  if (currencyChanged || timezoneChanged) {
+    await logEvent({
+      shopId: shop.id,
+      type: "admin.action",
+      source: "WEBHOOK",
+      payload: {
+        action: "shop_metadata_changed",
+        ...(currencyChanged
+          ? {
+              previousCurrencyCode: shop.currencyCode,
+              currencyCode,
+            }
+          : {}),
+        ...(timezoneChanged
+          ? {
+              previousIanaTimezone: shop.ianaTimezone,
+              ianaTimezone,
+            }
+          : {}),
+      },
+    });
+  }
+}
+
+/**
+ * CUSTOMERS_UPDATE
+ * Payload: customer (REST-shaped) — `id`, `admin_graphql_api_id`, `email`,
+ * `first_name`, `last_name`, `phone`.
+ *
+ * Contract mirrors refresh email/phone/name only inside
+ * syncContractFromShopify, which runs on CONTRACT-scoped webhooks: active
+ * contracts self-heal every billing cycle, but PAUSED / FAILED / CANCELLED
+ * contracts — exactly the populations dunning and winback email — held a
+ * stale address indefinitely when the customer changed it in the store. This
+ * handler refreshes the identity fields on ALL of the customer's mirrors,
+ * OURS and FOREIGN alike: it is identity data, not billing, and the
+ * CUSTOMERS_REDACT email-fallback filters match on the mirrored value, so
+ * letting it drift also weakens erasure coverage.
+ *
+ * GDPR: mirrors already anonymized by CUSTOMERS_REDACT (the
+ * redacted+…@example.invalid stamp) are never revived — customerId survives
+ * redaction as the financial-record key, so without this skip a later
+ * customers/update for the same customer id would write the live identity
+ * straight back onto an erased row.
+ *
+ * Only non-null payload values refresh a field (the same "never clobber with
+ * absence" rule the sync applies), and the event carries the changed FIELD
+ * NAMES only — no identity values on the event stream.
+ */
+async function handleCustomersUpdate({
+  shopDomain,
+  payload,
+  webhookId,
+}: WebhookHandlerContext): Promise<void> {
+  const shop = await requireShop(shopDomain);
+  const customerGid = toGid(
+    "Customer",
+    pick(payload, "admin_graphql_api_id", "id"),
+  );
+  if (!customerGid) {
+    console.warn("[webhooks] CUSTOMERS_UPDATE without customer id", webhookId);
+    return;
+  }
+
+  const email = asString(payload.email);
+  const phone = asString(payload.phone);
+  const firstName = asString(payload.first_name);
+  const lastName = asString(payload.last_name);
+
+  const contracts = await prisma.subscriptionContract.findMany({
+    where: { shopId: shop.id, customerId: customerGid },
+  });
+
+  for (const contract of contracts) {
+    if (
+      contract.email.startsWith("redacted+") &&
+      contract.email.endsWith("@example.invalid")
+    ) {
+      continue; // erased identity — see the GDPR note above
+    }
+
+    const data: Record<string, string> = {};
+    const changedFields: string[] = [];
+    if (email != null && email !== contract.email) {
+      data.email = email;
+      changedFields.push("email");
+    }
+    if (phone != null && phone !== contract.phone) {
+      data.phone = phone;
+      changedFields.push("phone");
+    }
+    if (firstName != null && firstName !== contract.firstName) {
+      data.firstName = firstName;
+      changedFields.push("firstName");
+    }
+    if (lastName != null && lastName !== contract.lastName) {
+      data.lastName = lastName;
+      changedFields.push("lastName");
+    }
+    if (changedFields.length === 0) continue;
+
+    await prisma.subscriptionContract.update({
+      where: { id: contract.id },
+      data,
+    });
+
+    await logEvent({
+      shopId: shop.id,
+      contractId: contract.id,
+      customerId: contract.customerId,
+      email: email ?? contract.email,
+      type: "contract.updated",
+      source: "WEBHOOK",
+      payload: { action: "customer_updated", changedFields },
+    });
+  }
 }
 
 // ── App lifecycle ────────────────────────────────────────────────────────────
@@ -2305,6 +3320,17 @@ async function handleCustomersDataRequest({
  *   field dies with the identity, wherever it was copied.
  * - MagicLinkToken / OtpCode / PortalSession rows for the identity deleted
  *   (a redacted customer must not retain live login artifacts).
+ * - KlaviyoOutbox: PENDING/FAILED rows for the identity are DELETED — the
+ *   1-minute flush would otherwise transmit the customer's email/phone and
+ *   acq profile attrs to Klaviyo for up to 24h AFTER the erasure was
+ *   acknowledged; SENT/DEAD rows (kept as delivery audit) are anonymized
+ *   like NotificationLog, with profileAttrs/properties cleared — they carry
+ *   cellexia_acq_source/cellexia_acq_country plus names on every
+ *   contract-scoped event, i.e. exactly the copies "EVERY acquisition field
+ *   dies with the identity" covers.
+ * - GDPR_DATA_REQUEST alerts for the identity: message and context stored
+ *   the customer's email and order list as operator guidance — rewritten to
+ *   the redacted identity (the dataRequestId survives as the audit key).
  * BillingAttempt / DunningCase / revenue counters — including the origin
  * order money mirror (originOrder*Cents) — are retained (legitimate
  * financial records). Raises an INFO alert and logs admin.action.
@@ -2481,6 +3507,77 @@ async function handleCustomersRedact({
     await prisma.magicLinkToken.deleteMany({ where: { OR: tokenFilters } });
   }
 
+  // Klaviyo outbox: every contract-scoped event copied the identity (email/
+  // phone) and the acq profile attrs into a row here, and rows are retained
+  // forever (the age-out sweep only flips status). Matched by the original
+  // identity AND by properties.contract_id — a customer whose store email
+  // drifted since the last enqueue is still reachable through the contract
+  // snapshot every row carries. PENDING/FAILED rows die outright: the
+  // 1-minute klaviyo_flush would otherwise deliver them to Klaviyo for up to
+  // MAX_EVENT_AGE_MS after this redact was acknowledged. SENT/DEAD rows stay
+  // as delivery audit, anonymized like NotificationLog (identity redacted,
+  // attrs/properties cleared — both carry acquisition copies).
+  const outboxFilters: Prisma.KlaviyoOutboxWhereInput[] = [];
+  if (originalEmail) outboxFilters.push({ email: originalEmail });
+  const originalPhone = asString(customer.phone);
+  if (originalPhone) outboxFilters.push({ phone: originalPhone });
+  for (const contractId of contractIds) {
+    outboxFilters.push({
+      properties: { path: ["contract_id"], equals: contractId },
+    });
+  }
+  if (outboxFilters.length > 0) {
+    await prisma.klaviyoOutbox.deleteMany({
+      where: {
+        shopId: shop.id,
+        status: { in: ["PENDING", "FAILED"] },
+        OR: outboxFilters,
+      },
+    });
+    await prisma.klaviyoOutbox.updateMany({
+      where: { shopId: shop.id, OR: outboxFilters },
+      data: {
+        email: redactedEmail,
+        phone: null,
+        profileAttrs: Prisma.DbNull,
+        properties: Prisma.DbNull,
+      },
+    });
+  }
+
+  // GDPR_DATA_REQUEST alerts carry the customer's email + requested order
+  // list in message/context (operator guidance for the export). The redact
+  // supersedes the guidance; the dataRequestId survives as the audit key.
+  const alertFilters: Prisma.AlertWhereInput[] = [];
+  if (customerGid) {
+    alertFilters.push({ context: { path: ["customerId"], equals: customerGid } });
+  }
+  if (originalEmail) {
+    alertFilters.push({ context: { path: ["email"], equals: originalEmail } });
+  }
+  if (alertFilters.length > 0) {
+    const dataRequestAlerts = await prisma.alert.findMany({
+      where: { shopId: shop.id, type: "GDPR_DATA_REQUEST", OR: alertFilters },
+      select: { id: true, context: true },
+    });
+    for (const alert of dataRequestAlerts) {
+      const context = (alert.context ?? {}) as Record<string, unknown>;
+      await prisma.alert.update({
+        where: { id: alert.id },
+        data: {
+          message: `GDPR data request for ${customerGid ?? redactedEmail} — identity redacted per customers/redact.`,
+          context: {
+            customerId: customerGid,
+            email: redactedEmail,
+            ordersRequested: [],
+            dataRequestId: context.dataRequestId ?? null,
+            redacted: true,
+          },
+        },
+      });
+    }
+  }
+
   await prisma.alert.create({
     data: {
       shopId: shop.id,
@@ -2553,7 +3650,10 @@ export const webhookHandlers: Record<string, WebhookHandler> = {
   CUSTOMER_PAYMENT_METHODS_REVOKE: handlePaymentMethodRevoke,
   ORDERS_CREATE: handleOrdersCreate,
   ORDERS_FULFILLED: handleOrdersFulfilled,
+  ORDERS_CANCELLED: handleOrdersCancelled,
   REFUNDS_CREATE: handleRefundsCreate,
+  SHOP_UPDATE: handleShopUpdate,
+  CUSTOMERS_UPDATE: handleCustomersUpdate,
   APP_UNINSTALLED: handleAppUninstalled,
   APP_SCOPES_UPDATE: handleAppScopesUpdate,
   CUSTOMERS_DATA_REQUEST: handleCustomersDataRequest,

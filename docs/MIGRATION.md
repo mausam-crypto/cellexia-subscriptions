@@ -29,7 +29,7 @@ One row per subscription line. Header (exact order, see
 [sample-import.csv](./sample-import.csv)):
 
 ```
-email,first_name,last_name,phone,variant_id,quantity,interval_weeks,next_charge_date,status,price_cents,currency,address1,address2,city,province_code,zip,country_code,payment_method_id,origin
+email,first_name,last_name,phone,variant_id,quantity,interval_weeks,interval_unit,interval_count,next_charge_date,status,price_cents,currency,address1,address2,city,province_code,zip,country_code,payment_method_id,origin,subscribed_since
 ```
 
 | Column | Required | Notes |
@@ -39,7 +39,8 @@ email,first_name,last_name,phone,variant_id,quantity,interval_weeks,next_charge_
 | `phone` | no | E.164 (`+447700900123`). |
 | `variant_id` | yes | Full GID: `gid://shopify/ProductVariant/…`. Numeric-only values are accepted and converted. The variant **must belong to a synced selling plan group** (Plans page) or the atomic create fails. |
 | `quantity` | yes | Integer ≥ 1. |
-| `interval_weeks` | yes | Whole weeks between charges (this engine is week-based — see conversion notes per source below). |
+| `interval_weeks` | one of the two interval shapes | Whole weeks between charges, 1–52 (the pre-v1.8.0 shape — old CSVs keep working unchanged). Required unless the row fills `interval_unit` + `interval_count`. |
+| `interval_unit` + `interval_count` | one of the two interval shapes | Native cadence pass-through (v1.8.0): `interval_unit` is `DAY` \| `WEEK` \| `MONTH` (any casing), `interval_count` an integer — DAY 1–90, WEEK 1–52, MONTH 1–12. Fill both or neither; a filled pair wins over `interval_weeks` on the same row. A `MONTH` contract bills on the calendar month (month-end clamped), not an approximated 4 weeks. |
 | `next_charge_date` | yes | `YYYY-MM-DD`, interpreted in the **shop's timezone**. Must be today or later; this is the first date *we* will bill. |
 | `status` | yes | `ACTIVE` or `PAUSED`. Do not import cancelled subscriptions (export them for Klaviyo win-back audiences instead). |
 | `price_cents` | yes | The per-unit price the subscriber currently pays, integer cents, **after** their subscription discount. Imported contracts are marked `grandfatheredPricing` so a later price propagation won't surprise them unless you include them deliberately. |
@@ -47,10 +48,13 @@ email,first_name,last_name,phone,variant_id,quantity,interval_weeks,next_charge_
 | `address1`…`country_code` | yes (address2 optional) | Delivery address. `province_code` uses Shopify codes (UK: `ENG`, `SCT`, `WLS`, `NIR`). |
 | `payment_method_id` | no | `gid://shopify/CustomerPaymentMethod/…` — see §3. Blank is allowed: the contract imports, but its first charge will fail into dunning and the customer gets a card-update link. Prefer migrating payment methods *first* so this column can be filled. |
 | `origin` | yes | Source system, lowercase: `recharge` \| `skio` \| `appstle` \| `bold` \| `manual`. Stored for audit/analytics. |
+| `subscribed_since` | no — **fill it if your export has it** | When the subscriber ORIGINALLY subscribed on the source platform: `YYYY-MM-DD` or an ISO-8601 timestamp with timezone (e.g. `2024-03-17` or `2024-03-17T10:00:00Z`), must be in the past. Without it, every imported subscriber "arrives" on import day — one giant fake signup-spike cohort — and tenure-based analytics (cohorts, survival, win-back timing) start from zero. Maps from the source's subscription *created-at* column (Recharge `created_at`, Skio `Created at`, Appstle `createdAt`, Bold `created_at` — verify against your header). The raw value is kept for audit (`acqRaw.importSubscribedSince`). |
 
 Multi-line subscriptions: repeat the row per line with the same `email` +
-`next_charge_date` + `interval_weeks`; the importer groups them into one
-contract.
+`next_charge_date` + cadence (`interval_weeks`, or `interval_unit` +
+`interval_count`); the importer groups them into one contract. Cadence
+identity is the exact unit+count pair — a 10-day row and a 2-week row are two
+different contracts even though both approximate to 2 weeks.
 
 ## 2. Export mapping per source platform
 
@@ -67,8 +71,9 @@ columns occasionally. Anything not listed maps to nothing (drop it).
 | `phone` | `phone` | normalise to E.164 |
 | `shopify_variant_id` | `variant_id` | prefix `gid://shopify/ProductVariant/` |
 | `quantity` | `quantity` | — |
-| `order_interval_frequency` + `order_interval_unit` | `interval_weeks` | `week` → as-is; `day` → divide by 7 (round to nearest); `month` → ×4 (a "1 month" Recharge sub becomes 4-weekly — communicate this to customers or pick 5 for ~monthly-on-average) |
+| `order_interval_frequency` + `order_interval_unit` | `interval_count` + `interval_unit` | pass-through: the count as-is, `day`/`week`/`month` → `DAY`/`WEEK`/`MONTH` (the importer uppercases for you). Leave `interval_weeks` empty. No more ÷7 / ×4 conversions — a "1 month" Recharge sub imports as a real monthly contract |
 | `next_charge_scheduled_at` | `next_charge_date` | date part only |
+| `created_at` | `subscribed_since` | the subscription's original signup date — keeps cohorts/tenure honest |
 | `status` | `status` | `ACTIVE` → `ACTIVE`; `CANCELLED`/`EXPIRED` → drop the row |
 | `price` | `price_cents` | ×100, integer |
 | `presentment_currency` | `currency` | — |
@@ -84,7 +89,7 @@ columns occasionally. Anything not listed maps to nothing (drop it).
 | `Customer first name` / `last name` | `first_name` / `last_name` | — |
 | `Shopify variant id` | `variant_id` | prefix GID |
 | `Quantity` | `quantity` | — |
-| `Billing interval count` + `Billing interval unit` | `interval_weeks` | same conversion rules as Recharge |
+| `Billing interval count` + `Billing interval unit` | `interval_count` + `interval_unit` | pass-through, same as Recharge |
 | `Next billing date` | `next_charge_date` | date part |
 | `Status` | `status` | `ACTIVE` → `ACTIVE`; `PAUSED` → `PAUSED`; others → drop |
 | `Price` | `price_cents` | ×100 |
@@ -100,7 +105,7 @@ columns occasionally. Anything not listed maps to nothing (drop it).
 | `customerFirstName` / `customerLastName` | `first_name` / `last_name` | — |
 | `variantId` | `variant_id` | Appstle exports the numeric id or full GID depending on report — GID-prefix if numeric |
 | `quantity` | `quantity` | — |
-| `billingIntervalCount` + `billingInterval` (`WEEK`/`MONTH`/`DAY`) | `interval_weeks` | same conversion rules |
+| `billingIntervalCount` + `billingInterval` (`WEEK`/`MONTH`/`DAY`) | `interval_count` + `interval_unit` | pass-through — Appstle's units are already our enum |
 | `nextBillingDate` | `next_charge_date` | date part |
 | `status` | `status` | `ACTIVE`/`PAUSED` map directly; others drop |
 | `currentPrice` | `price_cents` | ×100 |
@@ -116,7 +121,7 @@ columns occasionally. Anything not listed maps to nothing (drop it).
 | `customer_first_name` / `customer_last_name` | `first_name` / `last_name` | — |
 | `platform_variant_id` | `variant_id` | prefix GID |
 | `quantity` | `quantity` | — |
-| `interval_number` + `interval_type` (`day`/`week`/`month`) | `interval_weeks` | same conversion rules |
+| `interval_number` + `interval_type` (`day`/`week`/`month`) | `interval_count` + `interval_unit` | pass-through, same as Recharge |
 | `next_order_datetime` | `next_charge_date` | date part, shop timezone |
 | `subscription_status` | `status` | `active` → `ACTIVE`; `paused` → `PAUSED`; others drop |
 | `price` | `price_cents` | ×100 |
@@ -190,9 +195,14 @@ on its first charge.
 
    Progress and failures land in the `ImportBatch` row (Import page shows it);
    failed rows are listed with reasons and can be re-run — the importer skips
-   any email+interval that already has a live (ACTIVE **or** PAUSED) local
+   any email+cadence that already has a live (ACTIVE **or** PAUSED) local
    contract, so re-running the same file is safe for both statuses; only
-   cancelled/expired/failed contracts are eligible for re-import.
+   cancelled/expired/failed contracts are eligible for re-import. Cadence
+   equality is the exact unit+count pair (a pre-v1.8.0 contract that only
+   carries a week interval counts as that WEEK cadence): the same email at a
+   *different* cadence is a different subscription and imports normally — a
+   10-day and a 2-week contract are never conflated, even though both
+   approximate to 2 weeks.
 6. **Spot-check 10 contracts** across sources/statuses: open each in
    Subscribers and in Shopify admin → the customer's subscriptions. Verify next
    date, interval, price (grandfathered), address, payment method (last4),
@@ -235,8 +245,9 @@ Two consequences to internalise before you start:
 1. **Export from Joy** — subscriber list with email, variant, interval, next
    charge date, price, address and (if exposed) the Shopify payment method id.
    Map it to our CSV (§1); Joy's columns map like the other platforms in §2
-   (`Billing interval` → `interval_weeks`, `Next order date` →
-   `next_charge_date`, price ×100 → `price_cents`, `origin` → `manual`).
+   (`Billing interval` → `interval_unit` + `interval_count` pass-through,
+   `Next order date` → `next_charge_date`, price ×100 → `price_cents`,
+   `origin` → `manual`).
 2. **Cancel in Joy first.** For each subscriber you are moving, cancel (not
    pause) their Joy subscription. Only after that does anything get created
    here. If you must overlap, set the Cellexia `next_charge_date` after Joy's

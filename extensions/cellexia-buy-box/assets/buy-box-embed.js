@@ -31,7 +31,14 @@
  *     absent, gated-hidden, or anything at all goes wrong, the request passes
  *     through byte-identical — an add-to-cart must never break, and OTHER
  *     vendors' cart calls (e.g. the page's bundle widget posting a different
- *     product) must never be touched.
+ *     product) must never be touched. A line that ALREADY carries a
+ *     selling_plan is completed, never rewritten: when it is OUR OWN plan id
+ *     — a theme that serializes the widget's adopted selling_plan field into
+ *     a hand-built payload without copying the properties input — the
+ *     missing _cellexia_design attribution is stamped on (otherwise every
+ *     such order gets the subscription but loses take-rate-by-design
+ *     reporting, invisibly), while any other plan id passes through
+ *     byte-identical.
  *  3. TRACK VARIANTS: forward the theme's custom variant picker
  *     (.pdp__options) into the widget so prices stay correct — clicks as well
  *     as change events, since swatch buttons/labels fire no change event —
@@ -97,6 +104,11 @@
      element be adopted as our wrapper on the live store (see the header). */
   var OWN_WRAPPER = '.cx-buybox-embed[data-cellexia-embed]';
   var OWN_WIDGET = '.cx-buybox[data-cellexia-buybox]';
+  /* The subscription_ultra_max preset's relocated one-time line — OUR
+     markup that legitimately lives OUTSIDE the widget root once buy-box.js
+     mounts it (see the satellite module there), so "skip our own markup"
+     scans must skip it too. */
+  var OWN_SATELLITE = '.cx-buybox-satellite[data-cellexia-satellite]';
 
   /**
    * "Is this node OUR embed wrapper?" — asserted before the wrapper is moved,
@@ -630,8 +642,13 @@
    * items[] / flat-JSON injection. Mutates `payload`; returns true when
    * something was actually injected. Items are matched against OUR product's
    * variant ids so another vendor's add (the page's bundle widget, cart-page
-   * upsells) is never rewritten — that would 422 their checkout. The spec'd
-   * item[0] fallback applies only when no item carries a usable id at all.
+   * upsells) is never rewritten — that would 422 their checkout. An item
+   * that already carries a selling_plan is completed, never rewritten: OUR
+   * plan id gets the missing _cellexia_design attribution stamped on (a
+   * theme that serialized the widget's adopted field without the properties
+   * input), any other plan id is another app's line and is left alone. The
+   * spec'd item[0] fallback applies only when no item carries a usable id at
+   * all.
    */
   function injectJson(payload, state) {
     var items;
@@ -668,14 +685,29 @@
     var changed = false;
     for (var j = 0; j < targets.length; j++) {
       var target = targets[j];
-      if (target.selling_plan) {
-        continue; /* already a subscription line — leave it alone */
-      }
-      target.selling_plan = planIdValue(state.sellingPlanId);
       var properties =
         target.properties && typeof target.properties === 'object'
           ? target.properties
-          : {};
+          : null;
+      if (target.selling_plan) {
+        /* Already a subscription line. A foreign plan id is never ours to
+           touch; our own — String-compared, themes carry it numeric or as
+           text — may only be missing its design attribution (an empty
+           value counts as missing: it records no design either way). */
+        if (String(target.selling_plan) !== String(state.sellingPlanId)) {
+          continue;
+        }
+        if (properties && properties._cellexia_design) {
+          continue; /* the attribution already travelled with the line */
+        }
+        properties = properties || {};
+        properties._cellexia_design = state.design;
+        target.properties = properties;
+        changed = true;
+        continue;
+      }
+      target.selling_plan = planIdValue(state.sellingPlanId);
+      properties = properties || {};
       properties._cellexia_design = state.design;
       target.properties = properties;
       changed = true;
@@ -703,6 +735,7 @@
 
   var ITEM_ID_KEY = /^items\[(\d+)\]\[id\]$/;
   var ITEM_PLAN_KEY = /^items\[(\d+)\]\[selling_plan\]$/;
+  var ITEM_DESIGN_KEY = /^items\[(\d+)\]\[properties\]\[_cellexia_design\]$/;
 
   /**
    * The `items[i][…]` bracket shape, which is what jQuery produces for
@@ -711,14 +744,18 @@
    * finds nothing and the request goes out with no selling plan at all: the
    * shopper who chose the subscription silently gets a one-time line.
    *
-   * Returns the indexes to inject into, applying the same per-item rules as
-   * the JSON path: another vendor's variant is never touched, and an item
-   * that already carries a selling_plan is left alone. Empty ⇒ the body
-   * passes through byte-identical.
+   * Returns the indexes to touch, applying the same per-item rules as the
+   * JSON path — another vendor's variant is never rewritten: `plan` lists
+   * the items that get the full selling_plan + design pair, `designOnly`
+   * the items that already carry OUR plan id but no _cellexia_design (a
+   * theme that serialized the widget's adopted field without the properties
+   * input). An item planned with any other id is left alone. Both empty ⇒
+   * the body passes through byte-identical.
    */
   function itemIndexTargets(pairs, state) {
     var ids = {};
     var planned = {};
+    var designed = {};
     for (var i = 0; i < pairs.length; i++) {
       var key = pairs[i][0];
       var idMatch = ITEM_ID_KEY.exec(key);
@@ -728,21 +765,30 @@
       }
       var planMatch = ITEM_PLAN_KEY.exec(key);
       if (planMatch && pairs[i][1] !== '' && pairs[i][1] != null) {
-        planned[planMatch[1]] = true;
-      }
-    }
-    var targets = [];
-    for (var index in ids) {
-      if (!Object.prototype.hasOwnProperty.call(ids, index)) {
+        planned[planMatch[1]] = pairs[i][1];
         continue;
       }
-      if (planned[index]) {
+      var designMatch = ITEM_DESIGN_KEY.exec(key);
+      if (designMatch && pairs[i][1] !== '' && pairs[i][1] != null) {
+        designed[designMatch[1]] = true;
+      }
+    }
+    var targets = { plan: [], designOnly: [] };
+    for (var index in ids) {
+      if (!Object.prototype.hasOwnProperty.call(ids, index)) {
         continue;
       }
       if (!matchesVariant(ids[index], state)) {
         continue;
       }
-      targets.push(index);
+      if (planned[index] == null) {
+        targets.plan.push(index);
+      } else if (
+        String(planned[index]) === String(state.sellingPlanId) &&
+        !designed[index]
+      ) {
+        targets.designOnly.push(index);
+      }
     }
     return targets;
   }
@@ -761,11 +807,23 @@
     var id = params.get('id');
     if (id) {
       /* Flat shape: id=…&quantity=… */
-      if (params.get('selling_plan')) {
-        return null; /* someone already set it — not ours to overwrite */
-      }
       if (!matchesVariant(id, state)) {
         return null; /* not our product — pass through untouched */
+      }
+      var existingPlan = params.get('selling_plan');
+      if (existingPlan) {
+        /* Already a subscription line: a foreign plan id is never ours to
+           touch, and our own may only be missing its design attribution —
+           the theme serialized the widget's adopted field without the
+           properties input. An empty design value counts as missing. */
+        if (String(existingPlan) !== String(state.sellingPlanId)) {
+          return null;
+        }
+        if (params.get('properties[_cellexia_design]')) {
+          return null;
+        }
+        params.set('properties[_cellexia_design]', state.design);
+        return params.toString();
       }
       params.set('selling_plan', String(state.sellingPlanId));
       params.set('properties[_cellexia_design]', state.design);
@@ -776,16 +834,22 @@
       return null;
     }
     var targets = itemIndexTargets(pairs, state);
-    if (!targets.length) {
+    if (!targets.plan.length && !targets.designOnly.length) {
       return null; /* no id at all, or nothing of ours — untouched */
     }
-    for (var i = 0; i < targets.length; i++) {
+    for (var i = 0; i < targets.plan.length; i++) {
       params.set(
-        'items[' + targets[i] + '][selling_plan]',
+        'items[' + targets.plan[i] + '][selling_plan]',
         String(state.sellingPlanId)
       );
       params.set(
-        'items[' + targets[i] + '][properties][_cellexia_design]',
+        'items[' + targets.plan[i] + '][properties][_cellexia_design]',
+        state.design
+      );
+    }
+    for (var j = 0; j < targets.designOnly.length; j++) {
+      params.set(
+        'items[' + targets.designOnly[j] + '][properties][_cellexia_design]',
         state.design
       );
     }
@@ -829,18 +893,29 @@
     }
     var id = formData.get('id');
     var targets = null;
+    var designOnly = false;
     if (id) {
-      if (formData.get('selling_plan')) {
-        return null;
-      }
       if (!matchesVariant(id, state)) {
         return null;
+      }
+      var existingPlan = formData.get('selling_plan');
+      if (existingPlan) {
+        /* Same completion rule as the urlencoded flat shape: our own plan
+           id gets the missing design attribution, anything else passes
+           through untouched. */
+        if (String(existingPlan) !== String(state.sellingPlanId)) {
+          return null;
+        }
+        if (formData.get('properties[_cellexia_design]')) {
+          return null;
+        }
+        designOnly = true;
       }
     } else {
       /* Same items[i][id] shape as the urlencoded path (a FormData built by
          the theme from an items[] payload). */
       targets = itemIndexTargets(pairs, state);
-      if (!targets.length) {
+      if (!targets.plan.length && !targets.designOnly.length) {
         return null;
       }
     }
@@ -854,16 +929,24 @@
       return null;
     }
     if (targets) {
-      for (var j = 0; j < targets.length; j++) {
+      for (var j = 0; j < targets.plan.length; j++) {
         copy.set(
-          'items[' + targets[j] + '][selling_plan]',
+          'items[' + targets.plan[j] + '][selling_plan]',
           String(state.sellingPlanId)
         );
         copy.set(
-          'items[' + targets[j] + '][properties][_cellexia_design]',
+          'items[' + targets.plan[j] + '][properties][_cellexia_design]',
           state.design
         );
       }
+      for (var k = 0; k < targets.designOnly.length; k++) {
+        copy.set(
+          'items[' + targets.designOnly[k] + '][properties][_cellexia_design]',
+          state.design
+        );
+      }
+    } else if (designOnly) {
+      copy.set('properties[_cellexia_design]', state.design);
     } else {
       copy.set('selling_plan', String(state.sellingPlanId));
       copy.set('properties[_cellexia_design]', state.design);
@@ -985,14 +1068,18 @@
      every push here is safe. */
 
   function pushVariant(value) {
-    if (value == null || value === '') {
+    /* Trimmed: the client's live pills ship one variant id with trailing
+       whitespace inside the attribute value, and buy-box.js compares ids
+       by exact string against the island keys. */
+    var id = value == null ? '' : String(value).replace(/^\s+|\s+$/g, '');
+    if (id === '') {
       return false;
     }
     try {
       if (typeof subs.setVariant !== 'function') {
         return false;
       }
-      subs.setVariant(String(value));
+      subs.setVariant(id);
       return true;
     } catch (err) {
       return false; /* display-only — never matters */
@@ -1039,47 +1126,131 @@
   }
 
   /**
-   * Last resort for themes that never touch ?variant=: the field the theme
-   * itself maintains for the current selection. `[name="id"]` is canonical
-   * (it is what its own add-to-cart submits); a `[data-variant-id]` is only
-   * trusted OUTSIDE the picker, where it marks the current variant rather
-   * than one swatch among several.
+   * Attribute vocabulary for a variant id carried on a non-field element.
+   * data-val-id is the client's CURRENT Sleepify pill markup (v1.11.0,
+   * observed live — the pills moved off data-variant-id, and one pill ships
+   * its id with trailing whitespace; pushVariant trims).
+   */
+  function markerId(el) {
+    return (
+      el.getAttribute('data-variant-id') ||
+      el.getAttribute('data-val-id') ||
+      el.getAttribute('data-variant') ||
+      ''
+    );
+  }
+
+  /** Trimmed value for the isKnownVariant check (attribute may pad ids). */
+  function cleanId(value) {
+    return value == null ? '' : String(value).replace(/^\s+|\s+$/g, '');
+  }
+
+  /** The theme currently renders this element as the selected option. */
+  function markerActiveSignal(el) {
+    try {
+      if (el.checked === true) {
+        return true;
+      }
+      if (
+        el.getAttribute('aria-selected') === 'true' ||
+        el.getAttribute('aria-pressed') === 'true' ||
+        el.getAttribute('aria-checked') === 'true'
+      ) {
+        return true;
+      }
+      var cls = el.getAttribute('class') || '';
+      return /(^|[\s_-])(active|selected|current)([\s_-]|$)/.test(cls);
+    } catch (err) {
+      return false;
+    }
+  }
+
+  /**
+   * One swatch among several, not the current selection: a control-shaped
+   * carrier (button/label/link/option, radio/checkbox input) or one inside
+   * an option-picker container, WITHOUT the active signal.
+   */
+  function markerIsUnpickedOption(el) {
+    if (markerActiveSignal(el)) {
+      return false;
+    }
+    var tag = el.nodeName;
+    if (tag === 'BUTTON' || tag === 'LABEL' || tag === 'OPTION' || tag === 'A') {
+      return true;
+    }
+    if (tag === 'INPUT') {
+      var type = (el.getAttribute('type') || '').toLowerCase();
+      return type === 'radio' || type === 'checkbox';
+    }
+    try {
+      return !!(el.closest && el.closest('.pdp__options, [data-option]'));
+    } catch (err) {
+      return false;
+    }
+  }
+
+  /**
+   * Last resort for themes that never touch ?variant=: the state the theme
+   * itself maintains for the current selection, in trust order —
+   * `[name="id"]` fields (canonical: what its own add-to-cart submits), then
+   * carriers the theme paints as SELECTED (active class / aria / checked),
+   * then a passive current-variant marker outside any picker. The tiers are
+   * the fix for the live one-behind defect (v1.11.0): another vendor's
+   * product rows on the client's PDP carry [data-variant-id] naming OUR
+   * variants and update on their own schedule, so the old first-match read
+   * raced them and pushed the PREVIOUS variant after every pill click. The
+   * theme's own selection paint now always outranks a passive bystander, and
+   * an unpicked swatch is never evidence at all.
    *
    * This is the one document-wide lookup here that deliberately reads FOREIGN
-   * markup (it is the theme's own field we are after, so it cannot be
+   * markup (it is the theme's own state we are after, so it cannot be
    * class-qualified to ours). It is safe because it is strictly READ-ONLY —
    * nothing is written, marked or moved — every candidate must name one of
-   * OUR variant ids to be used at all, and anything inside our own widget or
-   * wrapper is skipped.
+   * OUR variant ids to be used at all, and anything inside our own widget,
+   * wrapper or satellite is skipped.
    */
   function syncVariantFromDom() {
     try {
       var known = knownVariantIds();
       var fields = document.querySelectorAll(
-        'input[name="id"], select[name="id"], [data-variant-id]'
+        'input[name="id"], select[name="id"], [data-variant-id], [data-val-id], [data-variant]'
       );
+      var fieldPick = null;
+      var activePick = null;
+      var passivePick = null;
       for (var i = 0; i < fields.length; i++) {
         var field = fields[i];
         if (
           field.closest &&
-          (field.closest(OWN_WIDGET) || field.closest(OWN_WRAPPER))
+          (field.closest(OWN_WIDGET) ||
+            field.closest(OWN_WRAPPER) ||
+            field.closest(OWN_SATELLITE))
         ) {
-          continue; /* our own markup — the theme's field is what we want */
+          continue; /* our own markup — the theme's state is what we want */
         }
-        var id = field.getAttribute('data-variant-id');
-        if (id) {
-          if (field.closest && field.closest('.pdp__options')) {
-            continue; /* a swatch marker, not the current selection */
-          }
-        } else {
-          id = field.value;
-        }
+        var isField = field.getAttribute('name') === 'id';
+        var id = cleanId(isField ? field.value : markerId(field));
         if (!id || !isKnownVariant(id, known)) {
           continue;
         }
-        if (pushVariant(id)) {
-          return; /* first field that names one of our variants wins */
+        if (isField) {
+          if (fieldPick === null) {
+            fieldPick = id;
+          }
+        } else if (markerActiveSignal(field)) {
+          if (activePick === null) {
+            activePick = id;
+          }
+        } else if (!markerIsUnpickedOption(field) && passivePick === null) {
+          passivePick = id;
         }
+      }
+      var pick = fieldPick !== null ? fieldPick : activePick;
+      if (pick === null) {
+        pick = passivePick;
+      }
+      if (pick !== null) {
+        pushVariant(pick);
       }
     } catch (err) {
       /* display-only — never matters */
@@ -1105,16 +1276,21 @@
       var node = target;
       for (var hops = 0; node && node.getAttribute && hops < 4; hops++) {
         var id =
-          node.getAttribute('data-variant-id') ||
-          node.getAttribute('data-variant') ||
-          (typeof node.value === 'string' ? node.value : '');
-        if (id) {
+          markerId(node) || (typeof node.value === 'string' ? node.value : '');
+        if (cleanId(id)) {
           pushVariant(id);
           break;
         }
         node = node.parentElement;
       }
+      /* Staggered re-reads instead of one 60ms shot: themes settle their
+         own state (and bystander widgets settle theirs) on unpredictable
+         schedules, and the tiers above make a late re-read corrective
+         rather than corruptive. buy-box.js's own click delegation + poll
+         sit underneath as the always-on net. */
       window.setTimeout(reReadVariant, 60);
+      window.setTimeout(reReadVariant, 350);
+      window.setTimeout(reReadVariant, 900);
     } catch (err) {
       /* display-only — never matters */
     }

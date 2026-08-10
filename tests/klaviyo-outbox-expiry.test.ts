@@ -99,7 +99,12 @@ vi.mock("~/lib/settings/settings.server", () => ({
   })),
 }));
 
-vi.mock("~/lib/events/log.server", () => ({ logEvent: mocks.logEvent }));
+vi.mock("~/lib/events/log.server", () => ({
+  logEvent: mocks.logEvent,
+  // Consumed by runAlertScan's EVENT_WRITE_FAILURES check — zero keeps it
+  // silent so these tests stay about the outbox backlog alone.
+  getEventWriteFailureStats: () => ({ count: 0, processStartedAt: "t0" }),
+}));
 
 import { flushKlaviyoOutbox } from "~/lib/klaviyo/outbox.server";
 import { runAlertScan } from "~/lib/analytics/alerts.server";
@@ -150,8 +155,16 @@ describe("flushKlaviyoOutbox age-out sweep", () => {
       skipped: true,
     });
     // No delivery attempt without the key — but the sweep DID run, so a key
-    // configured weeks later starts from a clean outbox.
-    expect(mocks.outboxFindMany).not.toHaveBeenCalled();
+    // configured weeks later starts from a clean outbox. (The sweep now also
+    // snapshots the expiring ids for NotificationLog reconciliation, so
+    // findMany itself IS called — what must never happen keyless is the
+    // delivery CLAIM, recognizable by its nextAttemptAt window.)
+    const claimCalls = mocks.outboxFindMany.mock.calls.filter(
+      (c) =>
+        (c[0] as { where?: Record<string, unknown> } | undefined)?.where
+          ?.nextAttemptAt != null,
+    );
+    expect(claimCalls).toHaveLength(0);
     expect(mocks.createKlaviyoEvent).not.toHaveBeenCalled();
 
     const call = mocks.outboxUpdateMany.mock.calls[0]![0] as {
@@ -205,7 +218,14 @@ describe("flushKlaviyoOutbox age-out sweep", () => {
     const stats = await flushKlaviyoOutbox();
 
     expect(stats.expired).toBe(0);
-    expect(mocks.outboxFindMany).toHaveBeenCalledTimes(1); // flush proceeded
+    // The delivery claim (nextAttemptAt window) still ran despite the sweep
+    // failure — the age-out's own snapshot read doesn't count as a claim.
+    const claimCalls = mocks.outboxFindMany.mock.calls.filter(
+      (c) =>
+        (c[0] as { where?: Record<string, unknown> } | undefined)?.where
+          ?.nextAttemptAt != null,
+    );
+    expect(claimCalls).toHaveLength(1); // flush proceeded
   });
 });
 

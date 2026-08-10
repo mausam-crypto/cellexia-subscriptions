@@ -1,9 +1,13 @@
 import prisma from "~/db.server";
 import { subDays, subHours } from "date-fns";
-import { logEvent } from "~/lib/events/log.server";
+import { getEventWriteFailureStats, logEvent } from "~/lib/events/log.server";
 import { getSetting } from "~/lib/settings/settings.server";
 import { shopDayStartUtc } from "~/lib/dates.server";
-import { COUNTABLE_CONTRACT, requireShopById } from "./queries.server";
+import {
+  COUNTABLE_CONTRACT,
+  requireShopById,
+  shopDayLabelUtc,
+} from "./queries.server";
 import { OURS_ONLY, numericIdFromGid } from "~/lib/ownership/ownership.server";
 import { isKlaviyoConfigured } from "~/lib/klaviyo/client.server";
 
@@ -65,10 +69,28 @@ export async function runAlertScan(
     return result;
   }
 
+  // ── Availability history, before any alert logic ────────────────────────
+  // The variant feed the STOCKOUT_RENEWALS check consumes is otherwise
+  // ephemeral — each 15-minute scan overwrites the last one's knowledge, so
+  // "was this variant out of stock last Tuesday?" was unanswerable. Persist
+  // what this scan saw as one AvailabilitySnapshot row per shop-day before
+  // the checks run (a check failure must not lose the observation). Contained
+  // like every check: a snapshot failure only costs history, never the scan.
+  if (opts.variantAvailability) {
+    try {
+      await recordAvailabilitySnapshot(shopId, tz, now, opts.variantAvailability);
+    } catch (err) {
+      console.error("[alerts] availability snapshot failed", err);
+      result.errors.push(`availability_snapshot: ${String(err)}`);
+    }
+  }
+
   const checks: [string, () => Promise<boolean | null>][] = [
     ["BILLING_RUN_FAILED", () => checkBillingRunFailed(shopId, now)],
     ["WEBHOOK_FAILURES", () => checkWebhookFailures(shopId, shopDomain, now)],
     ["ORIGIN_BACKFILL_FAILURES", () => checkOriginBackfillFailures(shopId, now)],
+    ["ATTEMPT_AMOUNT_MISSING", () => checkAttemptAmountMissing(shopId, now)],
+    ["EVENT_WRITE_FAILURES", () => checkEventWriteFailures(shopId)],
     ["STUCK_CONTRACTS", () => checkStuckContracts(shopId, now)],
     ["FAILURE_SPIKE", () => checkFailureSpike(shopId, tz, now)],
     ["CHURN_SPIKE", () => checkChurnSpike(shopId, tz, now)],
@@ -94,6 +116,59 @@ export async function runAlertScan(
   }
 
   return result;
+}
+
+/**
+ * Persist what the variant feed saw as the shop-day's availability history:
+ * one row per (shop, day) in DailyRollup's label space (`shopDayLabelUtc` —
+ * the synthetic UTC midnight of the shop-tz calendar day, so availability
+ * history joins rollup days without timezone drift).
+ *
+ * The unavailable set is the UNION across the day's scans — the row answers
+ * "was this variant out of stock at any point that day", not "at the last
+ * scan", so a morning stockout restocked by noon stays visible to whoever
+ * correlates skipped/delayed cycles with availability. `checkedVariants`
+ * keeps the widest coverage any scan achieved (the feed only carries variants
+ * renewing within the lookahead, so per-scan coverage varies through the
+ * day; unioned unavailable ids can therefore legitimately exceed a later,
+ * narrower scan's coverage). Read-then-upsert is race-free in practice: the
+ * alerts_run JobLock lease serializes scans.
+ */
+async function recordAvailabilitySnapshot(
+  shopId: string,
+  tz: string,
+  now: Date,
+  availability: ReadonlyMap<string, boolean>,
+): Promise<void> {
+  const date = shopDayLabelUtc(now, tz);
+  const unavailableNow = [...availability.entries()]
+    .filter(([, availableForSale]) => !availableForSale)
+    .map(([variantId]) => variantId);
+
+  const existing = await prisma.availabilitySnapshot.findUnique({
+    where: { shopId_date: { shopId, date } },
+    select: { unavailableVariantIds: true, checkedVariants: true },
+  });
+  const prior = Array.isArray(existing?.unavailableVariantIds)
+    ? (existing.unavailableVariantIds as unknown[]).filter(
+        (id): id is string => typeof id === "string",
+      )
+    : [];
+  const unavailable = [...new Set([...prior, ...unavailableNow])];
+
+  await prisma.availabilitySnapshot.upsert({
+    where: { shopId_date: { shopId, date } },
+    create: {
+      shopId,
+      date,
+      unavailableVariantIds: unavailable,
+      checkedVariants: availability.size,
+    },
+    update: {
+      unavailableVariantIds: unavailable,
+      checkedVariants: Math.max(existing?.checkedVariants ?? 0, availability.size),
+    },
+  });
 }
 
 // ── Individual checks (return true = alert created, false = all clear, null = skipped) ──
@@ -185,6 +260,103 @@ async function checkOriginBackfillFailures(
       captured: asCount(stats.captured),
       exhausted: asCount(stats.exhausted),
       scanned: asCount(stats.scanned),
+    },
+  });
+}
+
+/**
+ * How far back the missing-amount scan looks. Settlement copies the charged
+ * amount from the order onto the attempt; a SUCCESS attempt that finished
+ * settlement (settledAt stamped) with amountCents still NULL means that copy
+ * failed — the customer WAS charged, but the charge is invisible to every
+ * revenue surface (rollup, cohorts, lifetimeRevenueCents) that sums
+ * amountCents. The window keeps a historical, no-longer-fixable row from
+ * re-raising the alert forever after the merchant resolves it; a settlement
+ * path that is actively dropping amounts produces fresh rows inside the
+ * window every day.
+ */
+const AMOUNT_MISSING_LOOKBACK_DAYS = 7;
+
+/**
+ * WARNING when settled SUCCESS attempts carry no amount — money collected
+ * that analytics cannot see (the one shape the settlement redrive cannot
+ * fix, because the attempt looks fully settled).
+ */
+async function checkAttemptAmountMissing(
+  shopId: string,
+  now: Date,
+): Promise<boolean> {
+  const missing = await prisma.billingAttempt.findMany({
+    where: {
+      contract: { shopId, ...COUNTABLE_CONTRACT },
+      status: "SUCCESS",
+      settledAt: { gte: subDays(now, AMOUNT_MISSING_LOOKBACK_DAYS) },
+      amountCents: null,
+    },
+    select: { id: true, contractId: true, orderId: true, settledAt: true },
+    take: 200,
+  });
+  if (missing.length === 0) return false;
+
+  return raiseAlert({
+    shopId,
+    type: "ATTEMPT_AMOUNT_MISSING",
+    severity: "WARNING",
+    message: `${missing.length} successful charge(s) settled in the last ${AMOUNT_MISSING_LOOKBACK_DAYS} days with no amount recorded. The customers were charged, but these charges are invisible to revenue analytics (rollup, cohorts, lifetime revenue) — check the settlement log for the order lookups that failed.`,
+    context: {
+      count: missing.length,
+      lookbackDays: AMOUNT_MISSING_LOOKBACK_DAYS,
+      sample: missing.slice(0, CONTEXT_SAMPLE).map((a) => ({
+        attemptId: a.id,
+        contractId: a.contractId,
+        orderId: a.orderId,
+        settledAt: a.settledAt?.toISOString() ?? null,
+      })),
+    },
+  });
+}
+
+/**
+ * WARNING when this process has swallowed SubscriberEvent write failures
+ * (logEvent's never-throw containment — see the counter's doc block in
+ * events/log.server.ts for why each lost write is permanent undercounting).
+ *
+ * The counter is in-process, so this check re-raises only on NEW loss: a
+ * higher count from the same process, or any nonzero count from a new process
+ * (`processStartedAt` changed — a restart RESETS the counter, so a lower
+ * count means restart, never recovery). The comparison baseline is the most
+ * recent EVENT_WRITE_FAILURES alert row, open or resolved — durable where the
+ * counter is not. Multi-instance honesty: only the instance holding the
+ * alerts_run lease is inspected; losses in a sibling instance surface when it
+ * wins a later scan.
+ */
+async function checkEventWriteFailures(shopId: string): Promise<boolean> {
+  const stats = getEventWriteFailureStats();
+  if (stats.count === 0) return false;
+
+  const last = await prisma.alert.findFirst({
+    where: { shopId, type: "EVENT_WRITE_FAILURES" },
+    orderBy: { createdAt: "desc" },
+    select: { context: true },
+  });
+  if (last) {
+    const ctx = (last.context ?? {}) as Record<string, unknown>;
+    const prevCount = typeof ctx.count === "number" ? ctx.count : 0;
+    if (ctx.processStartedAt === stats.processStartedAt && stats.count <= prevCount) {
+      return false; // nothing lost since the last raise
+    }
+  }
+
+  return raiseAlert({
+    shopId,
+    type: "EVENT_WRITE_FAILURES",
+    severity: "WARNING",
+    message: `${stats.count} subscriber event write(s) failed and were swallowed since the app process started (last: ${stats.lastType ?? "unknown"}). Each lost event permanently understates event-sourced analytics (refunds, take rate, skips, saves) and can weaken behavioral guards (winback/lifecycle dedupe, rate limits) — check database health and the app logs around the failure time.`,
+    context: {
+      count: stats.count,
+      lastAt: stats.lastAt?.toISOString() ?? null,
+      lastType: stats.lastType,
+      processStartedAt: stats.processStartedAt,
     },
   });
 }

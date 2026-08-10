@@ -2,7 +2,14 @@ import { Prisma } from "@prisma/client";
 import prisma from "~/db.server";
 import { logEvent } from "~/lib/events/log.server";
 import { getSetting } from "~/lib/settings/settings.server";
-import { addDaysTz, addWeeksTz } from "~/lib/dates.server";
+import { addDaysTz, addIntervalTz, addWeeksTz } from "~/lib/dates.server";
+import {
+  FREQUENCY_COUNT_LIMITS,
+  type Frequency,
+  approxWeeks,
+  contractFrequency,
+  sameFrequency,
+} from "~/lib/frequency";
 import { clampGrantPercentForContract } from "~/lib/billing/stacking.server";
 import { releaseHeldCycleAttempts } from "~/lib/billing/release.server";
 import {
@@ -81,6 +88,24 @@ async function requireVariant(
 // ── Skip / unskip ────────────────────────────────────────────────────────────
 
 /**
+ * Who triggered a skip. CUSTOMER (the default — every portal/magic-link
+ * caller keeps today's behavior without changes) counts toward the
+ * customer's own skip behavior: skipCount and lastSkippedAt feed the
+ * risk/win-back models as disengagement signals. ADMIN and STOCKOUT are
+ * merchant operations — a mass stockout skip must not make a loyal
+ * subscriber look disengaged — so they count in merchantSkipCount instead
+ * (migration 0016) and never stamp lastSkippedAt.
+ */
+export type SkipInitiator = "CUSTOMER" | "ADMIN" | "STOCKOUT";
+
+export interface SkipCycleOptions extends ServiceOptions {
+  initiator?: SkipInitiator;
+  /** Why the initiator skipped ("stockout_tool", "SKIP_NOTIFY", …) — carried
+   * verbatim into the cycle.skipped payload. */
+  reason?: string;
+}
+
+/**
  * Skip the next billing cycle (per-cycle — the contract cadence is untouched).
  * Idempotent: a second call while the cycle is already skipped is a no-op.
  * One-time add-ons staged on the skipped cycle are removed first (Shopify
@@ -90,7 +115,7 @@ async function requireVariant(
 export async function skipNextCycle(
   shopDomain: string,
   contractLocalId: string,
-  options?: ServiceOptions,
+  options?: SkipCycleOptions,
 ): Promise<LocalContractWithLines> {
   const ctx = await loadContractContext(shopDomain, contractLocalId);
   const { shop, contract, admin } = ctx;
@@ -189,16 +214,27 @@ export async function skipNextCycle(
     null,
   );
   if (!newNext || newNext.getTime() <= nextBillingDate.getTime()) {
-    newNext = addWeeksTz(nextBillingDate, contract.intervalWeeks, shop.ianaTimezone);
+    const freq = contractFrequency(contract);
+    newNext = addIntervalTz(
+      nextBillingDate,
+      freq.unit,
+      freq.count,
+      shop.ianaTimezone,
+    );
   }
 
+  const initiator: SkipInitiator = options?.initiator ?? "CUSTOMER";
   await withMirrorGuard("skipNextCycle", ctx, options, () =>
     prisma.subscriptionContract.update({
       where: { id: contract.id },
       data: {
         nextBillingDate: newNext,
-        skipCount: { increment: 1 },
-        lastSkippedAt: new Date(),
+        // CUSTOMER skips are behavior signals; merchant-driven skips count
+        // in their own column so a bulk stockout op can never contaminate
+        // the customer's disengagement profile (see SkipInitiator).
+        ...(initiator === "CUSTOMER"
+          ? { skipCount: { increment: 1 }, lastSkippedAt: new Date() }
+          : { merchantSkipCount: { increment: 1 } }),
       },
     }),
   );
@@ -210,6 +246,10 @@ export async function skipNextCycle(
     actor: resolveActor(options),
     payload: {
       cycleIndex: cycle.cycleIndex,
+      // Always present, so stream analytics can split customer skips from
+      // merchant skips without joining against the mirror columns.
+      initiator,
+      reason: options?.reason ?? null,
       previousNextBillingDate: nextBillingDate.toISOString(),
       nextBillingDate: newNext.toISOString(),
     },
@@ -234,7 +274,14 @@ export async function unskipNextCycle(
 
   // After a skip, the skipped cycle sits one interval before the (advanced)
   // nextBillingDate. Probe there first, then at the current date.
-  const previousDate = addWeeksTz(nextBillingDate, -contract.intervalWeeks, tz);
+  const unskipFreq = contractFrequency(contract);
+  const previousDate = addIntervalTz(
+    nextBillingDate,
+    unskipFreq.unit,
+    unskipFreq.count,
+    tz,
+    -1,
+  );
   let cycle = await getBillingCycleByDate(
     admin,
     contract.shopifyContractId,
@@ -262,12 +309,48 @@ export async function unskipNextCycle(
     newNext = cycle.billingAttemptExpectedDate ?? previousDate;
   }
 
+  // Which counter does this unskip reverse? cycle.skipped events always
+  // carry { initiator }: merchant-driven skips (ADMIN/STOCKOUT) counted in
+  // merchantSkipCount, customer skips in skipCount — so the reversal must
+  // decrement the SAME column. Decrementing skipCount unconditionally let an
+  // admin skip+unskip pair erase a genuine customer-disengagement signal
+  // while the merchant counter stayed overstated — wrong inputs to the
+  // risk/win-back models on both columns. Prefer the skip staged on this
+  // exact cycle; fall back to the most recent skip, then to CUSTOMER
+  // (pre-initiator history holds only customer skips). Floored at zero like
+  // the original.
+  const recentSkips = await prisma.subscriberEvent.findMany({
+    where: { contractId: contract.id, type: "cycle.skipped" },
+    orderBy: { createdAt: "desc" },
+    take: 10,
+    select: { payload: true },
+  });
+  const skipPayload = (e: { payload: unknown }) =>
+    (e.payload ?? {}) as { cycleIndex?: unknown; initiator?: unknown };
+  const reversedSkip =
+    recentSkips.find((e) => skipPayload(e).cycleIndex === cycle.cycleIndex) ??
+    recentSkips[0] ??
+    null;
+  const reversedInitiator =
+    reversedSkip && typeof skipPayload(reversedSkip).initiator === "string"
+      ? (skipPayload(reversedSkip).initiator as string)
+      : "CUSTOMER";
+  const reversesMerchantSkip =
+    reversedInitiator === "ADMIN" || reversedInitiator === "STOCKOUT";
+
   await withMirrorGuard("unskipNextCycle", ctx, options, () =>
     prisma.subscriptionContract.update({
       where: { id: contract.id },
       data: {
         nextBillingDate: newNext,
-        skipCount: Math.max(0, contract.skipCount - 1),
+        ...(reversesMerchantSkip
+          ? {
+              merchantSkipCount: Math.max(
+                0,
+                (contract.merchantSkipCount ?? 0) - 1,
+              ),
+            }
+          : { skipCount: Math.max(0, contract.skipCount - 1) }),
       },
     }),
   );
@@ -279,6 +362,9 @@ export async function unskipNextCycle(
     actor: resolveActor(options),
     payload: {
       cycleIndex: cycle.cycleIndex,
+      // The initiator of the skip this unskip reversed — stream analytics
+      // can pair skip/unskip without joining the mirror columns.
+      reversedInitiator,
       previousNextBillingDate: nextBillingDate.toISOString(),
       nextBillingDate: newNext.toISOString(),
     },
@@ -364,32 +450,49 @@ export async function delayNextCycle(
 
 // ── Frequency ────────────────────────────────────────────────────────────────
 
-/** Change the billing + delivery cadence to every `weeks` weeks. */
+/**
+ * Change the billing + delivery cadence. Accepts a multi-unit `Frequency`
+ * ({unit, count}) or a bare week count (the pre-v1.8.0 form, still used by
+ * week-denominated flows like the cancel save-offer).
+ */
 export async function changeFrequency(
   shopDomain: string,
   contractLocalId: string,
-  weeks: number,
+  frequency: Frequency | number,
   options?: ServiceOptions,
 ): Promise<LocalContractWithLines> {
-  if (!Number.isInteger(weeks) || weeks < 1 || weeks > 52) {
-    throw new Error(`Invalid frequency: ${weeks} weeks`);
+  const freq: Frequency =
+    typeof frequency === "number"
+      ? { unit: "WEEK", count: frequency }
+      : frequency;
+  if (!Number.isInteger(freq.count) || freq.count < 1) {
+    throw new Error(`Invalid frequency: ${freq.count} ${freq.unit}`);
+  }
+  const limits = FREQUENCY_COUNT_LIMITS[freq.unit];
+  // WEEK keeps its historical wider service-layer ceiling (52 — imported and
+  // legacy contracts land anywhere in it); other units follow the plan limits.
+  const max = freq.unit === "WEEK" ? 52 : limits?.max;
+  if (!limits || freq.count > max) {
+    throw new Error(`Invalid frequency: ${freq.count} ${freq.unit}`);
   }
 
   const ctx = await loadContractContext(shopDomain, contractLocalId);
   const { shop, contract, admin } = ctx;
-  if (contract.intervalWeeks === weeks) return reloadContract(contract.id);
+  if (sameFrequency(contractFrequency(contract), freq)) {
+    return reloadContract(contract.id);
+  }
 
   await withContractDraft(
     admin,
     contract.shopifyContractId,
     async (draftId, run) => {
       await draftUpdateBillingPolicy(run, draftId, {
-        interval: "WEEK",
-        intervalCount: weeks,
+        interval: freq.unit,
+        intervalCount: freq.count,
       });
       await draftUpdateDeliveryPolicy(run, draftId, {
-        interval: "WEEK",
-        intervalCount: weeks,
+        interval: freq.unit,
+        intervalCount: freq.count,
       });
     },
   );
@@ -403,7 +506,12 @@ export async function changeFrequency(
   await withMirrorGuard("changeFrequency", ctx, options, () =>
     prisma.subscriptionContract.update({
       where: { id: contract.id },
-      data: { intervalWeeks: weeks, nextBillingDate: newNext },
+      data: {
+        intervalWeeks: approxWeeks(freq.unit, freq.count),
+        billingIntervalUnit: freq.unit,
+        billingIntervalCount: freq.count,
+        nextBillingDate: newNext,
+      },
     }),
   );
 
@@ -412,7 +520,15 @@ export async function changeFrequency(
     type: "contract.frequency_changed",
     source: resolveSource(options),
     actor: resolveActor(options),
-    payload: { oldWeeks: contract.intervalWeeks, newWeeks: weeks },
+    payload: {
+      // Week approximations stay first for Klaviyo flows built on them.
+      oldWeeks: contract.intervalWeeks,
+      newWeeks: approxWeeks(freq.unit, freq.count),
+      oldUnit: contract.billingIntervalUnit ?? "WEEK",
+      oldCount: contract.billingIntervalCount ?? contract.intervalWeeks,
+      newUnit: freq.unit,
+      newCount: freq.count,
+    },
   });
 
   return reloadContract(contract.id);
@@ -1041,6 +1157,15 @@ export async function addOneTimeAddon(
 
 // ── Pause / resume ───────────────────────────────────────────────────────────
 
+export interface PauseOptions extends ServiceOptions {
+  /** Why the contract paused — CUSTOMER | ADMIN | SAVE_FLOW | STOCKOUT_DELAY
+   * | SYSTEM (the pause analogue of cancelReason; migration 0016). Stored on
+   * SubscriptionContract.pausedReason and cleared on resume; null = "reason
+   * not recorded", which is what every pre-existing caller keeps saying
+   * until it opts in. */
+  reason?: string;
+}
+
 /**
  * Pause for 1–N months (clamped by settings.pause.maxMonths). `resumeAt` uses
  * 30-day months for calendar honesty; the resume job re-activates then.
@@ -1049,7 +1174,7 @@ export async function pauseContract(
   shopDomain: string,
   contractLocalId: string,
   months: number,
-  options?: ServiceOptions,
+  options?: PauseOptions,
 ): Promise<LocalContractWithLines> {
   const ctx = await loadContractContext(shopDomain, contractLocalId);
   const { shop, contract, admin } = ctx;
@@ -1065,11 +1190,14 @@ export async function pauseContract(
 
   const now = new Date();
   const resumeAt = addDaysTz(now, clampedMonths * 30, shop.ianaTimezone);
+  const reason = options?.reason ?? null;
 
   await withMirrorGuard("pauseContract", ctx, options, () =>
     prisma.subscriptionContract.update({
       where: { id: contract.id },
-      data: { status: "PAUSED", pausedAt: now, resumeAt },
+      // pausedReason describes THIS pause episode — written fresh (null
+      // included) on every pause, cleared on resume, like pausedAt.
+      data: { status: "PAUSED", pausedAt: now, resumeAt, pausedReason: reason },
     }),
   );
 
@@ -1078,7 +1206,7 @@ export async function pauseContract(
     type: "contract.paused",
     source: resolveSource(options),
     actor: resolveActor(options),
-    payload: { months: clampedMonths, resumeAt: resumeAt.toISOString() },
+    payload: { months: clampedMonths, resumeAt: resumeAt.toISOString(), reason },
   });
 
   return reloadContract(contract.id);
@@ -1126,6 +1254,9 @@ export async function resumeContract(
         status: "ACTIVE",
         pausedAt: null,
         resumeAt: null,
+        // pausedReason travels with pausedAt: it describes the pause episode
+        // that just ended, not the contract.
+        pausedReason: null,
         // failedAt is LIVE-STATE (like the cancel columns — see the win-back
         // engine): a resumed subscriber is retained again. The failure stays
         // in the event log and the closed episode's attempt rows.
@@ -1168,6 +1299,13 @@ export async function resumeContract(
 
 // ── Cancel ───────────────────────────────────────────────────────────────────
 
+/**
+ * Sources the ENGINE paths stamp. A fifth value, "EXTERNAL", exists on the
+ * mirror column but is written only by syncContractFromShopify: a cancel
+ * first observed from Shopify with no app-internal source stamped ahead of
+ * it (Shopify-admin cancels, other surfaces). It is deliberately not in this
+ * union — no engine caller may claim it.
+ */
 export type CancelSource = "CUSTOMER" | "ADMIN" | "DUNNING" | "SYSTEM";
 
 export interface CancelOptions extends ServiceOptions {
@@ -1217,12 +1355,54 @@ export async function cancelContract(
     }),
   );
 
+  // ── Cancel-funnel bookkeeping for admin cancels ────────────────────────────
+  // The CancelSession funnel was portal-only in practice: ADMIN was a
+  // declared channel no writer ever produced, so admin-entered reasons never
+  // reached the reason histogram and channel-split retention analysis had a
+  // single bucket. An admin cancel not riding an open portal session records
+  // a minimal completed session here (channel ADMIN, outcome CANCELLED, the
+  // admin form's reason); when a session IS open, its own flow owns the
+  // funnel verdict. DUNNING/SYSTEM cancels stay out on purpose — the funnel
+  // measures cancel-intent conversations, not bookkeeping or dunning.
+  // Contained: funnel bookkeeping must never break the cancel itself.
+  let cancelSessionId: string | null = null;
+  if (cancelSource === "ADMIN") {
+    try {
+      const openSession = await prisma.cancelSession.findFirst({
+        where: { contractId: contract.id, outcome: null },
+        select: { id: true },
+      });
+      if (!openSession) {
+        const session = await prisma.cancelSession.create({
+          data: {
+            contractId: contract.id,
+            channel: "ADMIN",
+            reason,
+            outcome: "CANCELLED",
+            completedAt: new Date(),
+          },
+        });
+        cancelSessionId = session.id;
+      }
+    } catch (err) {
+      console.error(
+        "[contracts] cancelContract: admin cancel-session bookkeeping failed",
+        contract.id,
+        err,
+      );
+    }
+  }
+
   await logEvent({
     ...eventIdentity(shop, contract),
     type: "contract.cancelled",
     source: resolveSource(options),
     actor: resolveActor(options),
-    payload: { reason, cancelSource },
+    payload: {
+      reason,
+      cancelSource,
+      ...(cancelSessionId ? { cancelSessionId } : {}),
+    },
   });
 
   const updated = await reloadContract(contract.id);

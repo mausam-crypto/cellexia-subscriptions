@@ -1,7 +1,7 @@
 # Cellexia Buy Box — theme app extension
 
 The PDP subscription widget. Renders the product's selling plans as one of
-**seven design presets** (classic stacked cards by default) and carries the
+**eight design presets** (classic stacked cards by default) and carries the
 choice into the cart — through the theme's product form where one exists, or
 by patching the theme's JS cart requests where none does (see the app
 embed). The active design is configured from the app's **Buy box designer**
@@ -25,8 +25,9 @@ snippets/cx-buybox-core.liquid   THE widget's brain: group ownership (which sell
                                  resolution, text resolution, templating, frequency/save labels,
                                  price blocks, preset dispatch, JSON island. ALL string/value
                                  computation happens here — the presets only print.
-snippets/cx-preset-*.liquid      the seven design presets (classic, toggle, tiles, inline,
-                                 value_stack, planner, subscription_max), one partial each,
+snippets/cx-preset-*.liquid      the eight design presets (classic, toggle, tiles, inline,
+                                 value_stack, planner, subscription_max,
+                                 subscription_ultra_max), one partial each,
                                  rendered DIRECTLY (markup position) from the core's case
                                  statement. Pure markup: they compute nothing, resolve no text
                                  and render no further snippet — see the Liquid rules below.
@@ -50,8 +51,8 @@ moment a render is captured into a variable they become part of the
 (`<!-- BEGIN app snippet: cx-design-text -->CHOOSE YOUR RITUAL…`). That is
 exactly what corrupted the v1.2.x storefront render.
 
-The refined invariants (v1.7.0, when the seven preset partials were
-extracted from the core for the platform's Liquid size budget — since
+The refined invariants (v1.7.0, when the preset partials — seven then,
+eight today — were extracted from the core for the platform's Liquid size budget — since
 verified to be a TOTAL across the extension, not per-file; see "The shipped
 Liquid is minified on purpose" below):
 
@@ -61,7 +62,7 @@ Liquid is minified on purpose" below):
 - **Renders happen only in direct-output markup position**, where the
   comment markers land between elements as ordinary invisible HTML
   comments: the single `{% render 'cx-buybox-core' %}` in each of the two
-  block files, and the seven preset renders in the core's `{% case %}`
+  block files, and the eight preset renders in the core's `{% case %}`
   dispatch. Nowhere else — never inside a `{% capture %}`, never as a line
   inside a `{% liquid %}` block.
 - **Snippets never return values — a snippet is never a function.** All
@@ -70,7 +71,7 @@ Liquid is minified on purpose" below):
   arguments; a preset partial only prints. Capturing PURE MARKUP that
   contains no render is fine — that is how the preset ordering knobs work.
 - The `snippets/` directory holds exactly `cx-buybox-core.liquid` plus the
-  seven `cx-preset-*.liquid` partials — the list is pinned by
+  eight `cx-preset-*.liquid` partials — the list is pinned by
   `tests/liquid/lint.test.ts`, so a stray snippet fails CI. A preset
   partial never renders another snippet.
 
@@ -105,7 +106,7 @@ When editing, the whole convention is greppable:
   as attribute-injection hardening);
 - `grep '| t'` — no hit may ever be followed by `| escape`;
 - `grep 'render'` — every hit must be one of: the two block files' render
-  of `cx-buybox-core`, or the core's seven direct preset renders in its
+  of `cx-buybox-core`, or the core's eight direct preset renders in its
   `{% case %}` dispatch. None may sit inside a `{% capture %}` and none may
   appear in a preset partial.
 
@@ -135,7 +136,7 @@ shipped `.liquid` file is therefore kept minified:
   and pipe-free — see the comment discipline above);
 - **`{% schema %}` JSON compacted** (`JSON.stringify` style — Shopify only
   parses it, and `tests/liquid/schema.test.ts` still validates it);
-- the seven preset partials **end without a trailing newline**, so a
+- the eight preset partials **end without a trailing newline**, so a
   partial's rendered output ends flush at its last tag and no stray
   whitespace lands before Shopify's `END app snippet` marker.
 
@@ -401,27 +402,66 @@ Embed behaviours worth knowing:
   are the fast path: product-form `change` and `?variant=` (history patch +
   popstate) in `buy-box.js`, plus this embed's Sleepify size-picker watcher
   (`.pdp__options`, **clicks as well as `change` events** — swatch buttons
-  and labels fire no `change`). Underneath them, `buy-box.js` also tracks
+  and labels fire no `change`; since v1.11.0 the fast path also knows the
+  pills' `data-val-id` attribute — the client's current vocabulary, one
+  pill's value shipped with trailing whitespace, so every read is
+  trimmed — and re-reads at **+60/350/900 ms** instead of one +60 ms shot,
+  because themes and bystander widgets settle their state on unpredictable
+  schedules; its DOM re-read uses the same field → active-selection →
+  passive-marker trust order as `buy-box.js` below). Underneath them,
+  `buy-box.js` also tracks
   variants **with no event at all** — the fix for the live merchant report:
   their theme sells jar packs as separate variants switched by its own pill
   buttons, setting state programmatically (jQuery `.val()`, no `change`
   event, no `?variant=` write), and every widget price stayed frozen on the
   landing variant. Three layers, all funnelling into one authoritative
-  re-read (the theme's `[name="id"]` input-or-select — bound form first,
-  then a READ-ONLY document-wide scan that skips our own markup — then
-  `?variant=`, else keep current): click delegation over the product area
+  re-read (`readThemeVariant()`: the bound form's `[name="id"]` first, then
+  a READ-ONLY document-wide scan — `scanThemeFields()`, which skips our own
+  markup and, since v1.11.0, collects next to `[name="id"]`
+  inputs-and-selects any element carrying a variant id only as an
+  ATTRIBUTE (`data-variant-id` / `data-val-id` / `data-variant`, values
+  trimmed) — then `?variant=`, else keep current): click delegation over
+  the product area
   (re-read next macrotask + again at +350 ms, themes update state
   asynchronously), and a 600 ms poll of the same field — a string compare,
   only while the document is visible, ONE interval per widget, cleared on
   pagehide and detach, re-armed by `resync()` — which catches ANY
   mechanism, including pure-JS themes. The poll reuses the last scan's
   field list (validated for liveness, re-queried every 10th tick);
-  click-driven re-reads always re-query. A page carrying SEVERAL
-  `[name="id"]` fields for this product (quick-buy modal, sticky
-  add-to-cart bar) is settled on evidence, not document order: when
-  island-known values disagree, the field whose value **changed** since
-  the last read wins, then a field inside the widget's own section, else
-  keep current — a stale duplicate can never freeze or flip the widget. On
+  click-driven re-reads always re-query. A page carrying SEVERAL such
+  signals for this product (quick-buy modal, sticky add-to-cart bar,
+  bystander widgets) is settled on evidence, not document order. The
+  v1.11.0 tiers came from the SECOND live Sleepify defect: the pills moved
+  their id to `data-val-id` (no `input[name="id"]` exists on the page any
+  more, and the theme marks selection only by moving an `active` class
+  between pills), and the only other page-level signal was a bystander
+  vendor widget's rows (`.cx-az-fbt__row[data-variant-id]`) tracking the
+  current variant on their own schedule — the old one-shot +60 ms re-read
+  didn't know `data-val-id`, trusted the first `[data-variant-id]` found,
+  raced the bystander's update and pushed the PREVIOUS variant after every
+  pill click, so the widget ran permanently one click behind (wrong
+  subscription price, and the theme add-to-cart button swap stopped
+  matching, so it froze too). Every signal is now classified **per read**
+  into evidence tiers, strongest first:
+    1. the bound (ownership-checked) form's `[name="id"]` — conclusive;
+    2. any signal whose value **CHANGED** since the last read — the one
+       the shopper is driving — fields and markers alike;
+    3. `[name="id"]` fields, unanimous, then the own-section tiebreak —
+       the canonical form state stays above any mere marker, and a laggy
+       field self-corrects through tier 2 the moment it catches up;
+    4. the theme's own active-selection paint (checked input,
+       `aria-selected` / `aria-pressed` / `aria-checked`, or an
+       `active`/`selected`/`current` class token), unanimous;
+    5. passive bystander markers (another widget's row naming one of OUR
+       variants), unanimous, and only when no field and no active carrier
+       said anything — the weakest evidence never overrides the theme's
+       own state.
+  An **unpicked swatch is never evidence**: a control-shaped carrier
+  (button/label/link/option, radio/checkbox input) without the active
+  signal, or one inside `.pdp__options` / `[data-option]`, permanently
+  names its OWN variant, not the current selection — reading it as
+  "current" is how a widget freezes on the first pill in a row. A stale
+  duplicate can never freeze or flip the widget. On
   a change, every price surface of every preset repaints from the island's
   per-variant matrix, the root `data-cellexia-money-*` pair re-anchors, and
   the theme add-to-cart price sync swaps the new variant's strings.
@@ -429,7 +469,11 @@ Embed behaviours worth knowing:
   row for, read from the bound (ownership-checked) form or from a field
   that was previously seen holding this product's ids, is conclusive: the
   product gained a variant after the last plan sync, and nothing the
-  widget could show would price it. The widget **parks** — root `[hidden]`
+  widget could show would price it. Only a real `[name="id"]` **field** may
+  raise this verdict (v1.11.0) — a marker ATTRIBUTE, e.g. another widget's
+  rows reshuffling to a variant we never sold, is not evidence this
+  product changed, so a marker never parks the widget. The widget
+  **parks** — root `[hidden]`
   plus its own `data-cellexia-unsynced` marker, the theme's form released
   (no `selling_plan` left to 422 the new variant, design property
   disabled), the theme's button text restored, `getState()` null so the
@@ -536,7 +580,9 @@ guard that restores the bare lookup and asserts the widget is stranded again).
      `selling_plan` input either way (it reuses the theme's input when one
      exists), but visually you want exactly one widget.
 7. Save, then test: add to cart with subscription selected and confirm the
-   cart line shows the selling plan ("Every 8 weeks" etc.).
+   cart line shows the selling plan ("Every 8 weeks", "Every 10 days",
+   "Every 1 month" etc. — since v1.8.0 plan cadences can mix days, weeks
+   and months).
 
 The block is safe to add to *all* product templates: **when a product has no
 selling plan the block renders nothing at all** — no wrapper, no CSS, no JS
@@ -833,7 +879,7 @@ separate mechanism in the app itself; see `docs/OPERATIONS.md`.
 
 ## Design presets
 
-Seven CRO archetypes, all sharing the same selling-plan wiring, launch
+Eight CRO archetypes, all sharing the same selling-plan wiring, launch
 gating, preview reveal, variant-change price updates and accessibility
 contract. Every preset supports every layout/style/text knob from the
 designer; the difference is the persuasion architecture.
@@ -847,6 +893,7 @@ designer; the difference is the persuasion architecture.
 | **value_stack** | A benefit-rich subscription panel — headline price plus a check-mark benefit list (first-order saving, ongoing saving, milestone gift, skip/pause/cancel — locale defaults, overridable) — with one-time demoted to a small "or buy once for {amount}" text link. | Warm, high-consideration traffic and replenishable heroes. Highest expected take-rate, but demoting one-time is a real CVR risk on cold traffic. Watch CVR, not just take-rate. |
 | **planner** | Frequency-forward "routine planner": cadence chips first (with a "Recommended" tag on the plan default), price shown per delivery, subscription as the primary card, one-time as a secondary row. | Consumables with a well-understood usage rhythm — sells the cadence, not the discount. Chips ask for a decision, which can stall unsure shoppers. |
 | **subscription_max** (v1.6.0) | The subscription card **is** the buy box: one calm card (price, "then {price} every {frequency}", savings kept quiet, the reassurance line prominent). Heading, badge and frequency selector default OFF (each re-enableable); the plan default cadence is used. One-time purchase stays fully real but is demoted to a single muted underlined "or buy once for {amount}" line below the card; tapping it swaps in a minimal selected state (check + "One-time purchase — {amount}" + a quiet switch-back link). | When subscribing should read as the obvious way to buy — zero decision fatigue, purely visual (no extra perks or discounts). Highest take-rate posture; demoting one-time is a **medium** CVR risk on cold traffic. Test against your baseline; restoring the previous design is one click in the designer. |
+| **subscription_ultra_max** (v1.11.0) | subscription_max taken to its logical end: the card sheds **all** offer chrome (no border/tint via `cx-buybox__ultramax-card`; badge, savings, reassurance and frequency selector all default OFF, each re-enableable by an explicit config `true`; heading defaults empty) so the subscription price reads as the product's plain price, not a plan being sold. Subscription is preselected unless `behavior.preselect === 'one_time'`; the recurring "then {price} every {frequency}" line **always stays** — recurrence disclosure is not optional. The quiet priced one-time line doubles as a **satellite** that `buy-box.js` relocates below the theme's whole buy area while the widget is visible (see the subsection below). | Maximum posture, maximum accountability: watch PDP conversion **and** refund/cancel quality, not just take-rate — shoppers who did not understand they subscribed are expensive. Warm traffic on a hero product where subscription is the intended default. |
 
 ### subscription_max: the compliance guardrails are load-bearing
 
@@ -860,6 +907,69 @@ the subscription radio (`aria-hidden` — it duplicates the radio group, which
 screen readers and keyboards operate directly). `buy-box.js` contains no
 subscription_max-specific code: the preset rides the existing
 `data-cellexia-option` radio machinery end to end.
+
+### subscription_ultra_max: the plain-buy-box posture and the satellite
+
+subscription_max taken to its logical end (v1.11.0, partial
+`snippets/cx-preset-subscription_ultra_max.liquid`). The card sheds **all**
+offer chrome: no border or tint (the `cx-buybox__ultramax-card` CSS), and
+badge, savings, reassurance and frequency selector all default **off** —
+each re-enableable only by an explicit config `true`. The heading defaults
+empty; subscription is preselected unless `behavior.preselect ===
+'one_time'`. The one guardrail that never sheds is the recurring "then
+{price} every {frequency}" line — **recurrence disclosure is not
+optional**, in this preset or any other.
+
+The quiet priced one-time line (same radio, same one-tap reach and
+pre-selection price as subscription_max) doubles as a **satellite**:
+
+```html
+<div class="cx-buybox__submax-onetime cx-buybox-satellite"
+     data-cellexia-satellite data-cellexia-for="{{ uid }}">…</div>
+```
+
+It is rendered **inside** the widget root — so no-JS and launch-gated pages
+are exactly as safe as subscription_max (the launch gate is an ancestor
+`[hidden]`, and the line is inside that ancestry at render time) — and
+`buy-box.js` relocates it below the theme's whole buy area while the widget
+is visible. **Anchor order**: the first `.pdp__grey` found walking **up**
+from the root (the client's PDP: quantity + Add to cart + badges +
+guarantee + reviews), else the bound `/cart/add` form, else it stays where
+the Liquid put it — which is the subscription_max layout.
+
+The gate-safety invariants are load-bearing — do not "simplify" any of them:
+
+- **Outside the root the ancestor-`[hidden]` gate is gone**, so the
+  satellite mirrors `widgetHidden()` onto its **own** `hidden` attribute on
+  every sync — a gated, parked or ghost widget never leaves a visible
+  one-time line behind. It also carries its own copy of the
+  `cx-buybox--no-sub` state class, since the root's class list no longer
+  cascades to it.
+- **Ownership is asserted (`isOwnSatellite`) before every move or
+  removal** — the same rule as every other own-markup mutation (see the
+  namespace note). Both asset files hoist the lookup into the new
+  `OWN_SATELLITE` constant (`.cx-buybox-satellite[data-cellexia-satellite]`),
+  registered in the lint allow-list, and the variant-tracking scans skip it
+  like the other own-markup selectors.
+- **A ghost root's satellite is removed**: when the widget's markup was
+  replaced (theme-editor section re-render), its relocated line must not
+  survive it — the successor renders and mounts its own; a predecessor's
+  stray satellite for the same block is also cleaned up at init.
+- **A relocated radio must never join a theme `<form>`**: whenever a FORM
+  ancestor appears above the satellite, its inputs get a form-detaching
+  attribute (`form` pointing at a non-existent id) so a stray `cx-purchase`
+  field can never be submitted with the theme's add-to-cart.
+- Every radio/wrap/price node reference was collected **at init**, while
+  the satellite was still inside the root, so the existing state machine
+  drives it **by reference** after the move — `buy-box.js` still contains
+  no preset-specific selection logic; the satellite rides the same
+  `data-cellexia-option` radio machinery, relocated. A theme re-render that
+  destroys the satellite's host brings it home to the widget first, then
+  re-mounts.
+
+Size guard: the satellite module is part of why
+`tests/liquid/size-limits.test.ts` raised `JS_FILE_LIMIT` 92→112KB in
+v1.11.0.
 
 ### Per-market design selection (`config.markets`, v1.6.0)
 
@@ -966,6 +1076,27 @@ cellexialabs.com's Sleepify theme. See
 [docs/OPERATIONS.md §17](../../docs/OPERATIONS.md) for the troubleshooting
 runbook.
 
+**Theme MAIN price display (v1.11.0).** The same exact-money-string swap now
+also covers the theme's main price display — the price under the product
+title, which otherwise keeps quoting the one-time price while the
+subscription is selected. Two new config fields, sanitized and published
+exactly like their button counterparts: `themeSync.syncMainPrice` (boolean,
+default **on**) and `themeSync.mainPriceSelector` (string, default `""`,
+same sanitization as `priceSelector`, max 300 chars — when set it replaces
+the built-in list entirely). The built-in main-price selector list is
+`.pdp__price, .product__price, .price__regular, .product-price,
+[data-product-price]` — the first entry is cellexialabs.com's Sleepify
+theme. Struck-through compare-at and per-unit strings are **deliberately
+untouched**: they are not the one-time money string, and this module never
+computes money. The Liquid emits two new root attributes,
+`data-cellexia-price-sync-main` and `data-cellexia-main-selector`; a
+missing `syncMainPrice` key in an old metafield means **on**, while
+pre-v1.11.0 cached markup without the attribute keeps exactly the old
+button-only behavior. Both surfaces share the one swap engine, so every
+safety property above (text nodes only, literal-string match, exclusion
+list, write budget, restore-on-hidden, try/catch) applies to the main price
+unchanged.
+
 ### The `_cellexia_design` line property (design attribution)
 
 When a subscription option is selected, `buy-box.js` maintains a hidden
@@ -994,7 +1125,7 @@ open — before the merchant updated the extension are still attributed.
 | **Show badge / Badge text** | on / "Most popular" | Social proof on the subscription card. Leave the text empty to use the translated "Most popular" from the locale files. Only claim "Most popular" once it is true — unearned badges erode trust and reviews. |
 | **Preselect subscription** | on | Subscription-first ordering + preselection is the single biggest take-rate lever (defaults are sticky). **Ethics**: preselection is fine only because the card states the full ongoing price ("then X every Y weeks") and the reassurance line before add-to-cart — never hide the recurring commitment. **A/B guidance**: test preselect on vs off per traffic source; preselect can slightly depress overall conversion on cold traffic while lifting take-rate — judge on projected LTGP per session (take-rate x LTV vs conversion delta), not on either metric alone. The daily `takeRateNum/takeRateDen` rollups in the app give you the take-rate side. |
 | **Show frequency selector** | on | Letting customers pick a realistic cadence reduces "too much product" churn — the #1 voluntary cancel reason in replenishment categories. Hide it only for single-cadence offers; the recommended frequency then applies. The app-level switch (Buy box designer → layout → "Show frequency selector", published as `layout.showFrequency`) **overrides this block setting in both directions** and also governs the embed — see "Removing the frequency selector" below. |
-| **Recommended frequency** | "8 weeks" | Matched against selling plan names; the matching plan is preselected. Set per product from real days-to-empty (the app's `ProductCadence` data), not an arbitrary monthly default — a cadence that matches actual usage prevents pantry-loading skips and cancels. |
+| **Recommended frequency** | "8 weeks" | Matched against selling plan names — any unit works ("8 weeks", "10 days", "1 month"); the matching plan is preselected. Set per product from real days-to-empty (the app's `ProductCadence` data), not an arbitrary monthly default — a cadence that matches actual usage prevents pantry-loading skips and cancels. |
 | **Savings display** | Percent | Percent reads stronger below ~£50 price points ("Save 20%"); absolute reads stronger on premium AOV ("Save £18"). "Both" is honest but busy — test it on your highest-traffic PDP before rolling out. The savings are computed live from the selling-plan allocation vs the variant price, so they can never drift from checkout reality. |
 | **Show reassurance** | on | "Skip, pause or cancel anytime." directly attacks commitment anxiety, the main psychological blocker to subscribing. Only show it if the portal genuinely offers all three (it does — skip/pause/cancel are one click in the Cellexia portal). |
 | **Accent color** | `#1d1d1b` | The subscription card's distinct border/fill/badge. The default is the brand near-black, the same value as `--cx-accent` in `assets/buy-box.css`, as the app embed's accent and as `DEFAULT_DESIGN_CONFIG.style.accent` — this setting is **always** written into the widget's inline style, so it beats the stylesheet and a stray sample colour here repaints the whole widget (including on the "Force preset: …" emergency override, which ignores the published `style` block). Match the brand's primary CTA family but keep contrast ≥ 3:1 against the page background. Deeper overrides via CSS custom properties (`--cx-accent`, `--cx-accent-soft`, `--cx-border`, `--cx-radius`, ... — see the header of `assets/buy-box.css`). |
@@ -1003,7 +1134,7 @@ open — before the merchant updated the extension are still attributed.
 ### Removing the frequency selector (`layout.showFrequency`, v1.2.0)
 
 The Buy box designer can remove the delivery-frequency selector from the
-widget **entirely, across all seven presets** (published as
+widget **entirely, across all eight presets** (published as
 `layout.showFrequency: false` in the design config; a missing key means
 `true`, so pre-v1.2.0 configs are unaffected):
 
