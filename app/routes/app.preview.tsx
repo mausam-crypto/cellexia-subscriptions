@@ -450,7 +450,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     checklist: {
       plansSynced: syncedConfigs.length > 0,
       schedulerHealthy: recentJobRun != null,
-      klaviyoKeyPresent: isKlaviyoConfigured(),
+      klaviyoKeyPresent: await isKlaviyoConfigured(shop.id),
     },
     overdueCount: overdue.length,
     overdueSample: overdue.slice(0, 5).map((c) => ({
@@ -1294,7 +1294,7 @@ export default function PreviewPage() {
                 detail={
                   checklist.klaviyoKeyPresent
                     ? "API key configured. Events are suppressed until you go live."
-                    : "KLAVIYO_PRIVATE_API_KEY is not set — lifecycle emails fall back to plain direct-SMTP delivery (no Klaviyo flows, and SMS is not sent at all) until it is."
+                    : "No Klaviyo API key is configured — add one under Settings → Klaviyo connection (or set KLAVIYO_PRIVATE_API_KEY). Until then lifecycle emails fall back to plain direct-SMTP delivery (no Klaviyo flows, and SMS is not sent at all)."
                 }
               >
                 <ChecklistCheckbox
@@ -1305,7 +1305,7 @@ export default function PreviewPage() {
                   helpText={
                     checklist.klaviyoKeyPresent
                       ? undefined
-                      : "Set the API key first."
+                      : "Add the API key first (Settings → Klaviyo connection)."
                   }
                 />
               </ChecklistRow>

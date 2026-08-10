@@ -256,7 +256,7 @@ const CHECKS: CheckDef[] = [
     category: "Platform",
     remediation:
       "Set the missing variables in the deployed environment (.env / host secrets) and restart the app.",
-    run: async () => {
+    run: async (ctx) => {
       const required = [
         "DATABASE_URL",
         "SHOPIFY_API_KEY",
@@ -274,13 +274,13 @@ const CHECKS: CheckDef[] = [
           detail: `Missing environment variables: ${missing.join(", ")}.`,
         };
       }
-      if (!isKlaviyoConfigured()) {
+      if (!(await isKlaviyoConfigured(ctx.shop.id))) {
         return {
           status: "WARN",
           detail:
-            "KLAVIYO_PRIVATE_API_KEY is not set — lifecycle email falls back to direct SMTP and SMS is suppressed entirely.",
+            "No Klaviyo API key is configured (Settings → Klaviyo connection, or KLAVIYO_PRIVATE_API_KEY) — lifecycle email falls back to direct SMTP and SMS is suppressed entirely.",
           remediation:
-            "Set the key (docs/KLAVIYO_SETUP.md) if Klaviyo flows are expected to fire.",
+            "Add the key on the Settings page (or set the env var; docs/KLAVIYO_SETUP.md) if Klaviyo flows are expected to fire.",
         };
       }
       return { status: "PASS", detail: "All required variables are set." };
@@ -291,13 +291,17 @@ const CHECKS: CheckDef[] = [
     label: "Email transport deliverable",
     category: "Platform",
     remediation:
-      "Fix the SMTP settings (MAIL_PROVIDER/SMTP_*) — OTP codes, 3DS links and admin alerts ride this transport alone, even with Klaviyo configured.",
-    run: async () => {
-      const status = await verifyMailer();
+      "Fix the email transport under Settings → Email delivery (or the MAIL_PROVIDER/SMTP_* environment fallback) — OTP codes, 3DS links and admin alerts ride this transport alone, even with Klaviyo configured.",
+    run: async (ctx) => {
+      const status = await verifyMailer(ctx.shop.id);
+      const sourceLabel =
+        status.source === "settings"
+          ? "configured on the Settings page"
+          : "configured via environment variables";
       if (!status.ok) {
         return {
           status: "FAIL",
-          detail: `Mailer not deliverable (provider ${status.provider}): ${status.error ?? "verification failed"}.`,
+          detail: `Mailer not deliverable (provider ${status.provider}, ${sourceLabel}): ${status.error ?? "verification failed"}.`,
         };
       }
       if (status.provider === "console") {
@@ -305,10 +309,10 @@ const CHECKS: CheckDef[] = [
           status: status.implicitFallback ? "WARN" : "PASS",
           detail: status.implicitFallback
             ? "Mail provider fell back to console implicitly — fine in development, an outage in production."
-            : "Console mail provider chosen explicitly (development).",
+            : `Console mail provider chosen explicitly (${sourceLabel}) — emails are logged, not delivered.`,
         };
       }
-      return { status: "PASS", detail: "SMTP transport verified." };
+      return { status: "PASS", detail: `SMTP transport verified (${sourceLabel}).` };
     },
   },
   {
@@ -1182,7 +1186,7 @@ const CHECKS: CheckDef[] = [
     label: "Klaviyo outbox draining",
     category: "Notifications",
     remediation:
-      "Events older than 24h are DEADed (never fired late, by design). Check KLAVIYO_PRIVATE_API_KEY and the klaviyo_flush job on the Audit page before the backlog ages out.",
+      "Events older than 24h are DEADed (never fired late, by design). Check the Klaviyo key (Settings → Klaviyo connection, or KLAVIYO_PRIVATE_API_KEY) and the klaviyo_flush job on the Audit page before the backlog ages out.",
     run: async (ctx) => {
       const pendingWhere = { status: { in: ["PENDING", "FAILED"] } };
       const [dueUndrained, oldest, expiredRecent] = await Promise.all([
@@ -1207,11 +1211,11 @@ const CHECKS: CheckDef[] = [
           },
         }),
       ]);
-      if (!isKlaviyoConfigured()) {
+      if (!(await isKlaviyoConfigured(ctx.shop.id))) {
         if (dueUndrained > 0) {
           return {
             status: "WARN",
-            detail: `${dueUndrained} event(s) queued with no KLAVIYO_PRIVATE_API_KEY set — they will age out DEAD after 24h without firing.`,
+            detail: `${dueUndrained} event(s) queued with no Klaviyo API key configured (Settings or env) — they will age out DEAD after 24h without firing.`,
           };
         }
         return {

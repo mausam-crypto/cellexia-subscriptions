@@ -75,7 +75,9 @@ conversion; minimise voluntary and involuntary churn.**
 - **Win-back** — staged touches timed to the *predicted empty date*, not the
   cancel date.
 - **Klaviyo** — every lifecycle event feeds Klaviyo flows through a guaranteed-
-  delivery outbox; SMTP fallback for transactional email.
+  delivery outbox; SMTP fallback for transactional email. Both the Klaviyo key
+  and the SMTP transport are configurable in the admin (Settings page, secrets
+  stored encrypted) with env vars as fallback.
 - **Analytics** — daily rollups and a cohort heatmap of retention & true-LTV
   LTGP (first checkout payment + every renewal, net of refunds), computed
   from a merchant-editable cost model (per-product COGS with Shopify-cost
@@ -109,7 +111,8 @@ Full runbook with every gotcha: **[docs/INSTALL.md](docs/INSTALL.md)**. Compress
 ```bash
 # Partner Dashboard: create custom app; request Subscriptions API +
 # protected customer data access (docs/INSTALL.md §2) — mandatory.
-cp .env.example .env            # fill everything (openssl rand -hex 32 for secrets)
+cp .env.example .env            # fill everything (openssl rand -hex 32 for secrets;
+                                # SMTP + Klaviyo may instead be set later in admin Settings)
 npm ci
 npx prisma migrate deploy       # against your PostgreSQL
 npm run config:link             # link shopify.app.toml to your app (fills client_id)

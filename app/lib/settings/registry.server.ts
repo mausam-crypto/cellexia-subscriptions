@@ -465,6 +465,56 @@ export const settingsSchemas = {
     })
     .default({ version: 1, weeks: [] }),
 
+  /**
+   * Email transport (direct SMTP) — the admin-panel override of the
+   * MAIL_PROVIDER / MAIL_FROM / SMTP_* environment variables. Resolution
+   * (app/lib/notifications/mailer.server.ts): provider "" (the default) means
+   * "use the environment variables", so an env-only install behaves exactly
+   * as before this key existed; provider "smtp"/"console" is an explicit
+   * admin choice, with each blank field falling back to its matching env var.
+   * smtpPass holds "" or an encrypted blob ("enc:v1:..." —
+   * app/lib/crypto/secrets.server.ts); it is redacted from the Settings
+   * loader and from settings_updated audit events, never echoed anywhere.
+   */
+  mailTransport: z
+    .object({
+      provider: z.enum(["", "smtp", "console"]).default(""),
+      /** "" = MAIL_FROM env var (or the built-in default sender). */
+      from: z.string().default(""),
+      /** "" = SMTP_HOST env var. */
+      smtpHost: z.string().default(""),
+      /** 0 = SMTP_PORT env var (default 587). */
+      smtpPort: z.number().int().min(0).max(65535).default(0),
+      /** "" = SMTP_USER env var. */
+      smtpUser: z.string().default(""),
+      /** "" or encrypted blob; "" = SMTP_PASS env var. */
+      smtpPass: z.string().default(""),
+      /** auto = implicit TLS on port 465 / SMTP_SECURE env var; else forced. */
+      smtpSecure: z.enum(["auto", "always", "never"]).default("auto"),
+    })
+    .default({
+      provider: "",
+      from: "",
+      smtpHost: "",
+      smtpPort: 0,
+      smtpUser: "",
+      smtpPass: "",
+      smtpSecure: "auto",
+    }),
+
+  /**
+   * Klaviyo connection — the admin-panel override of KLAVIYO_PRIVATE_API_KEY.
+   * privateApiKey holds "" or an encrypted blob (see mailTransport note); ""
+   * falls back to the environment variable. The API revision stays env-only
+   * (KLAVIYO_API_REVISION — docs/INSTALL.md: "only change with a release that
+   * says so").
+   */
+  klaviyo: z
+    .object({
+      privateApiKey: z.string().default(""),
+    })
+    .default({ privateApiKey: "" }),
+
   /** Monitoring & alerting. */
   alerts: z
     .object({

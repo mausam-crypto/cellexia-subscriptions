@@ -39,8 +39,9 @@ fails `npm test` instead of `shopify app deploy`.
    developer preview). Dev stores run **Shopify Payments in test mode** out of
    the box (Settings → Payments → confirm "Test mode" is on).
 2. Install the app per [INSTALL.md](./INSTALL.md) (a second, staging deploy +
-   staging DB is ideal; `MAIL_PROVIDER=console` is acceptable here — OTP codes
-   then appear in server logs).
+   staging DB is ideal; `MAIL_PROVIDER=console` — or Settings → Email
+   delivery → Console — is acceptable here; OTP codes then appear in server
+   logs).
 3. Create a plan config (Plans page) with frequencies `[4,6,8]`, default 8,
    20%/10% discounts, sync it, add the buy box block to the theme.
 4. **Go live on the dev store**: the app installs in Setup mode (dark — jobs

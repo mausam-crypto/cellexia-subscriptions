@@ -2,7 +2,8 @@ import prisma from "~/db.server";
 import { logEvent } from "~/lib/events/log.server";
 import {
   createKlaviyoEvent,
-  isKlaviyoConfigured,
+  resolveKlaviyoAuth,
+  type KlaviyoAuth,
   type KlaviyoSendResult,
 } from "./client.server";
 
@@ -141,8 +142,9 @@ export interface FlushStats {
   /** Rows aged out (DEAD) for exceeding MAX_EVENT_AGE_MS before delivery. */
   expired: number;
   /**
-   * true when KLAVIYO_PRIVATE_API_KEY is unset — undelivered rows are left
-   * PENDING (until the age-out sweep retires them) and nothing is sent.
+   * true when no API key is available anywhere (Settings or
+   * KLAVIYO_PRIVATE_API_KEY) — undelivered rows are left PENDING (until the
+   * age-out sweep retires them) and nothing is sent.
    */
   skipped?: boolean;
 }
@@ -246,8 +248,43 @@ export async function flushKlaviyoOutbox(limit = 100): Promise<FlushStats> {
     console.error("[klaviyo] outbox age-out sweep failed", err);
   }
 
-  if (!isKlaviyoConfigured()) {
-    // Leave remaining rows PENDING; they flush once the key is configured.
+  // Credentials resolve fresh every flush run (per-shop setting first, env
+  // fallback) so an admin-saved key takes effect on the next 1-minute tick —
+  // no restart, keeping the KLAVIYO_SETUP promise that queued rows "flush
+  // automatically once the key appears". The pre-claim gate follows the
+  // app's single-tenant convention (the primary shop decides whether ANY
+  // delivery is possible); the per-row lookup below is the multi-shop-safe
+  // belt over those braces.
+  // Same predicate as getPrimaryShop (install.server), inlined because that
+  // module drags in shopify.server; the flush must stay importable with only
+  // db + client mocked.
+  let primaryShopId: string | undefined;
+  try {
+    const primaryShop = await prisma.shop.findFirst({
+      where: { uninstalledAt: null },
+      orderBy: { installedAt: "desc" },
+      select: { id: true },
+    });
+    primaryShopId = primaryShop?.id;
+  } catch {
+    // No shop context available — resolve from env alone.
+  }
+  const primaryAuth = await resolveKlaviyoAuth(primaryShopId);
+  const authByShop = new Map<string, KlaviyoAuth>();
+  if (primaryShopId) authByShop.set(primaryShopId, primaryAuth);
+  const authFor = async (shopId: unknown): Promise<KlaviyoAuth> => {
+    if (typeof shopId !== "string" || !shopId) return primaryAuth;
+    const cached = authByShop.get(shopId);
+    if (cached) return cached;
+    const auth = await resolveKlaviyoAuth(shopId);
+    authByShop.set(shopId, auth);
+    return auth;
+  };
+
+  if (!primaryAuth.apiKey) {
+    // Leave remaining rows PENDING; they flush once a key is configured
+    // (Settings page or KLAVIYO_PRIVATE_API_KEY). The delivery claim below
+    // must never run keyless.
     return { ...stats, skipped: true };
   }
   const rows = await prisma.klaviyoOutbox.findMany({
@@ -261,18 +298,23 @@ export async function flushKlaviyoOutbox(limit = 100): Promise<FlushStats> {
   stats.claimed = rows.length;
 
   for (const row of rows) {
+    const auth = await authFor(row.shopId);
+    if (!auth.apiKey) continue; // foreign shop without a key — leave PENDING
     let result: KlaviyoSendResult | null = null;
     let thrownMessage: string | null = null;
 
     try {
-      result = await createKlaviyoEvent({
-        eventName: row.eventName,
-        email: row.email,
-        phone: row.phone,
-        profileAttrs: (row.profileAttrs ?? {}) as Record<string, unknown>,
-        properties: (row.properties ?? {}) as Record<string, unknown>,
-        eventTime: row.eventTime,
-      });
+      result = await createKlaviyoEvent(
+        {
+          eventName: row.eventName,
+          email: row.email,
+          phone: row.phone,
+          profileAttrs: (row.profileAttrs ?? {}) as Record<string, unknown>,
+          properties: (row.properties ?? {}) as Record<string, unknown>,
+          eventTime: row.eventTime,
+        },
+        auth,
+      );
     } catch (err) {
       // 5xx / network — retryable.
       thrownMessage = err instanceof Error ? err.message : String(err);

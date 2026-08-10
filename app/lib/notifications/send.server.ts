@@ -361,6 +361,7 @@ export async function sendNotification(
       try {
         const rendered = renderEmail(input.template, locale, templateVars);
         await sendEmail({
+          shopId: input.shopId,
           to,
           subject: rendered.subject,
           html: rendered.html,
@@ -393,7 +394,7 @@ export async function sendNotification(
 
     // ── Primary path: Klaviyo event (never for otp_code) ────────────────────
     if (tmpl.klaviyoMetric && input.template !== "otp_code") {
-      if (isKlaviyoConfigured()) {
+      if (await isKlaviyoConfigured(input.shopId)) {
         const profileAttrs: Record<string, unknown> = contract
           ? contractProfileAttrs(contract)
           : {};
@@ -446,7 +447,7 @@ export async function sendNotification(
           });
         }
       } else if (!tmpl.critical) {
-        // KLAVIYO_PRIVATE_API_KEY is not set. Enqueueing anyway would strand
+        // No Klaviyo key is configured (Settings or env). Enqueueing anyway would strand
         // the row PENDING (flushKlaviyoOutbox skips entirely without the key)
         // while this router reported SENT — dunning ladders would advance,
         // cycle dedupe would stick, and the customer would receive nothing;

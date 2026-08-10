@@ -108,6 +108,7 @@ describe("production refuses the implicit console fallback", () => {
     await expect(verifyMailer()).resolves.toEqual({
       ok: true,
       provider: "console",
+      source: "env",
     });
   });
 });
@@ -137,7 +138,11 @@ describe("MAIL_PROVIDER is case-insensitive", () => {
 
     expect(transport.sendMail).toHaveBeenCalledTimes(1);
     expect(console.log).not.toHaveBeenCalled();
-    await expect(verifyMailer()).resolves.toEqual({ ok: true, provider: "smtp" });
+    await expect(verifyMailer()).resolves.toEqual({
+      ok: true,
+      provider: "smtp",
+      source: "env",
+    });
     expect(transport.verify).toHaveBeenCalledTimes(1);
   });
 

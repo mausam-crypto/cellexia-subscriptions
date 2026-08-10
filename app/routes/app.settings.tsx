@@ -35,6 +35,12 @@ import {
 import { settingsSchemas } from "~/lib/settings/registry.server";
 import type { SettingsKey } from "~/lib/settings/registry.server";
 import { logEvent } from "~/lib/events/log.server";
+import { verifyMailer } from "~/lib/notifications/mailer.server";
+import {
+  probeKlaviyoKey,
+  resolveKlaviyoAuth,
+} from "~/lib/klaviyo/client.server";
+import { encryptSecret } from "~/lib/crypto/secrets.server";
 
 /**
  * Admin — Settings.
@@ -58,7 +64,14 @@ type FieldType =
   | "toggle"
   | "select"
   | "intList"
-  | "stringList";
+  | "stringList"
+  /**
+   * Write-only credential. The loader never ships the stored value (only a
+   * "where does the effective value come from" hint); a blank submit keeps
+   * what is stored, the clear checkbox removes it, and a typed value is
+   * encrypted before it touches the Setting table or the audit log.
+   */
+  | "secret";
 
 interface FieldDef {
   path: string; // dot-path inside the section value, e.g. "channels.email"
@@ -699,6 +712,89 @@ const SECTION_DEFS: SectionDef[] = [
       },
     ],
   },
+  {
+    key: "mailTransport",
+    title: "Email delivery (SMTP)",
+    description:
+      "Direct transactional email — OTP login codes, 3DS confirmation links and admin alerts ride this transport alone, even with Klaviyo connected. Values saved here override the server environment variables; blank fields fall back to them. Changes apply on the next email sent — no restart needed.",
+    fields: [
+      {
+        path: "provider",
+        label: "Transport",
+        helpText:
+          "“Use environment variables” keeps the server-configured (MAIL_PROVIDER) behavior. Console only logs emails to the server output — in production that means nobody receives OTP codes or payment-recovery mail.",
+        type: "select",
+        options: [
+          { label: "Use environment variables (default)", value: "" },
+          { label: "SMTP", value: "smtp" },
+          { label: "Console — log only, no delivery", value: "console" },
+        ],
+      },
+      {
+        path: "from",
+        label: "From address",
+        helpText:
+          "e.g. “Cellexia <care@cellexia.com>” — use a domain your SMTP provider is verified to send for (SPF/DKIM). Blank = the MAIL_FROM environment variable.",
+        type: "text",
+      },
+      {
+        path: "smtpHost",
+        label: "SMTP host",
+        helpText:
+          "e.g. smtp.postmarkapp.com. Blank = the SMTP_HOST environment variable.",
+        type: "text",
+      },
+      {
+        path: "smtpPort",
+        label: "SMTP port",
+        helpText:
+          "587 for STARTTLS, 465 for implicit TLS. 0 = the SMTP_PORT environment variable (default 587).",
+        type: "int",
+        min: 0,
+        max: 65535,
+      },
+      {
+        path: "smtpUser",
+        label: "SMTP username",
+        helpText: "Blank = the SMTP_USER environment variable.",
+        type: "text",
+      },
+      {
+        path: "smtpPass",
+        label: "SMTP password",
+        helpText:
+          "Stored encrypted; never displayed again. Leave blank to keep the saved value. With nothing saved, the SMTP_PASS environment variable applies.",
+        type: "secret",
+      },
+      {
+        path: "smtpSecure",
+        label: "TLS mode",
+        helpText:
+          "Auto: implicit TLS on port 465, STARTTLS otherwise (or whatever the SMTP_SECURE environment variable says).",
+        type: "select",
+        options: [
+          { label: "Auto", value: "auto" },
+          { label: "Always (implicit TLS)", value: "always" },
+          { label: "Never (STARTTLS / plain)", value: "never" },
+        ],
+      },
+    ],
+  },
+  {
+    key: "klaviyo",
+    title: "Klaviyo connection",
+    description:
+      "Server-side connection for lifecycle flows — Klaviyo owns delivery, branding and timing (docs/KLAVIYO_SETUP.md). Queued events start flushing on the next scheduler tick after a key is saved (a minute on standard installs); events older than 24 hours are dropped, never fired late. Without a key, lifecycle email falls back to direct SMTP and SMS is not sent.",
+    fields: [
+      {
+        path: "privateApiKey",
+        label: "Private API key",
+        helpText:
+          "pk_… private key with the Events: Full scope (Klaviyo → Account → Settings → API keys). Stored encrypted; never displayed again. Leave blank to keep the saved value; with nothing saved, the KLAVIYO_PRIVATE_API_KEY environment variable applies. Use “Test key” before saving — a wrong key kills queued events within a minute.",
+        type: "secret",
+      },
+    ],
+  },
 ];
 
 // ── Dot-path helpers ─────────────────────────────────────────────────────────
@@ -749,7 +845,26 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     throw new Response("App is not installed on any shop", { status: 503 });
   }
   const settings = await getAllSettings(shop.id);
-  return json({ settings, currencyCode: shop.currencyCode });
+
+  // Secret fields are write-only: the stored blobs (even encrypted) never
+  // reach the browser. The UI only learns where the EFFECTIVE value comes
+  // from, to phrase its placeholder and offer the clear checkbox.
+  const secretsState: Record<string, "settings" | "env" | "none"> = {
+    "mailTransport.smtpPass": settings.mailTransport.smtpPass
+      ? "settings"
+      : process.env.SMTP_PASS
+        ? "env"
+        : "none",
+    "klaviyo.privateApiKey": settings.klaviyo.privateApiKey
+      ? "settings"
+      : process.env.KLAVIYO_PRIVATE_API_KEY
+        ? "env"
+        : "none",
+  };
+  settings.mailTransport = { ...settings.mailTransport, smtpPass: "" };
+  settings.klaviyo = { ...settings.klaviyo, privateApiKey: "" };
+
+  return json({ settings, currencyCode: shop.currencyCode, secretsState });
 };
 
 // ── Action ───────────────────────────────────────────────────────────────────
@@ -808,15 +923,48 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       );
     }
     const key = sectionKey as SettingsKey;
+    const secretFields = def.fields.filter((f) => f.type === "secret");
+
+    // Read the outgoing value BEFORE the write so the audit event carries
+    // both sides of the change — `value` alone said what the settings became
+    // but never what they were, so the event log could not answer "who
+    // changed the dunning ladder and from what" without replaying every save.
+    // Sections with secret fields also need it before PARSING: a blank secret
+    // submit means "keep what is stored".
+    const previous = await getSetting(shop.id, key);
 
     const candidate: Record<string, unknown> = {};
     for (const field of def.fields) {
+      if (field.type === "secret") continue;
       const raw = formData.get(`f_${field.path}`);
       setPath(
         candidate,
         field.path,
         coerceField(field, typeof raw === "string" ? raw : null),
       );
+    }
+    // Secret merge: typed value → encrypted; blank → keep stored; clear
+    // checkbox → "". The markers (never the values) go into the audit event.
+    const secretAudit: Record<string, { previous: string; value: string }> = {};
+    for (const field of secretFields) {
+      const raw = formData.get(`f_${field.path}`);
+      const typed = (typeof raw === "string" ? raw : "").trim();
+      const clear =
+        String(formData.get(`f_${field.path}__clear`) ?? "") === "true";
+      const prior = String(getPath(previous, field.path) ?? "");
+      const next = clear ? "" : typed === "" ? prior : encryptSecret(typed);
+      setPath(candidate, field.path, next);
+      secretAudit[field.path] = {
+        previous: prior ? "(set)" : "(not set)",
+        value:
+          next === ""
+            ? prior
+              ? "(cleared)"
+              : "(not set)"
+            : next === prior
+              ? "(unchanged)"
+              : "(updated)",
+      };
     }
 
     const parsed = settingsSchemas[key].safeParse(candidate);
@@ -832,14 +980,22 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       );
     }
 
-    // Read the outgoing value BEFORE the write so the audit event carries
-    // both sides of the change — `value` alone said what the settings became
-    // but never what they were, so the event log could not answer "who
-    // changed the dunning ladder and from what" without replaying every save.
-    const previous = await getSetting(shop.id, key);
-
     // parsed.data already passed the exact schema setSetting re-validates.
     await setSetting(shop.id, key, parsed.data as never, actor);
+
+    // Redact secret fields from BOTH sides of the audit payload: the event
+    // lands in append-only SubscriberEvent rows that the Audit page renders
+    // and exports as CSV — a credential there would be visible forever.
+    const auditValue = JSON.parse(
+      JSON.stringify(parsed.data),
+    ) as Record<string, unknown>;
+    const auditPrevious = JSON.parse(
+      JSON.stringify(previous),
+    ) as Record<string, unknown>;
+    for (const [path, markers] of Object.entries(secretAudit)) {
+      setPath(auditValue, path, markers.value);
+      setPath(auditPrevious, path, markers.previous);
+    }
     await logEvent({
       shopId: shop.id,
       type: "admin.action",
@@ -851,8 +1007,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         // `value` keeps its historical meaning (the NEXT state — additive
         // rule: never repurpose an event field); `previous` is the state it
         // replaced, as getSetting resolved it (defaults included).
-        value: parsed.data as Record<string, unknown>,
-        previous: previous as Record<string, unknown>,
+        value: auditValue,
+        previous: auditPrevious,
       },
     });
 
@@ -862,6 +1018,39 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       section: key,
       toast: `${def.title} settings saved`,
     });
+  }
+
+  if (intent === "test-mailer") {
+    // Verifies the EFFECTIVE saved transport (Settings layer + env fallback)
+    // with a real SMTP round-trip — save first, then test.
+    const status = await verifyMailer(shop.id);
+    return json<ActionData>({
+      intent,
+      ok: status.ok,
+      toast: status.ok
+        ? status.provider === "smtp"
+          ? `SMTP verified (${status.source === "settings" ? "Settings" : "environment"} configuration)`
+          : "Console transport active — emails are logged, not delivered"
+        : `Mail transport failed: ${status.error ?? "verification failed"}`,
+    });
+  }
+
+  if (intent === "test-klaviyo") {
+    // Tests the key typed in the form when present (so it can be validated
+    // BEFORE saving — a wrong saved key dead-letters queued events within a
+    // minute), otherwise the effective saved/env key.
+    const typed = String(formData.get("key") ?? "").trim();
+    const keyToTest = typed || (await resolveKlaviyoAuth(shop.id)).apiKey || "";
+    if (!keyToTest) {
+      return json<ActionData>({
+        intent,
+        ok: false,
+        toast:
+          "No Klaviyo key to test — enter one above or set KLAVIYO_PRIVATE_API_KEY",
+      });
+    }
+    const probe = await probeKlaviyoKey(keyToTest);
+    return json<ActionData>({ intent, ok: probe.ok, toast: probe.detail });
   }
 
   return json<ActionData>(
@@ -882,6 +1071,11 @@ function initialSectionState(def: SectionDef, value: unknown): SectionState {
       state[field.path] = Boolean(raw);
     } else if (field.type === "intList" || field.type === "stringList") {
       state[field.path] = Array.isArray(raw) ? raw.join(", ") : "";
+    } else if (field.type === "secret") {
+      // The loader redacts secrets, so this is always "" — typed here means
+      // "replace"; the companion __clear key means "remove the saved value".
+      state[field.path] = "";
+      state[`${field.path}__clear`] = false;
     } else {
       state[field.path] = raw == null ? "" : String(raw);
     }
@@ -912,12 +1106,28 @@ function FieldInput({
   value,
   error,
   onChange,
+  placeholder,
 }: {
   field: FieldDef;
   value: string | boolean;
   error?: string;
   onChange: (next: string | boolean) => void;
+  placeholder?: string;
 }) {
+  if (field.type === "secret") {
+    return (
+      <TextField
+        label={field.label}
+        autoComplete="new-password"
+        type="password"
+        value={String(value)}
+        onChange={(next) => onChange(next)}
+        placeholder={placeholder}
+        helpText={field.helpText}
+        error={error}
+      />
+    );
+  }
   if (field.type === "toggle") {
     return (
       <Checkbox
@@ -1148,6 +1358,8 @@ function SettingsSection({
   saving,
   onSave,
   preview,
+  secretsState,
+  extraActions,
 }: {
   def: SectionDef;
   initialValue: unknown;
@@ -1155,6 +1367,10 @@ function SettingsSection({
   saving: boolean;
   onSave: (def: SectionDef, state: SectionState) => void;
   preview?: (state: SectionState) => ReactNode;
+  /** Per "<sectionKey>.<fieldPath>": where the effective secret comes from. */
+  secretsState?: Record<string, "settings" | "env" | "none">;
+  /** Extra footer buttons (e.g. test-connection) rendered beside Save. */
+  extraActions?: (state: SectionState) => ReactNode;
 }) {
   const [state, setState] = useState<SectionState>(() =>
     initialSectionState(def, initialValue),
@@ -1176,18 +1392,46 @@ function SettingsSection({
         </BlockStack>
         <Divider />
         <BlockStack gap="300">
-          {def.fields.map((field) => (
-            <FieldInput
-              key={field.path}
-              field={field}
-              value={state[field.path] ?? ""}
-              error={errorFor(errors, field.path)}
-              onChange={(next) => setField(field.path, next)}
-            />
-          ))}
+          {def.fields.map((field) => {
+            const secretSource =
+              field.type === "secret"
+                ? (secretsState?.[`${def.key}.${field.path}`] ?? "none")
+                : undefined;
+            return (
+              <BlockStack key={field.path} gap="200">
+                <FieldInput
+                  field={field}
+                  value={state[field.path] ?? ""}
+                  error={errorFor(errors, field.path)}
+                  onChange={(next) => setField(field.path, next)}
+                  placeholder={
+                    secretSource === "settings"
+                      ? "•••••••• saved — leave blank to keep"
+                      : secretSource === "env"
+                        ? "Using environment variable — enter a value to override"
+                        : secretSource === "none"
+                          ? "Not set"
+                          : undefined
+                  }
+                />
+                {secretSource === "settings" ? (
+                  <Checkbox
+                    label="Remove the saved value (fall back to the environment variable, if any)"
+                    checked={Boolean(state[`${field.path}__clear`])}
+                    onChange={(checked) =>
+                      setField(`${field.path}__clear`, checked)
+                    }
+                  />
+                ) : null}
+              </BlockStack>
+            );
+          })}
         </BlockStack>
         {preview ? preview(state) : null}
-        <InlineStack align="end">
+        <InlineStack align="space-between" blockAlign="center">
+          <InlineStack gap="200">
+            {extraActions ? extraActions(state) : null}
+          </InlineStack>
           <Button
             variant="primary"
             loading={saving}
@@ -1204,16 +1448,40 @@ function SettingsSection({
 // ── Page ─────────────────────────────────────────────────────────────────────
 
 export default function SettingsPage() {
-  const { settings, currencyCode } = useLoaderData<typeof loader>();
+  const { settings, currencyCode, secretsState } =
+    useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const shopify = useAppBridge();
   const submit = useSubmit();
   const navigation = useNavigation();
 
+  // Bumped per section on every SUCCESSFUL save; used in the section's React
+  // key so it remounts and re-initializes from the freshly revalidated
+  // loader data. Load-bearing for secret fields: without the remount the
+  // typed plaintext would linger in client state (re-encrypted and audited
+  // "(updated)" on every later save of the section) and a used clear
+  // checkbox would keep sending __clear=true after its own checkbox
+  // unmounted — silently discarding the next credential typed into the same
+  // page. Failed saves don't bump, so 422 corrections keep their input.
+  const [saveGeneration, setSaveGeneration] = useState<Record<string, number>>(
+    {},
+  );
+
   useEffect(() => {
     if (!actionData) return;
     if (actionData.toast) {
       shopify.toast.show(actionData.toast, { isError: !actionData.ok });
+    }
+    if (
+      actionData.intent === "save-section" &&
+      actionData.ok &&
+      actionData.section
+    ) {
+      const section = actionData.section;
+      setSaveGeneration((prev) => ({
+        ...prev,
+        [section]: (prev[section] ?? 0) + 1,
+      }));
     }
   }, [actionData, shopify]);
 
@@ -1222,6 +1490,10 @@ export default function SettingsPage() {
     navigation.formData?.get("intent") === "save-section"
       ? String(navigation.formData.get("section") ?? "")
       : null;
+  const runningIntent =
+    navigation.state !== "idle"
+      ? String(navigation.formData?.get("intent") ?? "")
+      : "";
 
   const handleSave = (def: SectionDef, state: SectionState) => {
     const fd = new FormData();
@@ -1233,7 +1505,20 @@ export default function SettingsPage() {
         `f_${field.path}`,
         field.type === "toggle" ? String(Boolean(value)) : String(value ?? ""),
       );
+      if (field.type === "secret") {
+        fd.set(
+          `f_${field.path}__clear`,
+          String(Boolean(state[`${field.path}__clear`])),
+        );
+      }
     }
+    submit(fd, { method: "post" });
+  };
+
+  const handleTest = (intent: string, extra?: Record<string, string>) => {
+    const fd = new FormData();
+    fd.set("intent", intent);
+    for (const [k, v] of Object.entries(extra ?? {})) fd.set(k, v);
     submit(fd, { method: "post" });
   };
 
@@ -1253,7 +1538,7 @@ export default function SettingsPage() {
             </Text>
             {SECTION_DEFS.map((def) => (
               <SettingsSection
-                key={def.key}
+                key={`${def.key}:${saveGeneration[def.key] ?? 0}`}
                 def={def}
                 initialValue={settingsRecord[def.key]}
                 errors={
@@ -1265,6 +1550,7 @@ export default function SettingsPage() {
                 }
                 saving={savingSection === def.key}
                 onSave={handleSave}
+                secretsState={secretsState}
                 preview={
                   def.key === "dunning"
                     ? (state) => <DunningLadderPreview state={state} />
@@ -1278,6 +1564,31 @@ export default function SettingsPage() {
                             />
                           )
                         : undefined
+                }
+                extraActions={
+                  def.key === "mailTransport"
+                    ? () => (
+                        <Button
+                          loading={runningIntent === "test-mailer"}
+                          onClick={() => handleTest("test-mailer")}
+                        >
+                          Test saved transport
+                        </Button>
+                      )
+                    : def.key === "klaviyo"
+                      ? (state) => (
+                          <Button
+                            loading={runningIntent === "test-klaviyo"}
+                            onClick={() =>
+                              handleTest("test-klaviyo", {
+                                key: String(state["privateApiKey"] ?? ""),
+                              })
+                            }
+                          >
+                            Test key
+                          </Button>
+                        )
+                      : undefined
                 }
               />
             ))}

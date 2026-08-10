@@ -256,6 +256,11 @@ flyctl secrets set \
   SMTP_HOST="smtp.eu.example.com" SMTP_PORT="587" \
   SMTP_USER="..." SMTP_PASS="..."
 
+# The KLAVIYO_* and MAIL_*/SMTP_* lines are optional since v1.12.0: both can
+# instead be configured in the admin (Settings → Email delivery / Klaviyo
+# connection; secrets stored encrypted). Admin values win; blank admin fields
+# fall back to these variables.
+
 # 4. Deploy (Docker build runs prisma generate + remix build; boot runs migrate deploy)
 flyctl deploy
 ```
@@ -326,11 +331,11 @@ Fill every variable:
 | `CRON_SECRET` | Shared secret for `POST /api/jobs/run`. Generate: `openssl rand -hex 32`. |
 | `SCHEDULER_MODE` | `internal` (always-on host) or `external` (cron hits `/api/jobs/run`). See §3. |
 | `DEFAULT_TIMEZONE` | IANA fallback timezone until the shop's own timezone is synced (e.g. `Europe/London`). |
-| `KLAVIYO_PRIVATE_API_KEY` | Klaviyo private key (`pk_...`) with Events/Profiles/Lists full access. |
-| `KLAVIYO_API_REVISION` | Klaviyo API revision date; ships as `2025-01-15`. Only change with a release that says so. |
-| `MAIL_PROVIDER` | `smtp` in production. `console` prints emails to logs (local dev only — OTP codes appear in the server log). |
+| `KLAVIYO_PRIVATE_API_KEY` | Klaviyo private key (`pk_...`) with the **Events: Full** scope (custom-scoped key recommended — see [KLAVIYO_SETUP.md](./KLAVIYO_SETUP.md) §1). Optional since v1.12.0 — a key saved under Settings → Klaviyo connection wins over this. |
+| `KLAVIYO_API_REVISION` | Klaviyo API revision date; ships as `2025-01-15`. Only change with a release that says so. Env-only on purpose (not an admin setting). |
+| `MAIL_PROVIDER` | `smtp` in production. `console` prints emails to logs (local dev only — OTP codes appear in the server log). Optional since v1.12.0 — a transport chosen under Settings → Email delivery wins over this. |
 | `MAIL_FROM` | From header for OTP + fallback transactional email, e.g. `"Cellexia <care@cellexia.com>"`. Use a domain with SPF/DKIM configured. |
-| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` | Your transactional SMTP relay (Postmark, SES, Mailgun…). Port 587 STARTTLS. |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` / `SMTP_SECURE` | Your transactional SMTP relay (Postmark, SES, Mailgun…). Port 587 STARTTLS; `SMTP_SECURE=true` (or port 465) forces implicit TLS. Fallbacks for blank fields in Settings → Email delivery. |
 | `SMS_PROVIDER` | `none` — SMS goes out through Klaviyo flows. Only set if you wire a direct provider. |
 | `NODE_ENV` / `PORT` | `production` / `3000` (must match the host's internal port). |
 
@@ -490,7 +495,9 @@ products, and each renders its own widget.
 
 ## 8. Klaviyo
 
-1. Ensure `KLAVIYO_PRIVATE_API_KEY` and `KLAVIYO_API_REVISION` are set (§4).
+1. Connect the private API key — either in the admin (**Settings → Klaviyo
+   connection**, with the "Test key" button; stored encrypted) or via
+   `KLAVIYO_PRIVATE_API_KEY` (§4). An admin-saved key wins over the env var.
 2. Follow [KLAVIYO_SETUP.md](./KLAVIYO_SETUP.md) to create the metrics, flows
    (upcoming order, payment failed ladder, card expiring, cancel/save, win-back,
    gifts/milestones) and profile properties.

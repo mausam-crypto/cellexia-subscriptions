@@ -4,6 +4,66 @@ All notable changes to Cellexia Subscriptions. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [SemVer](https://semver.org) as contracted in [docs/UPDATE.md](docs/UPDATE.md).
 
+## [1.12.0] — 2026-08-10
+
+**SMTP and Klaviyo are now configurable from the admin — Settings → Email
+delivery / Klaviyo connection — with the env vars as fallback.** No
+migration, no new env vars, no scope or theme changes (`npm run deploy` not
+needed). Env-only installs behave exactly as before; every existing
+`MAIL_*`/`SMTP_*`/`KLAVIYO_*` variable keeps working as the fallback layer.
+
+### Added
+
+- **Settings → Email delivery (SMTP)** (`mailTransport` setting): transport
+  choice (env-vars / SMTP / console), From address, host, port, username,
+  password and TLS mode, editable in the admin. A saved transport wins over
+  `MAIL_PROVIDER`; blank fields fall back to their matching env var. Saves
+  apply on the next email sent, on every instance — the transport cache is
+  keyed by the resolved config (`global.__cellexiaMailTransport`), no
+  restart. A **Test saved transport** button runs a real SMTP `verify()`
+  round-trip.
+- **Settings → Klaviyo connection** (`klaviyo` setting): the private API key,
+  editable in the admin. A saved key wins over `KLAVIYO_PRIVATE_API_KEY`;
+  the outbox flush resolves it fresh on every tick, so queued events start
+  delivering on the next flush after a save (a minute with the internal
+  scheduler, up to the cron interval with `SCHEDULER_MODE=external`) —
+  keeping the KLAVIYO_SETUP promise (and its 24h age-out). A **Test key**
+  button probes the key BEFORE saving
+  (only a 401 condemns it; 403 = healthy Events-only scoped key — a wrong
+  saved key would dead-letter queued events within a minute).
+  `KLAVIYO_API_REVISION` stays env-only by design.
+- **Secrets handling** (`app/lib/crypto/secrets.server.ts`): the SMTP
+  password and Klaviyo key are stored AES-256-GCM-encrypted under a key
+  derived from `APP_SIGNING_SECRET`. They are write-only in the UI (never
+  echoed to the browser; blank keeps the saved value, an explicit checkbox
+  clears it) and redacted to markers — "(set)"/"(updated)"/"(cleared)" — in
+  `settings_updated` audit events, so neither the Audit page nor its CSV
+  export can ever leak them. Rotating `APP_SIGNING_SECRET` invalidates the
+  stored credentials: delivery falls back to the env vars (never crashes)
+  and they must be re-entered — documented in OPERATIONS §10.
+- New suites: `tests/settings-secrets.test.ts`,
+  `tests/mailer-settings-override.test.ts`,
+  `tests/klaviyo-settings-key.test.ts`,
+  `tests/settings-secret-redaction.test.ts`.
+
+### Changed
+
+- `sendEmail`/`verifyMailer` (mailer) and `isKlaviyoConfigured`/
+  `createKlaviyoEvent` (Klaviyo client) resolve configuration
+  settings-first with env fallback; `isKlaviyoConfigured` is now **async**
+  and shop-aware, and `verifyMailer` takes an optional shopId (env-only
+  without one — `/api/health` passes the primary shop's, guarded, so a
+  down DB degrades to the env-only check instead of failing the probe).
+  Any settings-read or decrypt failure degrades to env resolution:
+  settings can improve delivery, never break it. The production fail-loud
+  contract is unchanged — no provider chosen anywhere still throws on send
+  and turns `/api/health` red.
+- Debug self-check (`mailer`, `app_secrets`, `klaviyo_outbox`), the
+  `KLAVIYO_OUTBOX_BACKLOG` alert and the launch checklist now report the
+  effective (settings-or-env) configuration and point their remediation at
+  the Settings page; the mailer check names the config source in its
+  detail. `MailerStatus` gains a `source: "settings" | "env"` field.
+
 ## [1.11.0] — 2026-08-10
 
 **Buy box: the one-click-behind variant defect fixed at the root, the

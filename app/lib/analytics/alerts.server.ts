@@ -1099,8 +1099,9 @@ async function checkPlanGroupDrift(
 /**
  * How long a PENDING outbox row may sit unflushed before it counts as stalled.
  * A healthy flush attempts every PENDING row within minutes of enqueue; a row
- * still PENDING after an hour means either KLAVIYO_PRIVATE_API_KEY is unset
- * (flushKlaviyoOutbox skips entirely) or the klaviyo_flush job is not running.
+ * still PENDING after an hour means either no Klaviyo key is configured
+ * anywhere (Settings or env — flushKlaviyoOutbox skips entirely) or the
+ * klaviyo_flush job is not running.
  * Rows mid-retry are FAILED, not PENDING, so a Klaviyo outage riding its
  * backoff train never trips this arm — it surfaces through DEAD rows instead.
  */
@@ -1138,13 +1139,13 @@ async function checkKlaviyoOutboxBacklog(
   ]);
   if (pendingStalled === 0 && deadRecent === 0) return false;
 
-  const configured = isKlaviyoConfigured();
+  const configured = await isKlaviyoConfigured(shopId);
   const parts: string[] = [];
   if (pendingStalled > 0) {
     parts.push(
       configured
         ? `${pendingStalled} Klaviyo event(s) have sat unflushed for over ${KLAVIYO_STALLED_MINUTES} minutes — is the klaviyo_flush job running?`
-        : `${pendingStalled} Klaviyo event(s) are queued but undeliverable because KLAVIYO_PRIVATE_API_KEY is not set`,
+        : `${pendingStalled} Klaviyo event(s) are queued but undeliverable because no Klaviyo API key is configured (Settings → Klaviyo connection, or KLAVIYO_PRIVATE_API_KEY)`,
     );
   }
   if (deadRecent > 0) {

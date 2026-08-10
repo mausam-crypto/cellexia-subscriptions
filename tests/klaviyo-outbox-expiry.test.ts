@@ -20,24 +20,38 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  * (tests/origin-backfill-alert.test.ts pattern).
  */
 
-const mocks = vi.hoisted(() => ({
-  isKlaviyoConfigured: vi.fn((): boolean => false),
-  createKlaviyoEvent: vi.fn(
-    async (_input: unknown): Promise<unknown> => ({ ok: true, status: 202 }),
-  ),
-  outboxUpdateMany: vi.fn(async (_args?: unknown) => ({ count: 0 })),
-  outboxFindMany: vi.fn(async (_args?: unknown): Promise<unknown[]> => []),
-  outboxUpdate: vi.fn(async (_args?: unknown): Promise<unknown> => ({})),
-  outboxCount: vi.fn(async (_args?: unknown): Promise<number> => 0),
-  alertCreate: vi.fn(
-    async (args: { data: Record<string, unknown> }): Promise<unknown> => ({
-      id: "alert_1",
-      ...args.data,
-    }),
-  ),
-  alertFindFirst: vi.fn(async (): Promise<unknown> => null),
-  logEvent: vi.fn(async (): Promise<void> => {}),
-}));
+const mocks = vi.hoisted(() => {
+  const isKlaviyoConfigured = vi.fn(async (): Promise<boolean> => false);
+  return {
+    isKlaviyoConfigured,
+    // The flush resolves credentials via resolveKlaviyoAuth; deriving the
+    // mock from isKlaviyoConfigured keeps each test's single
+    // mockReturnValue/mockResolvedValue toggle driving both seams.
+    resolveKlaviyoAuth: vi.fn(async () =>
+      (await isKlaviyoConfigured())
+        ? { apiKey: "pk_test", revision: "2024-10-15", source: "env" }
+        : { apiKey: null, revision: "2024-10-15", source: null },
+    ),
+    createKlaviyoEvent: vi.fn(
+      async (_input: unknown, _auth?: unknown): Promise<unknown> => ({
+        ok: true,
+        status: 202,
+      }),
+    ),
+    outboxUpdateMany: vi.fn(async (_args?: unknown) => ({ count: 0 })),
+    outboxFindMany: vi.fn(async (_args?: unknown): Promise<unknown[]> => []),
+    outboxUpdate: vi.fn(async (_args?: unknown): Promise<unknown> => ({})),
+    outboxCount: vi.fn(async (_args?: unknown): Promise<number> => 0),
+    alertCreate: vi.fn(
+      async (args: { data: Record<string, unknown> }): Promise<unknown> => ({
+        id: "alert_1",
+        ...args.data,
+      }),
+    ),
+    alertFindFirst: vi.fn(async (): Promise<unknown> => null),
+    logEvent: vi.fn(async (): Promise<void> => {}),
+  };
+});
 
 vi.mock("~/db.server", () => {
   const stubFor = (method: string) => async () => {
@@ -78,6 +92,7 @@ vi.mock("~/db.server", () => {
 
 vi.mock("~/lib/klaviyo/client.server", () => ({
   isKlaviyoConfigured: mocks.isKlaviyoConfigured,
+  resolveKlaviyoAuth: mocks.resolveKlaviyoAuth,
   createKlaviyoEvent: mocks.createKlaviyoEvent,
 }));
 
@@ -130,7 +145,7 @@ function primeCounts(pendingStalled: number, deadRecent: number): void {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  mocks.isKlaviyoConfigured.mockReturnValue(false);
+  mocks.isKlaviyoConfigured.mockResolvedValue(false);
   mocks.outboxUpdateMany.mockResolvedValue({ count: 0 });
   mocks.outboxFindMany.mockResolvedValue([]);
   mocks.alertFindFirst.mockResolvedValue(null);
@@ -182,7 +197,7 @@ describe("flushKlaviyoOutbox age-out sweep", () => {
   });
 
   it("with the key set, sweeps first and still delivers fresh rows", async () => {
-    mocks.isKlaviyoConfigured.mockReturnValue(true);
+    mocks.isKlaviyoConfigured.mockResolvedValue(true);
     mocks.outboxUpdateMany.mockResolvedValue({ count: 2 });
     mocks.outboxFindMany.mockResolvedValue([
       {
@@ -203,6 +218,12 @@ describe("flushKlaviyoOutbox age-out sweep", () => {
     expect(stats.claimed).toBe(1);
     expect(stats.sent).toBe(1);
     expect(mocks.createKlaviyoEvent).toHaveBeenCalledTimes(1);
+    // The resolved per-shop credentials ride along to the client — the key
+    // that authenticates is the one resolveKlaviyoAuth chose (settings-or-
+    // env), not whatever happens to sit in process.env at send time.
+    expect(mocks.createKlaviyoEvent.mock.calls[0]![1]).toMatchObject({
+      apiKey: "pk_test",
+    });
     const update = mocks.outboxUpdate.mock.calls[0]![0] as {
       where: { id: string };
       data: { status: string };
@@ -212,7 +233,7 @@ describe("flushKlaviyoOutbox age-out sweep", () => {
   });
 
   it("a broken sweep never blocks delivery", async () => {
-    mocks.isKlaviyoConfigured.mockReturnValue(true);
+    mocks.isKlaviyoConfigured.mockResolvedValue(true);
     mocks.outboxUpdateMany.mockRejectedValue(new Error("db hiccup"));
 
     const stats = await flushKlaviyoOutbox();
@@ -272,7 +293,7 @@ describe("KLAVIYO_OUTBOX_BACKLOG", () => {
   });
 
   it("with the key set, stalled rows point at the flush job instead", async () => {
-    mocks.isKlaviyoConfigured.mockReturnValue(true);
+    mocks.isKlaviyoConfigured.mockResolvedValue(true);
     primeCounts(4, 0);
 
     await runAlertScan("shop_1", { now: NOW });

@@ -12,22 +12,33 @@ OTP login codes, 3DS action requests, admin alerts and import summaries.
 
 ---
 
-## 1. Private API key + environment
+## 1. Private API key
 
 1. In Klaviyo: **Account → Settings → API keys → Create Private API Key**.
 2. Name it `Cellexia Subscriptions (server)`. Grant scope **Events: Full**
    (custom-scoped keys are recommended over Full Access keys).
 3. Copy the `pk_...` value — it is shown once.
-4. Set the environment variables on the app host:
+4. Connect it, either way:
+   - **Admin (recommended):** app **Settings → Klaviyo connection** — paste
+     the key, click **Test key** (a 403 on the test is normal for an
+     Events-only scoped key; only a 401 means the key is bad), then Save.
+     The key is stored encrypted and applies on the next `klaviyo_flush`
+     tick — a minute with the internal scheduler, up to your cron interval
+     with `SCHEDULER_MODE=external`; no restart either way.
+   - **Environment variables** on the app host:
 
-```bash
-KLAVIYO_PRIVATE_API_KEY=pk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-KLAVIYO_API_REVISION=2024-10-15     # Events API revision date (optional; this is the default)
-```
+     ```bash
+     KLAVIYO_PRIVATE_API_KEY=pk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+     KLAVIYO_API_REVISION=2024-10-15     # Events API revision date (optional; this is the default)
+     ```
 
-Until the key is set, events accumulate in the `KlaviyoOutbox` table with
-status `PENDING` and flush automatically once the key appears — you lose
-nothing by configuring Klaviyo after launch.
+   A key saved in the admin wins over the env var; clearing the admin value
+   falls back to the env var. `KLAVIYO_API_REVISION` stays env-only.
+
+Until a key is set, events accumulate in the `KlaviyoOutbox` table with
+status `PENDING` and flush automatically once the key appears (events older
+than 24 h are dropped, never fired late) — you lose nothing by configuring
+Klaviyo after launch.
 
 Delivery mechanics (for the curious): the `klaviyo_flush` job drains the
 outbox every tick; retryable failures (Klaviyo 5xx, network, 429) back off

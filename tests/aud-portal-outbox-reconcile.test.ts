@@ -186,6 +186,13 @@ vi.mock("~/db.server", () => {
 
 vi.mock("~/lib/klaviyo/client.server", () => ({
   isKlaviyoConfigured: mocks.isKlaviyoConfigured,
+  // The flush resolves credentials via resolveKlaviyoAuth; deriving it from
+  // isKlaviyoConfigured keeps each test's single toggle driving both seams.
+  resolveKlaviyoAuth: vi.fn(async () =>
+    mocks.isKlaviyoConfigured()
+      ? { apiKey: "pk_test", revision: "2024-10-15", source: "env" }
+      : { apiKey: null, revision: "2024-10-15", source: null },
+  ),
   createKlaviyoEvent: mocks.createKlaviyoEvent,
 }));
 vi.mock("~/lib/events/log.server", () => ({ logEvent: mocks.logEvent }));

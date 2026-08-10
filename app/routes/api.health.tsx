@@ -30,7 +30,16 @@ async function mailerStatus(now: Date): Promise<MailerStatus> {
   if (mailerCache && now.getTime() - mailerCache.at < MAILER_VERIFY_TTL_MS) {
     return mailerCache.status;
   }
-  const status = await verifyMailer();
+  // The per-shop Settings layer needs a shopId; resolve it here, guarded, so
+  // a down database (or a not-yet-installed app) degrades to the env-only
+  // check instead of failing the probe outright.
+  let shopId: string | undefined;
+  try {
+    shopId = (await getPrimaryShop())?.id;
+  } catch {
+    // env-only resolution
+  }
+  const status = await verifyMailer(shopId);
   mailerCache = { at: now.getTime(), status };
   return status;
 }
@@ -137,6 +146,7 @@ export const loader = async () => {
     mailer = {
       ok: false,
       provider: "console",
+      source: "env",
       error: err instanceof Error ? err.message : String(err),
     };
   }
