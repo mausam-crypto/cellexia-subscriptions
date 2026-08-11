@@ -1,32 +1,61 @@
 # Klaviyo Setup — Cellexia Subscriptions
 
-The app pushes every customer-facing subscription moment to Klaviyo as a
-server-side event (via a durable outbox — nothing is lost if Klaviyo is briefly
-down). **Klaviyo flows own delivery, branding and consent**; the app
-supplies the metrics, the properties, and — crucially — signed one-tap
-**magic-link URLs** so every email/SMS can carry "Skip", "Delay", "Update card"
-buttons that work with zero login.
+**You do not need Klaviyo for the app's emails.** Since v1.17.0 every email
+the app sends can be authored, previewed, branded and delivered entirely
+in-app (admin → **Emails**): each message has an editor with formatting and
+a live preview, the Design tab styles them all, and a test send proves what
+lands in an inbox. Klaviyo is the *optional* layer on top — it adds SMS,
+segmentation, and the choice to let your flows deliver instead.
+
+## The one decision per email: who sends it
+
+Every email row on the **Emails** page has a **sender**:
+
+- **Auto** (default) — Klaviyo delivers while a key is connected (your flow
+  renders the ready-made content, below); Cellexia delivers directly
+  otherwise. This is exactly the behavior of every release before v1.17.0.
+- **Cellexia sends it** — the app delivers directly through your SMTP
+  transport (Settings → Email delivery), pixel-identical to the preview.
+  The app then deliberately does NOT fire that email's delivery metric, so
+  a Klaviyo flow on the same metric cannot double-send — but switch the
+  flow's email off anyway if one exists, for clarity.
+- **Klaviyo flow only** — only the event is fired; if no key is configured
+  the send is logged SUPPRESSED rather than silently rerouted.
+
+The state-change **confirmations** (skip, delay, pause, resume, unskip,
+swap, frequency change, cancel) default to your Klaviyo flows as they
+always have. Flip their sender to "Cellexia" and the app sends them itself
+on the state-change event — no flow needed, same copy editor and preview
+as every other email.
+
+**Klaviyo flows own delivery, branding and consent** for every email you
+leave on Auto/Klaviyo; the app supplies the metrics, the properties, and —
+crucially — signed one-tap **magic-link URLs** so every email/SMS can carry
+"Skip", "Delay", "Update card" buttons that work with zero login.
 
 **In-app content (v1.16.0, admin → Emails).** Every EMAIL-channel
-notification event now also carries three READY-RENDERED properties —
+notification event also carries three READY-RENDERED properties —
 `content_subject`, `content_html`, `content_text` — holding the copy
 configured on the app's **Emails** tab (or the built-in copy when nothing is
 customized), with every placeholder already substituted (one-tap links
-included). Build a flow email whose subject is
+included) and, since v1.17.0, the Emails → Design brand kit applied. Build
+a flow email whose subject is
 `{{ event.content_subject }}` and whose body is a single custom-HTML block
 `{{ event.content_html }}` and the flow always sends exactly what the
-Emails tab shows — no flow edit needed when the copy changes. The SMS event
-(`payment_failed_sms`) carries `content_text` only, and the auto-mapped
-state-change metrics (§2's first table — skip/pause/cancel confirmations
-and the like) carry no content properties at all: their copy lives in your
-flow, exactly as before. Flows that compose their own design from the raw
-properties keep working unchanged. The Emails tab also owns per-template
+Emails tab previews — no flow edit needed when the copy or design changes.
+The SMS event (`payment_failed_sms`) carries `content_text` only, and the
+auto-mapped state-change metrics (§2's first table) carry no content
+properties: for those moments, either your flow owns the copy (default) or
+you flip the confirmation's sender to "Cellexia" and the app sends the
+previewed email itself. Flows that compose their own design from the raw
+properties keep working unchanged. The Emails pages also own per-template
 enable/disable and every send-timing knob (reminder lead time, dunning
-ladder days, win-back offsets), so timing changes no longer need a matching
+ladder days, win-back offsets), so timing changes never need a matching
 flow edit as long as your flows send immediately on the metric.
 
 Direct SMTP is used only for mail that must never depend on Klaviyo:
-OTP login codes, 3DS action requests, admin alerts and import summaries.
+OTP login codes, 3DS action requests, admin alerts and import summaries —
+plus every email whose sender is "Cellexia" (or "Auto" without a key).
 
 ---
 

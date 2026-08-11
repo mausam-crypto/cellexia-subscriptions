@@ -53,14 +53,20 @@ export interface EmailCatalogEntry {
   /** Whether the merchant may disable it (critical templates: never). */
   disableable: boolean;
   /**
-   * True for the confirmation moments the router never sends itself: their
-   * customer email comes from the Klaviyo flow on the state-change metric
-   * the event log fires automatically (cycle.skipped → "Cellexia Order
-   * Skipped", …). Content, timing and on/off live in that flow — an in-app
-   * override could never reach it, so the Emails tab shows these read-only
-   * instead of dead controls.
+   * Confirmation moments (v1.17.0): the internal event type whose logging
+   * triggers this template. Historically these were flow-owned — the event
+   * log fires the canonical state-change metric and the merchant's Klaviyo
+   * flow sends the email; that remains the default. When the merchant flips
+   * the template's sender to "app" on the Emails page, the confirmation
+   * bridge (confirmations.server.ts) sends it directly on this event, with
+   * the in-app copy and full preview. Absent = router-sent or system mail.
    */
-  flowOwned?: boolean;
+  confirmationEvent?: string;
+  /**
+   * Declared for future use — no code path fires this template today, so
+   * the Emails page shows it read-only instead of dead controls.
+   */
+  dormant?: boolean;
   group: "reminders" | "orders" | "payments" | "lifecycle" | "winback" | "system";
 }
 
@@ -138,121 +144,116 @@ export const EMAIL_CATALOG: Record<TemplateKey, Omit<EmailCatalogEntry, "templat
   skip_confirmed: {
     title: "Skip confirmed",
     trigger:
-      'The customer skipped their next order (portal, email link or SMS) — your Klaviyo flow on the state-change metric sends the confirmation.',
-    sentBy: 'your Klaviyo flow (cycle.skipped metric) — copy and on/off live in the flow',
+      "The customer skipped their next order (portal, email link or SMS).",
+    sentBy: "confirmation bridge on cycle.skipped (or your Klaviyo flow)",
     timing: null,
-    links: [],
-    customizable: false,
-    disableable: false,
-    flowOwned: true,
+    links: PORTAL_ONLY,
+    customizable: true,
+    disableable: true,
+    confirmationEvent: "cycle.skipped",
     group: "orders",
   },
   unskip_confirmed: {
     title: "Unskip confirmed",
-    trigger:
-      'The customer restored a previously skipped order — your Klaviyo flow on the state-change metric sends the confirmation.',
-    sentBy: 'your Klaviyo flow (cycle.unskipped metric) — copy and on/off live in the flow',
+    trigger: "The customer restored a previously skipped order.",
+    sentBy: "confirmation bridge on cycle.unskipped (or your Klaviyo flow)",
     timing: null,
-    links: [],
-    customizable: false,
-    disableable: false,
-    flowOwned: true,
+    links: PORTAL_ONLY,
+    customizable: true,
+    disableable: true,
+    confirmationEvent: "cycle.unskipped",
     group: "orders",
   },
   delay_confirmed: {
     title: "Delay confirmed",
-    trigger:
-      'The customer delayed their next order — your Klaviyo flow on the state-change metric sends the confirmation.',
-    sentBy: 'your Klaviyo flow (cycle.delayed metric) — copy and on/off live in the flow',
+    trigger: "The customer delayed their next order.",
+    sentBy: "confirmation bridge on cycle.delayed (or your Klaviyo flow)",
     timing: null,
-    links: [],
-    customizable: false,
-    disableable: false,
-    flowOwned: true,
+    links: PORTAL_ONLY,
+    customizable: true,
+    disableable: true,
+    confirmationEvent: "cycle.delayed",
     group: "orders",
   },
   pause_confirmed: {
     title: "Pause confirmed",
-    trigger:
-      'The subscription was paused — your Klaviyo flow on the state-change metric sends the confirmation.',
-    sentBy: 'your Klaviyo flow (contract.paused metric) — copy and on/off live in the flow',
+    trigger: "The subscription was paused.",
+    sentBy: "confirmation bridge on contract.paused (or your Klaviyo flow)",
     timing: null,
-    links: [],
-    customizable: false,
-    disableable: false,
-    flowOwned: true,
+    links: PORTAL_ONLY,
+    customizable: true,
+    disableable: true,
+    confirmationEvent: "contract.paused",
     group: "orders",
   },
   resume_confirmed: {
     title: "Resume confirmed",
-    trigger:
-      'The subscription resumed (customer action or auto-resume) — your Klaviyo flow on the state-change metric sends the confirmation.',
-    sentBy: 'your Klaviyo flow (contract.resumed metric) — copy and on/off live in the flow',
+    trigger: "The subscription resumed (customer action or auto-resume).",
+    sentBy: "confirmation bridge on contract.resumed (or your Klaviyo flow)",
     timing: null,
-    links: [],
-    customizable: false,
-    disableable: false,
-    flowOwned: true,
+    links: PORTAL_ONLY,
+    customizable: true,
+    disableable: true,
+    confirmationEvent: "contract.resumed",
     group: "orders",
   },
   swap_confirmed: {
     title: "Product swap confirmed",
-    trigger:
-      'The customer swapped a product variant — your Klaviyo flow on the state-change metric sends the confirmation.',
-    sentBy: 'your Klaviyo flow (contract.line_swapped metric) — copy and on/off live in the flow',
+    trigger: "The customer swapped a product variant.",
+    sentBy:
+      "confirmation bridge on contract.line_swapped (or your Klaviyo flow)",
     timing: null,
-    links: [],
-    customizable: false,
-    disableable: false,
-    flowOwned: true,
+    links: PORTAL_ONLY,
+    customizable: true,
+    disableable: true,
+    confirmationEvent: "contract.line_swapped",
     group: "orders",
   },
   frequency_changed: {
     title: "Frequency change confirmed",
-    trigger:
-      'The customer changed their delivery frequency — your Klaviyo flow on the state-change metric sends the confirmation.',
-    sentBy: 'your Klaviyo flow (contract.frequency_changed metric) — copy and on/off live in the flow',
+    trigger: "The customer changed their delivery frequency.",
+    sentBy:
+      "confirmation bridge on contract.frequency_changed (or your Klaviyo flow)",
     timing: null,
-    links: [],
-    customizable: false,
-    disableable: false,
-    flowOwned: true,
+    links: PORTAL_ONLY,
+    customizable: true,
+    disableable: true,
+    confirmationEvent: "contract.frequency_changed",
     group: "orders",
   },
   quantity_changed: {
     title: "Quantity change confirmed",
     trigger:
-      "The customer changed a line's quantity. No metric fires for this moment today — the template is declared for future use only.",
-    sentBy: 'nothing today (declared for future use)',
+      "The customer changed a line's quantity. No event fires for this moment today — the template is declared for future use only.",
+    sentBy: "nothing today (declared for future use)",
     timing: null,
     links: [],
     customizable: false,
     disableable: false,
-    flowOwned: true,
+    dormant: true,
     group: "orders",
   },
   address_updated: {
     title: "Address updated",
     trigger:
-      'The delivery address changed. No metric fires for this moment today — the template is declared for future use only.',
-    sentBy: 'nothing today (declared for future use)',
+      "The delivery address changed. No event fires for this moment today — the template is declared for future use only.",
+    sentBy: "nothing today (declared for future use)",
     timing: null,
     links: [],
     customizable: false,
     disableable: false,
-    flowOwned: true,
+    dormant: true,
     group: "orders",
   },
   cancel_confirmed: {
     title: "Cancellation confirmed",
-    trigger:
-      'The subscription was cancelled — your Klaviyo flow on the state-change metric sends the confirmation.',
-    sentBy: 'your Klaviyo flow (contract.cancelled metric) — copy and on/off live in the flow',
+    trigger: "The subscription was cancelled.",
+    sentBy: "confirmation bridge on contract.cancelled (or your Klaviyo flow)",
     timing: null,
-    links: [],
-    customizable: false,
-    disableable: false,
-    flowOwned: true,
+    links: PORTAL_ONLY,
+    customizable: true,
+    disableable: true,
+    confirmationEvent: "contract.cancelled",
     group: "orders",
   },
   payment_method_updated: {

@@ -1,4 +1,10 @@
 import { t } from "~/lib/i18n/i18n.server";
+import {
+  DEFAULT_EMAIL_DESIGN,
+  formatEmailBody,
+  renderEmailShell,
+  type EmailDesign,
+} from "./format";
 
 /**
  * Notification template registry.
@@ -276,15 +282,6 @@ export function interpolateVars(text: string, vars: TemplateVars): string {
   });
 }
 
-function escapeHtml(s: string): string {
-  return s
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
-
 function humanize(template: string): string {
   const words = template.replaceAll("_", " ");
   return words.charAt(0).toUpperCase() + words.slice(1);
@@ -294,9 +291,12 @@ function humanize(template: string): string {
  * Renders a branded transactional email for direct SMTP delivery.
  * Subject/body copy comes from the merchant's override (the `emails`
  * setting, non-empty values only — v1.16.0) or the i18n catalog at
- * `email.{template}.subject` / `email.{template}.body`; `\n` becomes `<br>`
- * and a single `{cta}` placeholder (or, failing that, the end of the body)
- * receives a button built from `vars.cta_url` / `vars.cta_label`.
+ * `email.{template}.subject` / `email.{template}.body`. Since v1.17.0 the
+ * body supports the markdown-lite formatting vocabulary and the shell is
+ * driven by the merchant's brand kit (the `emailDesign` setting; defaults
+ * render the historical shell) — both via ./format. A single `{cta}`
+ * placeholder (or, failing that, the end of the body) receives a button
+ * built from `vars.cta_url` / `vars.cta_label`.
  *
  * If catalog keys are missing (locale files not yet shipped) it degrades to a
  * generic subject and a plain listing of the variables, so critical mail
@@ -312,6 +312,7 @@ export function renderEmail(
   locale: string | null | undefined,
   vars: TemplateVars = {},
   override?: EmailContentOverride | null,
+  design: EmailDesign = DEFAULT_EMAIL_DESIGN,
 ): RenderedEmail {
   const def = TEMPLATES[template];
   const subjectKey = `${def.i18nKey}.subject`;
@@ -342,45 +343,11 @@ export function renderEmail(
       ? vars.cta_label
       : "Manage subscription";
 
-  const button = ctaUrl
-    ? `<table role="presentation" cellpadding="0" cellspacing="0" style="margin:28px 0 8px;"><tr><td style="border-radius:6px;background:#1a1a1a;"><a href="${escapeHtml(ctaUrl)}" style="display:inline-block;padding:13px 28px;font-family:Georgia,'Times New Roman',serif;font-size:15px;color:#faf8f5;text-decoration:none;letter-spacing:0.02em;">${escapeHtml(ctaLabel)}</a></td></tr></table>`
-    : "";
+  const body = formatEmailBody(bodyText, { design, ctaUrl, ctaLabel });
 
-  // Escape first, then re-introduce structural HTML (<br> and the button).
-  let bodyHtml = escapeHtml(bodyText).replaceAll("\n", "<br>");
-  if (bodyHtml.includes("{cta}")) {
-    bodyHtml = bodyHtml.replace("{cta}", button);
-  } else if (button) {
-    bodyHtml = `${bodyHtml}${button}`;
-  }
-
-  // Plain-text twin: the {cta} slot becomes "label: url" (or disappears).
-  const ctaText = ctaUrl ? `${ctaLabel}: ${ctaUrl}` : "";
-  const text = bodyText.includes("{cta}")
-    ? bodyText.replace("{cta}", ctaText).trim()
-    : ctaText
-      ? `${bodyText}\n\n${ctaText}`
-      : bodyText;
-
-  const html = `<div style="margin:0;padding:0;background:#faf8f5;">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#faf8f5;">
-    <tr>
-      <td align="center" style="padding:32px 16px;">
-        <table role="presentation" width="560" cellpadding="0" cellspacing="0" style="width:100%;max-width:560px;">
-          <tr>
-            <td align="center" style="padding:8px 0 28px;font-family:Georgia,'Times New Roman',serif;font-size:22px;letter-spacing:0.35em;color:#1a1a1a;">C E L L E X I A</td>
-          </tr>
-          <tr>
-            <td style="background:#ffffff;border:1px solid #ece7df;border-radius:8px;padding:36px 40px;font-family:Georgia,'Times New Roman',serif;font-size:16px;line-height:1.65;color:#1a1a1a;">${bodyHtml}</td>
-          </tr>
-          <tr>
-            <td align="center" style="padding:24px 8px 0;font-family:Georgia,'Times New Roman',serif;font-size:12px;line-height:1.6;color:#8a837a;">Cellexia — skincare that keeps its promises.<br>You are receiving this email about your Cellexia subscription.</td>
-          </tr>
-        </table>
-      </td>
-    </tr>
-  </table>
-</div>`;
-
-  return { subject, html, text };
+  return {
+    subject,
+    html: renderEmailShell(body.html, design),
+    text: body.text,
+  };
 }

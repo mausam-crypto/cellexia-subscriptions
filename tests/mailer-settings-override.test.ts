@@ -110,6 +110,12 @@ describe("settings-configured SMTP delivers", () => {
       port: 2525,
       secure: false,
       auth: { user: "settings-user", pass: "settings-pass" },
+      // v1.17.0 fail-fast timeouts: sends can originate from portal
+      // actions and webhook handlers (confirmation bridge) — a hung relay
+      // must fail in seconds, not nodemailer's multi-minute defaults.
+      connectionTimeout: 10_000,
+      greetingTimeout: 10_000,
+      socketTimeout: 30_000,
     });
     expect(transport.sendMail).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -149,6 +155,9 @@ describe("settings-configured SMTP delivers", () => {
       port: 465,
       secure: true, // auto + port 465
       auth: { user: "env-user", pass: "env-pass" },
+      connectionTimeout: 10_000,
+      greetingTimeout: 10_000,
+      socketTimeout: 30_000,
     });
     expect(transport.sendMail).toHaveBeenCalledWith(
       expect.objectContaining({ from: "Env <env@cellexia.com>" }),

@@ -242,7 +242,11 @@ describe("renderEmail with merchant overrides", () => {
       },
     );
     expect(rendered.subject).toBe("Coming 12 Aug!");
-    expect(rendered.html).toContain("One click: https://magic/delay1w");
+    // v1.17.0: bare URLs in the body are auto-linked in the HTML shape —
+    // the substituted link must appear as a real anchor, and verbatim in
+    // the plain-text twin.
+    expect(rendered.html).toContain("One click: ");
+    expect(rendered.html).toContain('href="https://magic/delay1w"');
     expect(rendered.text).toContain("One click: https://magic/delay1w");
   });
 
@@ -313,8 +317,12 @@ describe("sendNotification — per-template controls (v1.16.0)", () => {
     expect(result.status).toBe("SENT");
     const properties = (store.outbox[0] as { properties: Row }).properties;
     expect(properties.content_subject).toBe("Your Cellexia box — 12 Aug");
+    // v1.17.0: the substituted magic link is auto-linked in content_html.
     expect(String(properties.content_html)).toContain(
-      "Push it back a week in one click: https://magic/delay1w",
+      "Push it back a week in one click: ",
+    );
+    expect(String(properties.content_html)).toContain(
+      'href="https://magic/delay1w"',
     );
     expect(String(properties.content_text)).toContain("https://magic/delay1w");
     // The one-tap links still travel as their own properties for flows that

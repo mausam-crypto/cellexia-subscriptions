@@ -4,7 +4,117 @@ All notable changes to Cellexia Subscriptions. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [SemVer](https://semver.org) as contracted in [docs/UPDATE.md](docs/UPDATE.md).
 
-## [1.16.0] — 2026-08-11
+## [1.17.0] — 2026-08-11
+
+**Email studio** — the Emails tab grows into a full email management
+surface: every message now has a **live rendered preview** (desktop/mobile,
+any language, plus a plain-text view), a **test send** to your own inbox,
+**formatting** in the body editor (bold, italic, links, buttons, headings,
+lists, quotes, dividers — bare links become clickable automatically), and a
+shop-wide **brand kit** (Design tab: wordmark or logo, fonts, colors,
+footer) that styles every email the app renders — direct sends and the
+`content_html` your Klaviyo flows carry alike. The confusing "flow-owned"
+split is replaced by one explicit, per-email **sender** choice: *Auto* (the
+pre-1.17.0 behavior — Klaviyo delivers while connected, Cellexia otherwise),
+*Cellexia sends it* (direct delivery, exactly as previewed; the delivery
+metric is not enqueued so a flow cannot double-send), or *Klaviyo flow only*
+(suppressed honestly when no key is configured, never silently rerouted).
+The skip/delay/pause/cancel/swap/frequency/resume/unskip **confirmation
+emails can now be sent by the app itself** — flip their sender to
+"Cellexia" and a new confirmation bridge sends them on the state-change
+event, with the same ownership/demo/launch gates as every other send and a
+10-minute per-contract dedupe; by default they stay with your Klaviyo flows
+exactly as before. **No migration**, no new env vars, no scope, webhook or
+theme changes, `npm run deploy` NOT required. Rollback-safe: the new
+settings key (`emailDesign`) and the new per-template fields (`sender`)
+simply go unread by older code. A shop that never opens the new surfaces
+keeps its copy, shell design and delivery routing unchanged — the only
+rendering differences on upgrade are the deliberate markup improvements
+listed under Changed/Fixed (real paragraph markup, auto-linked one-tap
+links). One rollback caveat: if you set any email's sender to "Cellexia
+sends it" and switched off the matching Klaviyo flow email as the editor
+advises, re-enable those flow emails when rolling back to v1.16.0 — older
+code reverts those templates to Klaviyo delivery, and with the flow off
+they would stop silently (the app still logs SENT because Klaviyo accepts
+the event, so nothing retries).
+
+### Added
+
+- **Per-email editor** (`/app/emails/:template`): subject + formatted body
+  with a toolbar and click-to-insert placeholder chips (each chip's tooltip
+  shows its sample value), a **live preview** rendered by the REAL send
+  pipeline on sample data (never a lookalike), desktop/mobile widths, a
+  language selector covering every portal locale, a plain-text view, and
+  **Send test** (uses the configured SMTP transport; every link in a test
+  points at example.com, so nothing in a test email can touch a real
+  subscription — and no magic token is ever minted for a preview).
+- **Formatting** (`app/lib/notifications/format.ts`, isomorphic): a
+  conservative markdown-lite vocabulary — `**bold**`, `*italic*`,
+  `[label](url)`, `[button:Label](url)`, `## headings`, `- lists`,
+  `> quotes`, `---` dividers, auto-linked bare URLs, `{cta}` slot semantics
+  preserved from v1.16.0. Escape-before-structure throughout; link and
+  button hrefs are protocol-allow-listed (http/https/mailto) so merchant
+  copy can never inject HTML or a `javascript:` URL. Existing plain-text
+  bodies render at least as well without edits (their bare one-tap link
+  lines become real links).
+- **Brand kit** (Emails → Design, new `emailDesign` setting): header
+  wordmark/logo/none, serif or sans font stack, page/card/border/text/
+  muted/link/button colors, footer lines — with a live preview and one-click
+  reset. Defaults reproduce the historical shell, so an untouched shop's
+  emails do not change.
+- **Sender choice** (`emails.templates[key].sender`: `auto` | `app` |
+  `klaviyo`, default `auto`): who delivers each email, per template, with
+  plain-language explanations and warnings in the editor (e.g. "switch off
+  the flow email before flipping to Cellexia"). SMS templates keep Klaviyo
+  (no SMTP transport exists for SMS); critical templates keep their
+  unconditional direct-SMTP copy under every sender value.
+- **Confirmation bridge**
+  (`app/lib/notifications/confirmations.server.ts`, called by
+  `logEvent()`): sends the eight state-change confirmations app-side when
+  their sender is `app`. Event → template map pinned by tests; contained
+  (never throws into a billing operation); 10-minute per-contract+template
+  dedupe absorbs double-logged moments.
+- **Emails overview** rebuilt: journey-grouped catalog with a "Sent by"
+  column resolving the effective sender, a three-question explainer (what /
+  who / when), and the Klaviyo metric list reframed as an advanced,
+  collapsed "event feed" — flows are an option, not a requirement, and the
+  page finally says so.
+- Tests: `email-format.test.ts` (escaping, href allow-list, vocabulary,
+  {cta}, brand kit), `email-sender-model.test.ts` (the full sender matrix
+  incl. honest suppression and design-in-content), 
+  `email-confirmations.test.ts` (mapping, gating, dedupe, containment,
+  logEvent integration), `email-preview.test.ts` (EVERY template renders
+  placeholder-free from sample data; sample links stay on example.com).
+
+### Changed
+
+- `renderEmail()` renders through the new formatting pipeline and accepts
+  the brand-kit design (defaults = historical shell). The HTML uses real
+  paragraphs/lists instead of raw `<br>` runs; Klaviyo flows built as
+  `{{ event.content_html }}` pick the new markup up automatically.
+- The Emails tab's edit modal is replaced by the per-template editor page;
+  timing knobs are edited there through the same schema-validated, audited
+  settings pipeline as before (still owned by their original settings
+  groups — nothing forked).
+- Catalog metadata: the former `flowOwned` flag is replaced by
+  `confirmationEvent` (which internal event triggers the moment) and
+  `dormant` (declared-for-future templates: quantity_changed,
+  address_updated). Confirmation templates are now customizable,
+  disableable and previewable.
+
+### Fixed
+
+- Bare one-tap link lines in built-in email bodies (e.g. "Skip this order:
+  {skip_url}") now render as clickable links in the HTML shape instead of
+  relying on the mail client's URL detection.
+
+### Migration notes
+
+None. `npx prisma migrate deploy` is a no-op. No `.env` changes. The new
+`emailDesign` settings key and the `sender` field default to the exact
+pre-upgrade behavior; delivery routing and copy are unchanged until you
+change them in the admin (the HTML markup improvements under Changed/Fixed
+apply to all emails on upgrade).
 
 **Emails tab + analytics data accuracy (merchant-decided defaults)** — a new
 admin **Emails** tab lists every message the app sends and customizes its

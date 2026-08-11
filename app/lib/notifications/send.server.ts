@@ -19,6 +19,11 @@ import {
   type TemplateKey,
   type TemplateVars,
 } from "./templates.server";
+import {
+  DEFAULT_EMAIL_DESIGN,
+  normalizeEmailDesign,
+  type EmailDesign,
+} from "./format";
 import { EMAIL_CATALOG } from "./catalog.server";
 import { sendEmail } from "./mailer.server";
 import { isBillableOwnership } from "~/lib/ownership/ownership.server";
@@ -293,13 +298,22 @@ export async function sendNotification(
     // ── Per-template overrides (v1.16.0, admin Emails tab) ──────────────────
     // enabled:false suppresses like a channel toggle (critical templates
     // bypass, same rule); non-empty subject/body replace the built-in copy in
-    // the rendering below. Failure-contained: a broken settings read must
-    // never block a send — overrides just don't apply.
+    // the rendering below; `sender` (v1.17.0) picks who delivers. Failure-
+    // contained: a broken settings read must never block a send — overrides
+    // just don't apply and the sender stays "auto".
     let contentOverride: EmailContentOverride | null = null;
+    let senderPref: "auto" | "app" | "klaviyo" = "auto";
     try {
       const emailsSettings = await getSetting(input.shopId, "emails");
       const override = emailsSettings.templates[input.template];
       if (override) {
+        if (
+          override.sender === "app" ||
+          override.sender === "klaviyo" ||
+          override.sender === "auto"
+        ) {
+          senderPref = override.sender;
+        }
         if (!tmpl.critical && override.enabled === false) {
           await writeLog({
             shopId: input.shopId,
@@ -324,6 +338,15 @@ export async function sendNotification(
       }
     } catch (err) {
       console.error("[notifications] emails settings read failed", err);
+    }
+
+    // ── Brand kit (v1.17.0) — failure-contained: defaults render the
+    // historical shell, a broken settings read must never block a send. ─────
+    let design: EmailDesign = DEFAULT_EMAIL_DESIGN;
+    try {
+      design = normalizeEmailDesign(await getSetting(input.shopId, "emailDesign"));
+    } catch (err) {
+      console.error("[notifications] emailDesign settings read failed", err);
     }
 
     // ── Build Klaviyo properties: vars + contract snapshot + action links ───
@@ -382,6 +405,7 @@ export async function sendNotification(
         locale,
         contentVars,
         contentOverride,
+        design,
       );
       properties.content_text = content.text;
       if (tmpl.channel === "EMAIL") {
@@ -428,6 +452,7 @@ export async function sendNotification(
           locale,
           templateVars,
           contentOverride,
+          design,
         );
         await sendEmail({
           shopId: input.shopId,
@@ -461,9 +486,45 @@ export async function sendNotification(
       }
     };
 
-    // ── Primary path: Klaviyo event (never for otp_code) ────────────────────
+    // ── Primary path: who delivers? (v1.17.0 sender model) ─────────────────
+    // "auto" keeps the pre-1.17.0 behavior exactly: Klaviyo event when a key
+    // is configured, direct SMTP otherwise (SMS suppressed honestly).
+    // "app" forces direct SMTP and deliberately skips the delivery-metric
+    // enqueue — a Klaviyo flow on the same metric would double-send; the
+    // canonical state-change events (events-map) keep firing for segments.
+    // "klaviyo" forces the event; without a key the send is SUPPRESSED
+    // (klaviyo_unconfigured), never silently rerouted — an explicit choice
+    // fails visibly, not differently. SMS has no SMTP transport, so "app"
+    // degrades to "auto" there; critical templates always get their direct
+    // SMTP copy from the block below regardless of sender.
     if (tmpl.klaviyoMetric && input.template !== "otp_code") {
-      if (await isKlaviyoConfigured(input.shopId)) {
+      if (senderPref === "app" && tmpl.channel === "EMAIL") {
+        if (!tmpl.critical) {
+          if (email) {
+            await deliverDirectEmail(email);
+          } else {
+            // Phone-only contact: an app-sent email has no reachable
+            // recipient. Log the failure — every send/suppression/failure
+            // lands in NotificationLog (module contract), and without this
+            // row the Emails activity tab would show nothing while the
+            // sweep retries.
+            directError = "sender=app but no email recipient";
+            await writeLog({
+              shopId: input.shopId,
+              contractId: contract?.id,
+              email,
+              phone,
+              channel: "EMAIL",
+              template: input.template,
+              status: "FAILED",
+              klaviyoEventName: tmpl.klaviyoMetric || null,
+              error: directError,
+              payload: { cycleIndex },
+            });
+          }
+        }
+        // Critical: the direct-SMTP block below delivers exactly once.
+      } else if (await isKlaviyoConfigured(input.shopId)) {
         const profileAttrs: Record<string, unknown> = contract
           ? contractProfileAttrs(contract)
           : {};
@@ -525,9 +586,12 @@ export async function sendNotification(
         // to direct SMTP — exactly what the launch checklist promises — and
         // SMS, which has no SMTP equivalent, is SUPPRESSED honestly so ladder
         // cursors advance without pretending delivery happened.
-        if (tmpl.channel === "EMAIL" && email) {
+        if (tmpl.channel === "EMAIL" && email && senderPref !== "klaviyo") {
           await deliverDirectEmail(email);
         } else {
+          // SMS (no SMTP transport exists), or an explicit "klaviyo" sender
+          // choice with no key: suppressed honestly — an explicit choice
+          // fails visibly rather than silently rerouting through SMTP.
           await writeLog({
             shopId: input.shopId,
             contractId: contract?.id,

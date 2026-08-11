@@ -269,6 +269,13 @@ function smtpTransport(config: ResolvedMailConfig): Transporter {
       config.user && config.pass
         ? { user: config.user, pass: config.pass }
         : undefined,
+    // Nodemailer's defaults (2 min connect, 10 min socket) would let one
+    // unreachable relay pin every caller for minutes — since v1.17.0 sends
+    // can originate from portal actions and webhook handlers (confirmation
+    // bridge), a hung transport must fail fast and land as FAILED instead.
+    connectionTimeout: 10_000,
+    greetingTimeout: 10_000,
+    socketTimeout: 30_000,
   });
   global.__cellexiaMailTransport = { key: cacheKey, transport };
   return transport;

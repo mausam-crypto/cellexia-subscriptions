@@ -2,26 +2,32 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs, SerializeFrom } from "@remix-run/node";
 import { json } from "@remix-run/node";
 import {
+  Outlet,
   useActionData,
+  useFetcher,
   useLoaderData,
   useNavigation,
+  useParams,
   useSearchParams,
   useSubmit,
 } from "@remix-run/react";
+import type { ShouldRevalidateFunction } from "@remix-run/react";
 import {
   Badge,
+  Banner,
   BlockStack,
   Box,
-  Banner,
   Button,
+  ButtonGroup,
   Card,
-  Checkbox,
+  Collapsible,
+  InlineGrid,
   InlineStack,
   IndexTable,
   Layout,
   Link as PolarisLink,
-  Modal,
   Page,
+  Select,
   Tabs,
   Text,
   TextField,
@@ -32,47 +38,40 @@ import prisma from "~/db.server";
 import { authenticate } from "~/shopify.server";
 import { getPrimaryShop } from "~/lib/shop/install.server";
 import { getSetting, setSetting } from "~/lib/settings/settings.server";
-import { settingsSchemas, type SettingsKey } from "~/lib/settings/registry.server";
+import { settingsSchemas } from "~/lib/settings/registry.server";
 import { logEvent } from "~/lib/events/log.server";
 import { isKlaviyoConfigured } from "~/lib/klaviyo/client.server";
 import { eventMetricEntries } from "~/lib/klaviyo/events-map.server";
 import { TEMPLATES, isTemplateKey } from "~/lib/notifications/templates.server";
 import {
-  EMAIL_CATALOG,
   emailCatalogEntries,
   type CatalogTiming,
 } from "~/lib/notifications/catalog.server";
+import { renderTemplatePreview } from "~/lib/notifications/preview.server";
+import {
+  DEFAULT_EMAIL_DESIGN,
+  normalizeEmailDesign,
+  type EmailDesign,
+} from "~/lib/notifications/format";
 
 /**
- * Emails tab (v1.16.0) — every message the app sends, in one place:
+ * Emails overview (v1.17.0) — every message the app sends, in one mental
+ * model with three questions the page answers per row:
  *
- * - the catalog (what, when, why), with per-template enable/disable;
- * - in-app content customization (subject/body) delivered THROUGH Klaviyo —
- *   the router renders the copy into `content_subject` / `content_html` /
- *   `content_text` event properties, so a flow email built as
- *   `{{ event.content_html }}` always carries what is written here (and the
- *   direct-SMTP fallback renders the identical copy);
- * - send-timing knobs (reminder lead times, dunning ladder, win-back
- *   offsets) — the SAME settings the Settings page owns, edited through the
- *   same audited pipeline;
- * - the one-click actions each email can carry ({skip_url}, {delay_1w_url},
- *   {delay_3w_url}, {addon_url}, …) — proven churn reducers vs a bare
- *   "manage subscription" link;
- * - the sent log (NotificationLog) for observability.
+ *   WHAT we send — the catalog, grouped by customer journey, each email
+ *   opening a full editor (/app/emails/:template) with formatting, live
+ *   preview and test send;
+ *   WHO sends it — the per-template sender (Cellexia app vs Klaviyo flow,
+ *   "auto" = the historical behavior), replacing the old opaque
+ *   "flow-owned" split;
+ *   WHEN it goes — the timing knobs (owned by the same settings groups the
+ *   Settings page edits, shown inline).
+ *
+ * Plus the Design tab (brand kit driving the shared email shell) and the
+ * Activity tab (NotificationLog sent log).
  */
 
 const LOG_PAGE_SIZE = 100;
-
-/** Variables available to every customized body, shown in the editor help. */
-const COMMON_PLACEHOLDERS = [
-  "{portal_url}",
-  "{first_name}",
-  "{total_estimate}",
-  "{next_date}",
-  "{items_summary}",
-  "{frequency}",
-  "{cta}",
-] as const;
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   await authenticate.admin(request);
@@ -87,6 +86,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   const [
     emails,
+    emailDesign,
     notifications,
     dunning,
     pause,
@@ -98,6 +98,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     logRows,
   ] = await Promise.all([
     getSetting(shop.id, "emails"),
+    getSetting(shop.id, "emailDesign"),
     getSetting(shop.id, "notifications"),
     getSetting(shop.id, "dunning"),
     getSetting(shop.id, "pause"),
@@ -111,7 +112,14 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       _count: { _all: true },
     }),
     prisma.notificationLog.findMany({
-      where: { shopId: shop.id, ...(logTemplate ? { template: logTemplate } : {}) },
+      where: {
+        shopId: shop.id,
+        // CLAIMED rows are transient confirmation-bridge claim markers
+        // (confirmations.server.ts), not sends — deleted after delivery,
+        // and never shown even if a crash strands one.
+        status: { not: "CLAIMED" },
+        ...(logTemplate ? { template: logTemplate } : {}),
+      },
       orderBy: { createdAt: "desc" },
       take: LOG_PAGE_SIZE,
       select: {
@@ -128,8 +136,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }),
   ]);
 
-  // Current timing values resolve off the loaded groups; all catalog timing
-  // paths are flat keys of their group (see catalog.server.ts).
   const groups: Record<string, Record<string, unknown>> = {
     notifications: notifications as unknown as Record<string, unknown>,
     dunning: dunning as unknown as Record<string, unknown>,
@@ -163,11 +169,20 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       channel: TEMPLATES[entry.template].channel,
       critical: TEMPLATES[entry.template].critical,
       enabled: override?.enabled !== false,
-      subject: override?.subject ?? "",
-      body: override?.body ?? "",
+      customized: Boolean(override?.subject || override?.body),
+      sender: (override?.sender ?? "auto") as "auto" | "app" | "klaviyo",
       timingValue: timingValue(entry.timing),
       sentCount: sentCount.get(entry.template) ?? 0,
     };
+  });
+
+  // Initial Design-tab preview: the saved design over the flagship email.
+  const designPreview = await renderTemplatePreview({
+    template: "upcoming_order",
+    locale: "en",
+    subject: emails.templates.upcoming_order?.subject ?? "",
+    body: emails.templates.upcoming_order?.body ?? "",
+    shopId: shop.id,
   });
 
   return json({
@@ -176,19 +191,17 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     klaviyoConfigured,
     logRows,
     logTemplate,
+    design: normalizeEmailDesign(emailDesign),
+    designPreviewHtml: designPreview.html,
   });
 };
-
-type LoaderData = SerializeFrom<typeof loader>;
-type EmailEntry = LoaderData["entries"][number];
 
 interface ActionData {
   intent: string;
   ok: boolean;
-  /** Template the submission was for — scopes validation errors to it. */
-  template?: string;
   toast?: string;
   errors?: Record<string, string>;
+  previewHtml?: string;
 }
 
 function actorFromSession(session: {
@@ -198,6 +211,28 @@ function actorFromSession(session: {
   return (
     session.onlineAccessInfo?.associated_user?.email ?? `admin@${session.shop}`
   );
+}
+
+/** Parses the posted brand-kit draft into a full EmailDesign candidate. */
+function designFromForm(formData: FormData): Record<string, unknown> {
+  const value = (name: string): string => String(formData.get(`design_${name}`) ?? "");
+  return {
+    headerStyle: value("headerStyle"),
+    wordmark: value("wordmark"),
+    logoUrl: value("logoUrl").trim(),
+    logoWidth: Number(value("logoWidth") || DEFAULT_EMAIL_DESIGN.logoWidth),
+    fontFamily: value("fontFamily"),
+    backgroundColor: value("backgroundColor").trim(),
+    cardBackground: value("cardBackground").trim(),
+    cardBorderColor: value("cardBorderColor").trim(),
+    textColor: value("textColor").trim(),
+    mutedColor: value("mutedColor").trim(),
+    linkColor: value("linkColor").trim(),
+    buttonColor: value("buttonColor").trim(),
+    buttonTextColor: value("buttonTextColor").trim(),
+    footerText: value("footerText"),
+    footerNote: value("footerNote"),
+  };
 }
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -210,157 +245,67 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const formData = await request.formData();
   const intent = String(formData.get("intent") ?? "");
 
-  if (intent !== "save-template") {
-    return json<ActionData>({ intent, ok: false, toast: "Unknown action" }, { status: 400 });
+  // ── Design-tab live preview (no persistence) ─────────────────────────────
+  if (intent === "preview-design") {
+    const emails = await getSetting(shop.id, "emails");
+    const preview = await renderTemplatePreview({
+      template: "upcoming_order",
+      locale: "en",
+      subject: emails.templates.upcoming_order?.subject ?? "",
+      body: emails.templates.upcoming_order?.body ?? "",
+      design: normalizeEmailDesign(designFromForm(formData)),
+    });
+    return json<ActionData>({ intent, ok: true, previewHtml: preview.html });
   }
 
-  const template = String(formData.get("template") ?? "");
-  if (!isTemplateKey(template)) {
-    return json<ActionData>(
-      { intent, ok: false, toast: "Unknown email template" },
-      { status: 400 },
-    );
-  }
-  const catalog = EMAIL_CATALOG[template];
-  if (catalog.flowOwned) {
-    return json<ActionData>(
-      {
-        intent,
-        ok: false,
-        template,
-        toast: "This message is owned by your Klaviyo flow",
-      },
-      { status: 400 },
-    );
-  }
-
-  const errors: Record<string, string> = {};
-
-  // ── 1. Content + enabled → the `emails` setting ─────────────────────────
-  const subject = String(formData.get("subject") ?? "").trim();
-  const body = String(formData.get("body") ?? "").trim();
-  const enabledRaw = String(formData.get("enabled") ?? "true");
-  const enabled = catalog.disableable ? enabledRaw === "true" : true;
-  if (!catalog.customizable && (subject !== "" || body !== "")) {
-    errors.subject = "This system email keeps its built-in content";
-  }
-  if (subject.length > 300) errors.subject = "Keep the subject under 300 characters";
-  if (body.length > 10_000) errors.body = "Keep the body under 10 000 characters";
-
-  // ── 2. Timing → the owning settings group, schema-validated ─────────────
-  const timing = catalog.timing;
-  const timingRaw = String(formData.get("timing") ?? "").trim();
-  let timingChange: {
-    key: SettingsKey;
-    value: Record<string, unknown>;
-    previous: unknown;
-  } | null = null;
-  if (timing && timingRaw !== "") {
-    const previousGroup = await getSetting(shop.id, timing.settingsKey);
-    const candidate = JSON.parse(JSON.stringify(previousGroup)) as Record<
-      string,
-      unknown
-    >;
-    if (timing.kind === "intList") {
-      const parts = timingRaw.split(/[,\s]+/).filter(Boolean);
-      const values = parts.map((p) => Number(p));
-      if (values.some((v) => !Number.isInteger(v))) {
-        errors.timing = "Use whole numbers separated by commas";
-      } else {
-        candidate[timing.path] = values;
-      }
-    } else {
-      const value = Number(timingRaw);
-      if (!Number.isInteger(value)) {
-        errors.timing = "Use a whole number";
-      } else {
-        candidate[timing.path] = value;
-      }
+  if (intent === "save-design" || intent === "reset-design") {
+    const candidate =
+      intent === "reset-design"
+        ? (DEFAULT_EMAIL_DESIGN as unknown as Record<string, unknown>)
+        : designFromForm(formData);
+    const parsed = settingsSchemas.emailDesign.safeParse(candidate);
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0];
+      return json<ActionData>(
+        {
+          intent,
+          ok: false,
+          toast: `${issue?.path.join(".") ?? "design"}: ${issue?.message ?? "invalid value"}`,
+        },
+        { status: 422 },
+      );
     }
-    if (!errors.timing) {
-      const parsed = settingsSchemas[timing.settingsKey].safeParse(candidate);
-      if (!parsed.success) {
-        errors.timing =
-          parsed.error.issues[0]?.message ?? "Invalid timing value";
-      } else {
-        timingChange = {
-          key: timing.settingsKey,
-          value: parsed.data as Record<string, unknown>,
-          previous: previousGroup,
-        };
-      }
+    const previous = await getSetting(shop.id, "emailDesign");
+    if (JSON.stringify(parsed.data) !== JSON.stringify(previous)) {
+      await setSetting(shop.id, "emailDesign", parsed.data, actor);
+      await logEvent({
+        shopId: shop.id,
+        type: "admin.action",
+        source: "ADMIN",
+        actor,
+        payload: {
+          action: "settings_updated",
+          key: "emailDesign",
+          value: parsed.data,
+          previous,
+        },
+      });
     }
-  }
-
-  if (Object.keys(errors).length > 0) {
-    return json<ActionData>(
-      { intent, ok: false, template, errors },
-      { status: 422 },
-    );
-  }
-
-  // Persist the emails setting (read previous BEFORE the write — the
-  // settings_updated audit contract carries both sides). No-op saves are
-  // skipped entirely: the audit log is append-only and one settings_updated
-  // event should mean one real change, not every modal round-trip.
-  const previousEmails = await getSetting(shop.id, "emails");
-  const nextTemplates = { ...previousEmails.templates };
-  if (enabled && subject === "" && body === "") {
-    // Fully default again — drop the row instead of storing an empty husk.
-    delete nextTemplates[template];
-  } else {
-    nextTemplates[template] = { enabled, subject, body };
-  }
-  const nextEmails = { templates: nextTemplates };
-  if (JSON.stringify(nextEmails) !== JSON.stringify(previousEmails)) {
-    await setSetting(shop.id, "emails", nextEmails, actor);
-    await logEvent({
-      shopId: shop.id,
-      type: "admin.action",
-      source: "ADMIN",
-      actor,
-      payload: {
-        action: "settings_updated",
-        key: "emails",
-        value: nextEmails,
-        previous: previousEmails,
-      },
+    return json<ActionData>({
+      intent,
+      ok: true,
+      toast:
+        intent === "reset-design" ? "Design reset to defaults" : "Email design saved",
     });
   }
 
-  if (
-    timingChange &&
-    JSON.stringify(timingChange.value) !== JSON.stringify(timingChange.previous)
-  ) {
-    await setSetting(
-      shop.id,
-      timingChange.key,
-      timingChange.value as never,
-      actor,
-    );
-    await logEvent({
-      shopId: shop.id,
-      type: "admin.action",
-      source: "ADMIN",
-      actor,
-      payload: {
-        action: "settings_updated",
-        key: timingChange.key,
-        value: timingChange.value,
-        previous: timingChange.previous,
-      },
-    });
-  }
-
-  return json<ActionData>({
-    intent,
-    ok: true,
-    template,
-    toast: `${catalog.title} saved`,
-  });
+  return json<ActionData>({ intent, ok: false, toast: "Unknown action" }, { status: 400 });
 };
 
 // ── UI ───────────────────────────────────────────────────────────────────────
+
+type LoaderData = SerializeFrom<typeof loader>;
+type EmailEntry = LoaderData["entries"][number];
 
 const GROUP_LABELS: Record<EmailEntry["group"], string> = {
   reminders: "Reminders",
@@ -378,56 +323,59 @@ const STATUS_TONE: Record<string, "success" | "critical" | "warning" | undefined
     SUPPRESSED: "warning",
   };
 
+function senderBadge(
+  entry: EmailEntry,
+  klaviyoConfigured: boolean,
+): { label: string; tone?: "success" | "info" } {
+  if (entry.dormant) return { label: "—" };
+  if (!entry.metric) return { label: "Cellexia" };
+  if (entry.channel === "SMS") return { label: "Klaviyo flow" };
+  if (entry.critical) {
+    return entry.sender === "app"
+      ? { label: "Cellexia", tone: "success" }
+      : { label: "Cellexia + Klaviyo" };
+  }
+  if (entry.confirmationEvent) {
+    return entry.sender === "app"
+      ? { label: "Cellexia", tone: "success" }
+      : { label: "Klaviyo flow" };
+  }
+  if (entry.sender === "app") return { label: "Cellexia", tone: "success" };
+  if (entry.sender === "klaviyo") return { label: "Klaviyo flow" };
+  return klaviyoConfigured
+    ? { label: "Auto · Klaviyo flow" }
+    : { label: "Auto · Cellexia" };
+}
+
+/**
+ * Preview posts render draft copy/design and change no state — re-running
+ * this route's heavy loader (settings + log queries + a preview render) on
+ * every debounced keystroke would only slow the editor down.
+ */
+export const shouldRevalidate: ShouldRevalidateFunction = ({
+  formData,
+  defaultShouldRevalidate,
+}) => {
+  const intent = formData?.get("intent");
+  if (intent === "preview" || intent === "preview-design") return false;
+  return defaultShouldRevalidate;
+};
+
 export default function EmailsPage() {
+  const params = useParams();
   const data = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const shopify = useAppBridge();
-  const submit = useSubmit();
-  const navigation = useNavigation();
   const [searchParams, setSearchParams] = useSearchParams();
 
-  const tabParam = searchParams.get("tab") === "activity" ? 1 : 0;
-  const [editing, setEditing] = useState<EmailEntry | null>(null);
-  const [subject, setSubject] = useState("");
-  const [body, setBody] = useState("");
-  const [enabled, setEnabled] = useState(true);
-  const [timing, setTiming] = useState("");
-
-  const saving = navigation.state === "submitting";
+  const tabParam = searchParams.get("tab");
+  const selectedTab = tabParam === "design" ? 1 : tabParam === "activity" ? 2 : 0;
 
   useEffect(() => {
     if (actionData?.toast) {
       shopify.toast.show(actionData.toast, { isError: !actionData.ok });
     }
-    if (actionData?.ok) setEditing(null);
   }, [actionData, shopify]);
-
-  const openEditor = useCallback((entry: EmailEntry) => {
-    setEditing(entry);
-    setSubject(entry.subject);
-    setBody(entry.body);
-    setEnabled(entry.enabled);
-    setTiming(entry.timingValue);
-  }, []);
-
-  // Validation errors belong to ONE submission — surfacing them on a
-  // different template's modal would show stale red fields.
-  const editorErrors =
-    editing && actionData?.template === editing.template
-      ? actionData?.errors
-      : undefined;
-
-  const saveEditing = useCallback(() => {
-    if (!editing) return;
-    const form = new FormData();
-    form.set("intent", "save-template");
-    form.set("template", editing.template);
-    form.set("subject", subject);
-    form.set("body", body);
-    form.set("enabled", String(enabled));
-    form.set("timing", timing);
-    submit(form, { method: "post" });
-  }, [editing, subject, body, enabled, timing, submit]);
 
   const grouped = useMemo(() => {
     const byGroup = new Map<EmailEntry["group"], EmailEntry[]>();
@@ -441,34 +389,46 @@ export default function EmailsPage() {
 
   const tabs = [
     { id: "catalog", content: "Emails" },
+    { id: "design", content: "Design" },
     { id: "activity", content: "Sent log" },
   ];
+
+  // Child editor route (/app/emails/:template) — this component is its
+  // layout parent in Remix flat routes, so it must yield to the Outlet.
+  // After every hook above, so the hook order stays stable across the
+  // overview ↔ editor navigation.
+  if (params.template) return <Outlet />;
 
   return (
     <Page
       title="Emails"
-      subtitle="Every message this app sends — content, timing and one-click actions, delivered through your Klaviyo flows."
+      subtitle="Every message this app sends — content, design, timing and one-click actions, with a live preview of each."
     >
       <Layout>
         <Layout.Section>
           {!data.klaviyoConfigured && (
-            <Banner tone="warning" title="Klaviyo is not connected">
+            <Banner tone="info" title="Klaviyo is not connected">
               <p>
-                Without a Klaviyo API key (Settings → Klaviyo), emails fall
-                back to plain direct email and SMS is suppressed. Connect
-                Klaviyo so your flows own branding and consent.
+                That&rsquo;s fine — reminders, payment and system emails are
+                sent by Cellexia itself through your email transport
+                (Settings → Email delivery), exactly as previewed here.
+                Order-change confirmations (skip, pause, cancel, …) default
+                to Klaviyo flows: without Klaviyo they are not sent unless
+                you open one and switch its sender to &ldquo;Cellexia sends
+                it&rdquo;. SMS also needs Klaviyo.
               </p>
             </Banner>
           )}
           <Box paddingBlockStart={data.klaviyoConfigured ? "0" : "400"}>
             <Tabs
               tabs={tabs}
-              selected={tabParam}
+              selected={selectedTab}
               onSelect={(index) => {
                 setSearchParams(
                   (prev) => {
                     const next = new URLSearchParams(prev);
-                    if (index === 1) next.set("tab", "activity");
+                    if (index === 1) next.set("tab", "design");
+                    else if (index === 2) next.set("tab", "activity");
                     else next.delete("tab");
                     return next;
                   },
@@ -477,166 +437,10 @@ export default function EmailsPage() {
               }}
             >
               <Box paddingBlockStart="400">
-                {tabParam === 0 ? (
-                  <BlockStack gap="400">
-                    <Card>
-                      <BlockStack gap="200">
-                        <Text as="h3" variant="headingMd">
-                          How customization reaches your customers
-                        </Text>
-                        <Text as="p" variant="bodySm" tone="subdued">
-                          Each email send carries your customized subject and
-                          body as the Klaviyo event properties{" "}
-                          <code>content_subject</code>, <code>content_html</code>{" "}
-                          and <code>content_text</code> — build a flow email
-                          whose body is{" "}
-                          <code>{"{{ event.content_html }}"}</code> and it
-                          always matches what you write here (the SMS event
-                          carries <code>content_text</code> only; rows marked
-                          &ldquo;Klaviyo flow&rdquo; keep their content in the
-                          flow itself). One-click action links ({"{skip_url}"},{" "}
-                          {"{delay_1w_url}"}, {"{delay_3w_url}"},{" "}
-                          {"{addon_url}"}, {"{pause_url}"}) are substituted
-                          into your copy and also travel as their own event
-                          properties. See docs/KLAVIYO_SETUP.md.
-                        </Text>
-                      </BlockStack>
-                    </Card>
-                    {[...grouped.entries()].map(([group, entries]) => (
-                      <Card key={group} padding="0">
-                        <Box padding="400" paddingBlockEnd="200">
-                          <Text as="h3" variant="headingMd">
-                            {GROUP_LABELS[group]}
-                          </Text>
-                        </Box>
-                        <IndexTable
-                          resourceName={{ singular: "email", plural: "emails" }}
-                          itemCount={entries.length}
-                          selectable={false}
-                          headings={[
-                            { title: "Email" },
-                            { title: "Trigger & timing" },
-                            { title: "Status" },
-                            { title: "Sent" },
-                            { title: "" },
-                          ]}
-                        >
-                          {entries.map((entry, index) => (
-                            <IndexTable.Row
-                              id={entry.template}
-                              key={entry.template}
-                              position={index}
-                            >
-                              <IndexTable.Cell>
-                                <BlockStack gap="050">
-                                  <Text as="span" fontWeight="semibold">
-                                    {entry.title}
-                                  </Text>
-                                  <Text as="span" variant="bodySm" tone="subdued">
-                                    {entry.channel === "SMS" ? "SMS" : "Email"}
-                                    {entry.metric ? ` · ${entry.metric}` : " · direct only"}
-                                  </Text>
-                                </BlockStack>
-                              </IndexTable.Cell>
-                              <IndexTable.Cell>
-                                <BlockStack gap="050">
-                                  <Text as="span" variant="bodySm">
-                                    {entry.trigger}
-                                  </Text>
-                                  <Text as="span" variant="bodySm" tone="subdued">
-                                    {entry.sentBy}
-                                    {entry.timing
-                                      ? ` · ${entry.timing.label.toLowerCase()} ${entry.timingValue}${
-                                          entry.timing.suffix
-                                            ? ` ${entry.timing.suffix}`
-                                            : ""
-                                        }`
-                                      : ""}
-                                  </Text>
-                                </BlockStack>
-                              </IndexTable.Cell>
-                              <IndexTable.Cell>
-                                <InlineStack gap="100">
-                                  {entry.flowOwned ? (
-                                    <Badge>Klaviyo flow</Badge>
-                                  ) : entry.enabled ? (
-                                    <Badge tone="success">On</Badge>
-                                  ) : (
-                                    <Badge tone="critical">Off</Badge>
-                                  )}
-                                  {(entry.subject || entry.body) && (
-                                    <Badge tone="info">Customized</Badge>
-                                  )}
-                                  {entry.critical && (
-                                    <Badge tone="attention">Always on</Badge>
-                                  )}
-                                </InlineStack>
-                              </IndexTable.Cell>
-                              <IndexTable.Cell>
-                                <Button
-                                  variant="plain"
-                                  size="slim"
-                                  onClick={() =>
-                                    setSearchParams(
-                                      (prev) => {
-                                        const next = new URLSearchParams(prev);
-                                        next.set("tab", "activity");
-                                        next.set("logTemplate", entry.template);
-                                        return next;
-                                      },
-                                      { replace: true, preventScrollReset: true },
-                                    )
-                                  }
-                                >
-                                  {String(entry.sentCount)}
-                                </Button>
-                              </IndexTable.Cell>
-                              <IndexTable.Cell>
-                                {entry.flowOwned ? (
-                                  <Text as="span" variant="bodySm" tone="subdued">
-                                    —
-                                  </Text>
-                                ) : (
-                                  <Button
-                                    size="slim"
-                                    onClick={() => openEditor(entry)}
-                                  >
-                                    Edit
-                                  </Button>
-                                )}
-                              </IndexTable.Cell>
-                            </IndexTable.Row>
-                          ))}
-                        </IndexTable>
-                      </Card>
-                    ))}
-                    <Card>
-                      <BlockStack gap="200">
-                        <Text as="h3" variant="headingMd">
-                          Event-triggered flows (content lives in Klaviyo)
-                        </Text>
-                        <Text as="p" variant="bodySm" tone="subdued">
-                          These metrics fire automatically at the moment the
-                          event happens — build a flow on the metric to message
-                          the customer; timing and copy are the flow&rsquo;s.
-                        </Text>
-                        <BlockStack gap="100">
-                          {data.flows.map((flow) => (
-                            <InlineStack key={flow.eventType} gap="200" wrap={false}>
-                              <Box minWidth="260px">
-                                <Text as="span" variant="bodySm" fontWeight="medium">
-                                  {flow.metric}
-                                </Text>
-                              </Box>
-                              <Text as="span" variant="bodySm" tone="subdued">
-                                fires on {flow.eventType}
-                              </Text>
-                            </InlineStack>
-                          ))}
-                        </BlockStack>
-                      </BlockStack>
-                    </Card>
-                  </BlockStack>
+                {selectedTab === 0 ? (
+                  <CatalogTab data={data} grouped={grouped} />
+                ) : selectedTab === 1 ? (
+                  <DesignTab data={data} />
                 ) : (
                   <ActivityTab data={data} setSearchParams={setSearchParams} />
                 )}
@@ -645,114 +449,450 @@ export default function EmailsPage() {
           </Box>
         </Layout.Section>
       </Layout>
+    </Page>
+  );
+}
 
-      {editing && (
-        <Modal
-          open
-          onClose={() => setEditing(null)}
-          title={editing.title}
-          primaryAction={{
-            content: "Save",
-            onAction: saveEditing,
-            loading: saving,
-          }}
-          secondaryActions={[
-            { content: "Cancel", onAction: () => setEditing(null) },
-          ]}
-        >
-          <Modal.Section>
-            <BlockStack gap="400">
-              <Text as="p" variant="bodySm" tone="subdued">
-                {editing.trigger}
-              </Text>
-              {editing.disableable ? (
-                <Checkbox
-                  label="Send this email"
-                  checked={enabled}
-                  onChange={setEnabled}
-                  helpText="Off = suppressed entirely (logged, never delivered)."
-                />
-              ) : (
-                <Text as="p" variant="bodySm" tone="subdued">
-                  This message cannot be disabled
-                  {editing.critical ? " (critical delivery)" : ""}.
-                </Text>
-              )}
-              {editing.timing && (
+function CatalogTab({
+  data,
+  grouped,
+}: {
+  data: LoaderData;
+  grouped: Map<EmailEntry["group"], EmailEntry[]>;
+}) {
+  const [, setSearchParams] = useSearchParams();
+  const [showFlows, setShowFlows] = useState(false);
+
+  return (
+    <BlockStack gap="400">
+      <Card>
+        <BlockStack gap="200">
+          <Text as="h3" variant="headingMd">
+            How your emails work
+          </Text>
+          <Text as="p" variant="bodySm">
+            Each row is one message with three simple controls: <b>what</b> it
+            says (open it to edit with formatting and a live preview),{" "}
+            <b>who</b> sends it — Cellexia directly, or your Klaviyo flow —
+            and <b>when</b> it goes out. &ldquo;Auto&rdquo; keeps the
+            behavior you have today: Klaviyo delivers while it is connected,
+            Cellexia delivers otherwise.
+          </Text>
+          <Text as="p" variant="bodySm" tone="subdued">
+            Emails marked &ldquo;Klaviyo flow&rdquo; are delivered by a flow
+            you build on the matching event — copy written here still rides
+            along as{" "}
+            <code>{"{{ event.content_html }}"}</code> so a flow email can stay
+            identical to the preview. See docs/KLAVIYO_SETUP.md for recipes.
+          </Text>
+        </BlockStack>
+      </Card>
+      {[...grouped.entries()].map(([group, entries]) => (
+        <Card key={group} padding="0">
+          <Box padding="400" paddingBlockEnd="200">
+            <Text as="h3" variant="headingMd">
+              {GROUP_LABELS[group]}
+            </Text>
+          </Box>
+          <IndexTable
+            resourceName={{ singular: "email", plural: "emails" }}
+            itemCount={entries.length}
+            selectable={false}
+            headings={[
+              { title: "Email" },
+              { title: "Sent by" },
+              { title: "Trigger & timing" },
+              { title: "Status" },
+              { title: "Sent" },
+              { title: "" },
+            ]}
+          >
+            {entries.map((entry, index) => {
+              const sender = senderBadge(entry, data.klaviyoConfigured);
+              return (
+                <IndexTable.Row
+                  id={entry.template}
+                  key={entry.template}
+                  position={index}
+                >
+                  <IndexTable.Cell>
+                    <BlockStack gap="050">
+                      {entry.dormant ? (
+                        <Text as="span" fontWeight="semibold">
+                          {entry.title}
+                        </Text>
+                      ) : (
+                        <PolarisLink url={`/app/emails/${entry.template}`}>
+                          <Text as="span" fontWeight="semibold">
+                            {entry.title}
+                          </Text>
+                        </PolarisLink>
+                      )}
+                      <Text as="span" variant="bodySm" tone="subdued">
+                        {entry.channel === "SMS" ? "SMS" : "Email"}
+                        {entry.metric ? ` · ${entry.metric}` : " · direct only"}
+                      </Text>
+                    </BlockStack>
+                  </IndexTable.Cell>
+                  <IndexTable.Cell>
+                    <Badge tone={sender.tone}>{sender.label}</Badge>
+                  </IndexTable.Cell>
+                  <IndexTable.Cell>
+                    <BlockStack gap="050">
+                      <Text as="span" variant="bodySm">
+                        {entry.trigger}
+                      </Text>
+                      <Text as="span" variant="bodySm" tone="subdued">
+                        {entry.timing
+                          ? `${entry.timing.label.toLowerCase()} ${entry.timingValue}${
+                              entry.timing.suffix ? ` ${entry.timing.suffix}` : ""
+                            }`
+                          : entry.sentBy}
+                      </Text>
+                    </BlockStack>
+                  </IndexTable.Cell>
+                  <IndexTable.Cell>
+                    <InlineStack gap="100">
+                      {entry.dormant ? (
+                        <Badge>Not active yet</Badge>
+                      ) : entry.enabled ? (
+                        <Badge tone="success">On</Badge>
+                      ) : (
+                        <Badge tone="critical">Off</Badge>
+                      )}
+                      {entry.customized && <Badge tone="info">Customized</Badge>}
+                      {entry.critical && <Badge tone="attention">Always on</Badge>}
+                    </InlineStack>
+                  </IndexTable.Cell>
+                  <IndexTable.Cell>
+                    <Button
+                      variant="plain"
+                      size="slim"
+                      onClick={() =>
+                        setSearchParams(
+                          (prev) => {
+                            const next = new URLSearchParams(prev);
+                            next.set("tab", "activity");
+                            next.set("logTemplate", entry.template);
+                            return next;
+                          },
+                          { replace: true, preventScrollReset: true },
+                        )
+                      }
+                    >
+                      {String(entry.sentCount)}
+                    </Button>
+                  </IndexTable.Cell>
+                  <IndexTable.Cell>
+                    {entry.dormant ? (
+                      <Text as="span" variant="bodySm" tone="subdued">
+                        —
+                      </Text>
+                    ) : (
+                      <Button size="slim" url={`/app/emails/${entry.template}`}>
+                        Edit
+                      </Button>
+                    )}
+                  </IndexTable.Cell>
+                </IndexTable.Row>
+              );
+            })}
+          </IndexTable>
+        </Card>
+      ))}
+      <Card>
+        <BlockStack gap="200">
+          <InlineStack align="space-between" blockAlign="center">
+            <Text as="h3" variant="headingMd">
+              Klaviyo event feed (advanced)
+            </Text>
+            <Button
+              variant="plain"
+              size="slim"
+              disclosure={showFlows ? "up" : "down"}
+              onClick={() => setShowFlows((v) => !v)}
+            >
+              {showFlows ? "Hide" : "Show"}
+            </Button>
+          </InlineStack>
+          <Text as="p" variant="bodySm" tone="subdued">
+            Every subscription moment also emits a Klaviyo event — that is
+            what powers segments and any flows you choose to build. You do
+            NOT need flows for the emails above unless a row&rsquo;s sender
+            says &ldquo;Klaviyo flow&rdquo;.
+          </Text>
+          <Collapsible id="klaviyo-flows" open={showFlows}>
+            <BlockStack gap="100">
+              {data.flows.map((flow) => (
+                <InlineStack key={flow.eventType} gap="200" wrap={false}>
+                  <Box minWidth="260px">
+                    <Text as="span" variant="bodySm" fontWeight="medium">
+                      {flow.metric}
+                    </Text>
+                  </Box>
+                  <Text as="span" variant="bodySm" tone="subdued">
+                    fires on {flow.eventType}
+                  </Text>
+                </InlineStack>
+              ))}
+            </BlockStack>
+          </Collapsible>
+        </BlockStack>
+      </Card>
+    </BlockStack>
+  );
+}
+
+// ── Design tab ───────────────────────────────────────────────────────────────
+
+const COLOR_FIELDS: Array<{ key: keyof EmailDesign; label: string }> = [
+  { key: "backgroundColor", label: "Page background" },
+  { key: "cardBackground", label: "Card background" },
+  { key: "cardBorderColor", label: "Card border" },
+  { key: "textColor", label: "Text" },
+  { key: "mutedColor", label: "Muted text & footer" },
+  { key: "linkColor", label: "Links" },
+  { key: "buttonColor", label: "Button" },
+  { key: "buttonTextColor", label: "Button text" },
+];
+
+function DesignTab({ data }: { data: LoaderData }) {
+  const submit = useSubmit();
+  const navigation = useNavigation();
+  const previewFetcher = useFetcher<ActionData>();
+  const [draft, setDraft] = useState<EmailDesign>(data.design);
+  const [device, setDevice] = useState<"desktop" | "mobile">("desktop");
+
+  const baseline = JSON.stringify(data.design);
+  const dirty = JSON.stringify(draft) !== baseline;
+  const navIntent = navigation.formData?.get("intent");
+  const saving = navigation.state === "submitting" && navIntent === "save-design";
+  const resetting =
+    navigation.state === "submitting" && navIntent === "reset-design";
+
+  // Re-init the draft after a successful save/reset revalidation.
+  useEffect(() => {
+    setDraft(data.design);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [baseline]);
+
+  const set = useCallback(<K extends keyof EmailDesign>(key: K, value: EmailDesign[K]) => {
+    setDraft((prev) => ({ ...prev, [key]: value }));
+  }, []);
+
+  const designForm = useCallback(
+    (intent: string): FormData => {
+      const form = new FormData();
+      form.set("intent", intent);
+      for (const [key, value] of Object.entries(draft)) {
+        form.set(`design_${key}`, String(value));
+      }
+      return form;
+    },
+    [draft],
+  );
+
+  // Debounced live preview of the draft design. Only trust the fetcher's
+  // draft render while the draft is actually dirty — after a save/reset the
+  // loader's fresh saved-design render must win, or "Reset to defaults"
+  // would keep showing the pre-reset colors from the fetcher's last POST.
+  const previewHtml = dirty
+    ? (previewFetcher.data?.previewHtml ?? data.designPreviewHtml)
+    : data.designPreviewHtml;
+  useEffect(() => {
+    if (!dirty) return;
+    const handle = setTimeout(() => {
+      previewFetcher.submit(designForm("preview-design"), { method: "post" });
+    }, 350);
+    return () => clearTimeout(handle);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [JSON.stringify(draft)]);
+
+  const previewWidth = device === "mobile" ? 375 : 600;
+
+  return (
+    <InlineGrid columns={{ xs: 1, lg: 2 }} gap="400" alignItems="start">
+      <BlockStack gap="400">
+        <Card>
+          <BlockStack gap="300">
+            <Text as="h3" variant="headingMd">
+              Brand kit
+            </Text>
+            <Text as="p" variant="bodySm" tone="subdued">
+              One design for every email — direct sends and the rendered
+              content your Klaviyo flows carry both use it. Defaults are the
+              classic Cellexia look.
+            </Text>
+            <Select
+              label="Header"
+              options={[
+                { label: "Wordmark text", value: "wordmark" },
+                { label: "Logo image", value: "logo" },
+                { label: "None", value: "none" },
+              ]}
+              value={draft.headerStyle}
+              onChange={(v) => set("headerStyle", v as EmailDesign["headerStyle"])}
+            />
+            {draft.headerStyle === "wordmark" && (
+              <TextField
+                autoComplete="off"
+                label="Wordmark"
+                value={draft.wordmark}
+                onChange={(v) => set("wordmark", v)}
+              />
+            )}
+            {draft.headerStyle === "logo" && (
+              <InlineGrid columns={{ xs: 1, sm: 2 }} gap="300">
                 <TextField
                   autoComplete="off"
-                  label={`${editing.timing.label}${
-                    editing.timing.suffix ? ` (${editing.timing.suffix})` : ""
-                  }`}
-                  value={timing}
-                  onChange={setTiming}
-                  error={editorErrors?.timing}
-                  helpText={
-                    editing.timing.kind === "intList"
-                      ? "Comma-separated day offsets, e.g. 0, 3, 7 — shared by the whole notice ladder."
-                      : undefined
-                  }
+                  label="Logo URL (https)"
+                  value={draft.logoUrl}
+                  onChange={(v) => set("logoUrl", v)}
+                  placeholder="https://cdn.shopify.com/…/logo.png"
                 />
-              )}
-              {editing.customizable ? (
-                <>
-                  <TextField
-                    autoComplete="off"
-                    label="Subject"
-                    value={subject}
-                    onChange={setSubject}
-                    placeholder="Leave empty to keep the built-in subject"
-                    error={editorErrors?.subject}
-                  />
-                  <TextField
-                    autoComplete="off"
-                    label="Body"
-                    value={body}
-                    onChange={setBody}
-                    multiline={8}
-                    placeholder="Leave empty to keep the built-in body"
-                    error={editorErrors?.body}
-                    helpText="Plain text; line breaks are kept. {placeholders} are filled in per send."
-                  />
-                  <Box background="bg-surface-secondary" borderRadius="200" padding="300">
-                    <BlockStack gap="100">
-                      <Text as="p" variant="bodySm" fontWeight="medium">
-                        Placeholders for this email
-                      </Text>
-                      <Text as="p" variant="bodySm" tone="subdued">
-                        {[
-                          ...editing.links.map((l) => `{${l}}`),
-                          ...COMMON_PLACEHOLDERS,
-                        ]
-                          .filter((v, i, arr) => arr.indexOf(v) === i)
-                          .join("  ")}
-                      </Text>
-                      {editing.links.includes("addon_url") && (
-                        <Text as="p" variant="bodySm" tone="subdued">
-                          {"{addon_url}"} adds the suggested product to the next
-                          order in one click; {"{delay_1w_url}"} /{" "}
-                          {"{delay_3w_url}"} push the charge back in one click —
-                          both proven to reduce churn versus a plain manage
-                          link.
-                        </Text>
-                      )}
-                    </BlockStack>
-                  </Box>
-                </>
-              ) : (
-                <Text as="p" variant="bodySm" tone="subdued">
-                  Content for this message is built in
-                  {editing.channel === "SMS"
-                    ? " (SMS copy lives in your Klaviyo flow)"
-                    : ""}
-                  .
-                </Text>
-              )}
-            </BlockStack>
-          </Modal.Section>
-        </Modal>
-      )}
-    </Page>
+                <TextField
+                  autoComplete="off"
+                  label="Logo width (px)"
+                  type="number"
+                  value={String(draft.logoWidth)}
+                  onChange={(v) => set("logoWidth", Number(v) || 140)}
+                />
+              </InlineGrid>
+            )}
+            <Select
+              label="Font"
+              options={[
+                { label: "Serif (Georgia — the classic look)", value: "serif" },
+                { label: "Sans-serif (system)", value: "sans" },
+              ]}
+              value={draft.fontFamily}
+              onChange={(v) => set("fontFamily", v as EmailDesign["fontFamily"])}
+            />
+          </BlockStack>
+        </Card>
+        <Card>
+          <BlockStack gap="300">
+            <Text as="h3" variant="headingMd">
+              Colors
+            </Text>
+            <InlineGrid columns={{ xs: 1, sm: 2 }} gap="300">
+              {COLOR_FIELDS.map(({ key, label }) => (
+                <TextField
+                  key={key}
+                  autoComplete="off"
+                  label={label}
+                  value={String(draft[key])}
+                  onChange={(v) => set(key, v as never)}
+                  prefix={
+                    <span
+                      style={{
+                        display: "inline-block",
+                        width: 16,
+                        height: 16,
+                        borderRadius: 4,
+                        border: "1px solid rgba(0,0,0,.2)",
+                        background: /^#[0-9a-fA-F]{6}$/.test(String(draft[key]))
+                          ? String(draft[key])
+                          : "transparent",
+                      }}
+                    />
+                  }
+                  helpText="Hex, e.g. #1a1a1a"
+                />
+              ))}
+            </InlineGrid>
+          </BlockStack>
+        </Card>
+        <Card>
+          <BlockStack gap="300">
+            <Text as="h3" variant="headingMd">
+              Footer
+            </Text>
+            <TextField
+              autoComplete="off"
+              label="Footer line"
+              value={draft.footerText}
+              onChange={(v) => set("footerText", v)}
+            />
+            <TextField
+              autoComplete="off"
+              label="Footer note"
+              value={draft.footerNote}
+              onChange={(v) => set("footerNote", v)}
+            />
+            <InlineStack gap="200">
+              <Button
+                variant="primary"
+                loading={saving}
+                disabled={!dirty}
+                onClick={() => submit(designForm("save-design"), { method: "post" })}
+              >
+                Save design
+              </Button>
+              <Button
+                loading={resetting}
+                onClick={() => submit(designForm("reset-design"), { method: "post" })}
+              >
+                Reset to defaults
+              </Button>
+            </InlineStack>
+          </BlockStack>
+        </Card>
+      </BlockStack>
+      <div style={{ position: "sticky", top: "16px" }}>
+        <Card>
+          <BlockStack gap="300">
+            <InlineStack align="space-between" blockAlign="center">
+              <Text as="h3" variant="headingMd">
+                Live preview
+              </Text>
+              <ButtonGroup variant="segmented">
+                <Button
+                  size="slim"
+                  pressed={device === "desktop"}
+                  onClick={() => setDevice("desktop")}
+                >
+                  Desktop
+                </Button>
+                <Button
+                  size="slim"
+                  pressed={device === "mobile"}
+                  onClick={() => setDevice("mobile")}
+                >
+                  Mobile
+                </Button>
+              </ButtonGroup>
+            </InlineStack>
+            <Box borderWidth="025" borderColor="border" borderRadius="200">
+              <div
+                style={{
+                  maxWidth: previewWidth,
+                  margin: "0 auto",
+                  transition: "max-width .2s ease",
+                }}
+              >
+                <iframe
+                  title="Email design preview"
+                  sandbox=""
+                  srcDoc={previewHtml}
+                  style={{
+                    display: "block",
+                    width: "100%",
+                    height: 620,
+                    border: "none",
+                    background: "#fff",
+                  }}
+                />
+              </div>
+            </Box>
+            <Text as="p" variant="bodySm" tone="subdued">
+              Shown on the upcoming-order reminder with sample data; every
+              email uses this shell.
+            </Text>
+          </BlockStack>
+        </Card>
+      </div>
+    </InlineGrid>
   );
 }
 

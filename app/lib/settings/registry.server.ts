@@ -474,11 +474,108 @@ export const settingsSchemas = {
             enabled: z.boolean().default(true),
             subject: z.string().max(300).default(""),
             body: z.string().max(10_000).default(""),
+            /**
+             * Who delivers this email (v1.17.0):
+             * - "auto" — the pre-1.17.0 behavior: Klaviyo event when a key
+             *   is configured (the flow owns delivery), direct SMTP
+             *   otherwise. Confirmation templates resolve "auto" to their
+             *   historical owner (the Klaviyo flow on the state-change
+             *   metric) so upgrades change nothing.
+             * - "app" — Cellexia renders and sends it via the configured
+             *   SMTP transport; the delivery metric is NOT enqueued (the
+             *   canonical state-change events keep firing for segments).
+             * - "klaviyo" — only the Klaviyo event is emitted; without a
+             *   configured key the send is SUPPRESSED honestly
+             *   (klaviyo_unconfigured), never silently rerouted.
+             */
+            sender: z.enum(["auto", "app", "klaviyo"]).default("auto"),
           }),
         )
         .default({}),
     })
     .default({ templates: {} }),
+
+  /**
+   * Email brand kit (v1.17.0, admin Emails → Design tab). Drives the shared
+   * shell every rendered email uses — direct SMTP and the Klaviyo
+   * content_html property alike (app/lib/notifications/format.ts). Defaults
+   * reproduce the pre-1.17.0 shell byte-for-byte in spirit: a shop that
+   * never opens the Design tab keeps its historical emails.
+   */
+  emailDesign: z
+    .object({
+      headerStyle: z.enum(["wordmark", "logo", "none"]).default("wordmark"),
+      wordmark: z.string().max(60).default("C E L L E X I A"),
+      logoUrl: z
+        .string()
+        .max(500)
+        .refine((v) => v === "" || /^https:\/\//.test(v), {
+          message: "Logo URL must start with https://",
+        })
+        .default(""),
+      logoWidth: z.number().int().min(40).max(400).default(140),
+      fontFamily: z.enum(["serif", "sans"]).default("serif"),
+      backgroundColor: z
+        .string()
+        .regex(/^#[0-9a-fA-F]{6}$/)
+        .default("#faf8f5"),
+      cardBackground: z
+        .string()
+        .regex(/^#[0-9a-fA-F]{6}$/)
+        .default("#ffffff"),
+      cardBorderColor: z
+        .string()
+        .regex(/^#[0-9a-fA-F]{6}$/)
+        .default("#ece7df"),
+      textColor: z
+        .string()
+        .regex(/^#[0-9a-fA-F]{6}$/)
+        .default("#1a1a1a"),
+      mutedColor: z
+        .string()
+        .regex(/^#[0-9a-fA-F]{6}$/)
+        .default("#8a837a"),
+      linkColor: z
+        .string()
+        .regex(/^#[0-9a-fA-F]{6}$/)
+        .default("#1a1a1a"),
+      buttonColor: z
+        .string()
+        .regex(/^#[0-9a-fA-F]{6}$/)
+        .default("#1a1a1a"),
+      buttonTextColor: z
+        .string()
+        .regex(/^#[0-9a-fA-F]{6}$/)
+        .default("#faf8f5"),
+      footerText: z
+        .string()
+        .max(300)
+        .default("Cellexia — skincare that keeps its promises."),
+      footerNote: z
+        .string()
+        .max(300)
+        .default(
+          "You are receiving this email about your Cellexia subscription.",
+        ),
+    })
+    .default({
+      headerStyle: "wordmark",
+      wordmark: "C E L L E X I A",
+      logoUrl: "",
+      logoWidth: 140,
+      fontFamily: "serif",
+      backgroundColor: "#faf8f5",
+      cardBackground: "#ffffff",
+      cardBorderColor: "#ece7df",
+      textColor: "#1a1a1a",
+      mutedColor: "#8a837a",
+      linkColor: "#1a1a1a",
+      buttonColor: "#1a1a1a",
+      buttonTextColor: "#faf8f5",
+      footerText: "Cellexia — skincare that keeps its promises.",
+      footerNote:
+        "You are receiving this email about your Cellexia subscription.",
+    }),
 
   /**
    * INTERNAL / MACHINE-WRITTEN — learned churn-risk model state. Written

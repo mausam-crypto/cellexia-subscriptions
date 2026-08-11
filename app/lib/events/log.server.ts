@@ -112,6 +112,22 @@ async function enqueueKlaviyo(input: LogEventInput): Promise<void> {
   }
 }
 
+function sendConfirmations(input: LogEventInput): void {
+  // Confirmation emails for app-sent state-change moments (v1.17.0): fires
+  // only for the templates the merchant flipped to sender "app" on the
+  // Emails page. DELIBERATELY not awaited — logEvent runs inside portal
+  // actions and webhook handlers, and an email delivery (SMTP round-trip)
+  // must never sit on those response paths; the bridge contains every
+  // failure internally and the mailer fails fast on a hung transport.
+  import("~/lib/notifications/confirmations.server")
+    .then(({ maybeSendConfirmationForEvent }) =>
+      maybeSendConfirmationForEvent(input),
+    )
+    .catch((err) => {
+      console.error("[events] confirmation send failed", input.type, err);
+    });
+}
+
 /**
  * Single funnel for every subscriber-affecting event. Writes the immutable
  * event log (timeline + audit + compliance) and forwards to the Klaviyo outbox
@@ -137,6 +153,7 @@ export async function logEvent(
   }
 
   await enqueueKlaviyo(input);
+  sendConfirmations(input);
 }
 
 /**
@@ -154,6 +171,7 @@ export async function logEventOrThrow(
 ): Promise<void> {
   await writeEvent(opts.tx ?? prisma, input);
   await enqueueKlaviyo(input);
+  sendConfirmations(input);
 }
 
 /** Timeline for one contract, newest first. */
