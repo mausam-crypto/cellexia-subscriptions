@@ -101,6 +101,7 @@ export async function runAlertScan(
     ],
     ["FOREIGN_CONTRACTS", () => checkForeignContracts(shopId)],
     ["KLAVIYO_OUTBOX_BACKLOG", () => checkKlaviyoOutboxBacklog(shopId, now)],
+    ["KLAVIYO_FLOW_COVERAGE", () => checkKlaviyoFlowCoverage(shopId, now)],
     ["PLAN_GROUP_DRIFT", () => checkPlanGroupDrift(shopId, shopDomain, now)],
   ];
 
@@ -1168,6 +1169,34 @@ async function checkKlaviyoOutboxBacklog(
       stalledMinutes: KLAVIYO_STALLED_MINUTES,
       deadLookbackHours: KLAVIYO_DEAD_LOOKBACK_HOURS,
     },
+  });
+}
+
+/**
+ * Klaviyo flow coverage (v1.18.0): after the guided setup has run at least
+ * once, hold the delivery checklist green — an accidentally deleted or
+ * paused flow means a subscription email silently goes nowhere. The
+ * underlying check refreshes its Klaviyo read at most once a day (the sweep
+ * runs every 15 minutes; Klaviyo must not be polled that often) and returns
+ * null whenever it cannot verify (no key, missing scopes, setup never ran)
+ * — never guess, never nag.
+ */
+async function checkKlaviyoFlowCoverage(
+  shopId: string,
+  now: Date,
+): Promise<boolean> {
+  if (!(await isKlaviyoConfigured(shopId))) return false;
+  const { staleOrMissingCoverage } = await import("~/lib/klaviyo/flows.server");
+  const coverage = await staleOrMissingCoverage(shopId, now);
+  if (!coverage || coverage.missing.length === 0) return false;
+  return raiseAlert({
+    shopId,
+    type: "KLAVIYO_FLOW_COVERAGE",
+    severity: "WARNING",
+    message: `${coverage.missing.length} subscription email(s) have no LIVE Klaviyo flow delivering them — customers receive nothing for: ${coverage.missing.join(
+      ", ",
+    )}. Open Emails → Klaviyo delivery setup; one click restores them.`,
+    context: { missing: coverage.missing, checkedAt: coverage.checkedAt },
   });
 }
 

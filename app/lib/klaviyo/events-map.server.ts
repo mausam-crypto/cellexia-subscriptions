@@ -70,6 +70,21 @@ const LINK_BUNDLE_TYPES = new Set([
 ]);
 
 /**
+ * Every enqueued event carries this property as the string "true"/"false"
+ * (v1.18.0). The auto-created Klaviyo flows (guided setup,
+ * app/lib/klaviyo/flows.server.ts) trigger-filter on it, and its meaning is
+ * STRICT: "true" = this event carries the app-rendered email
+ * (content_subject + content_html) and deserves delivery. Everything else
+ * is "false" — canonical state-change events whose metric the router also
+ * enqueues with content (the router leg is the delivery vehicle), SMS
+ * enqueues (content_text only — an email flow would render blank),
+ * confirmation moments that are system-initiated / disabled / app-sent,
+ * and setup SEED events (which is what makes metric seeding safe even with
+ * every flow live). Flows without the filter behave exactly as before.
+ */
+export const CELLEXIA_SEND_PROPERTY = "cellexia_send";
+
+/**
  * Read-only view of the auto-mapped state-change metrics, for the admin
  * Emails catalog (v1.16.0). The map itself stays private — the catalog must
  * never become a second writer of the event→metric contract.
@@ -165,6 +180,12 @@ export async function contractSnapshotProperties(
     contract_id: contract.id,
     shopify_contract_id: contract.shopifyContractId,
     contract_status: contract.status,
+    // v1.18.0 — the editor has always advertised {first_name} as a copy
+    // placeholder; putting it in the snapshot makes it actually resolve in
+    // BOTH content pipelines (router + confirmation events) instead of
+    // relying on the profile attributes flows can't interpolate from.
+    ...(contract.firstName ? { first_name: contract.firstName } : {}),
+    ...(contract.lastName ? { last_name: contract.lastName } : {}),
     interval_weeks: contract.intervalWeeks,
     interval_unit: freq.unit,
     interval_count: freq.count,
@@ -332,6 +353,43 @@ export async function enqueueKlaviyoForEvent(
       profileAttrs.cellexia_dunning_open = false;
     }
 
+    // ── cellexia_send + confirmation content (v1.18.0) ──────────────────────
+    // DEFAULT FALSE: canonical events are for segments/analytics; delivery
+    // rides the notifications router's enqueue, which carries the rendered
+    // content and stamps "true" itself. Several canonical types share a
+    // metric with router templates (billing.attempt_failed → "Cellexia
+    // Payment Failed", winback.*, lifecycle.*, …) and land OUTSIDE the
+    // 120s dedupe window on ladder days — a "true" here would make the
+    // auto-created flow send a blank email. Only confirmation moments earn
+    // "true", and only when: person-initiated (the SAME provenance gate the
+    // app-sent bridge uses, with the contract mirror as fallback for
+    // webhook-diff twins that carry no cancelSource), enabled in-app, NOT
+    // app-sent (the bridge owns delivery then — one email, never two), and
+    // the content actually rendered.
+    let cellexiaSend = false;
+    let confirmationTemplate: string | null = null;
+    try {
+      const { CONFIRMATION_TEMPLATE_BY_EVENT, isPersonInitiated } = await import(
+        "~/lib/notifications/confirmations.server"
+      );
+      confirmationTemplate = CONFIRMATION_TEMPLATE_BY_EVENT[event.type] ?? null;
+      if (confirmationTemplate) {
+        cellexiaSend = isPersonInitiated(event, contract);
+        if (cellexiaSend) {
+          const { getSetting } = await import("~/lib/settings/settings.server");
+          const emails = await getSetting(event.shopId, "emails");
+          const override = emails.templates[confirmationTemplate];
+          if (override?.enabled === false || override?.sender === "app") {
+            cellexiaSend = false;
+          }
+        }
+      }
+    } catch (err) {
+      // Fail SAFE: without a verdict, no auto-flow sends.
+      cellexiaSend = false;
+      console.error("[klaviyo] cellexia_send resolution failed", event.type, err);
+    }
+
     if (contract) {
       const shop = await prisma.shop.findUnique({
         where: { id: contract.shopId },
@@ -342,6 +400,46 @@ export async function enqueueKlaviyoForEvent(
         properties,
         await contractSnapshotProperties(contract, tz),
       );
+
+      if (confirmationTemplate && cellexiaSend) {
+        try {
+          const { renderEmail } = await import(
+            "~/lib/notifications/templates.server"
+          );
+          const { normalizeEmailDesign } = await import(
+            "~/lib/notifications/format"
+          );
+          const { getSetting } = await import("~/lib/settings/settings.server");
+          const [emails, design] = await Promise.all([
+            getSetting(event.shopId, "emails"),
+            getSetting(event.shopId, "emailDesign"),
+          ]);
+          const override = emails.templates[confirmationTemplate] ?? null;
+          const contentVars: Record<string, string | number> = {};
+          for (const [k, v] of Object.entries(properties)) {
+            if (typeof v === "string" || typeof v === "number") contentVars[k] = v;
+          }
+          const content = renderEmail(
+            confirmationTemplate as Parameters<typeof renderEmail>[0],
+            contract.locale,
+            contentVars,
+            override ? { subject: override.subject, body: override.body } : null,
+            normalizeEmailDesign(design),
+          );
+          properties.content_subject = content.subject;
+          properties.content_html = content.html;
+          properties.content_text = content.text;
+        } catch (err) {
+          // No content = an auto-created flow would send an EMPTY email —
+          // flip the verdict so it sends nothing instead.
+          cellexiaSend = false;
+          console.error(
+            "[klaviyo] confirmation content render failed",
+            event.type,
+            err,
+          );
+        }
+      }
 
       if (LINK_BUNDLE_TYPES.has(event.type)) {
         Object.assign(
@@ -365,6 +463,8 @@ export async function enqueueKlaviyoForEvent(
         }
       }
     }
+
+    properties[CELLEXIA_SEND_PROPERTY] = cellexiaSend ? "true" : "false";
 
     await enqueue(event.shopId, {
       eventName: metric,

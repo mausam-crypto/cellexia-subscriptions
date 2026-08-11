@@ -6,6 +6,7 @@ import {
   useActionData,
   useFetcher,
   useLoaderData,
+  useLocation,
   useNavigation,
   useParams,
   useSearchParams,
@@ -48,6 +49,7 @@ import {
   type CatalogTiming,
 } from "~/lib/notifications/catalog.server";
 import { renderTemplatePreview } from "~/lib/notifications/preview.server";
+import { readCachedCoverage } from "~/lib/klaviyo/flows.server";
 import {
   DEFAULT_EMAIL_DESIGN,
   normalizeEmailDesign,
@@ -72,6 +74,20 @@ import {
  */
 
 const LOG_PAGE_SIZE = 100;
+
+/**
+ * Deterministic timestamp label (fixed locale + UTC): rendered on the
+ * server AND re-rendered on hydration, so it must not depend on either
+ * side's locale/timezone — a bare toLocaleString() here is a React
+ * hydration mismatch.
+ */
+function formatUtcLabel(iso: string): string {
+  return `${new Intl.DateTimeFormat("en-GB", {
+    dateStyle: "medium",
+    timeStyle: "short",
+    timeZone: "UTC",
+  }).format(new Date(iso))} UTC`;
+}
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   await authenticate.admin(request);
@@ -185,10 +201,25 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     shopId: shop.id,
   });
 
+  // Klaviyo flow coverage — the CACHED verdict only (the setup page and the
+  // daily alert check are the ones that talk to Klaviyo). Rows whose
+  // templates are app-delivered or turned off don't need a flow and stay
+  // out of the numerator/denominator.
+  const coverage = await readCachedCoverage(shop.id);
+  const flowRows = coverage.rows.filter(
+    (r) => r.status !== "app_delivers" && r.status !== "off",
+  );
+  const coverageSummary = {
+    checkedAtLabel: coverage.checkedAt ? formatUtcLabel(coverage.checkedAt) : null,
+    total: flowRows.length,
+    live: flowRows.filter((r) => r.status === "live").length,
+  };
+
   return json({
     entries,
     flows: eventMetricEntries(),
     klaviyoConfigured,
+    coverageSummary,
     logRows,
     logTemplate,
     design: normalizeEmailDesign(emailDesign),
@@ -363,6 +394,7 @@ export const shouldRevalidate: ShouldRevalidateFunction = ({
 
 export default function EmailsPage() {
   const params = useParams();
+  const location = useLocation();
   const data = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const shopify = useAppBridge();
@@ -393,11 +425,14 @@ export default function EmailsPage() {
     { id: "activity", content: "Sent log" },
   ];
 
-  // Child editor route (/app/emails/:template) — this component is its
-  // layout parent in Remix flat routes, so it must yield to the Outlet.
+  // Child routes (/app/emails/:template editor, /app/emails/setup wizard) —
+  // this component is their layout parent in Remix flat routes, so it must
+  // yield to the Outlet for ANY deeper path, not only the dynamic one.
   // After every hook above, so the hook order stays stable across the
-  // overview ↔ editor navigation.
-  if (params.template) return <Outlet />;
+  // overview ↔ child navigation.
+  if (params.template || /\/app\/emails\/.+/.test(location.pathname)) {
+    return <Outlet />;
+  }
 
   return (
     <Page
@@ -463,8 +498,49 @@ function CatalogTab({
   const [, setSearchParams] = useSearchParams();
   const [showFlows, setShowFlows] = useState(false);
 
+  const cov = data.coverageSummary;
+  // The cached verdict is only meaningful while Klaviyo is connected — a
+  // disconnected shop delivers via SMTP, and a weeks-old "20 of 26 live"
+  // line next to the "not connected" banner would be nonsense.
+  const showCoverage = cov.total > 0 && data.klaviyoConfigured;
+
   return (
     <BlockStack gap="400">
+      <Card>
+        <BlockStack gap="200">
+          <InlineStack align="space-between" blockAlign="center" wrap>
+            <BlockStack gap="050">
+              <Text as="h3" variant="headingMd">
+                Klaviyo delivery
+              </Text>
+              <Text as="p" variant="bodySm" tone="subdued">
+                {showCoverage
+                  ? `${cov.live} of ${cov.total} emails are delivered by a live Klaviyo flow` +
+                    (cov.checkedAtLabel ? ` · checked ${cov.checkedAtLabel}` : "")
+                  : data.klaviyoConfigured
+                    ? "Let Klaviyo deliver every email for the best inbox placement — the guided setup builds all the flows for you, no technical knowledge needed."
+                    : "Optional: connect Klaviyo and the guided setup builds every delivery flow for you — best-in-class deliverability, zero technical knowledge needed."}
+              </Text>
+            </BlockStack>
+            <Button
+              url="/app/emails/setup"
+              variant={showCoverage && cov.live === cov.total ? undefined : "primary"}
+            >
+              {showCoverage ? "Open delivery checklist" : "Guided Klaviyo setup"}
+            </Button>
+          </InlineStack>
+          {showCoverage && cov.live < cov.total && (
+            <Banner tone="warning">
+              <p>
+                {cov.total - cov.live} email
+                {cov.total - cov.live === 1 ? " is" : "s are"} not covered by a
+                live flow — customers receive nothing for those moments. The
+                checklist shows which and fixes it in one click.
+              </p>
+            </Banner>
+          )}
+        </BlockStack>
+      </Card>
       <Card>
         <BlockStack gap="200">
           <Text as="h3" variant="headingMd">

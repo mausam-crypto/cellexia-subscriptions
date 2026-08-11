@@ -75,6 +75,7 @@ vi.mock("~/lib/klaviyo/outbox.server", () => ({
 }));
 
 vi.mock("~/lib/klaviyo/events-map.server", () => ({
+  CELLEXIA_SEND_PROPERTY: "cellexia_send",
   contractProfileAttrs: vi.fn(() => ({})),
   contractSnapshotProperties: mocks.contractSnapshotProperties,
 }));

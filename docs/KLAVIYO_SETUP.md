@@ -57,6 +57,41 @@ Direct SMTP is used only for mail that must never depend on Klaviyo:
 OTP login codes, 3DS action requests, admin alerts and import summaries —
 plus every email whose sender is "Cellexia" (or "Auto" without a key).
 
+## 0. Guided setup (v1.18.0 — start here)
+
+You do not need to build any flow by hand anymore. Open the app's
+**Emails → Guided Klaviyo setup** (`/app/emails/setup`):
+
+1. **Step 1** shows exactly how to create a Klaviyo private key with the
+   four permissions the setup needs (Events Full, Metrics Read, Flows
+   Full, Templates Full) and validates it before saving.
+2. **Step 2 — "Create my flows"** builds every missing delivery flow in
+   your Klaviyo account: metric trigger, a `cellexia_send equals "true"`
+   trigger filter (the app's safety interlock — see below), and one email
+   whose subject/body render the app's `content_*` properties. Metrics
+   Klaviyo has never seen are registered with harmless seed events
+   (`cellexia_send:"false"` — a seed can never send). Emails you already
+   deliver with your own LIVE flow are detected and left untouched.
+3. **Step 3** is the permanent green-check checklist, re-verified against
+   Klaviyo on every visit — and daily by the alert scan, which raises
+   `KLAVIYO_FLOW_COVERAGE` if a flow is ever deleted or paused.
+
+**The `cellexia_send` filter.** Every event the app emits carries this
+string property. The notifications router stamps `"true"` (it already
+applied every gate: launch mode, ownership, demo, channel toggles, the
+per-template enable). State-change confirmation events carry a verdict:
+`"true"` only when the moment was person-initiated (a consolidation
+merge-cancel, a stockout skip, a dunning cancel or an auto-resume is
+`"false"` — those must never email "as you requested") AND the template is
+enabled on the Emails page — so the in-app on/off switch controls the
+auto-created flows too. Hand-built flows without the filter behave exactly
+as before.
+
+Deliberately NOT auto-flowed: `threeds_action` (payment-critical — the app
+always delivers it directly), SMS (needs Klaviyo SMS consent — build it
+when you enable SMS), and merchant-facing system mail. The manual recipes
+below remain valid for custom journeys and SMS.
+
 ---
 
 ## 1. Private API key
@@ -76,7 +111,7 @@ plus every email whose sender is "Cellexia" (or "Auto" without a key).
 
      ```bash
      KLAVIYO_PRIVATE_API_KEY=pk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-     KLAVIYO_API_REVISION=2024-10-15     # Events API revision date (optional; this is the default)
+     KLAVIYO_API_REVISION=2025-01-15     # Events API revision date (optional; code default 2024-10-15). The guided flow setup always uses ≥2025-01-15 internally regardless.
      ```
 
    A key saved in the admin wins over the env var; clearing the admin value

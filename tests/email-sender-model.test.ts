@@ -117,6 +117,7 @@ vi.mock("~/lib/magiclinks/builder.server", () => ({
   ),
 }));
 vi.mock("~/lib/klaviyo/events-map.server", () => ({
+  CELLEXIA_SEND_PROPERTY: "cellexia_send",
   contractProfileAttrs: vi.fn((): Record<string, unknown> => ({})),
   contractSnapshotProperties: vi.fn(
     async (): Promise<Record<string, unknown>> => ({
@@ -182,10 +183,14 @@ describe("sender: app", () => {
       template: "payment_failed_sms",
       vars: { amount: "CHF 64.00" },
     });
-    // Klaviyo configured → behaves like auto: the event is enqueued.
+    // Klaviyo configured → behaves like auto: the event is enqueued — but
+    // stamped cellexia_send "false" (content_text only; an EMAIL flow on
+    // the shared metric must not fire a blank email off the SMS leg).
     expect(result.status).toBe("SENT");
     expect(store.outbox).toHaveLength(1);
     expect(mocks.sendEmail).not.toHaveBeenCalled();
+    const properties = (store.outbox[0] as { properties: Row }).properties;
+    expect(properties.cellexia_send).toBe("false");
   });
 
   it("phone-only contract (no email) logs a FAILED row — never a silent no-row failure", async () => {
@@ -266,7 +271,7 @@ describe("sender: klaviyo", () => {
 });
 
 describe("sender: auto (the pre-1.17.0 contract)", () => {
-  it("enqueues the Klaviyo event when configured", async () => {
+  it("enqueues the Klaviyo event when configured — stamped cellexia_send 'true' for the flow filter", async () => {
     const result = await sendNotification({
       shopId: "shop_1",
       contractId: "ctr_1",
@@ -275,6 +280,8 @@ describe("sender: auto (the pre-1.17.0 contract)", () => {
     expect(result.status).toBe("SENT");
     expect(result.klaviyoEnqueued).toBe(true);
     expect(mocks.sendEmail).not.toHaveBeenCalled();
+    const properties = (store.outbox[0] as { properties: Row }).properties;
+    expect(properties.cellexia_send).toBe("true");
   });
 
   it("falls back to direct SMTP when unconfigured (EMAIL)", async () => {

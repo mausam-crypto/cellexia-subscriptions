@@ -17,6 +17,7 @@
  * env-only (Events API revision date, e.g. "2024-10-15").
  */
 
+const KLAVIYO_API_BASE = "https://a.klaviyo.com";
 const KLAVIYO_EVENTS_URL = "https://a.klaviyo.com/api/events/";
 const KLAVIYO_ACCOUNTS_URL = "https://a.klaviyo.com/api/accounts/";
 const DEFAULT_REVISION = "2024-10-15";
@@ -282,4 +283,153 @@ export async function createKlaviyoEvent(
     permanent: true,
     error: `Klaviyo ${response.status}: ${detail || response.statusText}`,
   };
+}
+
+// ── Generic authenticated JSON:API requests (v1.18.0, flow setup) ────────────
+
+/**
+ * The flows/templates surface (Create Flow, flow definitions) went GA in
+ * revision 2025-01-15 — earlier revisions 404/400 those endpoints. The
+ * guided setup ALWAYS uses at least this revision regardless of the events
+ * revision (KLAVIYO_API_REVISION stays in charge of the outbox hot path,
+ * which is byte-identical to previous releases).
+ */
+export const FLOWS_API_REVISION = "2025-01-15";
+
+/** Auth pinned to the flows-capable revision for the guided-setup surface. */
+export function flowsAuth(auth: KlaviyoAuth): KlaviyoAuth {
+  return auth.revision >= FLOWS_API_REVISION
+    ? auth
+    : { ...auth, revision: FLOWS_API_REVISION };
+}
+
+export interface KlaviyoApiResponse {
+  ok: boolean;
+  status: number;
+  /** Parsed JSON body when one existed (success or error). */
+  json?: unknown;
+  /** Raw error detail for diagnostics (truncated). */
+  error?: string;
+  /** Set on 429 responses when Klaviyo provided a Retry-After. */
+  retryAfterSeconds?: number;
+}
+
+/**
+ * One authenticated request against the Klaviyo JSON:API. Unlike
+ * createKlaviyoEvent this never throws on 5xx — the guided setup surface
+ * reports every outcome inline, so callers get {ok:false} + detail instead.
+ * `path` is either an absolute Klaviyo URL (pagination `next` links) or an
+ * API path starting with /api/.
+ */
+export async function klaviyoApiRequest(
+  auth: KlaviyoAuth,
+  method: "GET" | "POST" | "PATCH",
+  path: string,
+  body?: unknown,
+): Promise<KlaviyoApiResponse> {
+  if (!auth.apiKey) {
+    return { ok: false, status: 0, error: "No Klaviyo API key is configured" };
+  }
+  const url = path.startsWith("http") ? path : `${KLAVIYO_API_BASE}${path}`;
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method,
+      headers: {
+        Authorization: `Klaviyo-API-Key ${auth.apiKey}`,
+        revision: auth.revision,
+        accept: "application/json",
+        ...(body !== undefined ? { "content-type": "application/json" } : {}),
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      status: 0,
+      error: `Could not reach Klaviyo: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  let json: unknown;
+  let text = "";
+  let bodyError: string | null = null;
+  try {
+    text = await response.text();
+    json = text ? JSON.parse(text) : undefined;
+  } catch (err) {
+    // Fail CLOSED on an unreadable/invalid body: a truncated flows listing
+    // reported as "ok, zero rows" would make every covered metric look
+    // missing and trigger duplicate creation.
+    bodyError = err instanceof Error ? err.message : String(err);
+  }
+  if (response.ok) {
+    if (bodyError !== null) {
+      return {
+        ok: false,
+        status: response.status,
+        error: `Klaviyo returned an unreadable response body: ${bodyError}`,
+      };
+    }
+    return { ok: true, status: response.status, json };
+  }
+  const retryAfterRaw = Number(response.headers.get("Retry-After") ?? "");
+  return {
+    ok: false,
+    status: response.status,
+    json,
+    error: klaviyoErrorDetail(json) ?? text.slice(0, 300) ?? response.statusText,
+    ...(response.status === 429 && Number.isFinite(retryAfterRaw) && retryAfterRaw > 0
+      ? { retryAfterSeconds: retryAfterRaw }
+      : {}),
+  };
+}
+
+/** Pulls the human-readable message out of a Klaviyo JSON:API error body. */
+export function klaviyoErrorDetail(json: unknown): string | null {
+  const errors = (json as { errors?: unknown })?.errors;
+  if (!Array.isArray(errors) || errors.length === 0) return null;
+  const first = errors[0] as { detail?: unknown; title?: unknown };
+  const detail =
+    typeof first.detail === "string"
+      ? first.detail
+      : typeof first.title === "string"
+        ? first.title
+        : null;
+  return detail ? detail.slice(0, 300) : null;
+}
+
+/**
+ * Fetches every page of a JSON:API collection (metrics, flows). Klaviyo
+ * paginates with links.next; MAX_PAGES bounds a runaway cursor.
+ */
+export async function klaviyoApiList(
+  auth: KlaviyoAuth,
+  path: string,
+): Promise<
+  | { ok: true; data: Array<Record<string, unknown>> }
+  | { ok: false; status: number; error: string }
+> {
+  const MAX_PAGES = 30;
+  const out: Array<Record<string, unknown>> = [];
+  let next: string | null = path;
+  for (let page = 0; page < MAX_PAGES && next; page += 1) {
+    const response = await klaviyoApiRequest(auth, "GET", next);
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status,
+        error: response.error ?? `Klaviyo ${response.status}`,
+      };
+    }
+    const body = response.json as {
+      data?: unknown;
+      links?: { next?: unknown };
+    };
+    if (Array.isArray(body?.data)) {
+      out.push(...(body.data as Array<Record<string, unknown>>));
+    }
+    next = typeof body?.links?.next === "string" ? body.links.next : null;
+  }
+  return { ok: true, data: out };
 }

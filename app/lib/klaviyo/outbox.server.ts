@@ -117,15 +117,33 @@ export async function enqueue(
         // empty. Graft the content keys onto the surviving row while it has
         // not been flushed yet; content-less duplicates (the common case)
         // change nothing. Failure-contained like the rest of this function.
+        // cellexia_send rides along (v1.18.0): the auto-created flows
+        // trigger-filter on it, so a content graft that left the surviving
+        // row without the "true" verdict would render the flow silent.
+        // Both writers (events-map.server.ts, send.server.ts) always stamp
+        // cellexia_send atomically WITH its content — "true" never appears
+        // without content, "false" never appears with it. So a row's
+        // verdict is only trustworthy (and worth protecting) once that row
+        // has actually received content: the add-only guard below is keyed
+        // on `existing.content_text`, not on whether a verdict string is
+        // merely present. A surviving row that is still contentless (e.g.
+        // the canonical event-map's default "false" for milestone_gift /
+        // rewards_unlocked / a hard-decline payment_failed_1, which never
+        // gets content of its own) has no finalized verdict yet, so the
+        // first content-bearing duplicate — router or canonical — legitimately
+        // supersedes it, verdict included. Once a row has real content, its
+        // verdict IS protected (e.g. a merge-cancel twin's provenance-gated
+        // "false" can never be flipped to "true" after the fact).
         const CONTENT_KEYS = [
           "content_subject",
           "content_html",
           "content_text",
           "template",
+          "cellexia_send",
         ] as const;
         const incoming = input.properties ?? {};
         const hasContent = CONTENT_KEYS.some(
-          (k) => typeof incoming[k] === "string",
+          (k) => k !== "cellexia_send" && typeof incoming[k] === "string",
         );
         const existing = (duplicate.properties ?? {}) as Record<
           string,
@@ -138,7 +156,8 @@ export async function enqueue(
         ) {
           const graft: Record<string, unknown> = {};
           for (const k of CONTENT_KEYS) {
-            if (typeof incoming[k] === "string") graft[k] = incoming[k];
+            if (typeof incoming[k] !== "string") continue;
+            graft[k] = incoming[k];
           }
           await prisma.klaviyoOutbox.update({
             where: { id: duplicate.id },

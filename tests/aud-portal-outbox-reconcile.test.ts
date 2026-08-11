@@ -214,6 +214,7 @@ vi.mock("~/lib/magiclinks/builder.server", () => ({
 // Snapshot builders read the shop and format dates — stub them so these
 // tests stay about the outbox linkage, not property shapes.
 vi.mock("~/lib/klaviyo/events-map.server", () => ({
+  CELLEXIA_SEND_PROPERTY: "cellexia_send",
   contractProfileAttrs: vi.fn((): Record<string, unknown> => ({})),
   contractSnapshotProperties: vi.fn(
     async (): Promise<Record<string, unknown>> => ({}),

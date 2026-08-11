@@ -578,6 +578,36 @@ export const settingsSchemas = {
     }),
 
   /**
+   * INTERNAL / MACHINE-WRITTEN — Klaviyo flow coverage cache (v1.18.0).
+   * Written by the guided flow setup / verification
+   * (app/lib/klaviyo/flows.server.ts) whenever it talks to Klaviyo; read by
+   * the Emails overview card and the daily KLAVIYO_FLOW_COVERAGE alert
+   * check so neither has to hit Klaviyo's API on every page view or sweep.
+   * Not rendered on the Settings page.
+   */
+  klaviyoFlowSetup: z
+    .object({
+      /** Last SUCCESSFUL verification. */
+      checkedAt: z.string().nullable().default(null),
+      /** Last attempt, failed ones included — holds the daily API budget. */
+      lastAttemptAt: z.string().nullable().default(null),
+      /** Set only by runGuidedSetup — the coverage alert's opt-in gate. */
+      setupRanAt: z.string().nullable().default(null),
+      rows: z
+        .array(
+          z.object({
+            metric: z.string(),
+            status: z.string(),
+            flowId: z.string().default(""),
+            flowName: z.string().default(""),
+            ours: z.boolean().default(false),
+          }),
+        )
+        .default([]),
+    })
+    .default({ checkedAt: null, lastAttemptAt: null, setupRanAt: null, rows: [] }),
+
+  /**
    * INTERNAL / MACHINE-WRITTEN — learned churn-risk model state. Written
    * exclusively by the nightly risk_learning_run job
    * (app/lib/analytics/learning.server.ts); never edited by hand and not

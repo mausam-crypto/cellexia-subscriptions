@@ -8,6 +8,7 @@ import {
 import { enqueue } from "~/lib/klaviyo/outbox.server";
 import { isKlaviyoConfigured } from "~/lib/klaviyo/client.server";
 import {
+  CELLEXIA_SEND_PROPERTY,
   contractProfileAttrs,
   contractSnapshotProperties,
   type ContractWithLines,
@@ -353,6 +354,12 @@ export async function sendNotification(
     const properties: Record<string, unknown> = {
       ...vars,
       template: input.template,
+      // Auto-created flows trigger-filter on this (guided setup). Strict
+      // meaning: "true" = this event carries the rendered EMAIL content.
+      // Only EMAIL-channel enqueues qualify — an SMS enqueue (content_text
+      // only, e.g. payment_failed_sms on the shared "Cellexia Payment
+      // Failed" metric) would make an email flow send a blank message.
+      [CELLEXIA_SEND_PROPERTY]: tmpl.channel === "EMAIL" ? "true" : "false",
     };
     if (contract) {
       Object.assign(properties, await contractSnapshotProperties(contract, tz));

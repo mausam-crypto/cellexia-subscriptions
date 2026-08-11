@@ -78,8 +78,19 @@ const CLAIM_STATUS = "CLAIMED";
  *   SYSTEM cancels have their own messaging. A webhook-observed cancel
  *   without a cancelSource (Shopify-admin cancel) is a real cancellation
  *   and does send.
+ *
+ * Exported (v1.18.0): the Klaviyo events-map applies the SAME gate when
+ * stamping `cellexia_send` on confirmation events, so the auto-created
+ * Klaviyo flows and the app-sent path can never disagree about which
+ * moments deserve an email. The optional `mirror` supplies the contract's
+ * persisted cancel provenance as a fallback: the webhook status-diff twin
+ * of a cancel carries NO reason/cancelSource in its payload, and without
+ * the fallback a consolidation merge-cancel's twin would pass the gate.
  */
-function isPersonInitiated(event: LogEventInput): boolean {
+export function isPersonInitiated(
+  event: LogEventInput,
+  mirror?: { cancelReason?: string | null; cancelSource?: string | null } | null,
+): boolean {
   if (event.source === "SYSTEM" || event.source === "SCHEDULER") return false;
   const payload = event.payload ?? {};
   if (event.type === "cycle.skipped") {
@@ -87,8 +98,13 @@ function isPersonInitiated(event: LogEventInput): boolean {
     if (typeof initiator === "string" && initiator !== "CUSTOMER") return false;
   }
   if (event.type === "contract.cancelled") {
-    if (payload.reason === "MERGED") return false;
-    const cancelSource = payload.cancelSource;
+    const reason =
+      typeof payload.reason === "string" ? payload.reason : mirror?.cancelReason;
+    if (reason === "MERGED") return false;
+    const cancelSource =
+      typeof payload.cancelSource === "string"
+        ? payload.cancelSource
+        : mirror?.cancelSource;
     if (
       typeof cancelSource === "string" &&
       cancelSource !== "CUSTOMER" &&

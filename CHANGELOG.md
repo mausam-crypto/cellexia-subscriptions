@@ -4,6 +4,122 @@ All notable changes to Cellexia Subscriptions. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [SemVer](https://semver.org) as contracted in [docs/UPDATE.md](docs/UPDATE.md).
 
+## [1.18.0] — 2026-08-11
+
+**Guided Klaviyo delivery** — "send every email through Klaviyo" becomes a
+one-button, zero-jargon operation. A new wizard (**Emails → Guided Klaviyo
+setup**, `/app/emails/setup`) walks through three steps: (1) create a
+Klaviyo key with the right permissions (click-by-click instructions, paste
+box, validated before saving); (2) **one click creates every delivery flow
+in Klaviyo** via Klaviyo's Flows API — metric trigger, safety filter, and
+an email that renders exactly what the app wrote (`{{ event.content_html }}`
+plus the required unsubscribe/sender-identity footer) — then sets each
+live; (3) a **live green-check checklist** per email, verified against
+Klaviyo, with a daily `KLAVIYO_FLOW_COVERAGE` alert if a flow is ever
+deleted or paused. Existing hand-built live flows are detected and counted
+as covered — nothing is ever duplicated. The state-change confirmation
+events now carry the app-rendered `content_*` properties too, so
+confirmation flows are the same dumb envelope as everything else, and every
+enqueued event carries the new **`cellexia_send`** ("true"/"false") verdict
+the auto-created flows filter on — which makes the in-app "Send this email"
+toggle control Klaviyo delivery, keeps system-driven moments (consolidation
+merge-cancels, stockout skips, dunning cancels, auto-resume) from emailing
+"as you requested", and makes metric seeding safe. **No migration**, no new
+env vars, no scope/webhook/theme changes, `npm run deploy` NOT required.
+**Rollback caution:** flows created by the wizard STOP delivering under
+v1.17.0 — its events carry no `cellexia_send`, so the trigger filter holds
+every event back (fail-closed: silence, never misfires; see Migration notes
+for the workaround before rolling back).
+
+### Added
+
+- **Klaviyo API layer** (`app/lib/klaviyo/client.server.ts` additions +
+  `flows.server.ts`): generic authenticated JSON:API requests with
+  pagination; flow specs derived from the template registry (the three
+  payment-failed notices share one flow; threeds/SMS/system mail excluded
+  with stated reasons); definition builder (metric trigger,
+  `cellexia_send equals "true"` string filter, single send-email action,
+  subject `{{ event.content_subject }}`, **smart sending OFF** — a
+  subscription email must never be swallowed because a campaign went out an
+  hour earlier); per-flow Klaviyo template with the compliance footer
+  (`{% unsubscribe_link %}`, organization tags); metric seeding for moments
+  Klaviyo has never seen (seed events stamp `cellexia_send:"false"` and can
+  never email anyone); idempotent orchestration + read-only verification;
+  cached coverage in the machine-written `klaviyoFlowSetup` setting.
+- **Setup wizard** (`app.emails.setup.tsx`): plain-language three-step
+  page; key paste field validates before saving (Settings-page rule) and
+  stores encrypted; per-flow results with friendly error text; "waiting for
+  Klaviyo" handling for freshly seeded metrics; the deliberate-exclusions
+  list so nothing looks forgotten.
+- **Coverage surfacing**: Emails overview card (X of Y live, warning banner
+  when short, cached — no Klaviyo call per page view) and the daily
+  `KLAVIYO_FLOW_COVERAGE` WARNING alert (refreshes its Klaviyo read at most
+  once per day; never guesses when the key/scopes can't verify).
+- **`cellexia_send` event property** on every enqueued event: "true" from
+  the notifications router (already fully gated); provenance verdict on
+  confirmation events (person-initiated + template enabled, the same gate
+  as the app-sent bridge); carried across the outbox dedupe graft; "false"
+  on seeds. Confirmation events also carry `content_subject` /
+  `content_html` / `content_text` (merchant copy + brand kit applied); a
+  content-render failure flips the verdict to "false" so an auto-created
+  flow can never send an empty email.
+- `first_name` / `last_name` join the contract snapshot properties — the
+  long-advertised `{first_name}` placeholder now actually resolves in email
+  copy on both delivery shapes.
+- Tests: `klaviyo-flows.test.ts` (spec coverage incl. exclusion reasons,
+  definition shape, compliance footer, coverage evaluation incl.
+  merchant-flow respect, seed safety, idempotency),
+  `klaviyo-cellexia-send.test.ts` (the stamping matrix + content
+  attachment + render-failure fail-safe).
+
+### Adversarial-review fixes (pre-release)
+
+- Flows/templates API calls pinned to revision 2025-01-15 (the surface's GA
+  revision) independently of the events revision; flow definitions fetched
+  per flow (the list endpoint cannot embed them), with an unreadable
+  definition treated as fatal — never as "no flow here" (which would have
+  created duplicates); template `editor_type` corrected to `CODE`.
+- `cellexia_send` semantics hardened to "this event carries the rendered
+  email": canonical non-confirmation events and SMS enqueues stamp
+  `"false"` (several share metrics with router templates — a `"true"`
+  without content would have made auto-created flows send BLANK emails on
+  ladder days), app-sent confirmations stamp `"false"` (the bridge owns
+  delivery — never two emails), the webhook cancel twin consults the
+  contract mirror's cancelSource (a consolidation merge-cancel's twin can
+  no longer email "your subscription was cancelled"), and the outbox graft
+  is add-only for the verdict (a router graft can never flip a provenance
+  "false" to "true").
+- Coverage model folds in the v1.17.0 sender model: app-delivered or
+  disabled emails report honestly ("Cellexia delivers it" / "Turned off")
+  instead of "customers receive nothing", are excluded from the wizard's
+  creation list, the overview tally and the alert.
+- Setup robustness: flow creation paced ~1/s and capped per click with a
+  friendly "click again in a minute" status (Klaviyo's 15/min limit), 429
+  never triggers the draft-retry double-POST, drafts we created are
+  re-PATCHed live on re-run ("click until green" is now true), a per-shop
+  re-entrancy guard stops double-clicks, and unreadable Klaviyo response
+  bodies fail closed.
+- Alert scan discipline: the coverage check arms itself ONLY after the
+  wizard has actually run (`setupRanAt`), and failed verifications also
+  advance the daily budget (`lastAttemptAt`) — an Events-only key can no
+  longer turn the 15-minute sweep into 96 Klaviyo calls a day.
+- Seed events go to a real merchant address (alerts recipient → shop
+  contact → session user), never a fabricated `admin@…myshopify.com`
+  profile; timestamps render deterministically (no hydration mismatch);
+  the Emails-overview coverage card yields to the "not connected" state
+  instead of showing stale claims.
+
+### Migration notes
+
+None to apply. `npx prisma migrate deploy` is a no-op; no `.env` changes.
+One rollback caveat: flows created by this setup trigger-filter on
+`cellexia_send`, which only v1.18.0+ events carry — rolling back to
+v1.17.0 or earlier would leave those flows filtering out every event
+(emails stop, Klaviyo shows "filtered" on the flow). If you must roll
+back after running the setup, remove the trigger filter from the
+"Cellexia — …" flows in Klaviyo (or pause them and rely on the app's
+direct sending via each email's sender setting).
+
 ## [1.17.0] — 2026-08-11
 
 **Email studio** — the Emails tab grows into a full email management
