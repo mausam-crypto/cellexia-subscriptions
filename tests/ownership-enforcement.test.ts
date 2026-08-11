@@ -513,6 +513,8 @@ const OWNERSHIP_FILTERED_QUERIES: Array<[string, string]> = [
   ["app/lib/analytics/risk.server.ts", "churn risk + predicted empty dates"],
   ["app/lib/analytics/forecast.server.ts", "forecasting"],
   ["app/lib/analytics/alerts.server.ts", "operational alert scan"],
+  ["app/lib/analytics/segments.server.ts", "segment id resolution + options"],
+  ["app/lib/analytics/segment-views.server.ts", "segment-filtered views"],
   ["app/lib/portal/otp.server.ts", "portal OTP login"],
   ["app/routes/proxy._index.tsx", "portal subscription list"],
   ["app/routes/proxy.account.tsx", "portal account page"],
@@ -817,6 +819,7 @@ describe("migration 0003 backfills fail-SAFE and stays additive", () => {
       "0016_data_collection_audit",
       "0017_plan_lock_window",
       "0018_variant_default_frequencies",
+      "0019_vat_reporting_cost",
     ]);
   });
 });
@@ -1413,6 +1416,49 @@ describe("migration 0018 (variant default frequencies) stays additive and leaves
     // Nullable, no default: every pre-upgrade plan simply has no per-variant
     // overrides, which renders exactly as before (the group default).
     expect(adds[0]).toMatch(/"variantDefaultFrequencies" JSONB$/);
+  });
+
+  it("never touches the ownership column or any existing default", () => {
+    expect(sql).not.toMatch(/ownership/i);
+    expect(sql).not.toMatch(/SET DEFAULT/i);
+  });
+});
+
+describe("migration 0019 (VAT reporting cost) stays additive and leaves ownership alone", () => {
+  const sql = read("prisma/migrations/0019_vat_reporting_cost/migration.sql")
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("is additive only — no destructive verb anywhere in it", () => {
+    for (const verb of [
+      /\bDROP\b/i,
+      /\bTRUNCATE\b/i,
+      /\bDELETE\s+FROM\b/i,
+      /\bUPDATE\s+"/i,
+      /\bRENAME\b/i,
+      /\bALTER\s+TYPE\b/i,
+      /\bALTER\s+COLUMN\s+"\w+"\s+TYPE\b/i,
+    ]) {
+      expect(sql, String(verb)).not.toMatch(verb);
+    }
+  });
+
+  it("adds exactly the four VAT columns, NOT NULL DEFAULT 0 — zero IS the pre-0019 behavior", () => {
+    // Both tables are derived (recomputed by rollup_run / cohort_run), and a
+    // 0 default means "no VAT accounted", which is exactly what every
+    // pre-upgrade row (and a vat-disabled shop) must read.
+    const adds = sql.match(/ADD COLUMN [^,;]+/g) ?? [];
+    expect(adds).toHaveLength(4);
+    for (const table of ["DailyRollup", "CohortCell"]) {
+      for (const column of ["vatCents", "estimatedVatCents"]) {
+        expect(sql).toMatch(
+          new RegExp(
+            `ALTER TABLE "${table}" ADD COLUMN "${column}" INTEGER NOT NULL DEFAULT 0;`,
+          ),
+        );
+      }
+    }
   });
 
   it("never touches the ownership column or any existing default", () => {

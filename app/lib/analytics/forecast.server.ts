@@ -9,6 +9,7 @@ import {
 } from "./queries.server";
 import { OURS_ONLY } from "~/lib/ownership/ownership.server";
 import { getSetting, setSetting } from "~/lib/settings/settings.server";
+import { defaultFor } from "~/lib/settings/registry.server";
 import { logEvent } from "~/lib/events/log.server";
 
 /**
@@ -1110,6 +1111,17 @@ export async function getForecast(
   const shop = await requireShopById(shopId);
   const tz = shop.ianaTimezone;
 
+  // Refund exclusion (v1.16.0): when ON, the rollup's chargedCents already
+  // excludes refunded payments (charge-day repair included), so subtracting
+  // the day's recorded refunds AGAIN would double-drop the money — net
+  // revenue reads chargedCents alone. Must stay in lockstep with
+  // runDailyRollup's estGrossProfitCents rule. Failure-contained like the
+  // history read below: a broken settings read falls back to the shipped
+  // default rather than taking the forecast down.
+  const { excludeRefundedPayments } = await getSetting(shopId, "analytics").catch(
+    () => defaultFor("analytics"),
+  );
+
   // Persisted per-model accuracy history (self-improvement). Failure-contained
   // and graceful: any read problem = no history = pre-history behavior.
   let recordedWeeks: ForecastModelHistoryWeek[] = [];
@@ -1192,11 +1204,15 @@ export async function getForecast(
         : prevSnapshotReal
           ? prev.pausedSubscribers
           : 0,
-      // Net revenue = charged − refunded, per recorded day. A week can go
-      // transiently negative here (refunds recorded for prior weeks'
-      // charges); the clamp below floors the WEEK's total, not each step.
+      // Net revenue = charged − refunded, per recorded day (with refund
+      // exclusion ON, charged alone — the refunded payments never entered
+      // it, see above). A week can go transiently negative here (refunds
+      // recorded for prior weeks' charges); the clamp below floors the
+      // WEEK's total, not each step.
       netRevenueCents:
-        (prev?.netRevenueCents ?? 0) + rollup.chargedCents - rollup.refundedCents,
+        (prev?.netRevenueCents ?? 0) +
+        rollup.chargedCents -
+        (excludeRefundedPayments ? 0 : rollup.refundedCents),
       newSubscribers: (prev?.newSubscribers ?? 0) + rollup.newSubscribers,
       churnedVoluntary: (prev?.churnedVoluntary ?? 0) + rollup.churnedVoluntary,
       churnedInvoluntary:

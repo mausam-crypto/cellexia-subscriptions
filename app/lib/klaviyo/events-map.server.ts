@@ -69,6 +69,21 @@ const LINK_BUNDLE_TYPES = new Set([
   "dunning.threeds_link_sent",
 ]);
 
+/**
+ * Read-only view of the auto-mapped state-change metrics, for the admin
+ * Emails catalog (v1.16.0). The map itself stays private — the catalog must
+ * never become a second writer of the event→metric contract.
+ */
+export function eventMetricEntries(): Array<{
+  eventType: string;
+  metric: string;
+}> {
+  return Object.entries(EVENT_METRIC_MAP).map(([eventType, metric]) => ({
+    eventType,
+    metric,
+  }));
+}
+
 export type ContractWithLines = Prisma.SubscriptionContractGetPayload<{
   include: { lines: true };
 }>;

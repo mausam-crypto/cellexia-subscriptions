@@ -15,9 +15,11 @@ import {
 import {
   renderEmail,
   TEMPLATES,
+  type EmailContentOverride,
   type TemplateKey,
   type TemplateVars,
 } from "./templates.server";
+import { EMAIL_CATALOG } from "./catalog.server";
 import { sendEmail } from "./mailer.server";
 import { isBillableOwnership } from "~/lib/ownership/ownership.server";
 
@@ -288,6 +290,42 @@ export async function sendNotification(
       }
     }
 
+    // ── Per-template overrides (v1.16.0, admin Emails tab) ──────────────────
+    // enabled:false suppresses like a channel toggle (critical templates
+    // bypass, same rule); non-empty subject/body replace the built-in copy in
+    // the rendering below. Failure-contained: a broken settings read must
+    // never block a send — overrides just don't apply.
+    let contentOverride: EmailContentOverride | null = null;
+    try {
+      const emailsSettings = await getSetting(input.shopId, "emails");
+      const override = emailsSettings.templates[input.template];
+      if (override) {
+        if (!tmpl.critical && override.enabled === false) {
+          await writeLog({
+            shopId: input.shopId,
+            contractId: contract?.id,
+            email,
+            phone,
+            channel: tmpl.channel,
+            template: input.template,
+            status: "SUPPRESSED",
+            klaviyoEventName: tmpl.klaviyoMetric || null,
+            payload: { cycleIndex, reason: "template_disabled" },
+          });
+          result.status = "SUPPRESSED";
+          return result;
+        }
+        // Copy overrides apply only where the catalog says the template is
+        // customizable — system mail (otp_code, admin_alert, import_summary)
+        // keeps its built-in copy no matter what a stored row claims.
+        if (EMAIL_CATALOG[input.template].customizable) {
+          contentOverride = { subject: override.subject, body: override.body };
+        }
+      }
+    } catch (err) {
+      console.error("[notifications] emails settings read failed", err);
+    }
+
     // ── Build Klaviyo properties: vars + contract snapshot + action links ───
     const properties: Record<string, unknown> = {
       ...vars,
@@ -325,6 +363,33 @@ export async function sendNotification(
       }
     }
 
+    // Ready-rendered content for Klaviyo flows (v1.16.0): the merchant's
+    // in-app copy (or the built-in catalog copy) with every placeholder —
+    // one-tap links included — already substituted, so a flow can render
+    // `{{ event.content_html }}` and stay in sync with the Emails tab.
+    // Rendered from the full property set (snapshot + link bundle), caller
+    // vars winning on collisions — the same variable set the SMTP fallback
+    // renders from. Computed BEFORE attaching so the content never
+    // recursively re-enters its own variable pool. otp_code never reaches
+    // here (no metric); admin templates carry no metric either.
+    const contentVars: TemplateVars = {
+      ...toTemplateVars(properties),
+      ...toTemplateVars(vars),
+    };
+    if (tmpl.klaviyoMetric) {
+      const content = renderEmail(
+        input.template,
+        locale,
+        contentVars,
+        contentOverride,
+      );
+      properties.content_text = content.text;
+      if (tmpl.channel === "EMAIL") {
+        properties.content_subject = content.subject;
+        properties.content_html = content.html;
+      }
+    }
+
     const channelsUsed: string[] = [];
     let directError: string | null = null;
 
@@ -352,14 +417,18 @@ export async function sendNotification(
       // bundle stays OUT of `logPayload` below — magic-link tokens must never
       // be persisted in NotificationLog.
       const templateVars: TemplateVars = {
-        ...toTemplateVars(properties),
-        ...toTemplateVars(vars),
+        ...contentVars,
       };
       const logPayload: Record<string, unknown> = tmpl.klaviyoMetric
         ? { cycleIndex, vars: toTemplateVars(vars) }
         : { cycleIndex };
       try {
-        const rendered = renderEmail(input.template, locale, templateVars);
+        const rendered = renderEmail(
+          input.template,
+          locale,
+          templateVars,
+          contentOverride,
+        );
         await sendEmail({
           shopId: input.shopId,
           to,

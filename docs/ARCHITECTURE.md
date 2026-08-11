@@ -47,10 +47,10 @@ flows, win-back, analytics.
 | Gifts & lifecycle | `app/lib/gifts/`, `app/lib/lifecycle/` | Gift rules/grants auto add/remove; milestones; rewards unlock; early-cycle incentives. |
 | Win-back | `app/lib/winback/` | Staged win-back timed to predicted empty date. |
 | Klaviyo | `app/lib/klaviyo/` | Outbox flush (with a 24h age-out — stale moments go DEAD, never fire late), event mapping (`events-map.server.ts` — replace the placeholder), profile sync. |
-| Notifications | `app/lib/notifications/` | Channel router (Klaviyo event; without a Klaviyo key — `klaviyo` setting or `KLAVIYO_PRIVATE_API_KEY` env fallback — lifecycle email falls back to direct SMTP and SMS is SUPPRESSED — never logged SENT undelivered), templates, `NotificationLog`. The SMTP transport itself resolves settings-first (`mailTransport` setting, admin Settings → Email delivery; env vars as fallback; password encrypted via `app/lib/crypto/secrets.server.ts`), with the transport cache keyed by the resolved config so admin saves apply without a restart. |
-| Analytics | `app/lib/analytics/` | Daily rollups, cohort LTGP (origin payment + renewals), the shared cost model (COGS/shipping/fees — `costs.server.ts`), censoring-corrected survival curves, churn risk with a self-training learned model (`learning.server.ts` — shadow-until-provably-better), predicted empty dates, five-model self-measuring forecasting with accuracy grades, take rate, alert scans, plain-language insights (`insights.server.ts`, imported directly — not via the barrel). See [Analytics](#analytics). |
+| Notifications | `app/lib/notifications/` | Channel router (Klaviyo event; without a Klaviyo key — `klaviyo` setting or `KLAVIYO_PRIVATE_API_KEY` env fallback — lifecycle email falls back to direct SMTP and SMS is SUPPRESSED — never logged SENT undelivered), templates, `NotificationLog`. Since v1.16.0 the admin **Emails** tab (`app/routes/app.emails.tsx` + `catalog.server.ts`) owns per-template customization: the `emails` setting holds enable/disable (SUPPRESSED reason `template_disabled`; critical templates bypass) and merchant subject/body overrides, which `renderEmail` applies in BOTH delivery shapes — the ready-rendered `content_subject`/`content_html`/`content_text` Klaviyo event properties (flows render `{{ event.content_html }}`) and the direct-SMTP fallback. Rendered content and link URLs are never persisted in `NotificationLog`. The SMTP transport itself resolves settings-first (`mailTransport` setting, admin Settings → Email delivery; env vars as fallback; password encrypted via `app/lib/crypto/secrets.server.ts`), with the transport cache keyed by the resolved config so admin saves apply without a restart. |
+| Analytics | `app/lib/analytics/` | Daily rollups, cohort LTGP (origin payment + renewals), the shared cost model (COGS/shipping/fees/VAT — `costs.server.ts`), censoring-corrected survival curves, churn risk with a self-training learned model (`learning.server.ts` — shadow-until-provably-better), predicted empty dates, five-model self-measuring forecasting with accuracy grades, take rate, alert scans, plain-language insights (`insights.server.ts`, imported directly — not via the barrel), and the segment layer (`segments.server.ts` + `segment-views.server.ts` — live filtered views by country/language/source/product/discount/device/value; the isomorphic vocabulary lives in `segments-shared.ts` for route components). See [Analytics](#analytics). |
 | Acquisition capture | `app/lib/acquisition/` + webhook/sync handlers | Sanitized origin-order acquisition signals (`acq*` columns: source, UTM, geo, device, first-order shape) captured once per OURS contract; pure sanitizer (`sanitize.ts`) — never a raw IP or full user-agent; erased on GDPR redact. Contract: [docs/DATA_FOUNDATION.md](DATA_FOUNDATION.md). |
-| Admin UI | `app/routes/app.*` | Polaris pages: dashboard, analytics, subscribers, dunning, alerts, audit, debug (live self-checks), bulk ops, plans, gifts, cancel-flow config, settings, import. |
+| Admin UI | `app/routes/app.*` | Polaris pages: dashboard, analytics, subscribers, dunning, emails (catalog + content/timing customization + sent log, v1.16.0), alerts, audit, debug (live self-checks), bulk ops, plans, gifts, cancel-flow config, settings, import. |
 | Buy box | `extensions/cellexia-buy-box/` | Theme app extension for the PDP, in two install shapes over one shared core snippet: a `section`-target app block, and (v1.2.0) a `body`-target **app embed** that self-mounts and patches JS cart requests for themes whose product section takes no app blocks. |
 | Widget design | `app/lib/widget/` | Buy-box design system: preset catalog + zod config schema + customCss sanitizer + text resolution (`presets.ts`, isomorphic — the admin designer imports it client-side), revision store / publish-to-metafield / restore (`design.server.ts`). Edited from the admin **Buy box designer** page. |
 | Launch & preview | `app/lib/launch/` | Install-dark launch mode (SETUP/LIVE), storefront PREVIEW tokens, go-live with ownership re-classification + overdue stagger; the gates live in jobs/notifications/Klaviyo/portal/buy box (see below). |
@@ -596,12 +596,33 @@ or carries `shippedAt` (stamped at the ADDED→SHIPPED flip and never cleared �
 a shipped gift's cost was incurred even if the grant row is later flipped
 `REMOVED`, while a gift removed before shipping costs nothing). Prepaid
 charges multiply COGS and
-shipment costs by deliveries-per-charge. Both gross-profit surfaces consume
-these same helpers, so **DailyRollup.estGrossProfitCents and
+shipment costs by deliveries-per-charge.
+
+**VAT / sales tax** (v1.15.0, `costModel.vat`; **on by default at 8.1%
+since v1.16.0** — reporting only, billing untouched): when enabled, both
+surfaces subtract a flat percentage of each charge's kept money via
+`resolveChargeVat` — kept × rate/100, VAT as a straight expense on revenue
+(the merchant-defined model: a CHF 100 charge at 8.1% books CHF 8.10) — at
+the contract country's rate (`countryRatesPct`, falling back to
+`defaultRatePct`). The captured order tax (`BillingAttempt.taxCents` /
+`originOrderTaxCents`, migration 0016) keeps being collected per the data
+foundation but deliberately no longer drives the deduction (v1.16.0): it is
+the tax-extracted-from-gross figure — net × rate/(100+rate), a smaller
+number on tax-inclusive prices — which is not the model the merchant runs
+their P&L on. The country resolves through `contractTaxCountry` (delivery
+address → acquisition country → null), the SAME helper the country segment
+dimension uses. All VAT is rate-derived and mirrored into
+`estimatedVatCents` (the estimatedCogsCents disclosure pattern).
+The rollup books charge-day VAT without crediting later refunds (the cohort
+surface carries the refund-adjusted figure — accepted day-ledger divergence,
+same family as the over-refund rule); closed rollup days keep their pre-VAT
+gross profit while the cohort triangle's full recompute carries VAT across
+all history from the first run after enablement. Both gross-profit surfaces
+consume these same helpers, so **DailyRollup.estGrossProfitCents and
 CohortCell.grossProfitCents use the identical formula by construction**:
 
 > gross profit = revenue collected (net of refunds) − COGS − fulfillment +
-> shipping per shipment − payment fees.
+> shipping per shipment − payment fees − VAT (where enabled).
 
 Discounts are *not* subtracted (charged amounts are already net of every
 discount); `discountCents` is stored alongside for reporting only.
@@ -633,16 +654,45 @@ promise live in [docs/DATA_FOUNDATION.md](DATA_FOUNDATION.md).
 idempotently per refund id on `BillingAttempt.refundedCents` (renewal orders,
 decrementing `lifetimeRevenueCents`, clamped at 0) or on
 `originOrderRefundedCents` (origin orders — matched by
-`contract.originOrderId` when no attempt claims the order), and netted in
-analytics. Netting requires **currency agreement**: REST refund transactions
-are denominated in the order's payment (presentment) currency while both
-mirrored totals are shopMoney figures, so a refund whose currency differs
-from the stored one (Shopify Markets foreign-presentment order) is skipped
-and logged (`refund_skipped_currency_mismatch`) rather than summed raw —
-the same mixed-currency exclusion rule the rollup applies to revenue. The
-rollup books refunds on the day they were **recorded** (closed rollup days
-are never rewritten); cohort cells net them against the attempt's — or
-origin payment's — month.
+`contract.originOrderId` when no attempt claims the order). Recording
+requires **currency agreement**: REST refund transactions are denominated in
+the order's payment (presentment) currency while both mirrored totals are
+shopMoney figures. A refund whose currency differs from the stored one
+(Shopify Markets foreign-presentment order) is **converted** to the stored
+currency via Shopify's own shop-currency figure for the refund
+(`getRefundShopMoney` — `refund.totalRefundedSet.shopMoney`, v1.16.0; the
+conversion is disclosed on the `refund_recorded` payload as
+`converted`/`presentmentAmountCents`); only when that read is unavailable is
+it skipped and logged (`refund_skipped_currency_mismatch`) rather than
+summed raw — the same mixed-currency exclusion rule the rollup applies to
+revenue.
+
+**Refund exclusion** (v1.16.0, `analytics.excludeRefundedPayments` — **on by
+default**): payments with ANY recorded refund — partial or full, renewal or
+origin — are removed from analytics revenue/gross-profit/LTGP **entirely**
+(charge, COGS, fees, VAT, shipping all drop with the payment), instead of
+netting: a refunded rebill is usually the surprise first renewal that got
+cancelled — noise, not revenue. Four consumers move in lockstep behind the
+flag (double-subtraction hazard): `runDailyRollup` (skips the payments AND
+stops subtracting day-recorded `refundedCents` from `estGrossProfitCents` —
+the column keeps being written as disclosure), `computeCohortRows` (and
+through it every segment view), `getForecast` (weekly net revenue reads
+`chargedCents` alone) and `getSegmentForecast`. Because refunds usually land
+after the charge's rollup day closed, `rollup_run` runs a **refund-repair
+pass** (`repairRefundAffectedRollupDays`): the charge days of every payment
+with recorded refunds inside the standing 90-day backfill window —
+candidates derived from STATE, oldest first, so runs are idempotent and no
+day can be starved out — are re-upserted in flow-columns-only (backfill)
+mode; snapshots survive. With the setting off, nightly behavior is the
+pre-v1.16.0 netting, byte-identical: the rollup books refunds on the day
+they were **recorded** (closed rollup days are never rewritten); cohort
+cells net them against the attempt's — or origin payment's — month.
+Saving the setting triggers an immediate cohort recompute PLUS a
+full-history repair of every refund-affected rollup day (charge days and
+refund-recorded days alike, both directions — a flip re-interprets what
+those days mean), then the live trailing window — so the day ledger and
+the rollup-fed forecast stay in lockstep with the cohorts after a toggle,
+not just for rows written since it.
 
 Other load-bearing details:
 
@@ -721,6 +771,36 @@ Other load-bearing details:
   dunning recovery vs 55–70%, save rate vs 20–30%, COGS coverage <80%,
   take-rate WoW moves, skip:cancel deterioration, forecast maturity); rules
   stay silent below minimum sample sizes.
+- **Segments** (v1.15.0, `segments.server.ts` + `segment-views.server.ts`):
+  the analytics page's filter bar — country / language / traffic source /
+  product / first-order discount band / device / first-order value, AND-
+  combinable, each with an explicit Unknown bucket. ONE pure predicate
+  derives every dimension (country via `contractTaxCountry` — shared with
+  VAT; language from the checkout locale (`acqRaw.checkoutLocale`, v1.16.0 —
+  the contract locale is catalog-normalized with an "en" default) falling
+  back to the contract locale; source through the v1.16.0 last-touch ladder
+  `acqUtm.source` → `acqRaw.paidChannel` (ad click-id presence) → referrer
+  classification of `acqReferringSite` (search/social by name, other
+  external hosts as "referral"; the capture-time `acqRaw.referrerInternal`
+  verdict — judged against the shop's own domains, which read time cannot
+  see — keeps internal navigation out) → `acqSourceName` with "web" reading
+  "direct" when a WEBHOOK-captured bundle proves no referrer
+  (import-passthrough bundles never claim it — the imported-book honesty
+  rule); discount band from the mirrored origin money; the first analytical
+  consumers of the acquisition data foundation, read-only).
+  `resolveSegmentContractIds` maps a segment to countable contract ids
+  once; every filtered view then computes LIVE from source over those ids —
+  cohorts/LTGP through the identical persisted-triangle engine
+  (`computeCohortRows` + `summarizeLtgp`, never writing), survival/MRR/
+  funnel via additive `contractIds` options, a rollup-classified weekly
+  churn series, and `getSegmentForecast`: the same pure forecast models
+  over a weekly history reconstructed from contracts + orders (no MRR — not
+  reconstructable; grade hard-capped at B with the reconstruction caveats
+  as reasons; never writes `forecastModelHistory`). Take rate stays
+  store-wide under a filter (its checkout denominator precedes contracts)
+  and insight cards hide. Route components import the vocabulary from
+  `segments-shared.ts` only (the ownership `shared.ts` pattern — a
+  `.server` import in a component breaks the client build).
 - **Jobs**: `rollup_run`, `cohort_run` (full triangle recompute — delete +
   createMany, self-healing after backfills), `risk_learning_run` (model
   training/evaluation + forecast accuracy recording, before scoring),

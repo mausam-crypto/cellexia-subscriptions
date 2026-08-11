@@ -105,9 +105,52 @@ export async function enqueue(
             ? { properties: { path: ["contract_id"], equals: contractId } }
             : {}),
         },
-        select: { id: true },
+        select: { id: true, status: true, properties: true },
       });
-      if (duplicate) return duplicate;
+      if (duplicate) {
+        // Content graft (v1.16.0): the router's enqueue carries the
+        // ready-rendered content_subject/content_html/content_text (Emails
+        // tab), but for metrics ALSO fired by the event log the event-map row
+        // often lands first — same metric, same profile, same contract —
+        // and this dedupe would silently discard the content-carrying twin.
+        // A flow built as `{{ event.content_html }}` would then render
+        // empty. Graft the content keys onto the surviving row while it has
+        // not been flushed yet; content-less duplicates (the common case)
+        // change nothing. Failure-contained like the rest of this function.
+        const CONTENT_KEYS = [
+          "content_subject",
+          "content_html",
+          "content_text",
+          "template",
+        ] as const;
+        const incoming = input.properties ?? {};
+        const hasContent = CONTENT_KEYS.some(
+          (k) => typeof incoming[k] === "string",
+        );
+        const existing = (duplicate.properties ?? {}) as Record<
+          string,
+          unknown
+        >;
+        if (
+          hasContent &&
+          duplicate.status === "PENDING" &&
+          typeof existing.content_text !== "string"
+        ) {
+          const graft: Record<string, unknown> = {};
+          for (const k of CONTENT_KEYS) {
+            if (typeof incoming[k] === "string") graft[k] = incoming[k];
+          }
+          await prisma.klaviyoOutbox.update({
+            where: { id: duplicate.id },
+            data: {
+              properties: JSON.parse(
+                JSON.stringify({ ...existing, ...graft }),
+              ) as object,
+            },
+          });
+        }
+        return { id: duplicate.id };
+      }
     }
 
     // JSON round-trip drops `undefined` values (Prisma rejects them in Json)

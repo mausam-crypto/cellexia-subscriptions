@@ -98,6 +98,10 @@ const COST_MODEL = {
   fulfillmentCostPerShipmentCents: 150,
   shippingCostPerShipmentCents: { mode: "flat", flatCents: 200 },
   cogsFallbackPctOfPrice: 25,
+  // Explicitly OFF: this suite pins the vat-less formulas. Without this key
+  // the registry's field-level default (enabled at 8.1% since v1.16.0)
+  // would silently enter every golden number below.
+  vat: { enabled: false, defaultRatePct: 0, countryRatesPct: {} },
 };
 
 /** Any instant inside the 2026-08-05 shop-tz day. */
@@ -193,6 +197,14 @@ function buildStore(opts: { pollute: boolean }): AnalyticsStore {
   const store = emptyStore();
   store.shops.push({ ...SHOP });
   store.settings.push({ shopId: SHOP_ID, key: "costModel", value: COST_MODEL });
+  // Pin the pre-v1.16.0 netting model: these fixtures exercise refunds as
+  // NETTED (revenue minus refund, full costs kept). The shipped default is
+  // exclusion — tests/refund-exclusion.test.ts pins that path.
+  store.settings.push({
+    shopId: SHOP_ID,
+    key: "analytics",
+    value: { excludeRefundedPayments: false },
+  });
 
   const cOurs = contractRow("c_ours", {
     firstChargeAt: D("2026-06-10T10:00:00Z"),
@@ -436,6 +448,11 @@ const GOLDEN_ROLLUP: Row = {
   shippingCostCents: 700,
   feesCents: 552,
   estimatedCogsCents: 1500,
+  // VAT explicitly off in the fixture cost model (the shipped default is ON
+  // since v1.16.0) — both columns stay 0 and gross profit is unchanged.
+  // tests/vat-cost.test.ts holds the VAT-enabled goldens.
+  vatCents: 0,
+  estimatedVatCents: 0,
   estGrossProfitCents: 9378,
   failedAttempts: 1,
   recoveredCents: 4990,
@@ -465,6 +482,8 @@ const cellRow = (over: Row): Row => ({
   estimatedCogsCents: 0,
   shippingCostCents: 0,
   feesCents: 0,
+  vatCents: 0,
+  estimatedVatCents: 0,
   grossProfitCents: 0,
   cumGrossProfitCents: 0,
   ...over,
@@ -550,6 +569,14 @@ describe("runDailyRollup — golden day 2026-08-05", () => {
     const store = emptyStore();
     store.shops.push({ ...SHOP });
     store.settings.push({ shopId: SHOP_ID, key: "costModel", value: COST_MODEL });
+  // Pin the pre-v1.16.0 netting model: these fixtures exercise refunds as
+  // NETTED (revenue minus refund, full costs kept). The shipped default is
+  // exclusion — tests/refund-exclusion.test.ts pins that path.
+  store.settings.push({
+    shopId: SHOP_ID,
+    key: "analytics",
+    value: { excludeRefundedPayments: false },
+  });
     dbHolder.current = createAnalyticsDb(store);
     await runDailyRollup(SHOP_ID, DAY);
     expect(store.dailyRollups[0]).toEqual({
@@ -599,6 +626,14 @@ describe("runCohortComputation — golden triangle", () => {
     const store = emptyStore();
     store.shops.push({ ...SHOP });
     store.settings.push({ shopId: SHOP_ID, key: "costModel", value: COST_MODEL });
+  // Pin the pre-v1.16.0 netting model: these fixtures exercise refunds as
+  // NETTED (revenue minus refund, full costs kept). The shipped default is
+  // exclusion — tests/refund-exclusion.test.ts pins that path.
+  store.settings.push({
+    shopId: SHOP_ID,
+    key: "analytics",
+    value: { excludeRefundedPayments: false },
+  });
     store.cohortCells.push(cellRow({ monthOffset: 0 })); // stale row from an earlier run
     dbHolder.current = createAnalyticsDb(store);
     const result = await runCohortComputation(SHOP_ID, NOW);
@@ -624,6 +659,14 @@ function survivalStore(): AnalyticsStore {
   const store = emptyStore();
   store.shops.push({ ...SHOP });
   store.settings.push({ shopId: SHOP_ID, key: "costModel", value: COST_MODEL });
+  // Pin the pre-v1.16.0 netting model: these fixtures exercise refunds as
+  // NETTED (revenue minus refund, full costs kept). The shipped default is
+  // exclusion — tests/refund-exclusion.test.ts pins that path.
+  store.settings.push({
+    shopId: SHOP_ID,
+    key: "analytics",
+    value: { excludeRefundedPayments: false },
+  });
   const push = (n: number, over: Row) => {
     for (let i = 0; i < n; i++) {
       store.subscriptionContracts.push(

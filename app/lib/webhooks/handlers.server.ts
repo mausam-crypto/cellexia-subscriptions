@@ -1701,6 +1701,7 @@ function acquisitionFromOrderPayload(
   payload: Payload,
   lineItems: Payload[],
   orderGid: string | null,
+  shopDomain?: string,
 ): AcquisitionCapture {
   const clientDetails = asRecord(payload.client_details);
   const address =
@@ -1743,6 +1744,13 @@ function acquisitionFromOrderPayload(
     sourceIdentifier: payload.source_identifier,
     buyerAcceptsMarketing: payload.buyer_accepts_marketing,
     orderTags: payload.tags,
+    // The shop's own hosts, so the sanitizer can mark a self-referral
+    // (internal navigation) at capture time: the myshopify domain plus the
+    // order-status URL — the one payload field that reliably carries the
+    // storefront's PRIMARY (custom) domain.
+    internalHosts: [shopDomain, asString(payload.order_status_url)].filter(
+      Boolean,
+    ),
   });
 }
 
@@ -2079,7 +2087,12 @@ async function handleOrdersCreate({
   // Guarded — acquisition must never fail order processing.
   if (containsSubscribable) {
     try {
-      const capture = acquisitionFromOrderPayload(payload, lineItems, orderGid);
+      const capture = acquisitionFromOrderPayload(
+        payload,
+        lineItems,
+        orderGid,
+        shopDomain,
+      );
       const hasStash =
         orderGid != null &&
         (await prisma.subscriberEvent.findFirst({
@@ -2259,6 +2272,44 @@ function refundMoneyFromPayload(payload: Payload): {
 }
 
 /**
+ * Shop-currency conversion for a foreign-presentment refund (v1.16.0).
+ *
+ * REST refund transactions are denominated in the order's payment
+ * (presentment) currency; the mirrored totals they net against are shopMoney
+ * figures. When the currencies disagree, this fetches Shopify's own
+ * shop-currency total for the refund (refund.totalRefundedSet.shopMoney) so
+ * the money can be netted properly — the store sells in several presentment
+ * currencies and analytics centralize on the store currency.
+ *
+ * Outcome contract (a skip event arms the PERMANENT replay guard, so the
+ * caller must never write one on a transient failure):
+ * - returns the converted figure when the refund reads back in the stored
+ *   currency;
+ * - returns null only on a CONCLUSIVE non-answer — no refund id/stored
+ *   currency to work with, the refund unreadable (deleted/erased), or its
+ *   shopMoney denominated in yet another currency: the standing terminal
+ *   skip-and-log behavior is then correct;
+ * - THROWS on transport/throttle errors (getAdmin, gql) — the live handler
+ *   propagates so the webhook receipt goes FAILED and the delivery stays
+ *   replayable; the reconcile job leaves the guard event unresolved and
+ *   retries next run.
+ */
+async function convertRefundToStoredCurrency(
+  shopDomain: string,
+  refundGid: string | null,
+  storedCurrency: string | null | undefined,
+): Promise<{ amountCents: number; currencyCode: string } | null> {
+  if (!refundGid || storedCurrency == null) return null;
+  const admin = await getAdmin(shopDomain);
+  const { getRefundShopMoney } = await import("~/lib/graphql/index.server");
+  const shopMoney = await getRefundShopMoney(admin, refundGid);
+  // The fetched figure must be denominated in the currency the stored
+  // total uses, or netting would mis-book by the FX delta all over again.
+  if (!shopMoney || shopMoney.currencyCode !== storedCurrency) return null;
+  return { amountCents: shopMoney.amountCents, currencyCode: storedCurrency };
+}
+
+/**
  * Can a refund's money be netted against a stored cents figure? Only when the
  * currencies AGREE — the same standing rule the analytics readers apply
  * ("Mixed-currency attempts/origin totals are excluded rather than summed
@@ -2316,7 +2367,11 @@ function refundCurrencyAgrees(
  * BOTH branches additionally require CURRENCY AGREEMENT
  * (refundCurrencyAgrees): a refund denominated in another currency than the
  * stored total (foreign-presentment order on a Shopify Markets shop) is
- * skipped with refund_skipped_currency_mismatch instead of mixed in raw.
+ * first CONVERTED to the stored currency via Shopify's own shopMoney figure
+ * (convertRefundToStoredCurrency, v1.16.0 — analytics centralize on the
+ * store currency, so the money must be netted, not dropped); only when that
+ * conversion is unavailable is it skipped with
+ * refund_skipped_currency_mismatch instead of mixed in raw.
  *
  * Idempotency: the route layer dedupes exact redeliveries on
  * X-Shopify-Webhook-Id (WebhookReceipt); manual redeliveries carry a NEW
@@ -2374,27 +2429,54 @@ async function handleRefundsCreate({
     // amountCents was stamped alongside currencyCode at settlement (same
     // `orderCurrency ?? contract.currencyCode` fallback) — that is the
     // denomination refundedCents nets against. A refund in another currency
-    // (foreign-presentment order on a Markets shop) is skipped and logged,
-    // never mixed in raw; the skip event carries the refundId, so the replay
-    // guard blocks redeliveries exactly like a recorded refund.
+    // (foreign-presentment order on a Markets shop) is CONVERTED to the
+    // stored currency via Shopify's own shopMoney figure (v1.16.0 — the
+    // store sells in several presentment currencies and analytics
+    // centralize on the store currency); when the conversion is unavailable
+    // it is skipped and logged, never mixed in raw. The skip event carries
+    // the refundId, so the replay guard blocks redeliveries exactly like a
+    // recorded refund.
+    let recordedAmountCents = amountCents;
+    let recordedCurrency = currencyCode ?? attempt.currencyCode;
+    let conversion: Record<string, unknown> = {};
     const attemptCurrency = attempt.currencyCode ?? attempt.contract.currencyCode;
     if (!refundCurrencyAgrees(currencyCode, attemptCurrency)) {
-      await logEvent({
-        ...contractEventBase(shop.id, attempt.contract),
-        type: "admin.action",
-        source: "WEBHOOK",
-        payload: {
-          action: "refund_skipped_currency_mismatch",
-          refundId: refundGid,
-          orderId: orderGid,
-          attemptId: attempt.id,
-          cycleIndex: attempt.cycleIndex,
-          amountCents,
-          currencyCode,
-          expectedCurrencyCode: attemptCurrency,
-        },
-      });
-      return;
+      // A transport/throttle error THROWS out of the handler here — the
+      // receipt goes FAILED and the delivery replays, instead of a terminal
+      // skip event arming the replay guard on a refund that would have
+      // converted fine one retry later. Nothing is written before this
+      // point, so the throw leaves no partial state.
+      const converted = await convertRefundToStoredCurrency(
+        shopDomain,
+        refundGid,
+        attemptCurrency,
+      );
+      if (!converted) {
+        await logEvent({
+          ...contractEventBase(shop.id, attempt.contract),
+          type: "admin.action",
+          source: "WEBHOOK",
+          payload: {
+            action: "refund_skipped_currency_mismatch",
+            refundId: refundGid,
+            orderId: orderGid,
+            attemptId: attempt.id,
+            cycleIndex: attempt.cycleIndex,
+            amountCents,
+            currencyCode,
+            expectedCurrencyCode: attemptCurrency,
+          },
+        });
+        return;
+      }
+      recordedAmountCents = converted.amountCents;
+      recordedCurrency = converted.currencyCode;
+      // Additive payload fields — the presentment original stays auditable.
+      conversion = {
+        converted: true,
+        presentmentAmountCents: amountCents,
+        presentmentCurrencyCode: currencyCode,
+      };
     }
 
     // The counter moves and its replay guard arms in ONE transaction — the
@@ -2412,7 +2494,7 @@ async function handleRefundsCreate({
     await prisma.$transaction(async (tx) => {
       await tx.billingAttempt.update({
         where: { id: attempt.id },
-        data: { refundedCents: { increment: amountCents } },
+        data: { refundedCents: { increment: recordedAmountCents } },
       });
 
       // Keep the contract's lifetime revenue NET of refunds — the same
@@ -2426,7 +2508,7 @@ async function handleRefundsCreate({
         select: { lifetimeRevenueCents: true },
       });
       const lifetimeDecrement = Math.min(
-        amountCents,
+        recordedAmountCents,
         Math.max(0, contractRow.lifetimeRevenueCents),
       );
       if (lifetimeDecrement > 0) {
@@ -2447,8 +2529,9 @@ async function handleRefundsCreate({
             orderId: orderGid,
             attemptId: attempt.id,
             cycleIndex: attempt.cycleIndex,
-            amountCents,
-            currencyCode: currencyCode ?? attempt.currencyCode,
+            amountCents: recordedAmountCents,
+            currencyCode: recordedCurrency,
+            ...conversion,
           },
         },
         { tx },
@@ -2505,6 +2588,34 @@ async function handleRefundsCreate({
   const { amountCents, currencyCode } = refundMoneyFromPayload(payload);
   if (amountCents <= 0) return;
 
+  // Foreign-presentment conversion (v1.16.0), mirroring the attempt branch:
+  // when the refund's currency provably disagrees with the captured origin
+  // currency, net Shopify's shopMoney figure instead of skipping. A
+  // transport/throttle error THROWS out of the handler (receipt FAILED →
+  // replayable — nothing has been written yet); a CONCLUSIVE null lets the
+  // original values flow into the transaction below, whose row-level
+  // currency gate produces the standing refund_skipped_currency_mismatch
+  // outcome.
+  let recordedAmountCents = amountCents;
+  let recordedCurrency = currencyCode;
+  let conversion: Record<string, unknown> = {};
+  if (!refundCurrencyAgrees(currencyCode, contract.originOrderCurrencyCode)) {
+    const converted = await convertRefundToStoredCurrency(
+      shopDomain,
+      refundGid,
+      contract.originOrderCurrencyCode,
+    );
+    if (converted) {
+      recordedAmountCents = converted.amountCents;
+      recordedCurrency = converted.currencyCode;
+      conversion = {
+        converted: true,
+        presentmentAmountCents: amountCents,
+        presentmentCurrencyCode: currencyCode,
+      };
+    }
+  }
+
   // Refunds net against the origin payment only FROM CAPTURE ONWARD — the
   // originMoneyFields contract in contracts/sync.server.ts. A pre-capture
   // refund is already inside the CURRENT total a late capture (sync or the
@@ -2530,16 +2641,16 @@ async function handleRefundsCreate({
         originOrderTotalCents: { not: null },
         // Null refund currency (sparse payload) nets against any capture —
         // the same null-tolerant rule refundCurrencyAgrees encodes.
-        ...(currencyCode != null
+        ...(recordedCurrency != null
           ? {
               OR: [
                 { originOrderCurrencyCode: null },
-                { originOrderCurrencyCode: currencyCode },
+                { originOrderCurrencyCode: recordedCurrency },
               ],
             }
           : {}),
       },
-      data: { originOrderRefundedCents: { increment: amountCents } },
+      data: { originOrderRefundedCents: { increment: recordedAmountCents } },
     });
 
     // Distinguish WHICH gate refused, for the event log only (both skip
@@ -2570,8 +2681,9 @@ async function handleRefundsCreate({
           refundId: refundGid,
           orderId: orderGid,
           originOrder: true,
-          amountCents,
-          currencyCode: currencyCode ?? contract.originOrderCurrencyCode,
+          amountCents: recordedAmountCents,
+          currencyCode: recordedCurrency ?? contract.originOrderCurrencyCode,
+          ...conversion,
           ...(action === "refund_skipped_currency_mismatch"
             ? { expectedCurrencyCode: contract.originOrderCurrencyCode }
             : {}),
@@ -2676,29 +2788,10 @@ export async function reconcileUnmatchedRefunds(): Promise<{
 
       const attemptCurrency =
         attempt.currencyCode ?? attempt.contract.currencyCode;
-      if (!refundCurrencyAgrees(currencyCode, attemptCurrency)) {
-        await logEvent({
-          ...contractEventBase(shop.id, attempt.contract),
-          type: "admin.action",
-          source: "SCHEDULER",
-          payload: {
-            action: "refund_skipped_currency_mismatch",
-            refundId: refundGid,
-            orderId: orderGid,
-            attemptId: attempt.id,
-            cycleIndex: attempt.cycleIndex,
-            amountCents,
-            currencyCode,
-            expectedCurrencyCode: attemptCurrency,
-            resolvedBy: "refund_reconcile",
-          },
-        });
-        matched += 1;
-        continue;
-      }
 
       if (lineItemRefund) {
-        // Item-linked money is inside the (later) capture's reduced total.
+        // Item-linked money is inside the (later) capture's reduced total —
+        // absorbed regardless of currency, so this verdict comes first.
         await logEvent({
           ...contractEventBase(shop.id, attempt.contract),
           type: "admin.action",
@@ -2718,19 +2811,73 @@ export async function reconcileUnmatchedRefunds(): Promise<{
         continue;
       }
 
+      // Foreign-presentment conversion (v1.16.0) — the same rule the live
+      // handler applies, so a refund that raced its settlement is not
+      // treated worse than one that arrived after it. Transient fetch
+      // failures leave the guard event UNRESOLVED (retried next run, the
+      // reconcile job's whole point); only a conclusive non-answer gets the
+      // terminal mismatch verdict.
+      let recordedAmountCents = amountCents;
+      let recordedCurrency = currencyCode;
+      let conversion: Record<string, unknown> = {};
+      if (!refundCurrencyAgrees(currencyCode, attemptCurrency)) {
+        let converted: { amountCents: number; currencyCode: string } | null;
+        try {
+          converted = await convertRefundToStoredCurrency(
+            shop.domain,
+            refundGid,
+            attemptCurrency,
+          );
+        } catch (err) {
+          console.warn(
+            "[webhooks] reconcile refund conversion failed — retrying next run",
+            refundGid,
+            err,
+          );
+          continue;
+        }
+        if (!converted) {
+          await logEvent({
+            ...contractEventBase(shop.id, attempt.contract),
+            type: "admin.action",
+            source: "SCHEDULER",
+            payload: {
+              action: "refund_skipped_currency_mismatch",
+              refundId: refundGid,
+              orderId: orderGid,
+              attemptId: attempt.id,
+              cycleIndex: attempt.cycleIndex,
+              amountCents,
+              currencyCode,
+              expectedCurrencyCode: attemptCurrency,
+              resolvedBy: "refund_reconcile",
+            },
+          });
+          matched += 1;
+          continue;
+        }
+        recordedAmountCents = converted.amountCents;
+        recordedCurrency = converted.currencyCode;
+        conversion = {
+          converted: true,
+          presentmentAmountCents: amountCents,
+          presentmentCurrencyCode: currencyCode,
+        };
+      }
+
       // Money-only: net it, atomically with its verdict event — the same
       // one-transaction rule the live attempt branch applies.
       await prisma.$transaction(async (tx) => {
         await tx.billingAttempt.update({
           where: { id: attempt.id },
-          data: { refundedCents: { increment: amountCents } },
+          data: { refundedCents: { increment: recordedAmountCents } },
         });
         const contractRow = await tx.subscriptionContract.findUniqueOrThrow({
           where: { id: attempt.contractId },
           select: { lifetimeRevenueCents: true },
         });
         const lifetimeDecrement = Math.min(
-          amountCents,
+          recordedAmountCents,
           Math.max(0, contractRow.lifetimeRevenueCents),
         );
         if (lifetimeDecrement > 0) {
@@ -2750,8 +2897,9 @@ export async function reconcileUnmatchedRefunds(): Promise<{
               orderId: orderGid,
               attemptId: attempt.id,
               cycleIndex: attempt.cycleIndex,
-              amountCents,
-              currencyCode: currencyCode ?? attemptCurrency,
+              amountCents: recordedAmountCents,
+              currencyCode: recordedCurrency ?? attemptCurrency,
+              ...conversion,
               resolvedBy: "refund_reconcile",
             },
           },

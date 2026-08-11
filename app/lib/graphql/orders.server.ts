@@ -283,6 +283,66 @@ export async function getOrderSummary(
   };
 }
 
+const REFUND_SHOP_MONEY_QUERY = `#graphql
+  query CellexiaRefundShopMoney($id: ID!) {
+    refund(id: $id) {
+      id
+      totalRefundedSet {
+        shopMoney {
+          amount
+          currencyCode
+        }
+        presentmentMoney {
+          amount
+          currencyCode
+        }
+      }
+    }
+  }
+`;
+
+interface RefundShopMoneyResponse {
+  refund: {
+    id: string;
+    totalRefundedSet: {
+      shopMoney: { amount: string; currencyCode: string } | null;
+      presentmentMoney: { amount: string; currencyCode: string } | null;
+    } | null;
+  } | null;
+}
+
+export interface RefundShopMoney {
+  amountCents: number;
+  currencyCode: string | null;
+}
+
+/**
+ * One refund's total in SHOP currency (v1.16.0 — the Markets conversion
+ * read). REST REFUNDS_CREATE payloads denominate their transactions in the
+ * order's PAYMENT (presentment) currency; when that disagrees with the
+ * mirrored shopMoney totals the webhook handler used to skip the refund
+ * entirely (refund_skipped_currency_mismatch). This read fetches Shopify's
+ * own shop-currency figure for the refund so the handler can net it
+ * properly instead. Returns null when the refund cannot be read (deleted,
+ * outside the access horizon, transport error is thrown by gql as usual) or
+ * carries no shop money — callers fall back to the skip-and-log behavior.
+ */
+export async function getRefundShopMoney(
+  admin: AdminClient,
+  refundGid: string,
+): Promise<RefundShopMoney | null> {
+  const data = await gql<RefundShopMoneyResponse>(
+    admin,
+    REFUND_SHOP_MONEY_QUERY,
+    { id: refundGid },
+  );
+  const shopMoney = data.refund?.totalRefundedSet?.shopMoney;
+  if (!shopMoney) return null;
+  const amountCents = centsFromMoneyOrZero(shopMoney);
+  if (amountCents <= 0) return null;
+  return { amountCents, currencyCode: shopMoney.currencyCode ?? null };
+}
+
 export interface RefundResult {
   refundId: string;
   refundedCents: number;

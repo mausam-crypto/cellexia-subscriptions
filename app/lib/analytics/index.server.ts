@@ -15,3 +15,5 @@ export * from "./forecast.server";
 export * from "./queries.server";
 export * from "./alerts.server";
 export * from "./costs.server";
+export * from "./segments.server";
+export * from "./segment-views.server";

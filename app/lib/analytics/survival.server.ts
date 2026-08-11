@@ -64,11 +64,24 @@ export interface SurvivalCurves {
  * The forecast derives per-cycle retention from ratios of `overall`, so this
  * estimator feeds it unbiased hazards even on a young book (a brand-new book
  * with zero observed transitions yields a flat 100% curve, not 0%).
+ *
+ * `opts.contractIds` (segment layer) restricts the population to those ids ON
+ * TOP of the ownership/demo filter — COUNTABLE_CONTRACT still applies, so a
+ * segment can only narrow the countable book, never widen it.
  */
-export async function getSurvivalByCycle(shopId: string): Promise<SurvivalCurves> {
+export async function getSurvivalByCycle(
+  shopId: string,
+  opts: { contractIds?: readonly string[] | null } = {},
+): Promise<SurvivalCurves> {
   const groups = await prisma.subscriptionContract.groupBy({
     by: ["ordersCount", "status", "cancelSource"],
-    where: { shopId, ...COUNTABLE_CONTRACT },
+    where: {
+      shopId,
+      ...COUNTABLE_CONTRACT,
+      ...(opts.contractIds != null
+        ? { id: { in: [...opts.contractIds] } }
+        : {}),
+    },
     _count: { _all: true },
   });
 

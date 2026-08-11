@@ -129,7 +129,7 @@ ignores the stamp, so a genuinely late order webhook still lands its bundle.
 | `acqTimeToPurchaseSeconds` | `Int?` | customer `createdAt` → origin order `processedAt` | Browse-to-buy latency, clamped ≥ 0. Needs the Shopify customer read; null when unavailable. |
 | `acqUnitsFirstOrder` | `Int?` | Σ line-item quantities | First-order basket size. |
 | `acqOrderValueBand` | `String?` | order total | Decile-friendly label (`"0_25"` … `"200_plus"`, major units, edges in `ORDER_VALUE_BAND_EDGES`). A presentation convenience — the raw total is kept in `acqRaw.orderTotalCents`, so bands can be recomputed with different edges without losing data. |
-| `acqRaw` | `Json?` | whole sanitized bundle | Everything above plus `orderId`, `orderTotalCents`, `orderCurrencyCode`, `orderProcessedAt`, `customerCreatedAt`, `customerNumberOfOrders` (and `importedFrom`/`importPassthrough`/`importSubscribedSince` for CSV imports). **Future-mining surface**: new ingest may add keys here without a migration. Additive keys so far: `rawUtm` — the five utm values length-capped ONLY, no scrub (the recompute reserve: scrub-heuristic changes can rebuild `acqUtm` instead of losing the dimension; it may hold what a scrub would catch, and lives inside `acqRaw` precisely so CUSTOMERS_REDACT clears it) — and the order-payload extras `discountCodes` (capped code list), `checkoutLocale`, `presentmentCurrencyCode`, `presentmentTotalCents`, `appId`, `sourceIdentifier` (scrubbed), `buyerAcceptsMarketing`, `orderTags` (capped list); each is null when its ingest cannot supply it. |
+| `acqRaw` | `Json?` | whole sanitized bundle | Everything above plus `orderId`, `orderTotalCents`, `orderCurrencyCode`, `orderProcessedAt`, `customerCreatedAt`, `customerNumberOfOrders` (and `importedFrom`/`importPassthrough`/`importSubscribedSince` for CSV imports). **Future-mining surface**: new ingest may add keys here without a migration. Additive keys so far: `rawUtm` — the five utm values length-capped ONLY, no scrub (the recompute reserve: scrub-heuristic changes can rebuild `acqUtm` instead of losing the dimension; it may hold what a scrub would catch, and lives inside `acqRaw` precisely so CUSTOMERS_REDACT clears it) — `paidChannel` (v1.16.0: the ad channel indicated by a click-id param — gclid/fbclid/ttclid/msclkid/… — on the RAW landing/referring URL, detected BEFORE the sanitizer strips those params; presence-only, the id values are never stored; feeds the traffic-source segment ladder) — `referrerInternal` (v1.16.0: whether the referrer is the shop ITSELF, judged at capture against the myshopify domain, the order-status-URL host and the landing host; true = internal navigation, false = proven external, null = no referrer; the ladder's self-referral guard) — and the order-payload extras `discountCodes` (capped code list), `checkoutLocale` (since v1.16.0 the language segment prefers it over the normalized contract locale), `presentmentCurrencyCode`, `presentmentTotalCents`, `appId`, `sourceIdentifier` (scrubbed), `buyerAcceptsMarketing`, `orderTags` (capped list); each is null when its ingest cannot supply it. |
 
 ### Sanitization rules (pure module: `app/lib/acquisition/sanitize.ts`)
 
@@ -173,6 +173,15 @@ personal data).
 - **Subscriber cockpit** (`/app/subscribers/:id`): the "Acquisition" card —
   first order, source, UTMs, location, device, account-to-first-order time,
   first-order units.
+- **Analytics segments** (v1.15.0, `app/lib/analytics/segments.server.ts`) —
+  the first analytical consumers, read-only as contracted: the analytics
+  page filters every view by country (`acqCountryCode` as the delivery-
+  address fallback), traffic source (`acqUtm.source` → `acqSourceName`),
+  device (`acqDeviceType`), first-order value (`acqOrderValueBand`) and
+  first-order discount depth (the origin money mirror). Contracts without
+  captured data appear under an explicit "Unknown" bucket — never silently
+  excluded. The VAT cost model (v1.15.0) reads `acqCountryCode` through the
+  same `contractTaxCountry` helper for its country-rate fallback.
 - **Klaviyo**: profile attributes `cellexia_acq_source` /
   `cellexia_acq_country`, synced on every contract-scoped event when present.
 - **Importers** (`scripts/import-subscribers.ts` CLI + `/app/import` admin):
@@ -192,16 +201,20 @@ personal data).
 ### What it unlocks later (why we collect now)
 
 - **Source-level LTGP** — join `acqSourceName`/`acqUtm.source` against cohort
-  LTGP: which channel produces subscribers worth keeping, not just cheap ones.
+  LTGP: which channel produces subscribers worth keeping, not just cheap
+  ones. *(Shipped v1.15.0 as the traffic-source segment.)*
 - **Geo cohorts** — retention/LTGP by `acqCountryCode`/`acqCity` (shipping
-  performance and product-market fit differ by region).
+  performance and product-market fit differ by region). *(Country shipped
+  v1.15.0 as the country segment; city remains future work.)*
 - **Device take-rate** — buy-box conversion and survival by `acqDeviceType`,
-  feeding preset choice in the designer.
+  feeding preset choice in the designer. *(Device-segmented survival/LTGP
+  shipped v1.15.0; per-device take rate remains future work — the checkout
+  denominator carries no device.)*
 - **Value-band survival** — do bigger first orders churn less?
   `acqOrderValueBand` (and the raw total in `acqRaw`) make that a query, not
-  a project.
+  a project. *(Shipped v1.15.0 as the first-order value segment.)*
 - **Churn-risk features** — `acqTimeToPurchaseSeconds`, units and band are
   natural inputs for the risk model once enough labeled history exists.
 
-None of these are computed yet; the rule is that when they are, they consume
-these columns read-only and any new signal lands additively.
+The rule stands: consumers read these columns read-only, and any new signal
+lands additively.

@@ -359,6 +359,19 @@ export const settingsSchemas = {
    *   (no Shopify inventory cost, no per-product override). Every use of the
    *   fallback is counted (DailyRollup/CohortCell.estimatedCogsCents) so the
    *   UI can report COGS coverage and flag partly-estimated LTGP.
+   * - vat: VAT / sales tax as a reporting cost. When enabled, both
+   *   gross-profit surfaces subtract a flat percentage of each charge's kept
+   *   money — kept × rate/100, VAT as a straight expense on revenue
+   *   (merchant-defined model, v1.16.0; a CHF 100 charge at 8.1% books
+   *   CHF 8.10) — at the contract's delivery-country rate (countryRatesPct,
+   *   ISO alpha-2 keys) falling back to defaultRatePct. Captured order tax
+   *   (BillingAttempt.taxCents / originOrderTaxCents) keeps being collected
+   *   but no longer drives the deduction — it is the tax-extracted-from-
+   *   gross figure, a different model. All VAT is rate-derived and is
+   *   accumulated into DailyRollup/CohortCell.estimatedVatCents so the
+   *   surfaces disclose it as modeled, exactly like estimated COGS.
+   *   Field-level default keeps previously stored costModel values valid
+   *   (additive change).
    */
   costModel: z
     .object({
@@ -370,6 +383,18 @@ export const settingsSchemas = {
         flatCents: z.number().int().min(0).max(100_000),
       }),
       cogsFallbackPctOfPrice: z.number().min(0).max(100),
+      vat: z
+        .object({
+          enabled: z.boolean(),
+          defaultRatePct: z.number().min(0).max(50),
+          countryRatesPct: z.record(
+            z
+              .string()
+              .regex(/^[A-Z]{2}$/, "Use 2-letter ISO country codes (e.g. CH, DE)"),
+            z.number().min(0).max(50),
+          ),
+        })
+        .default({ enabled: true, defaultRatePct: 8.1, countryRatesPct: {} }),
     })
     .default({
       paymentFeePct: 2.9,
@@ -379,7 +404,81 @@ export const settingsSchemas = {
       // nudges the merchant to set real per-parcel costs before trusting LTGP.
       shippingCostPerShipmentCents: { mode: "flat", flatCents: 0 },
       cogsFallbackPctOfPrice: 25,
+      // ON by default (merchant decision, v1.16.0 — flipped from the v1.15.0
+      // off-default before any subscription existed, so nothing is rewritten):
+      // VAT is subtracted as a flat 8.1% of revenue until per-country rates
+      // are configured. Both defaults (this one and the field-level one
+      // above) must stay in sync.
+      vat: { enabled: true, defaultRatePct: 8.1, countryRatesPct: {} },
     }),
+
+  /**
+   * Analytics data-accuracy options (Settings → Analytics data).
+   *
+   * - excludeRefundedPayments (ON by default, v1.16.0 — merchant decision,
+   *   flipped in before any subscription existed): when on, payments with
+   *   ANY recorded refund — fully OR partially refunded — are removed from
+   *   analytics revenue/gross-profit/LTGP entirely (charge, COGS, fees, VAT,
+   *   shipping and billed-cycle count all drop with them), instead of the
+   *   off-mode netting (revenue minus refund, full costs kept). Rationale: a
+   *   refunded rebill — most often the surprise first renewal that gets
+   *   cancelled — is noise the merchant wants out of LTV data, not revenue
+   *   to be netted. Consumed by runDailyRollup, computeCohortRows (and
+   *   therefore every segment view), getForecast and getSegmentForecast —
+   *   the four must stay in lockstep to avoid double-subtraction (see the
+   *   estGrossProfitCents doc in rollup.server.ts). The daily rollup
+   *   additionally repairs the charge-day rows of refunded payments inside
+   *   the standing 90-day window (repairRefundAffectedRollupDays,
+   *   flow-columns-only re-upsert) so a refund arriving after its charge's
+   *   day closed still removes the payment; TOGGLING this setting repairs
+   *   every refund-affected day across all history in both directions
+   *   (app.settings.tsx post-save hook), so stored rollup rows always carry
+   *   the current mode's semantics.
+   *   Contract surfaces (lifetimeRevenueCents, subscriber cockpit) keep
+   *   their net-of-refunds meaning regardless — this option shapes derived
+   *   analytics only.
+   */
+  analytics: z
+    .object({
+      excludeRefundedPayments: z.boolean(),
+    })
+    .default({ excludeRefundedPayments: true }),
+
+  /**
+   * Per-template email customization (v1.16.0, admin Emails tab).
+   *
+   * `templates` maps a notification TemplateKey to its merchant override:
+   * - enabled: false suppresses the send entirely (reason
+   *   "template_disabled"). Critical templates ignore it (otp_code,
+   *   threeds_action, admin_alert, import_summary — the router bypasses this
+   *   the same way it bypasses channel toggles), and the Emails tab refuses
+   *   to store it for them.
+   * - subject / body: non-empty values replace the built-in copy in BOTH
+   *   delivery shapes — the rendered content_subject/content_html/
+   *   content_text properties attached to the Klaviyo event (flows render
+   *   {{ event.content_html }}), and the direct-SMTP fallback. Empty string
+   *   = keep the built-in copy. {placeholders} interpolate from the same
+   *   variable set the Klaviyo event carries (skip_url, delay_1w_url,
+   *   addon_url, total_estimate, next_date, …).
+   *
+   * Keys are validated against the real template registry by the Emails tab
+   * action; the schema stays permissive (a template retired later must not
+   * corrupt the stored value).
+   */
+  emails: z
+    .object({
+      templates: z
+        .record(
+          z.string().regex(/^[a-z0-9_]+$/),
+          z.object({
+            enabled: z.boolean().default(true),
+            subject: z.string().max(300).default(""),
+            body: z.string().max(10_000).default(""),
+          }),
+        )
+        .default({}),
+    })
+    .default({ templates: {} }),
 
   /**
    * INTERNAL / MACHINE-WRITTEN — learned churn-risk model state. Written

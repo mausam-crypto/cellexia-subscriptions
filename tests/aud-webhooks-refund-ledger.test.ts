@@ -112,6 +112,10 @@ vi.mock("~/lib/graphql/index.server", () => ({
   draftUpdatePaymentMethod: vi.fn(),
   getContract: vi.fn(),
   getOrderSummary: vi.fn(),
+  // Conversion read (v1.16.0): a CONCLUSIVE non-answer by default, so the
+  // mismatch tests keep pinning the terminal skip verdict; the transient
+  // path (a throw) is pinned separately.
+  getRefundShopMoney: vi.fn(async (): Promise<unknown> => null),
   gql: vi.fn(),
   listCustomerPaymentMethods: vi.fn(),
   withContractDraft: vi.fn(),

@@ -76,6 +76,14 @@ function baseStore(): { store: AnalyticsStore; contract: Row } {
   const store = emptyStore();
   store.shops.push({ ...SHOP });
   store.settings.push({ shopId: SHOP_ID, key: "costModel", value: COST_MODEL });
+  // Pin the pre-v1.16.0 netting model: these fixtures exercise refunds as
+  // NETTED (revenue minus refund, full costs kept). The shipped default is
+  // exclusion — tests/refund-exclusion.test.ts pins that path.
+  store.settings.push({
+    shopId: SHOP_ID,
+    key: "analytics",
+    value: { excludeRefundedPayments: false },
+  });
   const contract: Row = {
     id: "c1",
     shopId: SHOP_ID,

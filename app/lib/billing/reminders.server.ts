@@ -384,7 +384,23 @@ export async function runPauseAutoResume(
       isDemo: false,
       resumeAt: { gt: now, lte: horizon },
     },
+    include: { lines: true },
   });
+
+  // One-tap add-on leg (v1.16.0), same gates and candidate pool as the
+  // upcoming-order reminder: a resume reminder is the other natural "your
+  // box is coming" moment for adding a product in one click.
+  const notifications = await getSetting(shop.id, "notifications");
+  const portal = await getSetting(shop.id, "portal");
+  const resumeAddonCandidates =
+    approaching.length > 0 &&
+    notifications.addonSuggestionEnabled &&
+    portal.allowAddProducts
+      ? await resolveAddonCandidates(
+          shop,
+          notifications.addonSuggestionVariantId.trim(),
+        )
+      : [];
 
   for (const contract of approaching) {
     try {
@@ -410,6 +426,10 @@ export async function runPauseAutoResume(
       // is required; frequency_weeks stays alongside (additive contract).
       const freq = contractFrequency(contract);
 
+      // `addon_variant_id` makes the notifications layer mint the one-tap
+      // `addon_url` (ADD_TO_NEXT) into this reminder's link bundle too.
+      const addon = pickAddonForContract(resumeAddonCandidates, contract.lines);
+
       const result = await sendNotification({
         shopId: shop.id,
         contractId: contract.id,
@@ -426,6 +446,22 @@ export async function runPauseAutoResume(
             "every",
             freq,
           ),
+          ...(addon
+            ? {
+                addon_variant_id: addon.variantId,
+                ...(addon.productId
+                  ? { addon_product_id: addon.productId }
+                  : {}),
+                addon_title: addon.title,
+                addon_price_cents: addon.priceCents,
+                addon_price_formatted: formatMoney(
+                  addon.priceCents,
+                  contract.currencyCode,
+                  contract.locale,
+                ),
+                ...(addon.imageUrl ? { addon_image_url: addon.imageUrl } : {}),
+              }
+            : {}),
         },
       });
       if (result.status === "SENT") stats.remindersSent += 1;

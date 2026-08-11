@@ -37,6 +37,7 @@ export default function App() {
         <Link to="/app/preview">Preview &amp; launch</Link>
         <Link to="/app/subscribers">Subscribers</Link>
         <Link to="/app/dunning">Dunning</Link>
+        <Link to="/app/emails">Emails</Link>
         <Link to="/app/analytics">Analytics</Link>
         <Link to="/app/plans">Plans</Link>
         <Link to="/app/buy-box">Buy box designer</Link>

@@ -125,6 +125,34 @@ export async function requireShopById(shopId: string) {
 }
 
 /**
+ * THE country of a contract for analytics purposes — VAT rate lookup and the
+ * country segment dimension resolve it through this one helper so the two can
+ * never disagree. Resolution: the CURRENT delivery address's countryCode
+ * (mirrored from Shopify — where renewals ship today), falling back to the
+ * acquisition capture's shipping country (acqCountryCode — where the FIRST
+ * order shipped; survives for pickup contracts and pre-address mirrors), else
+ * null ("unknown" — VAT falls back to the default rate, the segment surfaces
+ * an explicit Unknown bucket). Uppercased, never trusted beyond a short
+ * string (the address mirror is external input).
+ */
+export function contractTaxCountry(contract: {
+  deliveryAddress: unknown;
+  acqCountryCode: string | null;
+}): string | null {
+  const address = contract.deliveryAddress;
+  if (address != null && typeof address === "object" && !Array.isArray(address)) {
+    const code = (address as Record<string, unknown>).countryCode;
+    if (typeof code === "string" && code.trim() !== "") {
+      return code.trim().toUpperCase().slice(0, 8);
+    }
+  }
+  if (contract.acqCountryCode && contract.acqCountryCode.trim() !== "") {
+    return contract.acqCountryCode.trim().toUpperCase().slice(0, 8);
+  }
+  return null;
+}
+
+/**
  * Line shape needed for discount estimation. (COGS estimation moved to
  * app/lib/analytics/costs.server.ts — resolveLineCogs / perCycleLineCosts —
  * where merchant overrides and the cost-model fallback are applied.)
@@ -207,15 +235,26 @@ export function utcWeekStartKey(dayKey: Date): string {
  * rather than silently summed as if 1 EUR = 1 CHF. The excluded count is not
  * returned here (the headline stays a number); pass `shopCurrencyCode` when
  * the caller already loaded the shop to save a query.
+ *
+ * `opts.contractIds` (segment layer) restricts the ACTIVE population to those
+ * ids on top of the ownership/demo filter — narrowing only, never widening.
  */
 export async function computeMrrCents(
   shopId: string,
   shopCurrencyCode?: string,
+  opts: { contractIds?: readonly string[] | null } = {},
 ): Promise<number> {
   const currency =
     shopCurrencyCode ?? (await requireShopById(shopId)).currencyCode;
   const contracts = await prisma.subscriptionContract.findMany({
-    where: { shopId, status: "ACTIVE", ...COUNTABLE_CONTRACT },
+    where: {
+      shopId,
+      status: "ACTIVE",
+      ...COUNTABLE_CONTRACT,
+      ...(opts.contractIds != null
+        ? { id: { in: [...opts.contractIds] } }
+        : {}),
+    },
     select: {
       intervalWeeks: true,
       billingIntervalUnit: true,
@@ -459,15 +498,27 @@ export interface FunnelMetrics {
  * DailyRollup.date lives in (synthetic UTC midnight of the shop-tz day) — a
  * UTC-day cutoff would include one extra day whenever local time is past UTC
  * midnight (Europe/Zurich evenings).
+ *
+ * `opts.contractIds` (segment layer) scopes every contract-joined metric to
+ * those ids on top of the ownership/demo filter. Take rate is then reported
+ * null: its denominator (checkout.subscribable events) precedes any contract
+ * and cannot be segmented — an unsegmentable denominator under a segmented
+ * numerator would be a silently wrong ratio.
  */
 export async function getFunnelMetrics(
   shopId: string,
   rangeDays: number,
+  opts: { contractIds?: readonly string[] | null } = {},
 ): Promise<FunnelMetrics> {
   const shop = await requireShopById(shopId);
   const now = new Date();
   const cutoff = subDays(now, rangeDays);
   const rollupCutoff = shopDayLabelUtc(cutoff, shop.ianaTimezone);
+  const segmented = opts.contractIds != null;
+  const idFilter = segmented ? { id: { in: [...opts.contractIds!] } } : {};
+  const relationIdFilter = segmented
+    ? { contractId: { in: [...opts.contractIds!] } }
+    : {};
 
   const [
     rollupSums,
@@ -488,6 +539,7 @@ export async function getFunnelMetrics(
       by: ["reason", "outcome"],
       where: {
         contract: { shopId, ...COUNTABLE_CONTRACT },
+        ...relationIdFilter,
         startedAt: { gte: cutoff },
       },
       _count: { _all: true },
@@ -498,6 +550,7 @@ export async function getFunnelMetrics(
         type: "cycle.skipped",
         createdAt: { gte: cutoff },
         contract: { is: { ...COUNTABLE_CONTRACT } },
+        ...relationIdFilter,
       },
     }),
     // Consolidation merges (reason MERGED, source SYSTEM) are NOT churn —
@@ -509,6 +562,7 @@ export async function getFunnelMetrics(
       where: {
         shopId,
         ...COUNTABLE_CONTRACT,
+        ...idFilter,
         cancelledAt: { gte: cutoff },
         NOT: { cancelReason: "MERGED" },
       },
@@ -517,6 +571,7 @@ export async function getFunnelMetrics(
       by: ["resolution"],
       where: {
         contract: { shopId, ...COUNTABLE_CONTRACT },
+        ...relationIdFilter,
         resolvedAt: { gte: cutoff },
       },
       _count: { _all: true },
@@ -527,26 +582,38 @@ export async function getFunnelMetrics(
         type: "cycle.addon_added",
         createdAt: { gte: cutoff },
         contract: { is: { ...COUNTABLE_CONTRACT } },
+        ...relationIdFilter,
       },
     }),
     prisma.billingAttempt.count({
       where: {
         contract: { shopId, ...COUNTABLE_CONTRACT },
+        ...relationIdFilter,
         status: "SUCCESS",
         completedAt: { gte: cutoff },
       },
     }),
     prisma.subscriptionContract.count({
-      where: { shopId, status: "ACTIVE", ...COUNTABLE_CONTRACT },
+      where: { shopId, status: "ACTIVE", ...COUNTABLE_CONTRACT, ...idFilter },
     }),
     prisma.subscriptionContract.count({
-      where: { shopId, status: "ACTIVE", ...COUNTABLE_CONTRACT, isPrepaid: true },
+      where: {
+        shopId,
+        status: "ACTIVE",
+        ...COUNTABLE_CONTRACT,
+        ...idFilter,
+        isPrepaid: true,
+      },
     }),
   ]);
 
   const num = rollupSums._sum.takeRateNum ?? 0;
   const den = rollupSums._sum.takeRateDen ?? 0;
-  const takeRatePct = den > 0 ? round2((num / den) * 100) : null;
+  const takeRatePct = segmented
+    ? null
+    : den > 0
+      ? round2((num / den) * 100)
+      : null;
 
   // Reason breakdown + save rates from cancel sessions.
   const byReason = new Map<string, { sessions: number; saved: number }>();

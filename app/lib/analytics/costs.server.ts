@@ -311,6 +311,84 @@ export function paymentFeeCents(
   );
 }
 
+// ── VAT / sales tax (reporting cost) ─────────────────────────────────────────
+
+/** One charge's inputs to VAT resolution (shop-currency cents). */
+export interface VatCharge {
+  /** Money kept for this charge — amount charged net of recorded refunds. */
+  netAmountCents: number;
+  /** Amount originally charged — the base the captured tax was computed on. */
+  grossAmountCents: number;
+  /**
+   * REAL tax captured from the order mirror (BillingAttempt.taxCents /
+   * SubscriptionContract.originOrderTaxCents). Still collected (data
+   * foundation, additive promise) but NOT used by the deduction since
+   * v1.16.0 — the merchant's VAT model is a flat percentage of revenue, and
+   * the captured figure is the tax-extracted-from-gross amount (a different,
+   * smaller number on tax-inclusive prices). Kept in the input shape so the
+   * capture pipeline stays exercised and a future model can opt back in.
+   */
+  capturedTaxCents: number | null;
+  /** ISO country the charge ships to (contractTaxCountry), null when unknown. */
+  countryCode: string | null;
+}
+
+export interface ResolvedVat {
+  /** VAT booked against this charge's kept money, in cents. */
+  vatCents: number;
+  /** True whenever a configured rate produced a (possibly zero) deduction. */
+  estimated: boolean;
+}
+
+/** The configured VAT rate for a country: exact country entry, else the default. */
+export function vatRatePctForCountry(
+  costModel: CostModelSettings,
+  countryCode: string | null,
+): number {
+  if (!costModel.vat.enabled) return 0;
+  if (countryCode) {
+    const exact = costModel.vat.countryRatesPct[countryCode.toUpperCase()];
+    if (exact != null) return exact;
+  }
+  return costModel.vat.defaultRatePct;
+}
+
+/**
+ * VAT booked against one charge's kept money — a REPORTING cost subtracted by
+ * both gross-profit surfaces when the vat setting is enabled (never touches
+ * billing).
+ *
+ * The model (v1.16.0, merchant-defined): VAT is a flat percentage of revenue,
+ * subtracted exactly like any other expense — kept money × rate/100, so a
+ * CHF 100.00 charge at 8.1% books CHF 8.10. This deliberately replaces BOTH
+ * v1.15.0 paths (captured order tax, and the net × rate/(100+rate)
+ * extraction): each produced the tax-extracted-from-gross figure (CHF 7.49
+ * on that example), which is not the model the merchant runs their P&L on.
+ * `capturedTaxCents` keeps arriving in the input (still collected per the
+ * data foundation) but no longer drives the deduction.
+ *
+ * The rate is the contract country's entry, else the default rate. Every
+ * rate-derived deduction is flagged `estimated` and accumulated into
+ * estimatedVatCents, so the surfaces disclose that VAT figures are modeled
+ * from configured rates rather than read off orders.
+ *
+ * Disabled setting or non-positive kept money resolves to zero.
+ */
+export function resolveChargeVat(
+  charge: VatCharge,
+  costModel: CostModelSettings,
+): ResolvedVat {
+  if (!costModel.vat.enabled || charge.netAmountCents <= 0) {
+    return { vatCents: 0, estimated: false };
+  }
+  const ratePct = vatRatePctForCountry(costModel, charge.countryCode);
+  if (ratePct <= 0) return { vatCents: 0, estimated: true };
+  return {
+    vatCents: Math.round((charge.netAmountCents * ratePct) / 100),
+    estimated: true,
+  };
+}
+
 /**
  * Fulfillment + shipping cost the MERCHANT pays for one shipment.
  *

@@ -128,6 +128,10 @@ const COST_MODEL = {
   fulfillmentCostPerShipmentCents: 150,
   shippingCostPerShipmentCents: { mode: "flat", flatCents: 200 },
   cogsFallbackPctOfPrice: 25,
+  // Explicitly OFF: this suite pins the vat-less formulas. Without this key
+  // the registry's field-level default (enabled at 8.1% since v1.16.0)
+  // would silently enter every golden number below.
+  vat: { enabled: false, defaultRatePct: 0, countryRatesPct: {} },
 };
 
 const NOW = new Date("2026-08-05T12:00:00Z");
@@ -186,6 +190,14 @@ function buildStore(opts: OriginOverrides = {}): AnalyticsStore {
   const store = emptyStore();
   store.shops.push({ ...SHOP });
   store.settings.push({ shopId: SHOP_ID, key: "costModel", value: COST_MODEL });
+  // Pin the pre-v1.16.0 netting model: these fixtures exercise refunds as
+  // NETTED (revenue minus refund, full costs kept). The shipped default is
+  // exclusion — tests/refund-exclusion.test.ts pins that path.
+  store.settings.push({
+    shopId: SHOP_ID,
+    key: "analytics",
+    value: { excludeRefundedPayments: false },
+  });
 
   const origin: Row = opts.noOriginMoney
     ? {
@@ -281,6 +293,8 @@ const cellRow = (over: Row): Row => ({
   estimatedCogsCents: 0,
   shippingCostCents: 0,
   feesCents: 0,
+  vatCents: 0,
+  estimatedVatCents: 0,
   grossProfitCents: 0,
   cumGrossProfitCents: 0,
   ...over,

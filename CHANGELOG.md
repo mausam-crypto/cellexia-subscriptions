@@ -4,6 +4,250 @@ All notable changes to Cellexia Subscriptions. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [SemVer](https://semver.org) as contracted in [docs/UPDATE.md](docs/UPDATE.md).
 
+## [1.16.0] — 2026-08-11
+
+**Emails tab + analytics data accuracy (merchant-decided defaults)** — a new
+admin **Emails** tab lists every message the app sends and customizes its
+content, timing and one-click actions in-app (delivered through Klaviyo);
+analytics gain an **exclude refunded payments** option (ON by default) and a
+Shopify-Markets refund currency conversion so every figure centralizes on
+the store currency; **VAT flips ON by default at a flat 8.1% of revenue**
+(the rate model is now a straight percentage — a CHF 100 charge at 8.1%
+books CHF 8.10); and the traffic-source / language segments gain a
+derivation ladder (click-id paid channels, referrer classification,
+direct-vs-web, checkout locale) so segment filters are fully accurate for
+every new subscriber. **No migration**, no new env vars, no scope, webhook
+or theme changes, `npm run deploy` NOT required (the extension is
+untouched). The default flips (VAT ON, refund exclusion ON) are deliberate
+merchant decisions executed while the book holds zero subscriptions — no
+historical figure is rewritten by this upgrade, because there are none.
+Rollback-safe: no schema change; the new settings keys (`analytics`,
+`emails`) simply go unread by older code.
+
+### Added
+
+- **Emails tab** (`/app/emails`, nav between Dunning and Analytics): the
+  complete catalog of every notification the app sends — trigger, schedule,
+  channel, Klaviyo metric, send count — grouped by purpose, plus the
+  auto-mapped state-change metrics ("content lives in your Klaviyo flow");
+  a **sent log** view over `NotificationLog` (each catalog row's send count
+  links into it, filtered). Per router-sent template: enable/disable
+  (suppressed sends log reason `template_disabled`; critical templates —
+  OTP, 3-D Secure, admin mail — cannot be disabled), **in-app subject/body
+  customization**, and the send-timing knob (reminder lead time, dunning
+  email ladder, card-expiry notice, win-back offsets, milestone/rewards
+  timing, price-notice period) edited through the same schema-validated,
+  audited settings pipeline the Settings page uses — no-op saves write no
+  audit event. Confirmation moments the app never emails itself
+  (skip/pause/cancel confirmations and the like — the Klaviyo flow on the
+  state-change metric sends those) are listed read-only as flow-owned,
+  never with dead controls.
+- **In-app content delivered via Klaviyo**: every EMAIL-channel notification
+  event now carries ready-rendered `content_subject` / `content_html` /
+  `content_text` properties — the merchant's copy (or the built-in copy)
+  with every placeholder substituted, one-tap links included (the SMS event
+  carries `content_text` only; auto-mapped state-change metrics keep their
+  copy in the flow). A flow email built as `{{ event.content_html }}`
+  always sends exactly what the Emails tab shows; the direct-SMTP fallback
+  renders the identical copy. When a state-change event and the router fire
+  the same metric within the outbox's dedupe window, the content properties
+  are grafted onto the surviving row, so the flow never renders empty.
+  Rendered content and magic-link URLs are never persisted in
+  `NotificationLog`. (docs/KLAVIYO_SETUP.md has the flow recipe.)
+- **One-click delay / add-a-product in more emails**: the resume reminder
+  now resolves an add-on suggestion and carries `addon_url` (one-click
+  ADD_TO_NEXT) exactly like the upcoming-order reminder — same
+  `notifications.addonSuggestionEnabled` + `portal.allowAddProducts` gates —
+  and the Emails tab documents each template's one-click placeholders
+  (`{skip_url}`, `{delay_1w_url}`, `{delay_3w_url}`, `{addon_url}`,
+  `{pause_url}`).
+- **Exclude refunded payments** (`analytics.excludeRefundedPayments`,
+  Settings → Analytics data, **ON by default**): payments with ANY recorded
+  refund — partial or full, renewal or first order — are removed from
+  revenue / gross profit / LTGP entirely (their COGS, fees, VAT and
+  shipping drop too), instead of being netted: a refunded rebill is usually
+  the surprise renewal that got cancelled — noise, not revenue. Applied in
+  lockstep across the daily rollup, the cohort triangle (and therefore
+  every segment view), the shop forecast and the segment forecast; the
+  rollup additionally **repairs the charge day** of refunded payments
+  inside the standing 90-day window nightly (state-derived candidates,
+  flow-columns-only re-upsert — closed days keep their snapshots) so a
+  refund landing days after its charge still removes the payment. Saving
+  the toggle recomputes cohorts AND rewrites every refund-affected rollup
+  day across all history under the new mode (both directions), then the
+  trailing window — the day ledger and the forecast can never be left
+  reading stored rows under the wrong semantics. Off = the previous
+  netting behavior, byte-identical night to night.
+- **Foreign-presentment refund conversion**: a refund denominated in
+  another presentment currency (Shopify Markets) is now converted to the
+  store currency via Shopify's own `refund.totalRefundedSet.shopMoney`
+  figure and recorded, instead of being skipped — analytics stay fully
+  centralized on the store currency (EUR). Applied by the live webhook AND
+  the `refund_reconcile` job (a refund that raced its settlement is not
+  treated worse than one that arrived after it). The conversion is
+  disclosed on the `refund_recorded` event (`converted`,
+  `presentmentAmountCents`); a transient Shopify read failure makes the
+  delivery replayable (webhook receipt FAILED / reconcile retry next run)
+  rather than arming the permanent skip verdict, and only a conclusive
+  non-answer keeps the standing skip-and-log behavior.
+- **Traffic-source accuracy for new subscribers**: the sanitizer records a
+  presence-only **paid channel** from ad click-id params (gclid/gbraid/
+  wbraid → `google_ads`, fbclid → `meta_ads`, ttclid, msclkid, twclid,
+  epik, sccid — the id values themselves are never stored; `acqRaw`
+  additive key, cleared on GDPR redaction like the rest). The source
+  segment now derives through a last-touch ladder: `utm_source` → paid
+  channel → referrer classification (search engines and social platforms
+  by name, other external hosts as "referral"; a capture-time
+  `referrerInternal` verdict — judged against the shop's own domains,
+  including the custom storefront domain from the order-status URL — keeps
+  the shop's own pages from reading as referrals) → Shopify channel, with
+  "web" reading **"direct"** when a webhook-captured bundle proves the
+  visit had no referrer (import-passthrough bundles never claim it). The
+  language segment prefers the REAL checkout locale
+  (`acqRaw.checkoutLocale`) over the catalog-normalized contract locale,
+  so unsupported languages no longer inflate the "en" bucket.
+
+### Changed
+
+- **VAT is ON by default at 8.1%** (`costModel.vat` — Settings → Costs &
+  profit) **and the model is a flat percentage of revenue**: VAT = kept
+  money × rate/100, subtracted like any other expense (8.1% of CHF 100 =
+  CHF 8.10). This replaces BOTH v1.15.0 paths — the captured-order-tax
+  deduction and the extract-from-gross estimate (net × rate/(100+rate)) —
+  which produce the smaller tax-contained-in-a-gross-price figure that is
+  not the model the merchant runs their P&L on. Captured `taxCents` keeps
+  being collected (data foundation) but no longer drives the deduction;
+  every VAT figure is rate-derived and mirrored into `estimatedVatCents`.
+  Per-country rates still win over the default rate, resolved through the
+  same `contractTaxCountry` helper the country segment uses.
+- The analytics page's LTGP formula text discloses the active refund
+  handling ("fully and partially refunded payments excluded" vs "net of
+  refunds") and the new VAT wording; the segment-forecast caveats reflect
+  refund exclusion.
+- `tests/vat-cost.test.ts` goldens re-hand-computed for the flat-rate
+  model; the netting fixtures across the analytics suites now pin
+  `analytics.excludeRefundedPayments: false` explicitly (the exclusion
+  path has its own golden suite, `tests/refund-exclusion.test.ts`).
+
+### Fixed
+
+- The v1.15.0 ZIP accidentally omitted `.env.example` (INSTALL.md's
+  `cp .env.example .env` step); it is back in this release's archive.
+
+> Update notes: `npx prisma migrate deploy` is a no-op (no new migration).
+> New settings keys `analytics` and `emails` (safe defaults, no action
+> needed). If your Klaviyo flows should use the in-app copy, rebuild each
+> flow email as `{{ event.content_html }}` per docs/KLAVIYO_SETUP.md —
+> flows composing their own design from the raw event properties keep
+> working unchanged.
+
+## [1.15.0] — 2026-08-10
+
+**VAT as a reporting cost + analytics segmentation** — gross profit and LTGP
+can now subtract VAT / sales tax (set per country in Settings → Costs &
+profit), and every analytics view — cohorts/LTGP, churn, survival, funnel,
+forecast — can be filtered by country, language, traffic source, product,
+first-order discount depth, device and first-order value. One additive
+migration (`0019_vat_reporting_cost`, `prisma migrate deploy`); no new env
+vars, no scope, webhook or theme changes, `npm run deploy` NOT required (the
+extension is untouched). VAT is **off by default** — an upgrade changes no
+number until the merchant enables it; the filter bar works immediately.
+Rollback-safe: the new columns default to 0 and both analytics tables are
+derived (recomputed nightly), so downgrading the app simply leaves them
+inert.
+
+### Added
+
+- **VAT / sales tax in the cost model** (`costModel.vat` — Settings → Costs
+  & profit): when enabled, both gross-profit surfaces
+  (`DailyRollup.estGrossProfitCents`, `CohortCell.grossProfitCents`)
+  subtract each charge's tax share as a cost. Resolution per charge follows
+  the COGS pattern — first known value wins: the REAL captured order tax
+  (`BillingAttempt.taxCents` / `originOrderTaxCents`, collected since
+  0016), scaled to the kept share when partially refunded on the cohort
+  surface; else an estimate EXTRACTED from the charged total —
+  net × rate/(100+rate), the tax already inside a gross price, never
+  rate × net — at the contract's country rate (`countryRatesPct`, ISO codes,
+  edited as "CH:8.1, DE:19") falling back to `defaultRatePct`. The country
+  comes from the delivery address, then the acquisition (first-order)
+  shipping country — `contractTaxCountry`, the SAME helper the country
+  segment uses, so tax-country and segment-country can never disagree. The
+  estimated share is disclosed in new `estimatedVatCents` columns exactly
+  like estimated COGS. Reporting only: billing, checkout and Shopify tax
+  settings are untouched. History note: the cohort triangle (full nightly
+  recompute) carries VAT across all history from the first run after
+  enablement; closed daily-rollup days keep their pre-VAT figures (closed
+  days are never rewritten), and the day ledger books each charge's full
+  charge-day tax without crediting later refunds — the cohort surface
+  carries the refund-adjusted figure (same accepted-divergence family as
+  the over-refund rule). CONTAINED: with the setting off (the default),
+  `vatCents` stays 0 and every formula is byte-identical to v1.14.0 —
+  pinned by the unchanged golden tests.
+- **Analytics segments** (`app/lib/analytics/segments.server.ts` +
+  `segments-shared.ts`): one shared, pure per-contract predicate derives
+  seven dimensions — country (delivery address → acquisition country),
+  language (contract locale's base subtag), traffic source (`acqUtm.source`
+  → `acqSourceName`), product (non-gift lines, GID/numeric normalized),
+  first-order discount band (mirrored origin discount ÷ pre-discount total:
+  none / <10 / 10–20 / 20–30 / 30%+), device and first-order value band —
+  each with an explicit **Unknown** bucket, so imported or pre-tracking
+  subscribers are visibly unattributed instead of silently missing. These
+  are the first analytical consumers of the v1.5.0 acquisition data
+  foundation, read-only as contracted. Segments only ever NARROW the
+  countable population (`COUNTABLE_CONTRACT` stays in every query;
+  enforced by the ownership source-scan suite).
+- **Filter bar on the Analytics page**: seven selects (with per-value
+  contract counts) above the tabs, URL-persisted and combinable; an active
+  filter shows a banner with the segment's size, active count and MRR, and
+  every tab switches to a live computation over the segment's contracts:
+  cohorts/LTGP through the IDENTICAL triangle engine the nightly job
+  persists with (`computeCohortRows` + `summarizeLtgp`, now reusable and
+  read-only for segment calls), survival through the same censoring-corrected
+  life table, churn split + a weekly arrivals-vs-churn table classified
+  exactly like the rollup, and funnel metrics scoped through the contract
+  relation. Take rate reports "—" under a filter (its checkout denominator
+  precedes any contract and cannot be segmented) and the store-wide insight
+  cards hide rather than imply they were filtered.
+- **Segment forecast** (`getSegmentForecast`): the same pure models the
+  shop-level forecast runs (naive / damped Holt / seasonal / cohort
+  survival build-up / blend), selected by walk-forward backtest over a
+  weekly history reconstructed live from the segment's contracts and
+  orders (revenue from attempts + origin payments net of refunds,
+  currency-guarded; actives from arrival/churn-end timestamps). Honesty
+  built in: per-segment MRR history is not reconstructable and is not
+  shown; the accuracy grade carries the reconstruction caveats (pause
+  windows ignored, refunds netted on the charge week) and is hard-capped at
+  B; nothing writes to the shop-level `forecastModelHistory`, whose
+  recorded errors were measured against a different series.
+- **Tests**: `vat-cost.test.ts` (VAT resolution order, extraction math,
+  refund scaling, per-country lookup, codec + registry validation, and
+  VAT-enabled golden numbers on both surfaces incl. their reconciliation),
+  `segments.test.ts` (dimension derivations, fail-safe URL parsing, the
+  one-predicate resolution against a polluted store, the contract-id seams
+  of every filtered view, churn-series classification, segment-forecast
+  grade cap), migration 0019 vetted in the ownership-enforcement suite, and
+  the two new analytics modules added to its source-scan table.
+
+### Changed
+
+- **Gross-profit formula** (both surfaces): `revenue (net of refunds) −
+  COGS − fulfillment + shipping per shipment − payment fees − VAT` — the
+  VAT term is 0 while the setting is disabled. `analytics-formulas`
+  golden tests updated with the two new zero columns; every pre-existing
+  number is unchanged.
+- **`getSurvivalByCycle` / `computeMrrCents` / `getFunnelMetrics`** accept
+  an optional `contractIds` narrowing (additive parameter — all existing
+  call sites unchanged).
+- **`runCohortComputation`** now delegates to the extracted
+  `computeCohortRows` (same queries, same math — the golden triangle pins
+  byte-equality) so the segment layer can compute without persisting;
+  `getLtgpSummary` likewise delegates to the pure `summarizeLtgp`.
+- **Settings → Costs & profit** gained the VAT fields (enable toggle,
+  default rate, per-country rates as a validated `CH:8.1, DE:19` text
+  field — malformed entries are rejected per entry, never silently
+  dropped) and the worked example now shows the VAT extraction when
+  enabled.
+
 ## [1.14.0] — 2026-08-10
 
 **Per-variant default frequency** — products sold as unit-count variants

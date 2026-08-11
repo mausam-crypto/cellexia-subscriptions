@@ -2,10 +2,28 @@
 
 The app pushes every customer-facing subscription moment to Klaviyo as a
 server-side event (via a durable outbox — nothing is lost if Klaviyo is briefly
-down). **Klaviyo flows own delivery, branding, timing and consent**; the app
+down). **Klaviyo flows own delivery, branding and consent**; the app
 supplies the metrics, the properties, and — crucially — signed one-tap
 **magic-link URLs** so every email/SMS can carry "Skip", "Delay", "Update card"
 buttons that work with zero login.
+
+**In-app content (v1.16.0, admin → Emails).** Every EMAIL-channel
+notification event now also carries three READY-RENDERED properties —
+`content_subject`, `content_html`, `content_text` — holding the copy
+configured on the app's **Emails** tab (or the built-in copy when nothing is
+customized), with every placeholder already substituted (one-tap links
+included). Build a flow email whose subject is
+`{{ event.content_subject }}` and whose body is a single custom-HTML block
+`{{ event.content_html }}` and the flow always sends exactly what the
+Emails tab shows — no flow edit needed when the copy changes. The SMS event
+(`payment_failed_sms`) carries `content_text` only, and the auto-mapped
+state-change metrics (§2's first table — skip/pause/cancel confirmations
+and the like) carry no content properties at all: their copy lives in your
+flow, exactly as before. Flows that compose their own design from the raw
+properties keep working unchanged. The Emails tab also owns per-template
+enable/disable and every send-timing knob (reminder lead time, dunning
+ladder days, win-back offsets), so timing changes no longer need a matching
+flow edit as long as your flows send immediately on the metric.
 
 Direct SMTP is used only for mail that must never depend on Klaviyo:
 OTP login codes, 3DS action requests, admin alerts and import summaries.

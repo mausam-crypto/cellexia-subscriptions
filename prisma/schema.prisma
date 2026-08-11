@@ -957,6 +957,16 @@ model DailyRollup {
   // of silently dropped — a nonzero value tells the merchant the totals are
   // incomplete and by how much (in the foreign amounts' own cents).
   excludedForeignCurrencyCents Int      @default(0)
+  // VAT / sales tax as a reporting cost (migration 0019): the tax contained
+  // in the day's CHARGED (gross) revenue, subtracted from
+  // estGrossProfitCents while the costModel.vat setting is enabled (0
+  // otherwise). Like feesCents, booked per charge on its charge day and
+  // never credited back when a refund is later recorded — the cohort
+  // surface carries the refund-adjusted figure. Captured order tax
+  // preferred, country-rate estimate as fallback; the estimated share is
+  // disclosed in estimatedVatCents exactly like estimatedCogsCents.
+  vatCents                     Int      @default(0)
+  estimatedVatCents            Int      @default(0)
   // True on gap-backfilled rollup days whose point-in-time snapshot columns
   // (activeSubscribers, mrrCents, openDunningCases, ...) could not be
   // reconstructed after the fact — the flow columns are real, the snapshots
@@ -988,6 +998,11 @@ model CohortCell {
   // that came from the cogsFallbackPctOfPrice estimate (COGS coverage stat).
   refundedCents       Int      @default(0)
   estimatedCogsCents  Int      @default(0)
+  // VAT / sales tax as a reporting cost (migration 0019) — see DailyRollup:
+  // subtracted in grossProfitCents while costModel.vat is enabled; the
+  // estimated share is disclosed in estimatedVatCents.
+  vatCents            Int      @default(0)
+  estimatedVatCents   Int      @default(0)
 
   @@unique([shopId, cohortMonth, monthOffset])
 }

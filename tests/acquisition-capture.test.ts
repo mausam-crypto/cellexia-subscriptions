@@ -349,6 +349,12 @@ describe("buildAcquisitionCapture — the bundle never carries IP or full UA", (
         // Capped-only recompute reserve for the utm scrub — deliberately
         // unscrubbed, rides inside acqRaw so CUSTOMERS_REDACT clears it.
         "rawUtm",
+        // v1.16.0: presence-only paid-channel label from ad click-id params
+        // (the ids themselves are never stored) — traffic-source ladder input.
+        "paidChannel",
+        // v1.16.0: capture-time self-referral verdict (referrer host vs the
+        // shop's own domains) — internal navigation must not read "referral".
+        "referrerInternal",
         "countryCode",
         "provinceCode",
         "city",

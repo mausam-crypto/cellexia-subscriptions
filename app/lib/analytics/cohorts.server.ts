@@ -2,6 +2,7 @@ import prisma from "~/db.server";
 import { toZonedTime, fromZonedTime, format as formatTz } from "date-fns-tz";
 import {
   COUNTABLE_CONTRACT,
+  contractTaxCountry,
   originPaymentCountsOnce,
   perCycleDiscountCents,
   requireShopById,
@@ -12,7 +13,9 @@ import {
   paymentFeeCents,
   perCycleLineCosts,
   perShipmentCostCents,
+  resolveChargeVat,
 } from "./costs.server";
+import { getSetting } from "~/lib/settings/settings.server";
 
 /**
  * Cohort LTGP engine.
@@ -55,14 +58,18 @@ interface CellAccumulator {
   estimatedCogsCents: number;
   shippingCostCents: number;
   feesCents: number;
+  vatCents: number;
+  estimatedVatCents: number;
   billedCycles: number;
 }
 
-function ymKey(date: Date, tz: string): string {
+/** "yyyy-MM" month key of an instant in the shop timezone (exported for the segment layer). */
+export function ymKey(date: Date, tz: string): string {
   return formatTz(toZonedTime(date, tz), "yyyy-MM", { timeZone: tz });
 }
 
-function ymIndex(ym: string): number {
+/** Comparable month index (year×12 + month0) of a "yyyy-MM" key (exported for the segment layer). */
+export function ymIndex(ym: string): number {
   const [y, m] = ym.split("-").map(Number);
   return y * 12 + (m - 1);
 }
@@ -79,7 +86,56 @@ function monthStartUtc(index: number, tz: string): Date {
 }
 
 /**
- * Recompute the full cohort triangle for a shop and upsert CohortCell rows.
+ * When did this contract stop being a live subscriber? cancelledAt when
+ * cancelled; failedAt for dunning-exhausted contracts stuck in FAILED with
+ * no cancel timestamp; expiredAt for completed bounded plans (EXPIRED —
+ * voluntary churn, the shared classification, see the activeRemaining doc).
+ * Null = still considered retained, including pre-0016 expiries whose
+ * instant was never recorded. Exported so the segment layer's reconstructed
+ * active counts apply the IDENTICAL rule.
+ */
+export function churnEndOf(m: {
+  cancelledAt: Date | null;
+  status: string;
+  failedAt: Date | null;
+  expiredAt: Date | null;
+}): Date | null {
+  return (
+    m.cancelledAt ??
+    (m.status === "FAILED"
+      ? m.failedAt
+      : m.status === "EXPIRED"
+        ? m.expiredAt
+        : null)
+  );
+}
+
+/** One computed cohort cell — the CohortCell row shape minus id/computedAt. */
+export interface CohortRowData {
+  shopId: string;
+  cohortMonth: string;
+  monthOffset: number;
+  cohortSize: number;
+  activeRemaining: number;
+  revenueCents: number;
+  refundedCents: number;
+  discountCents: number;
+  cogsCents: number;
+  estimatedCogsCents: number;
+  shippingCostCents: number;
+  feesCents: number;
+  vatCents: number;
+  estimatedVatCents: number;
+  grossProfitCents: number;
+  cumGrossProfitCents: number;
+}
+
+/**
+ * Compute the full cohort triangle for a shop and upsert CohortCell rows
+ * (delete + createMany — the persisted, whole-book triangle the analytics
+ * page reads by default). The actual computation lives in computeCohortRows
+ * so the segment layer (segment-views.server.ts) can run the IDENTICAL
+ * formula over a filtered population live, without ever writing.
  *
  * Per (cohortMonth, monthOffset) cell:
  * - cohortSize: contracts whose (firstChargeAt ?? createdAt) falls in cohortMonth.
@@ -107,6 +163,12 @@ function monthStartUtc(index: number, tz: string): Date {
  *   on the origin total, one shipment (× deliveries-per-charge when
  *   prepaid), and COGS from the contract's CURRENT lines via resolveLineCogs
  *   — the documented origin-lines ≈ current-lines approximation.
+ *   REFUND EXCLUSION (v1.16.0, analytics.excludeRefundedPayments — ON by
+ *   default): payments with ANY recorded refund (partial or full) are
+ *   dropped from the cell entirely — revenue, refunded, COGS, fees, VAT,
+ *   shipping and billedCycles alike — instead of the off-mode netting. The
+ *   nightly full recompute makes this fully retroactive; segment views
+ *   inherit it through computeCohortRows.
  * - discountCents: per billed cycle, Σ non-gift lines max(0, compareAt − current) × qty
  *   (informational; not subtracted from gross profit since revenue is already net).
  * - cogsCents: per billed cycle, PREFERRING the cost basis frozen into
@@ -124,7 +186,17 @@ function monthStartUtc(index: number, tz: string): Date {
  *   from the cost model × shipments (prepaid: deliveries-per-charge).
  *   Customer-paid delivery is NOT a cost — it stays inside revenueCents.
  * - feesCents: payment processing fees per successful charge (cost model).
- * - grossProfitCents = revenue(net of refunds) − cogs − shipping − fees.
+ * - vatCents (migration 0019): VAT booked against the cell's kept revenue
+ *   while the costModel.vat setting is enabled (0 otherwise). Per charge a
+ *   flat percentage of the kept money — kept × rate/100 (v1.16.0,
+ *   merchant-defined: VAT is an expense that is a straight percentage of
+ *   revenue; captured order tax keeps being collected but no longer drives
+ *   the deduction) — on the contract's tax country rate (delivery address,
+ *   else acquisition country, else the default rate) — resolveChargeVat in
+ *   costs.server.ts. estimatedVatCents mirrors the rate-derived share —
+ *   since v1.16.0 every non-zero deduction (the estimatedCogsCents
+ *   disclosure pattern).
+ * - grossProfitCents = revenue(net of refunds) − cogs − shipping − fees − vat.
  * - cumGrossProfitCents: running total across offsets within the cohort.
  *
  * Approximations (documented, acceptable for a mirror): lines are read as they
@@ -134,15 +206,59 @@ export async function runCohortComputation(
   shopId: string,
   now: Date = new Date(),
 ): Promise<{ cohorts: number; cells: number }> {
+  const rows = await computeCohortRows(shopId, now);
+
+  if (rows.length === 0) {
+    await prisma.cohortCell.deleteMany({ where: { shopId } });
+    return { cohorts: 0, cells: 0 };
+  }
+
+  // Full refresh keeps the triangle self-consistent even after backfills.
+  await prisma.$transaction([
+    prisma.cohortCell.deleteMany({ where: { shopId } }),
+    prisma.cohortCell.createMany({ data: rows }),
+  ]);
+
+  return {
+    cohorts: new Set(rows.map((r) => r.cohortMonth)).size,
+    cells: rows.length,
+  };
+}
+
+/**
+ * The cohort-triangle computation itself (see runCohortComputation for the
+ * cell semantics — this is that function's body, made reusable). Pure over
+ * the database: reads, never writes.
+ *
+ * `opts.contractIds` restricts the population to those contract ids ON TOP of
+ * the ownership/demo filter (COUNTABLE_CONTRACT still applies — a segment can
+ * only ever narrow the countable book, never widen it). Null/absent = the
+ * whole countable book, byte-identical to the persisted triangle.
+ */
+export async function computeCohortRows(
+  shopId: string,
+  now: Date = new Date(),
+  opts: { contractIds?: readonly string[] | null } = {},
+): Promise<CohortRowData[]> {
   const shop = await requireShopById(shopId);
   const tz = shop.ianaTimezone;
   const nowIdx = ymIndex(ymKey(now, tz));
 
   const costCtx = await loadCostContext(shopId);
+  // Data-accuracy option (v1.16.0, ON by default) — see the revenueCents doc
+  // above. Loaded here so segment views inherit it automatically.
+  const { excludeRefundedPayments } = await getSetting(shopId, "analytics");
+
+  const idFilter =
+    opts.contractIds != null ? { id: { in: [...opts.contractIds] } } : {};
+  const relationIdFilter =
+    opts.contractIds != null
+      ? { contractId: { in: [...opts.contractIds] } }
+      : {};
 
   const [contracts, attempts, giftGrants] = await Promise.all([
     prisma.subscriptionContract.findMany({
-      where: { shopId, ...COUNTABLE_CONTRACT },
+      where: { shopId, ...COUNTABLE_CONTRACT, ...idFilter },
       select: {
         id: true,
         createdAt: true,
@@ -154,9 +270,12 @@ export async function runCohortComputation(
         deliveryPriceCents: true,
         isPrepaid: true,
         prepaidDeliveriesPerCharge: true,
+        deliveryAddress: true,
+        acqCountryCode: true,
         originOrderId: true,
         originOrderTotalCents: true,
         originOrderDiscountCents: true,
+        originOrderTaxCents: true,
         originOrderRefundedCents: true,
         originOrderProcessedAt: true,
         originOrderCurrencyCode: true,
@@ -176,6 +295,7 @@ export async function runCohortComputation(
     prisma.billingAttempt.findMany({
       where: {
         contract: { shopId, ...COUNTABLE_CONTRACT },
+        ...relationIdFilter,
         status: "SUCCESS",
         completedAt: { not: null },
       },
@@ -185,6 +305,7 @@ export async function runCohortComputation(
         amountCents: true,
         refundedCents: true,
         currencyCode: true,
+        taxCents: true,
         completedAt: true,
         costSnapshot: true,
       },
@@ -199,6 +320,7 @@ export async function runCohortComputation(
     prisma.giftGrant.findMany({
       where: {
         contract: { shopId, ...COUNTABLE_CONTRACT },
+        ...relationIdFilter,
         addedAt: { not: null },
         OR: [
           { status: { in: ["ADDED", "SHIPPED"] } },
@@ -215,8 +337,7 @@ export async function runCohortComputation(
   ]);
 
   if (contracts.length === 0) {
-    await prisma.cohortCell.deleteMany({ where: { shopId } });
-    return { cohorts: 0, cells: 0 };
+    return [];
   }
 
   // Contract → cohort assignment.
@@ -246,6 +367,8 @@ export async function runCohortComputation(
         estimatedCogsCents: 0,
         shippingCostCents: 0,
         feesCents: 0,
+        vatCents: 0,
+        estimatedVatCents: 0,
         billedCycles: 0,
       };
       cells.set(key, cell);
@@ -260,11 +383,40 @@ export async function runCohortComputation(
   for (const attempt of attempts) {
     if (attempt.orderId) successfulAttemptOrderIds.add(attempt.orderId);
   }
+  // Under a segment filter the attempts above cover only segment-member
+  // contracts, but the claim set must stay SHOP-WIDE: the anomaly the guard
+  // exists for (queries.server.ts — an origin order also claimed by a
+  // successful attempt) can sit on a contract OUTSIDE the segment, and a
+  // narrowed claim set would book money the whole-book triangle suppresses —
+  // a segment cell exceeding its whole-book counterpart. Same pattern as the
+  // rollup's deliberately contract-unfiltered claimedByAttempts lookup.
+  if (opts.contractIds != null) {
+    const originOrderIds = contracts
+      .map((c) => c.originOrderId)
+      .filter((id): id is string => id != null);
+    if (originOrderIds.length > 0) {
+      const claimedByAttempts = await prisma.billingAttempt.findMany({
+        where: {
+          status: "SUCCESS",
+          orderId: { in: originOrderIds },
+          contract: { shopId, ...COUNTABLE_CONTRACT },
+        },
+        select: { orderId: true },
+      });
+      for (const attempt of claimedByAttempts) {
+        if (attempt.orderId) successfulAttemptOrderIds.add(attempt.orderId);
+      }
+    }
+  }
 
   for (const attempt of attempts) {
     const contract = contractById.get(attempt.contractId);
     const cohortIdx = cohortIdxByContract.get(attempt.contractId);
     if (!contract || cohortIdx == null || !attempt.completedAt) continue;
+    // Refund exclusion (v1.16.0): a payment with ANY recorded refund leaves
+    // the triangle whole — before any accumulation, so its costs, fees, VAT
+    // and billed-cycle count drop with it (see the revenueCents doc).
+    if (excludeRefundedPayments && attempt.refundedCents > 0) continue;
     // Currency guard: never sum foreign-presentment cents into shop-currency cells.
     if (attempt.currencyCode && attempt.currencyCode !== shop.currencyCode) {
       continue;
@@ -301,6 +453,20 @@ export async function runCohortComputation(
         deliveries;
     }
     cell.feesCents += paymentFeeCents(amount, costCtx.costModel);
+    // VAT on the money KEPT (net of this attempt's refunds): captured order
+    // tax scaled to the kept share, else the country-rate estimate — see the
+    // vatCents cell doc above.
+    const vat = resolveChargeVat(
+      {
+        netAmountCents: amount - refunded,
+        grossAmountCents: amount,
+        capturedTaxCents: attempt.taxCents,
+        countryCode: contractTaxCountry(contract),
+      },
+      costCtx.costModel,
+    );
+    cell.vatCents += vat.vatCents;
+    if (vat.estimated) cell.estimatedVatCents += vat.vatCents;
     cell.billedCycles += 1;
   }
 
@@ -311,6 +477,13 @@ export async function runCohortComputation(
   for (const contract of contracts) {
     const cohortIdx = cohortIdxByContract.get(contract.id);
     if (cohortIdx == null) continue;
+    // Refund exclusion, mirroring the attempt loop above.
+    if (
+      excludeRefundedPayments &&
+      Math.max(0, contract.originOrderRefundedCents) > 0
+    ) {
+      continue;
+    }
     if (
       !originPaymentCountsOnce(
         contract,
@@ -347,6 +520,17 @@ export async function runCohortComputation(
       perShipmentCostCents(costCtx.costModel, contract.deliveryPriceCents) *
       deliveries;
     cell.feesCents += paymentFeeCents(amount, costCtx.costModel);
+    const vat = resolveChargeVat(
+      {
+        netAmountCents: amount - refunded,
+        grossAmountCents: amount,
+        capturedTaxCents: contract.originOrderTaxCents,
+        countryCode: contractTaxCountry(contract),
+      },
+      costCtx.costModel,
+    );
+    cell.vatCents += vat.vatCents;
+    if (vat.estimated) cell.estimatedVatCents += vat.vatCents;
   }
 
   // Gift COGS per grant, booked in the month the gift was attached (survives
@@ -368,41 +552,7 @@ export async function runCohortComputation(
 
   // Emit every cell 0..maxOffset per cohort (even all-zero months), with
   // survival counts and cumulative gross profit.
-  const rows: {
-    shopId: string;
-    cohortMonth: string;
-    monthOffset: number;
-    cohortSize: number;
-    activeRemaining: number;
-    revenueCents: number;
-    refundedCents: number;
-    discountCents: number;
-    cogsCents: number;
-    estimatedCogsCents: number;
-    shippingCostCents: number;
-    feesCents: number;
-    grossProfitCents: number;
-    cumGrossProfitCents: number;
-  }[] = [];
-
-  // When did this contract stop being a live subscriber? cancelledAt when
-  // cancelled; failedAt for dunning-exhausted contracts stuck in FAILED with
-  // no cancel timestamp; expiredAt for completed bounded plans (EXPIRED —
-  // voluntary churn, the shared classification, see activeRemaining doc).
-  // Null = still considered retained, including pre-0016 expiries whose
-  // instant was never recorded.
-  const churnEndOf = (m: {
-    cancelledAt: Date | null;
-    status: string;
-    failedAt: Date | null;
-    expiredAt: Date | null;
-  }): Date | null =>
-    m.cancelledAt ??
-    (m.status === "FAILED"
-      ? m.failedAt
-      : m.status === "EXPIRED"
-        ? m.expiredAt
-        : null);
+  const rows: CohortRowData[] = [];
 
   const cohortIndexes = [...cohortMembers.keys()].sort((a, b) => a - b);
   for (const cohortIdx of cohortIndexes) {
@@ -422,8 +572,9 @@ export async function runCohortComputation(
       const cogsCents = acc?.cogsCents ?? 0;
       const shippingCostCents = acc?.shippingCostCents ?? 0;
       const feesCents = acc?.feesCents ?? 0;
+      const vatCents = acc?.vatCents ?? 0;
       const grossProfitCents =
-        revenueCents - cogsCents - shippingCostCents - feesCents;
+        revenueCents - cogsCents - shippingCostCents - feesCents - vatCents;
       cumGrossProfitCents += grossProfitCents;
 
       rows.push({
@@ -439,19 +590,15 @@ export async function runCohortComputation(
         estimatedCogsCents: acc?.estimatedCogsCents ?? 0,
         shippingCostCents,
         feesCents,
+        vatCents,
+        estimatedVatCents: acc?.estimatedVatCents ?? 0,
         grossProfitCents,
         cumGrossProfitCents,
       });
     }
   }
 
-  // Full refresh keeps the triangle self-consistent even after backfills.
-  await prisma.$transaction([
-    prisma.cohortCell.deleteMany({ where: { shopId } }),
-    prisma.cohortCell.createMany({ data: rows }),
-  ]);
-
-  return { cohorts: cohortIndexes.length, cells: rows.length };
+  return rows;
 }
 
 // ── LTGP summary ──────────────────────────────────────────────────────────────
@@ -513,8 +660,36 @@ export async function getLtgpSummary(
     },
   });
 
+  return summarizeLtgp(cellRows, nowIdx);
+}
+
+/** Cell shape summarizeLtgp needs (subset of CohortCell / CohortRowData). */
+export interface LtgpSourceCell {
+  cohortMonth: string;
+  monthOffset: number;
+  cohortSize: number;
+  cumGrossProfitCents: number;
+}
+
+/**
+ * The LTGP summarization itself (see getLtgpSummary) — pure over its cell
+ * rows so the segment layer can run it on a live-computed triangle. `nowIdx`
+ * is the current month's ymIndex in the shop timezone; a cohort reports a
+ * horizon only once that offset month has fully elapsed.
+ */
+export function summarizeLtgp(
+  cellRows: LtgpSourceCell[],
+  nowIdx: number,
+): LtgpSummary {
+  // Order-independent: callers may pass a full triangle (segment layer) or
+  // the pre-filtered horizon cells (getLtgpSummary) in any order.
+  const sorted = [...cellRows].sort(
+    (a, b) =>
+      a.cohortMonth.localeCompare(b.cohortMonth) ||
+      a.monthOffset - b.monthOffset,
+  );
   const byCohort = new Map<string, typeof cellRows>();
-  for (const row of cellRows) {
+  for (const row of sorted) {
     const list = byCohort.get(row.cohortMonth) ?? [];
     list.push(row);
     byCohort.set(row.cohortMonth, list);

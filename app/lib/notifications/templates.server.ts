@@ -247,9 +247,34 @@ export function isTemplateKey(key: string): key is TemplateKey {
 export interface RenderedEmail {
   subject: string;
   html: string;
+  /** Plain-text form of the body (v1.16.0) — feeds SMS flows/content_text. */
+  text: string;
+}
+
+/** Merchant-edited copy from the `emails` setting (empty string = built-in). */
+export interface EmailContentOverride {
+  subject?: string;
+  body?: string;
 }
 
 export type TemplateVars = Record<string, string | number>;
+
+/**
+ * `{var}` interpolation for merchant-edited copy — the same placeholder
+ * syntax the i18n catalog uses (t() interpolates its own strings; override
+ * strings never pass through t(), so they need this twin). Unknown
+ * placeholders are left visible rather than swallowed: a typo'd
+ * `{delay_1w_ur}` in the editor should be seen, not silently vanish.
+ * `{cta}` is deliberately not interpolated here — the html assembly below
+ * owns it.
+ */
+export function interpolateVars(text: string, vars: TemplateVars): string {
+  return text.replace(/\{([a-z0-9_]+)\}/gi, (match, key: string) => {
+    if (key === "cta") return match;
+    const value = vars[key];
+    return value === undefined ? match : String(value);
+  });
+}
 
 function escapeHtml(s: string): string {
   return s
@@ -267,7 +292,8 @@ function humanize(template: string): string {
 
 /**
  * Renders a branded transactional email for direct SMTP delivery.
- * Subject/body copy comes from the i18n catalog at
+ * Subject/body copy comes from the merchant's override (the `emails`
+ * setting, non-empty values only — v1.16.0) or the i18n catalog at
  * `email.{template}.subject` / `email.{template}.body`; `\n` becomes `<br>`
  * and a single `{cta}` placeholder (or, failing that, the end of the body)
  * receives a button built from `vars.cta_url` / `vars.cta_label`.
@@ -275,20 +301,33 @@ function humanize(template: string): string {
  * If catalog keys are missing (locale files not yet shipped) it degrades to a
  * generic subject and a plain listing of the variables, so critical mail
  * (OTP codes, admin alerts) still carries its payload.
+ *
+ * The same rendering feeds the Klaviyo event's content properties
+ * (content_subject / content_html / content_text — send.server.ts), so
+ * whatever the merchant writes in the Emails tab is what BOTH delivery
+ * shapes carry.
  */
 export function renderEmail(
   template: TemplateKey,
   locale: string | null | undefined,
   vars: TemplateVars = {},
+  override?: EmailContentOverride | null,
 ): RenderedEmail {
   const def = TEMPLATES[template];
   const subjectKey = `${def.i18nKey}.subject`;
   const bodyKey = `${def.i18nKey}.body`;
 
-  let subject = t(locale, subjectKey, vars);
+  const overrideSubject = override?.subject?.trim() || null;
+  const overrideBody = override?.body?.trim() || null;
+
+  let subject = overrideSubject
+    ? interpolateVars(overrideSubject, vars)
+    : t(locale, subjectKey, vars);
   if (subject === subjectKey) subject = `Cellexia — ${humanize(template)}`;
 
-  let bodyText = t(locale, bodyKey, vars);
+  let bodyText = overrideBody
+    ? interpolateVars(overrideBody, vars)
+    : t(locale, bodyKey, vars);
   if (bodyText === bodyKey) {
     // Catalog fallback: never send an empty critical email.
     bodyText = Object.entries(vars)
@@ -315,6 +354,14 @@ export function renderEmail(
     bodyHtml = `${bodyHtml}${button}`;
   }
 
+  // Plain-text twin: the {cta} slot becomes "label: url" (or disappears).
+  const ctaText = ctaUrl ? `${ctaLabel}: ${ctaUrl}` : "";
+  const text = bodyText.includes("{cta}")
+    ? bodyText.replace("{cta}", ctaText).trim()
+    : ctaText
+      ? `${bodyText}\n\n${ctaText}`
+      : bodyText;
+
   const html = `<div style="margin:0;padding:0;background:#faf8f5;">
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#faf8f5;">
     <tr>
@@ -335,5 +382,5 @@ export function renderEmail(
   </table>
 </div>`;
 
-  return { subject, html };
+  return { subject, html, text };
 }

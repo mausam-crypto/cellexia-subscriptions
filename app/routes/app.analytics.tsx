@@ -31,10 +31,26 @@ import {
   getFunnelMetrics,
   getLtgpSummary,
   getRiskModelStatus,
+  getSegmentChurnSeries,
+  getSegmentCohortData,
+  getSegmentForecast,
+  getSegmentHeadline,
+  getSegmentOptions,
   getSurvivalByCycle,
+  isEmptySegment,
+  loadSegmentSourceContracts,
+  parseSegmentFromParams,
+  resolveSegmentContractIds,
 } from "~/lib/analytics/index.server";
 import type { ForecastModelChoice } from "~/lib/analytics/index.server";
 import { getInsights } from "~/lib/analytics/insights.server";
+import { getSetting } from "~/lib/settings/settings.server";
+import {
+  SEGMENT_PARAM_NAMES,
+  UNKNOWN_SEGMENT_VALUE,
+  segmentValueLabel,
+} from "~/lib/analytics/segments-shared";
+import type { SegmentDimension } from "~/lib/analytics/segments-shared";
 import { formatMoney } from "~/lib/money";
 import { OURS_ONLY } from "~/lib/ownership/ownership.server";
 import {
@@ -115,49 +131,51 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   }
 
   const now = new Date();
+
+  // ── Segment resolution (v1.15.0) — an active filter swaps every view to a
+  // live computation over the segment's contract ids; the persisted
+  // shop-level tables keep serving the unfiltered page. Options always load
+  // (the filter bar renders on both); ONE book scan feeds both the options
+  // and the id resolution.
+  const segment = parseSegmentFromParams(url.searchParams);
+  const segmentSource = await loadSegmentSourceContracts(shop.id);
+  const [segmentOptions, segmentIds] = await Promise.all([
+    getSegmentOptions(shop.id, { contracts: segmentSource }),
+    isEmptySegment(segment)
+      ? Promise.resolve(null)
+      : resolveSegmentContractIds(shop.id, segment, {
+          contracts: segmentSource,
+        }),
+  ]);
+  const segmentActive = segmentIds != null;
+  const contractIdFilter = segmentActive ? { id: { in: segmentIds } } : {};
+
   // ONE forecast run per page load: insights reuse this promise's accuracy
   // grade for rule 7 instead of getInsights self-computing a duplicate
   // forecast (~5 queries + the full rollup history fetch). A failed forecast
   // degrades insights to "no grade" (the known-unknown contract) — the
   // Promise.all still rejects on the forecast element itself, unchanged.
-  const forecastPromise = getForecast(shop.id, {
-    model: modelChoice,
-    horizonWeeks,
-    now,
-  });
+  // Segment views run their own forecast (reconstructed history) and hide
+  // the store-wide insight cards, so neither is loaded then.
+  const forecastPromise = segmentActive
+    ? null
+    : getForecast(shop.id, { model: modelChoice, horizonWeeks, now });
   const [
     funnel,
-    ltgp,
     survival,
-    forecast,
-    insights,
     costCoverage,
     riskModel,
-    cohortCells,
+    costModel,
+    analyticsOptions,
     cancelGroups,
     decidedContracts,
   ] = await Promise.all([
-    getFunnelMetrics(shop.id, rangeDays),
-    getLtgpSummary(shop.id),
-    getSurvivalByCycle(shop.id),
-    forecastPromise,
-    forecastPromise.then(
-      (f) => getInsights(shop.id, now, { forecastGrade: f.accuracy.grade }),
-      () => getInsights(shop.id, now, { forecastGrade: null }),
-    ),
+    getFunnelMetrics(shop.id, rangeDays, { contractIds: segmentIds }),
+    getSurvivalByCycle(shop.id, { contractIds: segmentIds }),
     getCostCoverage(shop.id),
     getRiskModelStatus(shop.id),
-    prisma.cohortCell.findMany({
-      where: { shopId: shop.id },
-      orderBy: [{ cohortMonth: "asc" }, { monthOffset: "asc" }],
-      select: {
-        cohortMonth: true,
-        monthOffset: true,
-        cohortSize: true,
-        activeRemaining: true,
-        cumGrossProfitCents: true,
-      },
-    }),
+    getSetting(shop.id, "costModel"),
+    getSetting(shop.id, "analytics"),
     prisma.subscriptionContract.groupBy({
       by: ["cancelSource"],
       // OURS_ONLY: another subscription app's churn is not ours to report on.
@@ -168,6 +186,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         status: "CANCELLED",
         isDemo: false,
         ...OURS_ONLY,
+        ...contractIdFilter,
         NOT: { cancelReason: "MERGED" },
       },
       _count: { _all: true },
@@ -177,10 +196,141 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         shopId: shop.id,
         isDemo: false,
         ...OURS_ONLY,
+        ...contractIdFilter,
         OR: [{ status: "CANCELLED" }, { ordersCount: { gte: 2 } }],
       },
     }),
   ]);
+
+  // ── Cohorts + forecast + insights, per path (shared post-processing below) ──
+  type CohortCellRow = {
+    cohortMonth: string;
+    monthOffset: number;
+    cohortSize: number;
+    activeRemaining: number;
+    cumGrossProfitCents: number;
+  };
+  let ltgp: Awaited<ReturnType<typeof getLtgpSummary>>;
+  let cohortCells: CohortCellRow[];
+  let insights: Awaited<ReturnType<typeof getInsights>>;
+  let forecastData: {
+    requestedModel: ForecastModelChoice;
+    selectedModel: string;
+    horizonWeeks: number;
+    accuracy: { grade: "A" | "B" | "C" | "D"; label: string; reasons: string[] };
+    models: Array<{
+      key: string;
+      label: string;
+      available: boolean;
+      minWeeksRequired: number;
+      backtestMape: number | null;
+      backtestBias: number | null;
+      recommended: boolean;
+    }>;
+    modelHistory: { weeksRecorded: number; latestWeek: string | null };
+    metrics: {
+      mrrCents: SerializedMetricSeries | null;
+      activeSubscribers: SerializedMetricSeries;
+      netRevenueCents: SerializedMetricSeries;
+    };
+    legacyModel: {
+      avgCycleSurvival: number;
+      weeklyRetention: number;
+      avgIntervalWeeks: number;
+    } | null;
+  };
+  let segmentHeadline: {
+    totalContracts: number;
+    activeSubscribers: number;
+    mrrCents: number;
+  } | null = null;
+  let segmentChurnSeries: Awaited<
+    ReturnType<typeof getSegmentChurnSeries>
+  > | null = null;
+
+  if (!segmentActive) {
+    const [ltgpResult, cells, forecast, insightsResult] = await Promise.all([
+      getLtgpSummary(shop.id),
+      prisma.cohortCell.findMany({
+        where: { shopId: shop.id },
+        orderBy: [{ cohortMonth: "asc" }, { monthOffset: "asc" }],
+        select: {
+          cohortMonth: true,
+          monthOffset: true,
+          cohortSize: true,
+          activeRemaining: true,
+          cumGrossProfitCents: true,
+        },
+      }),
+      forecastPromise!,
+      forecastPromise!.then(
+        (f) => getInsights(shop.id, now, { forecastGrade: f.accuracy.grade }),
+        () => getInsights(shop.id, now, { forecastGrade: null }),
+      ),
+    ]);
+    ltgp = ltgpResult;
+    cohortCells = cells;
+    insights = insightsResult;
+    forecastData = {
+      requestedModel: modelChoice,
+      selectedModel: forecast.selectedModel,
+      horizonWeeks: forecast.horizonWeeks,
+      accuracy: forecast.accuracy,
+      models: forecast.models,
+      modelHistory: forecast.modelHistory,
+      metrics: {
+        mrrCents: forecast.series.mrrCents,
+        activeSubscribers: forecast.series.activeSubscribers,
+        netRevenueCents: forecast.series.netRevenueCents,
+      },
+      legacyModel: forecast.model,
+    };
+  } else {
+    const [cohortData, segForecast, headline, churnSeries] = await Promise.all([
+      getSegmentCohortData(shop.id, segmentIds, now),
+      getSegmentForecast(shop.id, segmentIds, {
+        model: modelChoice,
+        horizonWeeks,
+        now,
+      }),
+      getSegmentHeadline(shop.id, segmentIds, shop.currencyCode),
+      getSegmentChurnSeries(shop.id, segmentIds, { weekCount: 12, now }),
+    ]);
+    ltgp = cohortData.ltgp;
+    cohortCells = cohortData.rows.map((row) => ({
+      cohortMonth: row.cohortMonth,
+      monthOffset: row.monthOffset,
+      cohortSize: row.cohortSize,
+      activeRemaining: row.activeRemaining,
+      cumGrossProfitCents: row.cumGrossProfitCents,
+    }));
+    insights = []; // insight rules are store-wide; a filtered page must not imply otherwise
+    segmentHeadline = headline;
+    segmentChurnSeries = churnSeries;
+    forecastData = {
+      requestedModel: modelChoice,
+      selectedModel: segForecast.selectedModel,
+      horizonWeeks: segForecast.horizonWeeks,
+      accuracy: segForecast.accuracy,
+      models: segForecast.models.map((m) => ({
+        key: m.key,
+        label: m.label,
+        available: m.available,
+        minWeeksRequired: m.minWeeksRequired,
+        backtestMape: m.backtestMape,
+        backtestBias: m.backtestBias,
+        recommended: m.recommended ?? false,
+      })),
+      modelHistory: { weeksRecorded: 0, latestWeek: null },
+      metrics: {
+        // Per-segment MRR history cannot be reconstructed — the tab explains.
+        mrrCents: null,
+        activeSubscribers: segForecast.series.activeSubscribers,
+        netRevenueCents: segForecast.series.netRevenueCents,
+      },
+      legacyModel: null,
+    };
+  }
 
   // ── Churn split: one taxonomy — CUSTOMER/ADMIN/EXTERNAL voluntary
   // (EXTERNAL = a Shopify-admin/other-surface cancel the sync observed
@@ -271,26 +421,20 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         .slice(0, 5)
         .map((p) => p.title),
     },
+    vatEnabled: costModel.vat.enabled,
+    excludeRefunded: analyticsOptions.excludeRefundedPayments,
+    segment,
+    segmentActive,
+    segmentOptions,
+    segmentHeadline,
+    segmentChurnSeries,
     ltgpRows,
     ltgpWeightedAvg: ltgp.weightedAvg,
     heatmap: { rows: heatmapSource, maxOffset: heatmapMaxOffset },
     survival,
     decidedContracts,
     riskModel,
-    forecast: {
-      requestedModel: modelChoice,
-      selectedModel: forecast.selectedModel,
-      horizonWeeks: forecast.horizonWeeks,
-      accuracy: forecast.accuracy,
-      models: forecast.models,
-      modelHistory: forecast.modelHistory,
-      metrics: {
-        mrrCents: forecast.series.mrrCents,
-        activeSubscribers: forecast.series.activeSubscribers,
-        netRevenueCents: forecast.series.netRevenueCents,
-      },
-      legacyModel: forecast.model,
-    },
+    forecast: forecastData,
     churnSplit: { voluntaryChurn, involuntaryChurn, systemChurn },
   });
 };
@@ -373,6 +517,8 @@ export default function AnalyticsPage() {
       subtitle="Funnel, cohort profitability, retention and forecasts"
     >
       <BlockStack gap="400">
+        <SegmentFilterBar data={data} />
+        {data.segmentActive && <SegmentBanner data={data} />}
         <Tabs tabs={tabs} selected={selected} onSelect={handleTabSelect}>
           <Box paddingBlockStart="400">
             {selected === 0 && <OverviewTab data={data} />}
@@ -383,6 +529,156 @@ export default function AnalyticsPage() {
         </Tabs>
       </BlockStack>
     </Page>
+  );
+}
+
+// ── Segment filter bar ────────────────────────────────────────────────────────
+
+/** One Select per dimension; "" = no filter on that dimension. */
+const SEGMENT_SELECTS: Array<{
+  dimension: SegmentDimension;
+  label: string;
+  allLabel: string;
+  optionsKey:
+    | "countries"
+    | "languages"
+    | "sources"
+    | "products"
+    | "discountBands"
+    | "devices"
+    | "valueBands";
+}> = [
+  { dimension: "country", label: "Country", allLabel: "All countries", optionsKey: "countries" },
+  { dimension: "language", label: "Language", allLabel: "All languages", optionsKey: "languages" },
+  { dimension: "source", label: "Traffic source", allLabel: "All sources", optionsKey: "sources" },
+  { dimension: "productId", label: "Product", allLabel: "All products", optionsKey: "products" },
+  {
+    dimension: "discountBand",
+    label: "First-order discount",
+    allLabel: "Any discount",
+    optionsKey: "discountBands",
+  },
+  { dimension: "device", label: "Device", allLabel: "All devices", optionsKey: "devices" },
+  {
+    dimension: "valueBand",
+    label: "First-order value",
+    allLabel: "Any value",
+    optionsKey: "valueBands",
+  },
+];
+
+function SegmentFilterBar({ data }: { data: ReadyData }) {
+  const [, setSearchParams] = useSearchParams();
+  const { segment, segmentOptions, segmentActive } = data;
+
+  const setDimension = useCallback(
+    (dimension: SegmentDimension) => (value: string) => {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          if (value === "") next.delete(SEGMENT_PARAM_NAMES[dimension]);
+          else next.set(SEGMENT_PARAM_NAMES[dimension], value);
+          return next;
+        },
+        { preventScrollReset: true },
+      );
+    },
+    [setSearchParams],
+  );
+
+  const clearAll = useCallback(() => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        for (const param of Object.values(SEGMENT_PARAM_NAMES)) {
+          next.delete(param);
+        }
+        return next;
+      },
+      { preventScrollReset: true },
+    );
+  }, [setSearchParams]);
+
+  return (
+    <Card>
+      <BlockStack gap="200">
+        <InlineStack align="space-between" blockAlign="center">
+          <Text as="h2" variant="headingSm">
+            Filter every view
+          </Text>
+          {segmentActive && (
+            <Button variant="plain" onClick={clearAll}>
+              Clear filters
+            </Button>
+          )}
+        </InlineStack>
+        <InlineGrid columns={{ xs: 1, sm: 2, md: 4, lg: 7 }} gap="200">
+          {SEGMENT_SELECTS.map((def) => {
+            const options = segmentOptions[def.optionsKey];
+            const current = segment[def.dimension] ?? "";
+            const known = options.some((o) => o.value === current);
+            return (
+              <Select
+                key={def.dimension}
+                label={def.label}
+                options={[
+                  { label: def.allLabel, value: "" },
+                  // Keep an active value selectable even when it no longer
+                  // appears in the option scan (deleted product, empty value).
+                  ...(current !== "" && !known
+                    ? [{ label: current, value: current }]
+                    : []),
+                  ...options.map((option) => ({
+                    label: `${
+                      def.dimension === "productId"
+                        ? option.label
+                        : segmentValueLabel(def.dimension, option.value)
+                    } (${option.count})`,
+                    value: option.value,
+                  })),
+                ]}
+                value={current}
+                onChange={setDimension(def.dimension)}
+              />
+            );
+          })}
+        </InlineGrid>
+      </BlockStack>
+    </Card>
+  );
+}
+
+function SegmentBanner({ data }: { data: ReadyData }) {
+  const { segment, segmentHeadline, segmentOptions, currencyCode } = data;
+  const parts = SEGMENT_SELECTS.filter((def) => segment[def.dimension] != null).map(
+    (def) => {
+      const value = segment[def.dimension]!;
+      const label =
+        def.dimension === "productId"
+          ? (segmentOptions.products.find((p) => p.value === value)?.label ?? value)
+          : segmentValueLabel(def.dimension, value);
+      return `${def.label}: ${label}`;
+    },
+  );
+  return (
+    <Banner tone="info" title={`Filtered view — ${parts.join(" · ")}`}>
+      <p>
+        {segmentHeadline
+          ? `${segmentHeadline.totalContracts.toLocaleString("en")} of ${segmentOptions.totalContracts.toLocaleString(
+              "en",
+            )} subscribers match (all statuses, all time) — ${segmentHeadline.activeSubscribers.toLocaleString(
+              "en",
+            )} active, ${formatMoney(segmentHeadline.mrrCents, currencyCode)} MRR. `
+          : ""}
+        Every tab below is computed live from source records for this segment.
+        Store-wide items that cannot be filtered are hidden (take rate,
+        insight cards, the cost-coverage banner); the risk-scoring chip
+        describes the store-wide engine. Segments group by each
+        subscriber&rsquo;s current delivery country, language and first-order
+        acquisition data; imported or pre-tracking subscribers appear under
+        &ldquo;{segmentValueLabel("device", UNKNOWN_SEGMENT_VALUE)}&rdquo;.
+      </p>
+    </Banner>
   );
 }
 
@@ -417,7 +713,7 @@ function RiskModelChip({ riskModel }: { riskModel: ReadyData["riskModel"] }) {
 
 function OverviewTab({ data }: { data: ReadyData }) {
   const [, setSearchParams] = useSearchParams();
-  const { funnel, rangeDays, insights, riskModel } = data;
+  const { funnel, rangeDays, insights, riskModel, segmentActive } = data;
 
   const handleRangeChange = useCallback(
     (value: string) => {
@@ -452,7 +748,9 @@ function OverviewTab({ data }: { data: ReadyData }) {
 
   return (
     <BlockStack gap="400">
-      {insights.length > 0 && <InsightCards insights={insights} />}
+      {!segmentActive && insights.length > 0 && (
+        <InsightCards insights={insights} />
+      )}
 
       <RiskModelChip riskModel={riskModel} />
 
@@ -479,9 +777,11 @@ function OverviewTab({ data }: { data: ReadyData }) {
           title={`Subscription take rate (${windowLabel})`}
           value={pctFrom100(funnel.takeRatePct)}
           helpText={
-            funnel.takeRatePct != null
-              ? "Renewal orders are excluded from the checkout counter as of v1.4.0; days recorded before that include them and read lower. Imports can push this above 100%."
-              : "Shows a value once the storefront checkout counter starts reporting subscribable checkouts."
+            segmentActive
+              ? "Take rate is a storefront checkout metric — its denominator exists before any subscription does, so it cannot be filtered by segment."
+              : funnel.takeRatePct != null
+                ? "Renewal orders are excluded from the checkout counter as of v1.4.0; days recorded before that include them and read lower. Imports can push this above 100%."
+                : "Shows a value once the storefront checkout counter starts reporting subscribable checkouts."
           }
         />
         <Card>
@@ -607,7 +907,15 @@ const MEASURE_OPTIONS: { label: string; value: CohortMeasure }[] = [
 ];
 
 function CohortsTab({ data }: { data: ReadyData }) {
-  const { heatmap, ltgpRows, ltgpWeightedAvg, costCoverage, currencyCode } = data;
+  const {
+    heatmap,
+    ltgpRows,
+    ltgpWeightedAvg,
+    costCoverage,
+    currencyCode,
+    vatEnabled,
+    excludeRefunded,
+  } = data;
   const [measure, setMeasure] = useState<CohortMeasure>("retention");
 
   const heatmapRows: HeatmapRow[] = useMemo(() => {
@@ -729,8 +1037,13 @@ function CohortsTab({ data }: { data: ReadyData }) {
     ]);
   }
 
+  // The coverage stats describe the WHOLE billed book; under a segment
+  // filter they can name products that are not even in the filtered
+  // triangle, so the banner hides rather than mislabel the population.
   const showCostBanner =
-    costCoverage.totalLines > 0 && costCoverage.productsMissingCount > 0;
+    !data.segmentActive &&
+    costCoverage.totalLines > 0 &&
+    costCoverage.productsMissingCount > 0;
 
   return (
     <BlockStack gap="400">
@@ -808,8 +1121,14 @@ function CohortsTab({ data }: { data: ReadyData }) {
             Lifetime gross profit at 3 / 6 / 12 months
           </Text>
           <Text as="p" variant="bodySm" tone="subdued">
-            LTGP = payments actually collected (net of refunds) − product COGS
-            − shipping − payment processing fees, accumulated by signup-month
+            LTGP = payments actually collected
+            {excludeRefunded
+              ? " (fully and partially refunded payments excluded — Settings → Analytics data)"
+              : " (net of refunds)"}{" "}
+            − product COGS − shipping − payment processing fees
+            {vatEnabled &&
+              " − VAT (your per-country rate — default rate where unset — as a flat % of each charge)"}
+            , accumulated by signup-month
             cohort. First (checkout) orders are included where their payment
             has been captured — new subscriptions are captured on arrival and
             a daily backfill fills older contracts in, so freshly upgraded
@@ -858,7 +1177,7 @@ function CohortsTab({ data }: { data: ReadyData }) {
 // ── Survival & churn ──────────────────────────────────────────────────────────
 
 function SurvivalTab({ data }: { data: ReadyData }) {
-  const { survival, churnSplit, decidedContracts } = data;
+  const { survival, churnSplit, decidedContracts, segmentChurnSeries } = data;
 
   const toPoints = (fractions: number[]) =>
     survival.cycles.map((cycle, i) => ({ cycle, pct: fractions[i] ?? 0 }));
@@ -1002,6 +1321,32 @@ function SurvivalTab({ data }: { data: ReadyData }) {
           )}
         </BlockStack>
       </Card>
+
+      {segmentChurnSeries != null && (
+        <Card>
+          <BlockStack gap="300">
+            <Text as="h3" variant="headingMd">
+              Weekly arrivals vs churn (filtered, last{" "}
+              {segmentChurnSeries.weeks.length} weeks)
+            </Text>
+            <Text as="p" variant="bodySm" tone="subdued">
+              New subscribers, voluntary churn (chosen cancels and completed
+              bounded plans) and involuntary churn (payment failure) in this
+              segment, per week — computed live from contract records.
+            </Text>
+            <DataTable
+              columnContentTypes={["text", "numeric", "numeric", "numeric"]}
+              headings={["Week", "New", "Voluntary churn", "Involuntary churn"]}
+              rows={segmentChurnSeries.weeks.map((week, i) => [
+                dateKeyLabel(week),
+                segmentChurnSeries.newSubscribers[i] ?? 0,
+                segmentChurnSeries.churnedVoluntary[i] ?? 0,
+                segmentChurnSeries.churnedInvoluntary[i] ?? 0,
+              ])}
+            />
+          </BlockStack>
+        </Card>
+      )}
     </BlockStack>
   );
 }
@@ -1069,11 +1414,16 @@ function ForecastTab({ data }: { data: ReadyData }) {
     })),
   ];
 
-  const mrr = toForecastChartData(forecast.metrics.mrrCents);
+  // Segment forecasts carry no MRR series (per-segment MRR history cannot be
+  // reconstructed) — the MRR chart gives way to an explanation then.
+  const mrr = forecast.metrics.mrrCents
+    ? toForecastChartData(forecast.metrics.mrrCents)
+    : null;
   const actives = toForecastChartData(forecast.metrics.activeSubscribers);
   const netRevenue = toForecastChartData(forecast.metrics.netRevenueCents);
-  const weeksOfHistory = forecast.metrics.mrrCents.history.length;
-  const filledCount = forecast.metrics.mrrCents.filledWeeks.length;
+  const weeksOfHistory = forecast.metrics.activeSubscribers.history.length;
+  const filledCount = (forecast.metrics.mrrCents ?? forecast.metrics.activeSubscribers)
+    .filledWeeks.length;
 
   const backtestRows = models.map((m) => [
     m.label,
@@ -1119,42 +1469,61 @@ function ForecastTab({ data }: { data: ReadyData }) {
       </InlineGrid>
 
       <Text as="p" variant="bodySm" tone="subdued">
-        {forecast.modelHistory.weeksRecorded > 0
-          ? `Each week the models' backtest errors are recorded (${forecast.modelHistory.weeksRecorded} week${
-              forecast.modelHistory.weeksRecorded === 1 ? "" : "s"
-            } on record so far), and auto-selection weighs recent weeks more — so the model choice keeps improving as history accumulates.`
-          : "No recorded accuracy history yet — auto-selection uses the current backtest alone. The nightly analytics job starts recording each week's model errors from here, and the choice improves as that history accumulates."}
+        {data.segmentActive
+          ? "Filtered view — this forecast runs the same models over history reconstructed live for the segment; the store-wide recorded accuracy history does not apply to it."
+          : forecast.modelHistory.weeksRecorded > 0
+            ? `Each week the models' backtest errors are recorded (${forecast.modelHistory.weeksRecorded} week${
+                forecast.modelHistory.weeksRecorded === 1 ? "" : "s"
+              } on record so far), and auto-selection weighs recent weeks more — so the model choice keeps improving as history accumulates.`
+            : "No recorded accuracy history yet — auto-selection uses the current backtest alone. The nightly analytics job starts recording each week's model errors from here, and the choice improves as that history accumulates."}
       </Text>
 
-      <Card>
-        <BlockStack gap="300">
-          <Text as="h3" variant="headingMd">
-            MRR — observed and projected
-          </Text>
-          <Text as="p" variant="bodySm" tone="subdued">
-            Weekly MRR snapshots (solid, filled markers) with a{" "}
-            {forecast.horizonWeeks}-week projection (dashed, hollow markers).
-            The shaded band is the ~80% likely range.
-          </Text>
-          <ForecastChart
-            history={mrr.history}
-            forecast={mrr.forecast}
-            band={mrr.band}
-            modelLabel={selectedLabel}
-            accuracyGrade={grade}
-            height={260}
-            formatValue={(v) => compactMoney(v, currencyCode)}
-            accessibilityLabel={`Observed weekly MRR with a ${forecast.horizonWeeks}-week projection`}
-          />
-          {filledCount > 0 && (
-            <Text as="p" variant="bodySm" tone="subdued">
-              {filledCount} week{filledCount === 1 ? " was" : "s were"} filled
-              by carrying the previous value forward (no analytics rollup ran
-              those weeks).
+      {mrr ? (
+        <Card>
+          <BlockStack gap="300">
+            <Text as="h3" variant="headingMd">
+              MRR — observed and projected
             </Text>
-          )}
-        </BlockStack>
-      </Card>
+            <Text as="p" variant="bodySm" tone="subdued">
+              Weekly MRR snapshots (solid, filled markers) with a{" "}
+              {forecast.horizonWeeks}-week projection (dashed, hollow markers).
+              The shaded band is the ~80% likely range.
+            </Text>
+            <ForecastChart
+              history={mrr.history}
+              forecast={mrr.forecast}
+              band={mrr.band}
+              modelLabel={selectedLabel}
+              accuracyGrade={grade}
+              height={260}
+              formatValue={(v) => compactMoney(v, currencyCode)}
+              accessibilityLabel={`Observed weekly MRR with a ${forecast.horizonWeeks}-week projection`}
+            />
+            {filledCount > 0 && (
+              <Text as="p" variant="bodySm" tone="subdued">
+                {filledCount} week{filledCount === 1 ? " was" : "s were"} filled
+                by carrying the previous value forward (no analytics rollup ran
+                those weeks).
+              </Text>
+            )}
+          </BlockStack>
+        </Card>
+      ) : (
+        <Card>
+          <BlockStack gap="200">
+            <Text as="h3" variant="headingMd">
+              MRR — not available in filtered views
+            </Text>
+            <Text as="p" variant="bodySm" tone="subdued">
+              MRR history for a segment cannot be reconstructed after the fact
+              (past prices and cadences are not recorded per week), so the
+              filtered forecast covers active subscribers and collected
+              revenue below — both rebuilt live from this segment&rsquo;s
+              contracts and orders.
+            </Text>
+          </BlockStack>
+        </Card>
+      )}
 
       <InlineGrid columns={{ xs: 1, lg: 2 }} gap="400">
         <Card>
@@ -1232,15 +1601,19 @@ function ForecastTab({ data }: { data: ReadyData }) {
               Model details
             </Text>
             <Text as="p" variant="bodySm" tone="subdued">
-              Selected model: {selectedLabel} over {weeksOfHistory} week
-              {weeksOfHistory === 1 ? "" : "s"} of weekly history. Subscriber
-              decay uses a per-cycle survival estimate of{" "}
-              {(finite(legacyModel.avgCycleSurvival) * 100).toFixed(1)}% (≈
-              {(finite(legacyModel.weeklyRetention) * 100).toFixed(2)}% weekly
-              at the average {finite(legacyModel.avgIntervalWeeks)}-week
-              billing interval). When too few renewals have been observed, a
-              conservative default stands in — the trust card on the left
-              reflects exactly how solid these inputs are.
+              {legacyModel != null
+                ? `Selected model: ${selectedLabel} over ${weeksOfHistory} week${
+                    weeksOfHistory === 1 ? "" : "s"
+                  } of weekly history. Subscriber decay uses a per-cycle survival estimate of ${(
+                    finite(legacyModel.avgCycleSurvival) * 100
+                  ).toFixed(1)}% (≈ ${(
+                    finite(legacyModel.weeklyRetention) * 100
+                  ).toFixed(2)}% weekly at the average ${finite(
+                    legacyModel.avgIntervalWeeks,
+                  )}-week billing interval). When too few renewals have been observed, a conservative default stands in — the trust card on the left reflects exactly how solid these inputs are.`
+                : `Selected model: ${selectedLabel} over ${weeksOfHistory} week${
+                    weeksOfHistory === 1 ? "" : "s"
+                  } of weekly history reconstructed for this segment. Subscriber decay uses the segment's own censoring-corrected per-cycle survival; when too few of its renewals have been observed, a conservative default stands in — the trust card on the left reflects exactly how solid these inputs are.`}
             </Text>
           </BlockStack>
         </Card>

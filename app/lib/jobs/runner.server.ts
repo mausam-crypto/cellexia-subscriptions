@@ -3,6 +3,7 @@ import prisma from "~/db.server";
 import { adminClientForShop } from "~/shopify.server";
 import { getPrimaryShop } from "~/lib/shop/install.server";
 import { addDaysTz } from "~/lib/dates.server";
+import { getSetting } from "~/lib/settings/settings.server";
 import { OURS_ONLY } from "~/lib/ownership/ownership.server";
 
 /**
@@ -89,6 +90,19 @@ const ROLLUP_BACKFILL_MAX_DAYS = 90;
  * now extending at most one day further back.
  */
 const ROLLUP_RECOMPUTE_DAYS = 2;
+
+/**
+ * Refund-repair pass (v1.16.0, active only while
+ * analytics.excludeRefundedPayments is on): repair candidates derive from
+ * STATE (payments whose refundedCents > 0 with a charge day inside the
+ * standing ROLLUP_BACKFILL_MAX_DAYS window — see
+ * repairRefundAffectedRollupDays in rollup.server.ts), run oldest-first and
+ * idempotently every night, so progress can never be starved by an event
+ * window aging out. The cap equals the window size — it can only bind when
+ * literally every day in the window holds a refunded payment, and even then
+ * the same set re-runs next night (no lost days).
+ */
+const ROLLUP_REFUND_REPAIR_MAX_DAYS = ROLLUP_BACKFILL_MAX_DAYS;
 
 // ── Inline job: 90-day retention outcome for saved cancels ───────────────────
 
@@ -267,7 +281,41 @@ export async function runRollupJob(now: Date): Promise<unknown> {
   for (let daysAgo = ROLLUP_RECOMPUTE_DAYS; daysAgo >= 0; daysAgo--) {
     await runDailyRollup(shop.id, addDaysTz(now, -daysAgo, tz));
   }
-  return { days: ROLLUP_RECOMPUTE_DAYS + 1 + backfilled, backfilled };
+
+  // ── Refund repair (v1.16.0, only under analytics.excludeRefundedPayments) ─
+  // A refund usually lands days after its charge, i.e. after the charge's
+  // rollup day left the trailing window. Excluding the payment then requires
+  // re-upserting its CHARGE day; backfill mode confines the re-upsert to the
+  // flow columns, so the closed day's snapshots survive (the same
+  // flow-columns-only repair the firstChargeAt backfill uses). Candidates
+  // derive from refund STATE inside the standing backfill window — see
+  // repairRefundAffectedRollupDays — so runs are idempotent and no day can
+  // be starved out. Gated on the setting: with exclusion off, closed days
+  // are never rewritten — byte-identical to pre-v1.16.0 behavior (a TOGGLE
+  // of the setting runs its own full-history repair from the settings save).
+  let repairedDays = 0;
+  const { excludeRefundedPayments } = await getSetting(shop.id, "analytics");
+  // `oldest` gates repair like it gates the gap backfill: no rollup history
+  // yet (first run ever) means there is no closed charge day to repair, and
+  // synthesizing pre-analytics days would break the standing backfill rule.
+  if (excludeRefundedPayments && oldest) {
+    const { shopDayStartUtc } = await import("~/lib/dates.server");
+    const { repairRefundAffectedRollupDays } = await import(
+      "~/lib/analytics/rollup.server"
+    );
+    repairedDays = await repairRefundAffectedRollupDays(shop.id, {
+      since: addDaysTz(now, -ROLLUP_BACKFILL_MAX_DAYS, tz),
+      // The trailing window was recomputed live just above — skip it.
+      skipAfter: shopDayStartUtc(addDaysTz(now, -ROLLUP_RECOMPUTE_DAYS, tz), tz),
+      cap: ROLLUP_REFUND_REPAIR_MAX_DAYS,
+    });
+  }
+
+  return {
+    days: ROLLUP_RECOMPUTE_DAYS + 1 + backfilled + repairedDays,
+    backfilled,
+    repairedDays,
+  };
 }
 
 // ── Inline jobs: nightly analytics recorder pairs ────────────────────────────

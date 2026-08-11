@@ -8,6 +8,7 @@ import {
   discountCodesFromInput,
   orderTagsFromInput,
   orderValueBandFromCents,
+  paidChannelFromUrls,
   rawUtmFromUrl,
   sanitizeAcquisitionUrl,
   sanitizeUtmValue,
@@ -362,6 +363,29 @@ describe("discountCodesFromInput / orderTagsFromInput", () => {
   });
 });
 
+// ── paidChannelFromUrls (v1.16.0 — presence only, values never stored) ───────
+
+describe("paidChannelFromUrls", () => {
+  it("maps ad click-id params to channels, landing url first", () => {
+    expect(
+      paidChannelFromUrls("/products/serum?gclid=Cj0KCQjw", null),
+    ).toBe("google_ads");
+    expect(
+      paidChannelFromUrls("/x?fbclid=IwAR123", "https://google.com/?gclid=z"),
+    ).toBe("meta_ads"); // landing wins over referring
+    expect(paidChannelFromUrls(null, "/l?TTCLID=abc")).toBe("tiktok_ads");
+    expect(paidChannelFromUrls("/x?wbraid=abc")).toBe("google_ads");
+    expect(paidChannelFromUrls("/x?msclkid=abc")).toBe("microsoft_ads");
+  });
+
+  it("returns null without a click id, and never throws on junk", () => {
+    expect(paidChannelFromUrls("/products/serum?utm_source=ig")).toBeNull();
+    expect(paidChannelFromUrls(null, undefined, 42, "::::")).toBeNull();
+    // Param NAMES only — a click-id-shaped VALUE on another param is not one.
+    expect(paidChannelFromUrls("/x?next=gclid")).toBeNull();
+  });
+});
+
 // ── buildAcquisitionCapture ──────────────────────────────────────────────────
 
 describe("buildAcquisitionCapture", () => {
@@ -409,6 +433,60 @@ describe("buildAcquisitionCapture", () => {
     const serialized = JSON.stringify(capture);
     expect(serialized).not.toContain("Mozilla");
     expect(serialized).not.toContain("iPhone OS");
+  });
+
+  it("judges self-referrals at capture time against the shop's own hosts", () => {
+    const base = {
+      ...input,
+      landingSite: "/products/serum", // the usual RELATIVE Shopify shape
+      internalHosts: [
+        "cellexia.myshopify.com",
+        "https://cellexialabs.com/12345/orders/abc/authenticate?key=x",
+      ],
+    };
+    // The custom domain (from the order-status URL) is the shop itself.
+    expect(
+      buildAcquisitionCapture({
+        ...base,
+        referringSite: "https://www.cellexialabs.com/pages/about",
+      }).acqRaw.referrerInternal,
+    ).toBe(true);
+    // A real external referrer is proven external.
+    expect(
+      buildAcquisitionCapture({
+        ...base,
+        referringSite: "https://www.google.ch/search",
+      }).acqRaw.referrerInternal,
+    ).toBe(false);
+    // No referrer at all → nothing to judge.
+    expect(
+      buildAcquisitionCapture({ ...base, referringSite: null }).acqRaw
+        .referrerInternal,
+    ).toBeNull();
+    // An absolute landing URL counts as internal evidence even with no
+    // caller-supplied hosts.
+    expect(
+      buildAcquisitionCapture({
+        ...input,
+        internalHosts: undefined,
+        landingSite: "https://cellexialabs.com/products/serum",
+        referringSite: "https://cellexialabs.com/collections/all",
+      }).acqRaw.referrerInternal,
+    ).toBe(true);
+  });
+
+  it("records the paid channel from a click id while dropping the id itself", () => {
+    const capture = buildAcquisitionCapture({
+      ...input,
+      landingSite: "/products/serum?gclid=Cj0KCQjwSECRETVALUE123456&utm_medium=cpc",
+    });
+    expect(capture.acqRaw.paidChannel).toBe("google_ads");
+    // The click-id VALUE survives nowhere — presence only.
+    const serialized = JSON.stringify(capture);
+    expect(serialized).not.toContain("Cj0KCQjwSECRETVALUE123456");
+    expect(capture.acqLandingSite).not.toContain("gclid");
+    // No click id → null, not absent (the key reads "checked, none found").
+    expect(buildAcquisitionCapture(input).acqRaw.paidChannel).toBeNull();
   });
 
   it("handles a payload with nothing usable (all nulls, no throw)", () => {

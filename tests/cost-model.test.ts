@@ -60,6 +60,7 @@ const COST_MODEL: CostModelSettings = {
   fulfillmentCostPerShipmentCents: 150,
   shippingCostPerShipmentCents: { mode: "flat", flatCents: 200 },
   cogsFallbackPctOfPrice: 25,
+  vat: { enabled: false, defaultRatePct: 0, countryRatesPct: {} },
 };
 
 function ctxWith(
@@ -267,6 +268,14 @@ function coverageStore(): AnalyticsStore {
     ianaTimezone: "Europe/Zurich",
   });
   store.settings.push({ shopId: SHOP_ID, key: "costModel", value: COST_MODEL });
+  // Pin the pre-v1.16.0 netting model: these fixtures exercise refunds as
+  // NETTED (revenue minus refund, full costs kept). The shipped default is
+  // exclusion — tests/refund-exclusion.test.ts pins that path.
+  store.settings.push({
+    shopId: SHOP_ID,
+    key: "analytics",
+    value: { excludeRefundedPayments: false },
+  });
   // Product-level override for p2 → its lines count as KNOWN.
   store.productCadences.push({
     shopId: SHOP_ID,
@@ -384,6 +393,14 @@ describe("net-of-refunds revenue", () => {
       ianaTimezone: "Europe/Zurich",
     });
     store.settings.push({ shopId: SHOP_ID, key: "costModel", value: COST_MODEL });
+  // Pin the pre-v1.16.0 netting model: these fixtures exercise refunds as
+  // NETTED (revenue minus refund, full costs kept). The shipped default is
+  // exclusion — tests/refund-exclusion.test.ts pins that path.
+  store.settings.push({
+    shopId: SHOP_ID,
+    key: "analytics",
+    value: { excludeRefundedPayments: false },
+  });
     const contract: Row = {
       id: "cn",
       shopId: SHOP_ID,
@@ -462,6 +479,8 @@ describe("net-of-refunds revenue", () => {
         shippingCostCents: 700, // 350 × 2 shipments
         // Fees on the gross amounts: (145+30) + (116+30) = 321.
         feesCents: 321,
+        vatCents: 0, // VAT off in this fixture's cost model
+        estimatedVatCents: 0,
         grossProfitCents: 779, // 3800 − 2000 − 700 − 321
         cumGrossProfitCents: 779,
       },

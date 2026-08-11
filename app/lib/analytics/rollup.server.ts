@@ -5,9 +5,12 @@ import {
   COUNTABLE_CONTRACT,
   OPEN_DUNNING_STATES,
   computeMrrCents,
+  contractTaxCountry,
   originPaymentCountsOnce,
   perCycleDiscountCents,
   requireShopById,
+  shopDayLabelUtc,
+  utcDayKey,
 } from "./queries.server";
 import {
   loadCostContext,
@@ -15,7 +18,9 @@ import {
   paymentFeeCents,
   perCycleLineCosts,
   perShipmentCostCents,
+  resolveChargeVat,
 } from "./costs.server";
+import { getSetting } from "~/lib/settings/settings.server";
 
 /**
  * Daily rollup — one DailyRollup row per shop-timezone calendar day.
@@ -105,6 +110,16 @@ const CONTRACT_EVENT_TYPES = [
  *   left the recompute/backfill window stays out of that closed rollup row —
  *   closed days keep their snapshots — while the cohort triangle, which
  *   recomputes from source, always includes it.
+ *   REFUND EXCLUSION (v1.16.0, analytics.excludeRefundedPayments — ON by
+ *   default): payments with ANY recorded refund (attempt.refundedCents /
+ *   originOrderRefundedCents > 0, partial or full) are dropped from
+ *   chargedCents and every derived cost column, instead of the off-mode
+ *   netting. Because a refund usually lands days after its charge, the job
+ *   runner additionally re-upserts the CHARGE days of recently recorded
+ *   refunds in flow-columns-only mode (runner.server.ts repair pass —
+ *   snapshots survive, exactly like the firstChargeAt-backfill repair
+ *   above), so the ledger converges on excluding the payment even when the
+ *   charge day had already closed.
  * - refundedCents: Σ refund amounts RECORDED in day (admin.action events with
  *   payload.action "refund_recorded", written by the REFUNDS_CREATE webhook —
  *   renewal AND origin-order refunds alike). Attributed to the refund day,
@@ -123,6 +138,10 @@ const CONTRACT_EVENT_TYPES = [
  *   amount — in that (anomalous) case the day ledger reads lower than the
  *   cohort month by the excess. Accepted divergence: clamping here would
  *   require cross-day charge state the day-scoped recompute cannot see.
+ *   Under refund exclusion the column keeps being written (disclosure: how
+ *   much was refunded that day) but no longer participates in
+ *   estGrossProfitCents — the excluded charges never entered chargedCents,
+ *   so subtracting their refunds too would double-drop the money.
  * - discountCents: per successful attempt, the money-true discountCents
  *   captured onto the attempt at settlement (migration 0016) when present;
  *   attempts settled before 0016 fall back to the mirror-line estimate —
@@ -147,6 +166,22 @@ const CONTRACT_EVENT_TYPES = [
  * - feesCents: payment processing fees per successful charge, always computed
  *   at read time on the charged amount (never snapshotted — they derive from
  *   amountCents, which the attempt row already keeps immutable).
+ * - vatCents (migration 0019): VAT booked against the day's charges while
+ *   the costModel.vat setting is enabled (0 otherwise). Per charge —
+ *   attempt or origin payment — a flat percentage of the charged amount,
+ *   amount × rate/100 (v1.16.0, merchant-defined: VAT is an expense that is
+ *   a straight percentage of revenue; captured order tax keeps being
+ *   collected but no longer drives the deduction), at the contract's tax
+ *   country rate (contractTaxCountry: delivery address, else acquisition
+ *   country, else the default rate) — resolveChargeVat in costs.server.ts.
+ *   Like fees, VAT computes at read time on the charged amount, so this day
+ *   ledger books each charge's FULL tax on its charge day and deliberately
+ *   does NOT credit VAT back on a later refund's recorded day — the cohort
+ *   surface nets refunds per charge and carries the refund-adjusted VAT
+ *   (same family of accepted day-ledger divergence as the over-refund rule
+ *   above). estimatedVatCents mirrors the rate-derived share — since
+ *   v1.16.0 every non-zero deduction (all VAT is modeled from configured
+ *   rates; the estimatedCogsCents disclosure pattern).
  * - giftCogsCents: GiftGrants ATTACHED in day (addedAt in window) × their
  *   rule's unitCostCents (fallback: the merchant's per-product COGS override
  *   for the gift variant when the rule is gone). Status filter accepts the
@@ -157,10 +192,10 @@ const CONTRACT_EVENT_TYPES = [
  *   the trailing recompute. Supersede-retired grants (REMOVED with no
  *   shippedAt — never shipped) stay excluded.
  * - estGrossProfitCents = chargedCents − refundedCents − billedCogs −
- *   giftCogsCents − shippingCostCents − feesCents — the SAME formula the
- *   cohort cells use, so the two gross-profit surfaces reconcile.
- *   discountCents is NOT subtracted: chargedCents is already net of every
- *   discount. It is stored alongside for reporting.
+ *   giftCogsCents − shippingCostCents − feesCents − vatCents — the SAME
+ *   formula the cohort cells use, so the two gross-profit surfaces
+ *   reconcile. discountCents is NOT subtracted: chargedCents is already net
+ *   of every discount. It is stored alongside for reporting.
  * - failedAttempts: FAILED attempts with completedAt in day.
  * - recoveredCents: Σ DunningCase.recoveredCents over cases resolved in day
  *   that carry money (recoveredCents non-null). THE "recovered" definition —
@@ -237,6 +272,10 @@ export async function runDailyRollup(
   const window = { gte: dayStart, lt: dayEnd };
 
   const costCtx = await loadCostContext(shopId);
+  // Data-accuracy option (v1.16.0, ON by default): drop fully AND partially
+  // refunded payments from the ledger entirely — see the analytics settings
+  // doc (registry.server.ts) and the estGrossProfitCents note below.
+  const { excludeRefundedPayments } = await getSetting(shopId, "analytics");
 
   const [
     statusGroups,
@@ -304,14 +343,18 @@ export async function runDailyRollup(
       },
       select: {
         amountCents: true,
+        refundedCents: true,
         currencyCode: true,
         discountCents: true,
+        taxCents: true,
         costSnapshot: true,
         contract: {
           select: {
             deliveryPriceCents: true,
             isPrepaid: true,
             prepaidDeliveriesPerCharge: true,
+            deliveryAddress: true,
+            acqCountryCode: true,
             lines: {
               select: {
                 productId: true,
@@ -343,11 +386,15 @@ export async function runDailyRollup(
         originOrderId: true,
         originOrderTotalCents: true,
         originOrderDiscountCents: true,
+        originOrderTaxCents: true,
+        originOrderRefundedCents: true,
         originOrderProcessedAt: true,
         originOrderCurrencyCode: true,
         deliveryPriceCents: true,
         isPrepaid: true,
         prepaidDeliveriesPerCharge: true,
+        deliveryAddress: true,
+        acqCountryCode: true,
         lines: {
           select: {
             productId: true,
@@ -468,10 +515,19 @@ export async function runDailyRollup(
   let estimatedCogsCents = 0;
   let shippingCostCents = 0;
   let feesCents = 0;
+  let vatCents = 0;
+  let estimatedVatCents = 0;
   // Audit counter (migration 0016): every cent a currency guard silently
   // drops below is accumulated here so the exclusion is visible and sizeable.
   let excludedForeignCurrencyCents = 0;
   for (const attempt of successfulAttempts) {
+    // Refund exclusion (v1.16.0, ON by default): a payment with ANY recorded
+    // refund leaves the ledger whole — revenue, costs, fees and VAT alike.
+    // Checked before the currency audit: this money is out of the data
+    // entirely, so it is not "otherwise-countable" foreign cents either.
+    if (excludeRefundedPayments && attempt.refundedCents > 0) {
+      continue;
+    }
     // Currency guard: cents are only additive within one currency. Attempts in
     // another presentment currency are excluded rather than summed raw.
     if (attempt.currencyCode && attempt.currencyCode !== shop.currencyCode) {
@@ -511,6 +567,20 @@ export async function runDailyRollup(
         ) * deliveries;
     }
     feesCents += paymentFeeCents(amount, costCtx.costModel);
+    // VAT on the charged amount (see vatCents doc): captured order tax wins,
+    // country-rate estimate otherwise; day ledger books the full charge-day
+    // tax, refund credits live on the cohort surface.
+    const vat = resolveChargeVat(
+      {
+        netAmountCents: amount,
+        grossAmountCents: amount,
+        capturedTaxCents: attempt.taxCents,
+        countryCode: contractTaxCountry(attempt.contract),
+      },
+      costCtx.costModel,
+    );
+    vatCents += vat.vatCents;
+    if (vat.estimated) estimatedVatCents += vat.vatCents;
   }
 
   // ── Origin (checkout) payments booked on their processed day ───────────────
@@ -540,6 +610,14 @@ export async function runDailyRollup(
   }
 
   for (const contract of originContracts) {
+    // Refund exclusion, mirroring the attempt loop above: a refunded origin
+    // payment (any amount) leaves the ledger entirely.
+    if (
+      excludeRefundedPayments &&
+      Math.max(0, contract.originOrderRefundedCents) > 0
+    ) {
+      continue;
+    }
     if (
       !originPaymentCountsOnce(contract, originAttemptOrderIds, shop.currencyCode)
     ) {
@@ -581,6 +659,17 @@ export async function runDailyRollup(
       perShipmentCostCents(costCtx.costModel, contract.deliveryPriceCents) *
       deliveries;
     feesCents += paymentFeeCents(amount, costCtx.costModel);
+    const vat = resolveChargeVat(
+      {
+        netAmountCents: amount,
+        grossAmountCents: amount,
+        capturedTaxCents: contract.originOrderTaxCents,
+        countryCode: contractTaxCountry(contract),
+      },
+      costCtx.costModel,
+    );
+    vatCents += vat.vatCents;
+    if (vat.estimated) estimatedVatCents += vat.vatCents;
   }
 
   let refundedCents = 0;
@@ -645,13 +734,19 @@ export async function runDailyRollup(
     0,
   );
 
+  // Under refund exclusion the refunded payments never entered chargedCents
+  // (nor any cost column), so subtracting the day's recorded refunds AGAIN
+  // would drop the money twice — refundedCents stays written as disclosure
+  // but leaves the profit formula. getForecast applies the same rule to its
+  // weekly net revenue; the three surfaces move in lockstep behind the flag.
   const estGrossProfitCents =
     chargedCents -
-    refundedCents -
+    (excludeRefundedPayments ? 0 : refundedCents) -
     billedCogsCents -
     giftCogsCents -
     shippingCostCents -
-    feesCents;
+    feesCents -
+    vatCents;
 
   // Flow columns recompute from source identically in both modes; the
   // point-in-time snapshot columns (and the fabrication flag that describes
@@ -667,6 +762,8 @@ export async function runDailyRollup(
     giftCogsCents,
     shippingCostCents,
     feesCents,
+    vatCents,
+    estimatedVatCents,
     estimatedCogsCents,
     estGrossProfitCents,
     failedAttempts,
@@ -706,4 +803,111 @@ export async function runDailyRollup(
     // flow columns recompute, snapshots stay what they were.
     update: backfill ? flowData : { ...flowData, ...snapshotData },
   });
+}
+
+/**
+ * Refund repair (v1.16.0): re-upsert, in flow-columns-only (backfill) mode,
+ * every rollup day whose figures depend on refund state — the CHARGE days of
+ * refunded payments (attempt.refundedCents / originOrderRefundedCents > 0)
+ * and, when `includeRefundRecordedDays` is set, the days refunds were
+ * RECORDED on (their estGrossProfitCents participation differs between the
+ * netting and exclusion modes). Candidates derive from STATE, not from a
+ * recent-events window, so re-running is idempotent and progress can never
+ * be starved by an event window aging out; days run oldest-first for
+ * deterministic coverage under a cap.
+ *
+ * Two callers:
+ * - the nightly rollup job (exclusion mode only): `since` = the standing
+ *   90-day backfill window, so a refund landing after its charge day closed
+ *   still removes the payment. A refund recorded more than 90 days after
+ *   its charge leaves that charge day out of repair scope — the same
+ *   standing window the gap backfill applies; the cohort triangle (full
+ *   recompute) remains the truth for such tails.
+ * - the analytics settings save (`since` null = ALL history, both refund
+ *   kinds): flipping excludeRefundedPayments re-interprets what every
+ *   refund-affected day means, in BOTH directions, so the toggle rewrites
+ *   them under the new mode — keeping the day ledger and the
+ *   rollup-fed forecast in lockstep with the freshly recomputed cohorts.
+ *
+ * Days before the shop's first rollup are never synthesized (the standing
+ * backfill rule); `skipAfter` lets the nightly job exclude the trailing
+ * window its live pass already recomputed.
+ */
+export async function repairRefundAffectedRollupDays(
+  shopId: string,
+  opts: {
+    since?: Date | null;
+    /** Exclusive upper bound — instants at/after it are someone else's pass. */
+    skipAfter?: Date | null;
+    cap?: number;
+    includeRefundRecordedDays?: boolean;
+  } = {},
+): Promise<number> {
+  const shop = await requireShopById(shopId);
+  const tz = shop.ianaTimezone;
+  const oldest = await prisma.dailyRollup.findFirst({
+    where: { shopId },
+    orderBy: { date: "asc" },
+    select: { date: true },
+  });
+  if (!oldest) return 0;
+
+  const since = opts.since ?? null;
+  const [refundedAttempts, refundedOrigins] = await Promise.all([
+    prisma.billingAttempt.findMany({
+      where: {
+        contract: { shopId },
+        status: "SUCCESS",
+        refundedCents: { gt: 0 },
+        completedAt: since ? { gte: since } : { not: null },
+      },
+      select: { completedAt: true },
+    }),
+    prisma.subscriptionContract.findMany({
+      where: {
+        shopId,
+        originOrderRefundedCents: { gt: 0 },
+        originOrderProcessedAt: since ? { gte: since } : { not: null },
+      },
+      select: { originOrderProcessedAt: true },
+    }),
+  ]);
+  const instants: Date[] = [];
+  for (const a of refundedAttempts) {
+    if (a.completedAt) instants.push(a.completedAt);
+  }
+  for (const c of refundedOrigins) {
+    if (c.originOrderProcessedAt) instants.push(c.originOrderProcessedAt);
+  }
+  if (opts.includeRefundRecordedDays) {
+    const events = await prisma.subscriberEvent.findMany({
+      where: {
+        shopId,
+        type: "admin.action",
+        payload: { path: ["action"], equals: "refund_recorded" },
+        ...(since ? { createdAt: { gte: since } } : {}),
+      },
+      select: { createdAt: true },
+    });
+    for (const e of events) instants.push(e.createdAt);
+  }
+
+  const byKey = new Map<string, Date>();
+  for (const instant of instants) {
+    if (opts.skipAfter && instant >= opts.skipAfter) continue;
+    const label = shopDayLabelUtc(instant, tz);
+    if (label < oldest.date) continue;
+    const key = utcDayKey(label);
+    if (!byKey.has(key)) byKey.set(key, instant);
+  }
+  const days = [...byKey.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([, instant]) => instant);
+
+  let repaired = 0;
+  for (const instant of days.slice(0, opts.cap ?? days.length)) {
+    await runDailyRollup(shopId, instant, { backfill: true });
+    repaired += 1;
+  }
+  return repaired;
 }

@@ -327,6 +327,19 @@ function makeTable(store: AnalyticsStore, name: keyof AnalyticsStore) {
         }
         out._sum = sums;
       }
+      if (args._avg) {
+        const avgs: Row = {};
+        for (const field of Object.keys(args._avg)) {
+          avgs[field] =
+            matched.length === 0
+              ? null
+              : matched.reduce(
+                  (total, r) => total + (((r[field] as number) ?? 0) as number),
+                  0,
+                ) / matched.length;
+        }
+        out._avg = avgs;
+      }
       if (args._count) out._count = { _all: matched.length };
       return out;
     },

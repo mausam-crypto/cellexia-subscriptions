@@ -40,6 +40,9 @@ const mocks = vi.hoisted(() => ({
   getPrimaryShop: vi.fn(async (): Promise<unknown> => null),
   requireShop: vi.fn(async (): Promise<unknown> => null),
   getOrderSummary: vi.fn(async (_admin: unknown, _gid: string): Promise<unknown> => null),
+  getRefundShopMoney: vi.fn(
+    async (_admin: unknown, _gid: string): Promise<unknown> => null,
+  ),
 }));
 
 vi.mock("~/db.server", () => ({
@@ -85,6 +88,10 @@ vi.mock("~/lib/graphql/index.server", () => ({
   draftUpdatePaymentMethod: vi.fn(),
   getContract: vi.fn(),
   getOrderSummary: mocks.getOrderSummary,
+  // Conversion read (v1.16.0): defaults to a CONCLUSIVE non-answer (null →
+  // the standing terminal skip); individual tests override to model a
+  // successful conversion or a transport throw.
+  getRefundShopMoney: mocks.getRefundShopMoney,
   getVariants: vi.fn(async (): Promise<unknown[]> => []),
   listContractGids: vi.fn(async (): Promise<unknown[]> => []),
   listCustomerPaymentMethods: vi.fn(),
@@ -356,5 +363,78 @@ describe("REFUNDS_CREATE currency agreement (Shopify Markets multi-currency)", (
     await deliverRefund(9202, "10.00", "wh_fx5", "CHF");
     expect(attempt.refundedCents).toBe(1000);
     expect(contract.lifetimeRevenueCents).toBe(4760);
+  });
+
+  it("attempt branch: a SUCCESSFUL conversion nets the shopMoney figure with the audit trail", async () => {
+    const { store, contract } = buildStore({ lifetimeRevenueCents: 5760 });
+    const attempt: Row = {
+      id: "ba_cv",
+      contractId: contract.id,
+      contract,
+      orderId: ORIGIN_ORDER,
+      status: "SUCCESS",
+      amountCents: 5760,
+      currencyCode: "CHF",
+      refundedCents: 0,
+      cycleIndex: 3,
+    };
+    store.billingAttempts.push(attempt);
+    // Shopify's own shop-currency figure for the EUR refund.
+    mocks.getRefundShopMoney.mockResolvedValueOnce({
+      amountCents: 2880,
+      currencyCode: "CHF",
+    });
+
+    await deliverRefund(9301, "30.00", "wh_cv1", "EUR");
+
+    expect(attempt.refundedCents).toBe(2880);
+    expect(contract.lifetimeRevenueCents).toBe(5760 - 2880);
+    const recorded = mocks.events.find(
+      (e) => (e.payload as Row)?.action === "refund_recorded",
+    );
+    expect(recorded).toBeDefined();
+    expect((recorded!.payload as Row).converted).toBe(true);
+    expect((recorded!.payload as Row).amountCents).toBe(2880);
+    expect((recorded!.payload as Row).currencyCode).toBe("CHF");
+    expect((recorded!.payload as Row).presentmentAmountCents).toBe(3000);
+    expect((recorded!.payload as Row).presentmentCurrencyCode).toBe("EUR");
+  });
+
+  it("attempt branch: a TRANSIENT conversion failure rejects the delivery — no verdict, replayable", async () => {
+    const { store, contract } = buildStore({ lifetimeRevenueCents: 5760 });
+    const attempt: Row = {
+      id: "ba_tr",
+      contractId: contract.id,
+      contract,
+      orderId: ORIGIN_ORDER,
+      status: "SUCCESS",
+      amountCents: 5760,
+      currencyCode: "CHF",
+      refundedCents: 0,
+      cycleIndex: 3,
+    };
+    store.billingAttempts.push(attempt);
+    mocks.getRefundShopMoney.mockRejectedValueOnce(new Error("throttled"));
+
+    // The handler must THROW (receipt FAILED → Shopify redelivers) instead
+    // of arming the permanent skip verdict on a refund that would have
+    // converted fine one retry later.
+    await expect(
+      deliverRefund(9302, "30.00", "wh_tr1", "EUR"),
+    ).rejects.toThrow("throttled");
+    expect(attempt.refundedCents).toBe(0);
+    expect(
+      mocks.events.find((e) =>
+        String((e.payload as Row)?.action ?? "").startsWith("refund_"),
+      ),
+    ).toBeUndefined();
+
+    // The replay: conversion now succeeds and the refund nets normally.
+    mocks.getRefundShopMoney.mockResolvedValueOnce({
+      amountCents: 2880,
+      currencyCode: "CHF",
+    });
+    await deliverRefund(9302, "30.00", "wh_tr1_redelivery", "EUR");
+    expect(attempt.refundedCents).toBe(2880);
   });
 });

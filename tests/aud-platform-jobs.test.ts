@@ -25,6 +25,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   rollupFindFirst: vi.fn(async (_args?: unknown): Promise<unknown> => null),
   rollupFindMany: vi.fn(async (_args?: unknown): Promise<unknown[]> => []),
+  // Refund-repair pass inputs (v1.16.0): the stored analytics setting row
+  // (null → the shipped exclude-ON default) and the repair delegate the
+  // runner hands the day-resolution work to (its own behavior is pinned in
+  // tests/refund-exclusion.test.ts against the fake analytics db).
+  settingFindUnique: vi.fn(async (_args?: unknown): Promise<unknown> => null),
+  repairRefundDays: vi.fn(async (_shopId?: unknown, _opts?: unknown): Promise<number> => 0),
   // Typed with the real (shopId, day, opts?) shape so the recorded calls'
   // day/opts tuple positions type-check in the assertions below.
   runDailyRollup: vi.fn(
@@ -66,6 +72,7 @@ vi.mock("~/db.server", () => {
       update: mocks.sessionUpdate,
     },
     subscriptionContract: { findUnique: mocks.contractFindUnique },
+    setting: { findUnique: mocks.settingFindUnique },
   };
   return {
     default: new Proxy(
@@ -94,6 +101,7 @@ vi.mock("~/lib/shop/install.server", () => ({
 
 vi.mock("~/lib/analytics/rollup.server", () => ({
   runDailyRollup: mocks.runDailyRollup,
+  repairRefundAffectedRollupDays: mocks.repairRefundDays,
 }));
 
 vi.mock("~/lib/analytics/learning.server", () => ({
@@ -135,6 +143,8 @@ beforeEach(() => {
   mocks.sessionFindMany.mockResolvedValue([]);
   mocks.sessionUpdate.mockResolvedValue({});
   mocks.contractFindUnique.mockResolvedValue(null);
+  mocks.settingFindUnique.mockResolvedValue(null); // → shipped defaults apply
+  mocks.repairRefundDays.mockResolvedValue(0);
   mocks.runRiskLearning.mockResolvedValue({ trained: true });
   mocks.recordForecastAccuracyWeek.mockResolvedValue({ recorded: true });
   mocks.runChurnRiskScoring.mockResolvedValue({ scored: 3 });
@@ -172,7 +182,7 @@ describe("runRollupJob — backfill honesty (FR-3)", () => {
       [dayKeyAgo(2), dayKeyAgo(1), dayKeyAgo(0)],
     );
 
-    expect(stats).toEqual({ days: 5, backfilled: 2 });
+    expect(stats).toEqual({ days: 5, backfilled: 2, repairedDays: 0 });
   });
 
   it("never synthesizes pre-analytics history — days at or before the first rollup stay absent", async () => {
@@ -199,7 +209,59 @@ describe("runRollupJob — backfill honesty (FR-3)", () => {
     expect(
       mocks.runDailyRollup.mock.calls.every((c) => c[2] === undefined),
     ).toBe(true);
-    expect(stats).toEqual({ days: 3, backfilled: 0 });
+    expect(stats).toEqual({ days: 3, backfilled: 0, repairedDays: 0 });
+  });
+});
+
+describe("runRollupJob — refund repair under exclusion (v1.16.0)", () => {
+  it("delegates to the state-derived repair with the standing window, trailing-skip and cap", async () => {
+    // Closed history back to day -8, no gaps (rows for every day in window).
+    mocks.rollupFindFirst.mockResolvedValue({
+      date: new Date(`${dayKeyAgo(8)}T00:00:00.000Z`),
+    });
+    mocks.rollupFindMany.mockResolvedValue(
+      [8, 7, 6, 5, 4, 3].map((d) => ({
+        date: new Date(`${dayKeyAgo(d)}T00:00:00.000Z`),
+      })),
+    );
+    mocks.repairRefundDays.mockResolvedValue(2);
+
+    const stats = await runRollupJob(NOW);
+
+    expect(mocks.repairRefundDays).toHaveBeenCalledTimes(1);
+    const [shopId, opts] = mocks.repairRefundDays.mock.calls[0] as [
+      string,
+      { since: Date; skipAfter: Date; cap: number },
+    ];
+    expect(shopId).toBe("shop_1");
+    // The standing 90-day backfill window bounds repair scope…
+    expect(opts.since.toISOString().slice(0, 10)).toBe(dayKeyAgo(90));
+    // …the live trailing recompute (days -2..0) is excluded…
+    expect(opts.skipAfter.toISOString().slice(0, 10)).toBe(dayKeyAgo(2));
+    // …and the cap equals the window, so it can never starve a day out.
+    expect(opts.cap).toBe(90);
+    expect(stats).toEqual({ days: 5, backfilled: 0, repairedDays: 2 });
+  });
+
+  it("stays fully inert when the exclude-refunded option is off", async () => {
+    mocks.settingFindUnique.mockResolvedValueOnce({
+      value: { excludeRefundedPayments: false },
+    });
+    mocks.rollupFindFirst.mockResolvedValue({
+      date: new Date(`${dayKeyAgo(8)}T00:00:00.000Z`),
+    });
+    mocks.rollupFindMany.mockResolvedValue(
+      [8, 7, 6, 5, 4, 3].map((d) => ({
+        date: new Date(`${dayKeyAgo(d)}T00:00:00.000Z`),
+      })),
+    );
+
+    const stats = await runRollupJob(NOW);
+    // No repair at all — off-mode behavior is byte-identical to pre-v1.16.0
+    // (closed days are never rewritten by the nightly job; a TOGGLE of the
+    // setting runs its own full-history repair from the settings save).
+    expect(mocks.repairRefundDays).not.toHaveBeenCalled();
+    expect(stats).toEqual({ days: 3, backfilled: 0, repairedDays: 0 });
   });
 });
 

@@ -220,6 +220,65 @@ export function rawUtmFromUrl(value: unknown): AcqUtm | null {
   return Object.values(utm).some((v) => v != null) ? utm : null;
 }
 
+// ── Paid-channel click-id detection ──────────────────────────────────────────
+
+/**
+ * Ad-platform click-id params → channel labels. Detection is PRESENCE-ONLY:
+ * the sanitizer drops every non-utm query param (click-id VALUES are
+ * user-tracking tokens and are never stored — the standing privacy rule),
+ * but the fact that a click id was present is the strongest paid-traffic
+ * signal an order carries when the merchant's ads lack utm tags. Order of
+ * this table is the tie-break when several ids ride one URL (rare).
+ */
+const CLICK_ID_CHANNELS: ReadonlyArray<{ param: string; channel: string }> = [
+  { param: "gclid", channel: "google_ads" },
+  { param: "gbraid", channel: "google_ads" },
+  { param: "wbraid", channel: "google_ads" },
+  { param: "fbclid", channel: "meta_ads" },
+  { param: "ttclid", channel: "tiktok_ads" },
+  { param: "msclkid", channel: "microsoft_ads" },
+  { param: "twclid", channel: "x_ads" },
+  { param: "epik", channel: "pinterest_ads" },
+  { param: "sccid", channel: "snapchat_ads" },
+];
+
+/**
+ * Lowercased, "www."-stripped host of a URL or bare-host string; null when
+ * the input carries no host-shaped prefix (relative paths, junk). Scheme is
+ * stripped textually first so a bare "cellexialabs.com" is a host, not a
+ * path.
+ */
+export function normalizeHost(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const stripped = value
+    .trim()
+    .toLowerCase()
+    .replace(/^[a-z][a-z0-9+.-]*:\/\//, "");
+  const host = stripped.split(/[/?#]/, 1)[0] ?? "";
+  if (!host.includes(".")) return null;
+  return host.replace(/^www\./, "");
+}
+
+/**
+ * The paid channel indicated by a click-id param on any of the given RAW
+ * urls (checked in argument order — pass the landing url first). Must run
+ * BEFORE sanitization: the sanitizer strips exactly these params. Returns
+ * the channel label only — no value from the URL survives into it.
+ */
+export function paidChannelFromUrls(...urls: unknown[]): string | null {
+  for (const value of urls) {
+    const url = parseUrlLoose(value);
+    if (!url) continue;
+    const keys = new Set(
+      [...url.searchParams.keys()].map((k) => k.toLowerCase()),
+    );
+    for (const { param, channel } of CLICK_ID_CHANNELS) {
+      if (keys.has(param)) return channel;
+    }
+  }
+  return null;
+}
+
 // ── Device class ──────────────────────────────────────────────────────────────
 
 export type AcqDeviceType = "mobile" | "desktop" | "tablet";
@@ -369,6 +428,15 @@ export interface AcquisitionInput {
   buyerAcceptsMarketing?: unknown;
   /** Order `tags` — REST comma-separated string or an array. */
   orderTags?: unknown;
+  /**
+   * Hosts (or URLs) that ARE the shop itself — the myshopify domain plus the
+   * order's own status-page URL host (the storefront's primary domain).
+   * Feeds acqRaw.referrerInternal so the traffic-source ladder can tell a
+   * self-referral (internal navigation — not a source) from a real external
+   * referrer even when the landing_site was captured path-relative (the
+   * usual Shopify shape).
+   */
+  internalHosts?: unknown;
 }
 
 /** Sanitized, column-shaped acquisition capture. */
@@ -437,6 +505,31 @@ export function buildAcquisitionCapture(
     // Length-capped ONLY, deliberately unscrubbed — the recompute reserve for
     // the utm scrub (see rawUtmFromUrl). Same source precedence as `utm`.
     rawUtm: rawUtmFromUrl(landingRaw) ?? rawUtmFromUrl(referringRaw),
+    // Presence-only paid-channel signal from ad click ids on the RAW urls
+    // (v1.16.0, additive key) — the ids themselves are never stored. Feeds
+    // the traffic-source segment's derivation ladder (segments.server.ts).
+    paidChannel: paidChannelFromUrls(landingRaw, referringRaw),
+    // Whether the referrer is the shop ITSELF (v1.16.0, additive key):
+    // matched against the caller-supplied internal hosts (myshopify domain,
+    // order-status host) plus the landing host when the landing URL was
+    // absolute. true = internal navigation, not a source; false = proven
+    // external; null = no referrer to judge. Computed at capture because
+    // the stored landing URL is usually path-relative — read-time host
+    // comparison cannot see the shop's own custom domain.
+    referrerInternal: (() => {
+      const referrerHost = normalizeHost(referringRaw);
+      if (!referrerHost) return null;
+      const internal = new Set<string>();
+      for (const entry of Array.isArray(input.internalHosts)
+        ? input.internalHosts
+        : []) {
+        const host = normalizeHost(entry);
+        if (host) internal.add(host);
+      }
+      const landingHost = normalizeHost(landingRaw);
+      if (landingHost) internal.add(landingHost);
+      return internal.has(referrerHost);
+    })(),
     countryCode: capture.acqCountryCode,
     provinceCode: capture.acqProvinceCode,
     city: capture.acqCity,

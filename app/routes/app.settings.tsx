@@ -34,6 +34,10 @@ import {
 } from "~/lib/settings/settings.server";
 import { settingsSchemas } from "~/lib/settings/registry.server";
 import type { SettingsKey } from "~/lib/settings/registry.server";
+import {
+  decodeCountryRates,
+  encodeCountryRates,
+} from "~/lib/settings/country-rates";
 import { logEvent } from "~/lib/events/log.server";
 import { verifyMailer } from "~/lib/notifications/mailer.server";
 import {
@@ -65,6 +69,13 @@ type FieldType =
   | "select"
   | "intList"
   | "stringList"
+  /**
+   * Record of ISO country code → percentage, edited as "CH:8.1, DE:19".
+   * Encoded/decoded by encodeCountryRates/decodeCountryRates; malformed
+   * entries survive coercion verbatim so the zod schema rejects them with a
+   * per-entry message instead of being silently dropped.
+   */
+  | "countryRates"
   /**
    * Write-only credential. The loader never ships the stored value (only a
    * "where does the effective value come from" hint); a blank submit keeps
@@ -670,6 +681,46 @@ const SECTION_DEFS: SectionDef[] = [
         step: 1,
         suffix: "%",
       },
+      {
+        path: "vat.enabled",
+        label: "Subtract VAT / sales tax from gross profit",
+        helpText:
+          "On by default. Analytics subtract VAT as a flat percentage of each charge — the country rate below (or the default rate) times the charged amount, like any other expense. Reporting only — billing and checkout taxes are untouched. The cohort history recomputes nightly with VAT included; closed daily-rollup days keep their pre-VAT figures.",
+        type: "toggle",
+      },
+      {
+        path: "vat.defaultRatePct",
+        label: "Default VAT rate",
+        helpText:
+          "Applied when a charge's country has no rate below (or the country is unknown). VAT is a straight percentage of revenue — an 8.1% rate on a CHF 100.00 charge subtracts CHF 8.10.",
+        type: "float",
+        min: 0,
+        max: 50,
+        step: 0.1,
+        suffix: "%",
+      },
+      {
+        path: "vat.countryRatesPct",
+        label: "VAT rates by country",
+        helpText:
+          "Comma-separated ISO country code : rate pairs, e.g. \"CH:8.1, DE:19, FR:20\". The charge's country comes from the subscription's delivery address (falling back to the first order's shipping country); countries not listed use the default rate above.",
+        type: "countryRates",
+      },
+    ],
+  },
+  {
+    key: "analytics",
+    title: "Analytics data",
+    description:
+      "Accuracy options applied to every analytics view — revenue, gross profit, LTGP, cohorts, forecasts and segment views. All figures are reported in the store currency.",
+    fields: [
+      {
+        path: "excludeRefundedPayments",
+        label: "Exclude refunded payments",
+        helpText:
+          "On by default. Payments with ANY refund — full or partial — are removed from the analytics entirely, revenue and costs alike (a refunded rebill is usually a surprise renewal that got cancelled: noise, not revenue). Turn off to instead net refunds against revenue while keeping the payment's costs. Saving recomputes the cohort history AND rewrites every refund-affected day of the daily ledger under the new mode immediately; the nightly job keeps repairing new refunds' charge days within its 90-day window.",
+        type: "toggle",
+      },
     ],
   },
   {
@@ -898,6 +949,8 @@ function coerceField(field: FieldDef, raw: string | null): unknown {
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean);
+    case "countryRates":
+      return decodeCountryRates(text);
     default:
       return text;
   }
@@ -1012,6 +1065,41 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       },
     });
 
+    // Analytics data options reshape every persisted derived table — kick an
+    // immediate recompute so the merchant sees the toggle's effect without
+    // waiting a night: the full cohort triangle, then EVERY refund-affected
+    // rollup day across all history in flow-columns-only mode (a toggle
+    // re-interprets what those days mean in BOTH directions — netting ↔
+    // exclusion — and the nightly repair pass only runs under exclusion and
+    // only inside its 90-day window), then the live trailing window. This
+    // keeps the day ledger and the rollup-fed forecast in lockstep with the
+    // recomputed cohorts after a flip. Contained (golden rule 9): analytics
+    // failures never fail a settings save — the nightly jobs recompute
+    // regardless.
+    if (key === "analytics") {
+      try {
+        const { runCohortComputation } = await import(
+          "~/lib/analytics/cohorts.server"
+        );
+        const { repairRefundAffectedRollupDays, runDailyRollup } = await import(
+          "~/lib/analytics/rollup.server"
+        );
+        const { addDaysTz } = await import("~/lib/dates.server");
+        const now = new Date();
+        await runCohortComputation(shop.id, now);
+        await repairRefundAffectedRollupDays(shop.id, {
+          includeRefundRecordedDays: true,
+          // Belt against a pathological book — ~2 years of daily refunds.
+          cap: 730,
+        });
+        for (let daysAgo = 2; daysAgo >= 0; daysAgo--) {
+          await runDailyRollup(shop.id, addDaysTz(now, -daysAgo, shop.ianaTimezone));
+        }
+      } catch (error) {
+        console.warn("[settings] analytics recompute after save failed", error);
+      }
+    }
+
     return json<ActionData>({
       intent,
       ok: true,
@@ -1071,6 +1159,8 @@ function initialSectionState(def: SectionDef, value: unknown): SectionState {
       state[field.path] = Boolean(raw);
     } else if (field.type === "intList" || field.type === "stringList") {
       state[field.path] = Array.isArray(raw) ? raw.join(", ") : "";
+    } else if (field.type === "countryRates") {
+      state[field.path] = encodeCountryRates(raw);
     } else if (field.type === "secret") {
       // The loader redacts secrets, so this is always "" — typed here means
       // "replace"; the companion __clear key means "remove the saved value".
@@ -1265,6 +1355,8 @@ function CostModelPreview({
   const shippingFlat =
     Number(String(state["shippingCostPerShipmentCents.flatCents"] ?? "0")) || 0;
   const fallbackPct = Number(String(state["cogsFallbackPctOfPrice"] ?? "0")) || 0;
+  const vatEnabled = state["vat.enabled"] === true;
+  const vatRatePct = Number(String(state["vat.defaultRatePct"] ?? "0")) || 0;
 
   // Worked example: one CHF 89.00 renewal with product cost CHF 24.00 known.
   const exampleRevenue = 8900;
@@ -1272,7 +1364,12 @@ function CostModelPreview({
   const fees = Math.round((exampleRevenue * feePct) / 100) + feeFixed;
   const shipping = shippingMode === "charged" ? 0 : shippingFlat;
   const perShipment = fulfillment + shipping;
-  const profit = exampleRevenue - exampleCogs - perShipment - fees;
+  // VAT is a flat percentage of revenue (rate/100) — the same formula the
+  // engine applies to every charge (see the field help text).
+  const vat = vatEnabled
+    ? Math.round((exampleRevenue * vatRatePct) / 100)
+    : 0;
+  const profit = exampleRevenue - exampleCogs - perShipment - fees - vat;
 
   return (
     <Box background="bg-surface-secondary" borderRadius="200" padding="300">
@@ -1286,7 +1383,11 @@ function CostModelPreview({
             shippingMode === "charged"
               ? " (shipping ≈ what the customer paid; 0 in this free-shipping example)"
               : ""
-          } − ${money(fees)} payment fees = `}
+          } − ${money(fees)} payment fees${
+            vatEnabled
+              ? ` − ${money(vat)} VAT (${vatRatePct}% of the charge)`
+              : ""
+          } = `}
           <Text as="span" fontWeight="semibold">
             {money(profit)}
           </Text>

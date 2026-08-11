@@ -1059,21 +1059,34 @@ describe("getForecast", () => {
     }
   });
 
-  // ── Net revenue is NET of refunds (FR-2/SM-01): the analytics page labels
-  //    this exact series "payments collected (net of refunds)" ──────────────
-  it("subtracts refundedCents from the weekly collected-revenue series", async () => {
-    mockShop({
-      rollups: [
-        rollupRow("2026-06-01", 100_000, 100, 20_000),
-        // Two rollup days in one week: 22 000 charged, 5 000 refunded.
-        rollupRow("2026-06-08", 110_000, 110, 12_000, 5, { refundedCents: 3_000 }),
-        rollupRow("2026-06-10", 110_000, 110, 10_000, 0, { refundedCents: 2_000 }),
-        rollupRow("2026-06-15", 120_000, 120, 24_000),
-        rollupRow("2026-06-22", 130_000, 130, 26_000),
-        rollupRow("2026-06-29", 140_000, 140, 28_000),
-        rollupRow("2026-07-06", 150_000, 240, 30_000),
-      ],
-    });
+  // ── Net revenue vs refunds. Netting (charged − refunded) is the OFF-mode of
+  //    the v1.16.0 exclude-refunded option; under the shipped DEFAULT the
+  //    rollup's chargedCents already excludes refunded payments, so the
+  //    forecast must read charged alone or the money is dropped twice. ──────
+  const REFUND_WEEK_ROLLUPS = () => [
+    rollupRow("2026-06-01", 100_000, 100, 20_000),
+    // Two rollup days in one week: 22 000 charged, 5 000 refunded.
+    rollupRow("2026-06-08", 110_000, 110, 12_000, 5, { refundedCents: 3_000 }),
+    rollupRow("2026-06-10", 110_000, 110, 10_000, 0, { refundedCents: 2_000 }),
+    rollupRow("2026-06-15", 120_000, 120, 24_000),
+    rollupRow("2026-06-22", 130_000, 130, 26_000),
+    rollupRow("2026-06-29", 140_000, 140, 28_000),
+    rollupRow("2026-07-06", 150_000, 240, 30_000),
+  ];
+
+  /** Store an analytics-settings row; other keys keep falling back to defaults. */
+  function mockAnalyticsSetting(excludeRefundedPayments: boolean) {
+    db.setting.findUnique.mockImplementation(
+      async (args: { where: { shopId_key: { key: string } } }) =>
+        args.where.shopId_key.key === "analytics"
+          ? { value: { excludeRefundedPayments } }
+          : null,
+    );
+  }
+
+  it("subtracts refundedCents from the weekly series when exclusion is OFF (netting mode)", async () => {
+    mockShop({ rollups: REFUND_WEEK_ROLLUPS() });
+    mockAnalyticsSetting(false);
     const result = await getForecast("shop1", { model: "naive", now: NOW });
     expect(result.series.netRevenueCents.history[1]).toEqual({
       weekStartIso: "2026-06-08",
@@ -1081,6 +1094,18 @@ describe("getForecast", () => {
     });
     // Un-refunded weeks are untouched.
     expect(result.series.netRevenueCents.history[0].value).toBe(20_000);
+  });
+
+  it("reads charged alone under refund exclusion (the default) — no double subtraction", async () => {
+    // No stored analytics row (the upgrade case): the zod default applies.
+    mockShop({ rollups: REFUND_WEEK_ROLLUPS() });
+    const result = await getForecast("shop1", { model: "naive", now: NOW });
+    expect(result.series.netRevenueCents.history[1]).toEqual({
+      weekStartIso: "2026-06-08",
+      // The rollup already dropped refunded payments from chargedCents;
+      // subtracting the recorded 5 000 again would double-count the refund.
+      value: 22_000,
+    });
   });
 
   it("a refund-heavier-than-charges week clamps at 0 instead of going negative", async () => {
@@ -1093,6 +1118,7 @@ describe("getForecast", () => {
         rollupRow("2026-07-06", 150_000, 240, 30_000),
       ],
     });
+    mockAnalyticsSetting(false); // netting mode — the only mode that subtracts
     const result = await getForecast("shop1", { model: "naive", now: NOW });
     const clamped = result.series.netRevenueCents.history.find(
       (p) => p.weekStartIso === "2026-06-29",
