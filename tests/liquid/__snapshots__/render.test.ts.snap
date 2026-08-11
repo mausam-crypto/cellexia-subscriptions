@@ -120,7 +120,8 @@ data-cellexia-selling-plan
 "pd": "CHF 51.20",
 "freq": "8 weeks",
 "savePct": "20%"
-}}
+}},
+"defaultPlan": ""
 },"4411100011102": {
 "available": true,
 "oneTime": "CHF 98.00",
@@ -156,7 +157,8 @@ data-cellexia-selling-plan
 "pd": "CHF 78.40",
 "freq": "8 weeks",
 "savePct": "20%"
-}}
+}},
+"defaultPlan": ""
 }}
 }
 </script>

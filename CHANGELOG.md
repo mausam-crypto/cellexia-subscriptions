@@ -4,6 +4,96 @@ All notable changes to Cellexia Subscriptions. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [SemVer](https://semver.org) as contracted in [docs/UPDATE.md](docs/UPDATE.md).
 
+## [1.14.0] — 2026-08-10
+
+**Per-variant default frequency** — products sold as unit-count variants
+(1 / 2 / 3 units) can now preselect a different delivery frequency per
+variant: 2 units defaults to every 3 months where 1 unit runs every 2, for
+example. One additive migration (`0018_variant_default_frequencies`,
+`prisma migrate deploy`); no new env vars, no scope or webhook changes. The
+theme app extension changed (`npm run deploy` required), and each plan needs
+one **Sync to Shopify** after setting its per-variant defaults so the new
+`cellexia.variant_defaults` metafield is published. Deploy order does not
+matter for safety: the new extension without the metafield (or without
+per-variant defaults configured) renders exactly as v1.13.0, and the old
+extension ignores the metafield entirely.
+
+### Added
+
+- **Variant auto-detection in the plan form** (Plans → create/edit): the
+  variants of every selected product are detected automatically — from the
+  product search result when a product is added, from a Shopify lookup when
+  editing — and each multi-variant product gets a "Default frequency by
+  variant" row of selectors. "Plan default" (the existing default above)
+  stays the value for any variant without an override. A failed variant
+  lookup says so in the dialog and keeps existing overrides intact rather
+  than silently dropping them.
+- **Validated like the plan default**: every per-variant override must be
+  one of the plan's offered frequencies (422 otherwise); overrides whose
+  variant no longer belongs to a product of the plan are dropped on save
+  (best-effort membership check against Shopify, contained on failure), and
+  a frequency edit that removes a cadence silently retires the overrides
+  that pointed at it — the storefront is never pointed at a plan that does
+  not exist.
+- **New shop metafield `cellexia.variant_defaults`** (json):
+  `{v:1, default: {unit, count}, byVariant: {"<numeric variant id>":
+  {unit, count}}}` — numeric ids because that is what Liquid's `variant.id`
+  and the theme's `[name=id]` field carry. `default` is the plan's
+  group-level default frequency, folded into every variant WITHOUT an
+  override: switching from an overridden pack size back to a plain one
+  reverts to the plan default, and the plan's "Default frequency" setting
+  finally drives the storefront preselect directly (previously only the
+  theme block's "recommended frequency" text handle did). Built from SYNCED
+  configs only — a plan saved but never synced cannot steer the live
+  storefront, and a deactivated-but-still-synced config keeps its defaults
+  exactly as long as the allow-list keeps rendering its group. Published as
+  a rides-along of every allow-list publish (plan sync, plan delete,
+  go-live, the daily factor sweep) through the `publishOwnGroupsMetafield`
+  choke point — CONTAINED: a failed defaults write degrades to
+  `PublishResult.variantDefaults.ok:false` on an otherwise-successful
+  publish, because a stale presentation metafield merely preselects the
+  group default while a failed allow-list is a widget outage. The outcome
+  is surfaced: the plan-sync and plan-delete audit events and the go-live
+  audit record `variantDefaultsMetafield`, and a sync whose defaults write
+  failed says so in its toast ("sync again to retry"). It is PRESENTATION
+  ONLY and never participates in the storefront ownership gate.
+- **Buy box preselects per variant** (extension): the Liquid resolves the
+  landing variant's default for the first paint (beating the
+  "recommended frequency" text handle), and the JSON island carries a
+  per-variant `defaultPlan` (the override, or the folded plan default). On
+  every variant switch — theme pills, poll, click delegation, un-park, or
+  an init-time theme-field disagreement — `buy-box.js` moves the selected
+  cadence onto the new variant's default; a variant without an override
+  reverts to the plan default. Two guardrails: an EXPLICIT cadence choice
+  by the shopper is sticky for the widget's lifetime (pack-size clicks
+  never fight the customer), and a default is adopted only when the new
+  variant actually sells that plan (otherwise the fallback stands — which
+  itself now prefers the variant's configured default over allocation
+  order). Prepaid plans are never resolved as defaults — "Every 8 weeks,
+  prepay 3 deliveries" bills three deliveries at once and must never be
+  auto-selected by a `{WEEK, 8}` override.
+- **Plans table** shows how many variant defaults each plan carries.
+
+### Changed
+
+- `SellingPlanConfig` gains nullable `variantDefaultFrequencies` (JSON map,
+  variant GID → `{unit, count}`; migration 0018, additive-only). Pre-upgrade
+  rows read as "no overrides" and render exactly as before. **Rollback
+  honesty**: a server rollback to v1.13.0 ignores the column, but the
+  PUBLISHED `cellexia.variant_defaults` metafield survives it and theme
+  extensions do not roll back with the server ZIP — the deployed v1.14.0
+  extension keeps applying the last-published defaults, and no v1.13.0 flow
+  can update or clear them (its publishes never touch that metafield). The
+  degradation stays presentation-only (stale entries can only preselect
+  live plans of our own group), but to fully retire the feature on a
+  rollback either clear the overrides and Sync each plan BEFORE rolling
+  back, or delete the shop metafield `cellexia.variant_defaults` via the
+  Admin API afterwards.
+- The widget JSON island's per-variant entries gain `defaultPlan` (`""`
+  when the variant has no usable override) — additive; the byte-golden
+  island snapshots moved accordingly. Liquid total: 88,743 bytes of the
+  90,112-byte primary budget.
+
 ## [1.13.0] — 2026-08-10
 
 **New per-plan option: "Block skip, pause, change or cancel for the first X

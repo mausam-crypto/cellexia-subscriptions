@@ -213,6 +213,50 @@ export function parseConfigDefaultFrequency(
   return { unit: "WEEK", count: Math.max(1, config.defaultFrequencyWeeks) };
 }
 
+// ── Per-variant default frequency (v1.8.0 columns; map added v1.14.0) ────────
+
+const VARIANT_GID_RE = /^gid:\/\/shopify\/ProductVariant\/\d+$/;
+
+/** Is `key` a well-formed ProductVariant GID? (Map keys, form field names.) */
+export function isVariantGid(key: string): boolean {
+  return VARIANT_GID_RE.test(key);
+}
+
+/**
+ * The per-variant default-frequency map of a SellingPlanConfig row
+ * (`variantDefaultFrequencies`): variant GID → `{unit, count}`, explicit
+ * overrides only — a variant absent here uses the group default. Defensive
+ * like every config parser in this module: a malformed column, key or entry
+ * is DROPPED, never thrown (admin and publish must both survive a bad row).
+ * When `offered` is given, entries outside it are dropped too — an override
+ * may only preselect a cadence the plan actually sells; a later frequency
+ * edit that removed the cadence silently retires the override rather than
+ * pointing the storefront at a plan that no longer exists.
+ */
+export function parseConfigVariantDefaults(
+  value: unknown,
+  offered?: Frequency[],
+): Map<string, Frequency> {
+  const out = new Map<string, Frequency>();
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return out;
+  }
+  const offeredTokens = offered
+    ? new Set(offered.map(frequencyToken))
+    : null;
+  for (const [key, entry] of Object.entries(value)) {
+    if (!VARIANT_GID_RE.test(key)) continue;
+    const parsed = frequencySchema.safeParse(entry);
+    if (!parsed.success) continue;
+    if (frequencyRangeError(parsed.data)) continue;
+    if (offeredTokens && !offeredTokens.has(frequencyToken(parsed.data))) {
+      continue;
+    }
+    out.set(key, parsed.data);
+  }
+  return out;
+}
+
 // ── Customer-facing plan strings (English — Shopify plan names/options) ──────
 
 const UNIT_NOUNS: Record<FrequencyUnit, { singular: string; plural: string }> = {

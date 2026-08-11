@@ -103,6 +103,26 @@ const PRODUCT_SEARCH_QUERY = `#graphql
   }
 `;
 
+const PRODUCT_VARIANTS_QUERY = `#graphql
+  query CellexiaProductVariants($ids: [ID!]!) {
+    nodes(ids: $ids) {
+      __typename
+      ... on Product {
+        id
+        title
+        variants(first: 100) {
+          nodes {
+            id
+            title
+            sku
+            availableForSale
+          }
+        }
+      }
+    }
+  }
+`;
+
 const SUBSCRIBABLE_PRODUCTS_QUERY = `#graphql
   query CellexiaSubscribableProducts {
     sellingPlanGroups(first: 10) {
@@ -210,6 +230,22 @@ interface ProductSearchResponse {
       variants?: { nodes?: RawSearchVariant[] | null } | null;
     }> | null;
   } | null;
+}
+
+interface ProductVariantsResponse {
+  nodes?: Array<{
+    __typename?: string | null;
+    id?: string | null;
+    title?: string | null;
+    variants?: {
+      nodes?: Array<{
+        id: string;
+        title?: string | null;
+        sku?: string | null;
+        availableForSale?: boolean | null;
+      }> | null;
+    } | null;
+  } | null> | null;
 }
 
 interface SellingPlanGroupSummariesResponse {
@@ -338,6 +374,66 @@ export async function getProducts(
         status: node.status ?? null,
         totalInventory: node.totalInventory ?? null,
         featuredImageUrl: node.featuredImage?.url ?? null,
+      });
+    }
+  }
+  return out;
+}
+
+export interface ProductVariantsSummary {
+  productId: string;
+  productTitle: string;
+  variants: Array<{
+    id: string;
+    title: string;
+    sku: string | null;
+    availableForSale: boolean;
+  }>;
+}
+
+/**
+ * Products per PRODUCT_VARIANTS_QUERY round trip. Each product node nests a
+ * variants(first: 100) connection, so Shopify's REQUESTED query cost is
+ * ~103 points per id regardless of how many variants actually exist — the
+ * default NODE_BATCH_SIZE of 100 would cost ~10,300 points and be rejected
+ * outright by the 1,000-point single-query ceiling (same budgeting as
+ * ATTACHMENT_QUERY_BATCH in sellingPlans.server.ts). 8 ids ≈ 824 points.
+ */
+const PRODUCT_VARIANTS_QUERY_BATCH = 8;
+
+/**
+ * The variants of each product, by product GID — the admin plan form's
+ * variant auto-detection (per-variant default frequency). First 100 variants
+ * per product: Shopify allows up to 2,048 variants on a product (page max
+ * 250), so a >100-variant product shows selectors for its first 100 only —
+ * far beyond any replenishment catalog; raise deliberately (and re-budget
+ * the batch size above) if that ever changes. Missing/deleted product GIDs
+ * are silently dropped, like getProducts.
+ */
+export async function getProductVariants(
+  admin: AdminClient,
+  productGids: string[],
+): Promise<ProductVariantsSummary[]> {
+  if (productGids.length === 0) return [];
+  const out: ProductVariantsSummary[] = [];
+
+  for (const batch of chunk(productGids, PRODUCT_VARIANTS_QUERY_BATCH)) {
+    const data = await gql<ProductVariantsResponse>(
+      admin,
+      PRODUCT_VARIANTS_QUERY,
+      { ids: batch },
+    );
+    for (const node of data.nodes ?? []) {
+      if (!node?.id || node.__typename !== "Product") continue;
+      out.push({
+        productId: node.id,
+        productTitle: node.title ?? "",
+        variants: (node.variants?.nodes ?? []).map((v) => ({
+          id: v.id,
+          title: v.title ?? "",
+          sku: v.sku ?? null,
+          availableForSale: v.availableForSale ?? false,
+        })),
       });
     }
   }

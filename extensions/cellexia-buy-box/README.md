@@ -315,6 +315,28 @@ exact instead of a string inequality; every displayed string still comes
 pre-formatted from Liquid. Every string in the island is RAW — see the
 island exception above for why.
 
+Since v1.14.0 each variant entry also carries `defaultPlan`: the plan id
+whose cadence matches the shop metafield
+`cellexia.variant_defaults.byVariant[<numeric variant id>]` — or, for a
+variant WITHOUT an override, the metafield's group-level `default` (both
+`{unit, count}`, published by the app whenever the ownership allow-list
+is) — or `""` when neither resolves. The Liquid resolves it with the same
+unit-word + first-numeric-token parse the freq labels use, prepaid plans
+excluded (their `a_n` stays 0), and the JS ADOPTS it on a variant switch
+so the preselected cadence follows the pack size (1 jar → every 2 months,
+2 jars → every 3 months) and REVERTS to the plan default on a pack size
+with no override. Two rules keep it honest: the default is only adopted
+while the shopper has NOT explicitly picked a cadence (an explicit pick is
+sticky for the widget's lifetime), and only when the new variant can
+actually buy that plan (its island `plans` map carries the id — otherwise
+the fallback stands, which itself prefers the variant's `defaultPlan` over
+allocation order). The same rule runs once at init when the theme's
+`[name=id]` field already disagrees with the server-rendered variant, and
+on the un-park path back from an un-synced variant. This metafield is
+PRESENTATION only: it never participates in the ownership gate, and a
+missing, stale or malformed value merely leaves the recommended-handle
+pick preselected.
+
 ### Merchant custom CSS (brace containment)
 
 `style.customCss` is sanitized server-side (`sanitizeCustomCss`) before

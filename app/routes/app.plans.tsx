@@ -40,9 +40,11 @@ import {
   frequencyRangeError,
   frequencySchema,
   frequencyToken,
+  isVariantGid,
   normalizeFrequencies,
   parseConfigDefaultFrequency,
   parseConfigFrequencies,
+  parseConfigVariantDefaults,
   parseFrequencyInput,
   parseFrequencyToken,
 } from "~/lib/frequency";
@@ -54,6 +56,7 @@ import { applyDiscountPct, formatMoney } from "~/lib/money";
 import {
   deleteSellingPlanGroup,
   findProductsMissingFromGroup,
+  getProductVariants,
   getProducts,
   getVariants,
   searchProducts,
@@ -79,6 +82,12 @@ import { getSetting } from "~/lib/settings/settings.server";
 
 // ── Shared view types (loader/action → component) ────────────────────────────
 
+/** One product's auto-detected variants, for the per-variant default UI. */
+interface ProductVariantOption {
+  id: string;
+  title: string;
+}
+
 interface PlanView {
   id: string;
   name: string;
@@ -86,6 +95,18 @@ interface PlanView {
   productTitles: string[];
   frequencies: Frequency[];
   defaultFrequency: Frequency;
+  /**
+   * Explicit per-variant default overrides, variant GID → frequency token
+   * ("3:MONTH"). Already filtered to the offered frequencies, so the modal
+   * never renders a Select value its option list does not contain.
+   */
+  variantDefaults: Record<string, string>;
+  /**
+   * The variants of each product in this plan, auto-detected from Shopify at
+   * load. A product missing here means the lookup failed (or the product is
+   * gone) — the modal says so instead of silently hiding the feature.
+   */
+  productVariants: Record<string, ProductVariantOption[]>;
   allowFrequencyChoice: boolean;
   firstOrderDiscountPct: number;
   ongoingDiscountPct: number;
@@ -168,6 +189,17 @@ const planSchema = z
       // inside both, and no real buy box wants more choices than that.
       .max(20, "Offer at most 20 frequencies"),
     defaultFrequency: frequencySchema,
+    // Explicit per-variant overrides only; every entry must be one of the
+    // offered frequencies (superRefine below, same rule as defaultFrequency).
+    // Bounded like `frequencies` (.max(20) above): the modal only submits
+    // detected variants, so the cap only ever stops a crafted POST — which
+    // would otherwise persist unbounded JSON and drive an unbounded
+    // getVariants chain in the membership check below.
+    variantDefaults: z
+      .record(z.string(), frequencySchema)
+      .refine((value) => Object.keys(value).length <= 400, {
+        message: "At most 400 per-variant defaults",
+      }),
     allowFrequencyChoice: z.boolean(),
     firstOrderDiscountPct: z
       .number()
@@ -215,6 +247,25 @@ const planSchema = z
         path: ["defaultFrequency"],
         message: "Default frequency must be one of the offered frequencies",
       });
+    }
+    for (const [variantGid, freq] of Object.entries(value.variantDefaults)) {
+      if (!isVariantGid(variantGid)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["variantDefaults"],
+          message: "Invalid variant in the per-variant defaults",
+        });
+        break;
+      }
+      if (!tokens.includes(frequencyToken(freq))) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["variantDefaults"],
+          message:
+            "Each per-variant default must be one of the offered frequencies",
+        });
+        break;
+      }
     }
   });
 
@@ -295,6 +346,37 @@ function parsePlanForm(formData: FormData): {
     errors.defaultFrequency = "Pick a default frequency";
   }
 
+  // Per-variant defaults arrive as {"gid://…/ProductVariant/123": "3:MONTH"}.
+  // Parse tokens here; key validity and offered-membership are planSchema's.
+  const variantDefaults: Record<string, Frequency> = {};
+  const variantDefaultsRaw = String(formData.get("variantDefaults") ?? "");
+  if (variantDefaultsRaw.length > 100_000) {
+    // Cheap pre-parse bound; the entry-count cap lives in planSchema.
+    errors.variantDefaults = "Too many per-variant defaults";
+  } else if (variantDefaultsRaw.trim() !== "") {
+    try {
+      const parsed: unknown = JSON.parse(variantDefaultsRaw);
+      if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        Array.isArray(parsed)
+      ) {
+        throw new Error("not an object");
+      }
+      for (const [key, token] of Object.entries(parsed)) {
+        const freq =
+          typeof token === "string" ? parseFrequencyToken(token) : null;
+        if (!freq) {
+          errors.variantDefaults = "Invalid per-variant default frequency";
+          break;
+        }
+        variantDefaults[key] = freq;
+      }
+    } catch {
+      errors.variantDefaults = "Invalid per-variant defaults";
+    }
+  }
+
   const giftRaw = String(formData.get("firstOrderGiftVariantId") ?? "").trim();
   const badgeRaw = String(formData.get("badgeText") ?? "").trim();
 
@@ -303,6 +385,7 @@ function parsePlanForm(formData: FormData): {
     productIds,
     frequencies: normalizeFrequencies(frequencies),
     defaultFrequency: defaultFrequency ?? { unit: "WEEK" as const, count: 8 },
+    variantDefaults,
     allowFrequencyChoice: boolFrom(formData, "allowFrequencyChoice"),
     firstOrderDiscountPct: intFrom(formData, "firstOrderDiscountPct"),
     ongoingDiscountPct: intFrom(formData, "ongoingDiscountPct"),
@@ -370,6 +453,29 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     console.error("[plans] product title lookup failed", err);
   }
 
+  // Variant auto-detection for the per-variant default-frequency UI. Same
+  // containment as the title lookup: a Shopify failure leaves the map empty
+  // and the modal explains variants could not be loaded, never breaks the
+  // page. Products in a plan only (the union above includes cadence-only
+  // products, which have no per-variant defaults).
+  const variantsByProduct = new Map<string, ProductVariantOption[]>();
+  try {
+    const planProductIds = [
+      ...new Set(parsedConfigs.flatMap((p) => p.productIds)),
+    ];
+    for (const summary of await getProductVariants(admin, planProductIds)) {
+      variantsByProduct.set(
+        summary.productId,
+        summary.variants.map((v) => ({ id: v.id, title: v.title })),
+      );
+      if (summary.productTitle && !titleById.has(summary.productId)) {
+        titleById.set(summary.productId, summary.productTitle);
+      }
+    }
+  } catch (err) {
+    console.error("[plans] product variant lookup failed", err);
+  }
+
   const giftVariantIds = [
     ...new Set(
       parsedConfigs
@@ -418,6 +524,23 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     productTitles: productIds.map((id) => titleById.get(id) ?? id),
     frequencies,
     defaultFrequency: parseConfigDefaultFrequency(config),
+    // Filtered to the offered list, so a frequency edit that removed a
+    // cadence retires its overrides in the UI too (the save then persists
+    // the retirement).
+    variantDefaults: Object.fromEntries(
+      [
+        ...parseConfigVariantDefaults(
+          config.variantDefaultFrequencies,
+          frequencies,
+        ),
+      ].map(([gid, freq]) => [gid, frequencyToken(freq)]),
+    ),
+    productVariants: Object.fromEntries(
+      productIds.flatMap((id) => {
+        const variants = variantsByProduct.get(id);
+        return variants ? [[id, variants]] : [];
+      }),
+    ),
     allowFrequencyChoice: config.allowFrequencyChoice,
     firstOrderDiscountPct: config.firstOrderDiscountPct,
     ongoingDiscountPct: config.ongoingDiscountPct,
@@ -568,6 +691,33 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
 
     const planId = String(formData.get("planId") ?? "");
+
+    // Best-effort membership check: keep only overrides whose variant still
+    // belongs to a product of this plan (a product removed in the same edit,
+    // or a variant deleted on Shopify, must not leave a ghost entry behind).
+    // CONTAINED — an unreadable Shopify keeps the schema-validated entries
+    // as-is rather than discarding merchant input on a transient failure.
+    let variantDefaults = values.variantDefaults;
+    const overrideGids = Object.keys(variantDefaults);
+    if (overrideGids.length > 0) {
+      try {
+        const productIdSet = new Set(values.productIds);
+        const known = await getVariants(admin, overrideGids);
+        const memberGids = new Set(
+          known
+            .filter((v) => v.productId && productIdSet.has(v.productId))
+            .map((v) => v.id),
+        );
+        variantDefaults = Object.fromEntries(
+          Object.entries(variantDefaults).filter(([gid]) =>
+            memberGids.has(gid),
+          ),
+        );
+      } catch (err) {
+        console.error("[plans] variant membership check failed", err);
+      }
+    }
+
     // Legacy week columns are kept written as approximations of the
     // multi-unit truth so a rollback to a pre-v1.8.0 build still sees a
     // coherent (week-only) view of this config.
@@ -579,6 +729,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       productIds: values.productIds,
       frequencies: values.frequencies,
       defaultFrequency: values.defaultFrequency,
+      variantDefaultFrequencies: variantDefaults,
       frequenciesWeeks: legacyWeeks,
       defaultFrequencyWeeks: approxWeeks(
         values.defaultFrequency.unit,
@@ -635,6 +786,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         name: saved.name,
         productCount: values.productIds.length,
         frequencies: values.frequencies.map(frequencyToken),
+        variantDefaultCount: Object.keys(variantDefaults).length,
         frequenciesWeeks: legacyWeeks,
         firstOrderDiscountPct: values.firstOrderDiscountPct,
         ongoingDiscountPct: values.ongoingDiscountPct,
@@ -745,6 +897,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           planGroupsMetafield: ownership.metafield.ok
             ? "published"
             : `failed: ${ownership.metafield.error ?? "unknown error"}`,
+          // The rides-along presentation publish (v1.14.0) — same
+          // surface-the-contained-failure rule as the heal field: a merchant
+          // who configured per-variant defaults must be able to see from the
+          // audit trail that the storefront never received them.
+          variantDefaultsMetafield:
+            ownership.metafield.variantDefaults == null
+              ? "not reached"
+              : ownership.metafield.variantDefaults.ok
+                ? "published"
+                : `failed: ${ownership.metafield.variantDefaults.error ?? "unknown error"}`,
           syncStatus,
           ...(syncStatus === "ATTACH_FAILED"
             ? { attachMissingProductIds: missingProductIds, attachError: syncError }
@@ -759,6 +921,19 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             missingProductIds.length > 0
               ? `"${config.name}" synced, but ${missingProductIds.length} product(s) are missing the plan — see the Plans row`
               : `"${config.name}" synced, but attachment could not be verified — re-sync to verify`,
+        });
+      }
+      if (
+        ownership.metafield.variantDefaults &&
+        !ownership.metafield.variantDefaults.ok
+      ) {
+        // The group synced, but the per-variant default frequencies never
+        // reached the storefront — without this the widget silently
+        // preselects the group default while everything looks green.
+        return json<ActionData>({
+          intent,
+          ok: false,
+          toast: `"${config.name}" synced, but publishing the variant default frequencies failed — sync again to retry`,
         });
       }
       return json<ActionData>({
@@ -821,8 +996,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
     await prisma.sellingPlanConfig.delete({ where: { id: config.id } });
     // Keep the storefront allow-list truthful: a deleted config must not leave
-    // its group id in cellexia.plan_groups. Never throws.
-    await publishOwnGroupsMetafield(shop.domain);
+    // its group id in cellexia.plan_groups — nor its per-variant defaults in
+    // cellexia.variant_defaults (the rides-along publish). Never throws.
+    const republished = await publishOwnGroupsMetafield(shop.domain);
     await logEvent({
       shopId: shop.id,
       type: "admin.action",
@@ -833,6 +1009,15 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         planConfigId: config.id,
         name: config.name,
         shopifyGroupId: config.shopifyGroupId,
+        planGroupsMetafield: republished.ok
+          ? "published"
+          : `failed: ${republished.error ?? "unknown error"}`,
+        variantDefaultsMetafield:
+          republished.variantDefaults == null
+            ? "not reached"
+            : republished.variantDefaults.ok
+              ? "published"
+              : `failed: ${republished.variantDefaults.error ?? "unknown error"}`,
       },
     });
     return json<ActionData>({
@@ -1027,6 +1212,13 @@ interface SelectedProduct {
   id: string;
   title: string;
   examplePriceCents: number | null;
+  /**
+   * The product's auto-detected variants — from the search result when the
+   * product was just added, from the loader lookup when editing. `null`
+   * means UNKNOWN (loader lookup failed): the per-variant defaults UI then
+   * says so for this product instead of pretending it has no variants.
+   */
+  variants: ProductVariantOption[] | null;
 }
 
 function useProductSearch() {
@@ -1105,6 +1297,10 @@ function ProductMultiPicker({
                         title: product.title,
                         examplePriceCents:
                           product.variants[0]?.priceCents ?? null,
+                        variants: product.variants.map((v) => ({
+                          id: v.id,
+                          title: v.title,
+                        })),
                       },
                     ])
                   }
@@ -1245,6 +1441,7 @@ function PlanFormModal({
           id,
           title: plan.productTitles[i] ?? id,
           examplePriceCents: null,
+          variants: plan.productVariants[id] ?? null,
         }))
       : [],
   );
@@ -1254,6 +1451,10 @@ function PlanFormModal({
   const [defaultFreq, setDefaultFreq] = useState(
     frequencyToken(plan?.defaultFrequency ?? { unit: "WEEK", count: 8 }),
   );
+  // Variant GID → frequency token; "" / absent = use the plan default.
+  const [variantDefaults, setVariantDefaults] = useState<
+    Record<string, string>
+  >(plan?.variantDefaults ?? {});
   const [allowChoice, setAllowChoice] = useState(
     plan?.allowFrequencyChoice ?? true,
   );
@@ -1301,6 +1502,26 @@ function PlanFormModal({
     [freqText],
   );
 
+  const offeredTokens = useMemo(
+    () => new Set(parsedFrequencies.map(frequencyToken)),
+    [parsedFrequencies],
+  );
+  // Per-variant defaults only make sense where a product HAS variants to
+  // choose between; single-variant products ("Default Title") follow the
+  // plan default by definition. EXCEPTION: a product that dropped to one
+  // variant while an override on the survivor exists keeps its row — the
+  // override is still live on the storefront, and hiding it here would make
+  // it invisible and un-clearable in the admin.
+  const multiVariantProducts = selectedProducts.filter(
+    (p) =>
+      (p.variants?.length ?? 0) > 1 ||
+      (p.variants ?? []).some((v) => variantDefaults[v.id]),
+  );
+  const unknownVariantProducts = selectedProducts.filter(
+    (p) => p.variants === null,
+  );
+  const planDefaultFreq = parseFrequencyToken(defaultFreq);
+
   const examplePriceCents =
     selectedProducts.find((p) => p.examplePriceCents != null)
       ?.examplePriceCents ?? EXAMPLE_FALLBACK_CENTS;
@@ -1316,6 +1537,20 @@ function PlanFormModal({
     fd.set("productIds", JSON.stringify(selectedProducts.map((p) => p.id)));
     fd.set("frequencies", freqText);
     fd.set("defaultFrequency", defaultFreq);
+    // Send only real overrides on offered cadences. Deliberately NOT
+    // filtered to currently-detected variants: when the variant lookup
+    // failed (variants:null) the existing overrides must survive the save —
+    // the server runs its own contained membership check against Shopify.
+    fd.set(
+      "variantDefaults",
+      JSON.stringify(
+        Object.fromEntries(
+          Object.entries(variantDefaults).filter(
+            ([, token]) => token !== "" && offeredTokens.has(token),
+          ),
+        ),
+      ),
+    );
     fd.set("allowFrequencyChoice", String(allowChoice));
     fd.set("firstOrderDiscountPct", firstPct);
     fd.set("ongoingDiscountPct", ongoingPct);
@@ -1386,6 +1621,81 @@ function PlanFormModal({
             error={errors.defaultFrequency}
             helpText="Preselected in the buy box — match it to the product's real days-to-empty."
           />
+          {multiVariantProducts.length > 0 ||
+          unknownVariantProducts.length > 0 ? (
+            <BlockStack gap="200">
+              <Text as="h4" variant="headingSm">
+                Default frequency by variant
+              </Text>
+              <Text as="p" tone="subdued" variant="bodySm">
+                Variants are detected automatically from the selected
+                products. Give a variant its own preselected frequency — e.g.
+                a 2-unit pack every 3 months where a single unit runs every 2
+                — and the buy box switches its default whenever the shopper
+                picks that variant. A shopper who already chose a frequency
+                keeps their choice; &ldquo;Plan default&rdquo; uses the
+                default above.
+              </Text>
+              {multiVariantProducts.map((product) => (
+                <BlockStack key={product.id} gap="150">
+                  <Text as="p" variant="bodyMd" fontWeight="medium">
+                    {product.title}
+                  </Text>
+                  <InlineStack gap="300" wrap>
+                    {(product.variants ?? []).map((variant) => {
+                      const current = variantDefaults[variant.id] ?? "";
+                      return (
+                        <Box key={variant.id} minWidth="200px">
+                          <Select
+                            label={variant.title}
+                            options={[
+                              {
+                                label: planDefaultFreq
+                                  ? `Plan default (${frequencyLabelEn(planDefaultFreq)})`
+                                  : "Plan default",
+                                value: "",
+                              },
+                              ...parsedFrequencies.map((f) => ({
+                                label: frequencyLabelEn(f),
+                                value: frequencyToken(f),
+                              })),
+                            ]}
+                            value={offeredTokens.has(current) ? current : ""}
+                            onChange={(value) =>
+                              setVariantDefaults((prev) => {
+                                const next = { ...prev };
+                                if (value === "") {
+                                  delete next[variant.id];
+                                } else {
+                                  next[variant.id] = value;
+                                }
+                                return next;
+                              })
+                            }
+                          />
+                        </Box>
+                      );
+                    })}
+                  </InlineStack>
+                </BlockStack>
+              ))}
+              {unknownVariantProducts.length > 0 ? (
+                <Text as="p" tone="subdued" variant="bodySm">
+                  {`Variants could not be loaded for: ${unknownVariantProducts
+                    .map((p) => p.title)
+                    .join(
+                      ", ",
+                    )}. Any saved per-variant defaults are kept — close and re-open this dialog to retry.`}
+                </Text>
+              ) : null}
+              {errors.variantDefaults ? (
+                <InlineError
+                  message={errors.variantDefaults}
+                  fieldID="variantDefaults"
+                />
+              ) : null}
+            </BlockStack>
+          ) : null}
           <Checkbox
             label="Let customers choose their frequency"
             checked={allowChoice}
@@ -1864,9 +2174,23 @@ export default function PlansPage() {
     >
       <Text as="span">{String(plan.productIds.length)}</Text>
     </Tooltip>,
-    plan.frequencies
-      .map((f) => `${f.count}${f.unit === "WEEK" ? "w" : f.unit === "DAY" ? "d" : "mo"}`)
-      .join(" / "),
+    <BlockStack key={`${plan.id}-freqs`} gap="050">
+      <Text as="span">
+        {plan.frequencies
+          .map(
+            (f) =>
+              `${f.count}${f.unit === "WEEK" ? "w" : f.unit === "DAY" ? "d" : "mo"}`,
+          )
+          .join(" / ")}
+      </Text>
+      {Object.keys(plan.variantDefaults).length > 0 ? (
+        <Text as="span" tone="subdued" variant="bodySm">
+          {`${Object.keys(plan.variantDefaults).length} variant default${
+            Object.keys(plan.variantDefaults).length === 1 ? "" : "s"
+          }`}
+        </Text>
+      ) : null}
+    </BlockStack>,
     `${plan.firstOrderDiscountPct}% → ${plan.ongoingDiscountPct}%`,
     plan.prepaidEnabled ? (
       <Badge key={`${plan.id}-prepaid`} tone="info">

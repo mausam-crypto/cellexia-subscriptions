@@ -328,7 +328,13 @@ describe("plan_groups metafield", () => {
 
     const result = await publishOwnGroupsMetafield("cellexia.myshopify.com");
     expect(result.ok).toBe(true);
-    expect(mocks.setShopMetafield).toHaveBeenCalledTimes(1);
+    // TWO writes since v1.14.0: the allow-list FIRST, then the rides-along
+    // cellexia.variant_defaults presentation metafield (its own suite:
+    // tests/variant-default-frequency.test.ts).
+    expect(mocks.setShopMetafield).toHaveBeenCalledTimes(2);
+    expect(
+      (mocks.setShopMetafield.mock.calls[1][1] as { key: string }).key,
+    ).toBe("variant_defaults");
     const input = mocks.setShopMetafield.mock.calls[0][1] as {
       namespace: string;
       key: string;
@@ -434,7 +440,12 @@ describe("plan_groups metafield", () => {
     });
     const result = await publishOwnGroupsMetafield("cellexia.myshopify.com");
     expect(result.ok).toBe(true);
-    expect(mocks.setShopMetafield).toHaveBeenCalledTimes(1);
+    // The allow-list write plus the rides-along variant_defaults write —
+    // the failed stamp gates NEITHER (it is reported, not thrown).
+    expect(mocks.setShopMetafield).toHaveBeenCalledTimes(2);
+    expect(
+      (mocks.setShopMetafield.mock.calls[0][1] as { key: string }).key,
+    ).toBe("plan_groups");
     expect(result.heal?.failed).toEqual(["gid://shopify/SellingPlanGroup/77"]);
   });
 
@@ -562,7 +573,11 @@ describe("recordSellingPlanSync", () => {
         shopifyPlanIds: [OUR_PLAN, OUR_PLAN_2],
       },
     });
-    expect(mocks.setShopMetafield).toHaveBeenCalledTimes(1);
+    // plan_groups + the rides-along variant_defaults (v1.14.0).
+    expect(mocks.setShopMetafield).toHaveBeenCalledTimes(2);
+    expect(
+      (mocks.setShopMetafield.mock.calls[0][1] as { key: string }).key,
+    ).toBe("plan_groups");
   });
 });
 

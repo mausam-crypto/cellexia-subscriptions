@@ -816,6 +816,7 @@ describe("migration 0003 backfills fail-SAFE and stays additive", () => {
       "0015_multi_unit_frequencies",
       "0016_data_collection_audit",
       "0017_plan_lock_window",
+      "0018_variant_default_frequencies",
     ]);
   });
 });
@@ -1380,6 +1381,42 @@ describe("migration 0017 (plan lock window) stays additive and leaves ownership 
     expect(sql).not.toMatch(/ownership/i);
     // The column's own DEFAULT 0 is the feature-off state; no existing
     // column's default is altered.
+    expect(sql).not.toMatch(/SET DEFAULT/i);
+  });
+});
+
+describe("migration 0018 (variant default frequencies) stays additive and leaves ownership alone", () => {
+  const sql = read(
+    "prisma/migrations/0018_variant_default_frequencies/migration.sql",
+  )
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("is additive only — no destructive verb anywhere in it", () => {
+    for (const verb of [
+      /\bDROP\b/i,
+      /\bTRUNCATE\b/i,
+      /\bDELETE\s+FROM\b/i,
+      /\bUPDATE\s+"/i,
+      /\bRENAME\b/i,
+      /\bALTER\s+TYPE\b/i,
+      /\bALTER\s+COLUMN\s+"\w+"\s+TYPE\b/i,
+    ]) {
+      expect(sql, String(verb)).not.toMatch(verb);
+    }
+  });
+
+  it("adds exactly the one nullable JSONB overrides column — null IS the pre-0018 behavior", () => {
+    const adds = sql.match(/ADD COLUMN [^,;]+/g) ?? [];
+    expect(adds).toHaveLength(1);
+    // Nullable, no default: every pre-upgrade plan simply has no per-variant
+    // overrides, which renders exactly as before (the group default).
+    expect(adds[0]).toMatch(/"variantDefaultFrequencies" JSONB$/);
+  });
+
+  it("never touches the ownership column or any existing default", () => {
+    expect(sql).not.toMatch(/ownership/i);
     expect(sql).not.toMatch(/SET DEFAULT/i);
   });
 });

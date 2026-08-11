@@ -1,0 +1,21 @@
+-- Per-variant default frequency (v1.14.0): products sold as unit-count
+-- variants (1 / 2 / 3 jars) empty at different rates, so the frequency the
+-- buy box PRESELECTS should follow the variant — 2 units defaults to every
+-- 3 months where 1 unit defaults to every 2, for example.
+--
+-- SellingPlanConfig.variantDefaultFrequencies — a JSON map of explicit
+-- overrides only: {"gid://shopify/ProductVariant/…": {"unit":"MONTH",
+-- "count":3}}. A variant absent from the map keeps the group-level
+-- defaultFrequency. Every entry must be one of the plan's offered
+-- frequencies (validated on save, re-filtered at publish). The storefront
+-- reads a projection of this column from the shop metafield
+-- cellexia.variant_defaults (numeric variant ids), republished by every
+-- allow-list publish flow.
+--
+-- ADDITIVE ONLY: one nullable ADD COLUMN — no DROP, no RENAME, no type
+-- change, no UPDATE/DELETE. Pre-upgrade code never reads the column, so a
+-- rollback simply ignores it (the group default applies everywhere), which
+-- is a coherent view.
+
+-- AlterTable
+ALTER TABLE "SellingPlanConfig" ADD COLUMN     "variantDefaultFrequencies" JSONB;

@@ -1238,6 +1238,40 @@
       mode: initialMode()
     };
 
+    /* ── Per-variant default frequency (v1.14.0) ─────────────────────────────
+       The island's per-variant `defaultPlan` (override, else the folded plan
+       default). A variant switch adopts it — but never over the shopper's
+       own explicit cadence pick, which is sticky for the widget's life. */
+    var planExplicit = false;
+
+    /** The variant's default plan id, only if the variant can buy it. */
+    function variantDefaultPlanId(variantId) {
+      var v = data.variants[String(variantId)];
+      if (!v || !v.defaultPlan) {
+        return '';
+      }
+      var dp = String(v.defaultPlan);
+      return v.plans && v.plans[dp] ? dp : '';
+    }
+
+    function maybeAdoptVariantDefault(variantId) {
+      if (planExplicit) {
+        return;
+      }
+      var dp = variantDefaultPlanId(variantId);
+      if (dp && dp !== String(state.planId)) {
+        state.planId = dp;
+        syncFreqControls();
+      }
+    }
+
+    /* The server preselected the default for the variant IT rendered; if the
+       theme's field already points elsewhere at init, adopt THAT variant's
+       default — nothing chosen yet. Before the initial render/apply below. */
+    if (String(state.variantId) !== String(data.initialVariant)) {
+      maybeAdoptVariantDefault(state.variantId);
+    }
+
     function currentVariant() {
       return (
         data.variants[String(state.variantId)] ||
@@ -1757,14 +1791,15 @@
          one-time line (see the applySellingPlan call at the end). */
       var planFellBack = false;
       if (!plan && variant.plans) {
-        /* Selected frequency has no allocation on this variant — fall back to
-           the variant's first available plan so subscription stays offerable.
-           This is reachable from the UI, not just from variant switching: the
-           chips/dropdown list EVERY plan in the group, while a variant only
-           carries the cadences it has an allocation for. */
+        /* Selected frequency has no allocation on this variant — fall back
+           to the variant's default (v1.14.0: the selection is unhonorable
+           either way, and the merchant's default beats allocation order),
+           else its first plan, so subscription stays offerable. Reachable
+           from the UI too: the chips/dropdown list EVERY group plan, while
+           a variant only carries the cadences it has an allocation for. */
         var ids = Object.keys(variant.plans);
         if (ids.length) {
-          state.planId = ids[0];
+          state.planId = variantDefaultPlanId(state.variantId) || ids[0];
           syncFreqControls();
           plan = variant.plans[state.planId];
           planFellBack = true;
@@ -1901,6 +1936,8 @@
         return;
       }
       state.variantId = nextId;
+      /* Before the paint, so render() prices the default it is adopting. */
+      maybeAdoptVariantDefault(nextId);
       render();
       /* Force: some themes rebuild form internals on variant change and drop
          our hidden input's value in the process. */
@@ -1908,6 +1945,8 @@
     }
 
     function onPlanChosen(planId) {
+      /* A real cadence click — variant defaults stop moving the selection. */
+      planExplicit = true;
       state.planId = String(planId);
       if (state.mode !== 'subscription') {
         /* Choosing a delivery frequency implies wanting the subscription. */
@@ -2675,8 +2714,10 @@
       if (unparkUnsynced()) {
         /* Back on a variant the island knows: repaint and re-write
            everything the parked state released — even when it is the very
-           variant the widget froze on. */
+           variant the widget froze on. Same default-adoption rule as the
+           normal switch path. */
         state.variantId = next;
+        maybeAdoptVariantDefault(next);
         render();
         applySellingPlan(true);
         return;

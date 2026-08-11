@@ -94,6 +94,15 @@ model SellingPlanConfig {
   // their next save — consumers fall back to the week columns above.
   frequencies                Json?
   defaultFrequency           Json? // {unit, count}
+  // Per-variant default frequency (v1.14.0): {"gid://shopify/ProductVariant/…":
+  // {unit, count}} — explicit overrides only; a variant absent here uses the
+  // group default above. Each entry must be one of the offered `frequencies`
+  // (validated on save, re-filtered on publish). Published to the storefront
+  // as shop metafield cellexia.variant_defaults keyed by NUMERIC variant id;
+  // the buy box preselects it per variant. No legacy projection: pre-v1.14.0
+  // builds never read this column, so a rollback simply loses the per-variant
+  // behaviour (group default applies), which is coherent.
+  variantDefaultFrequencies  Json?
   allowFrequencyChoice       Boolean  @default(true)
   // Offer architecture — discounts are baked into plan pricing policies (never codes)
   firstOrderDiscountPct      Int      @default(20)

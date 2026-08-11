@@ -978,6 +978,17 @@ export interface MakeContextOptions extends ProductFixtureOptions {
    * is passed through verbatim, so a test can hand it a malformed value.
    */
   planGroups?: unknown;
+  /**
+   * shop.metafields.cellexia.variant_defaults.value — the PRESENTATION
+   * metafield behind the per-variant default frequency (v1.14.0):
+   * `{v:1, byVariant: {"<numeric variant id>": {unit, count}}}`. `undefined`
+   * (the default) = the metafield is ABSENT — every shop that never set a
+   * per-variant default, and the state all pre-v1.14.0 tests render under.
+   * Anything else is passed through verbatim so tests can hand it malformed
+   * values; unlike the allow-list, a bad value here must merely fall back to
+   * the group default, never darken the widget.
+   */
+  variantDefaults?: unknown;
   /** request.locale.iso_code */
   locale?: string;
   /**
@@ -1054,6 +1065,12 @@ export function makeContext(options: MakeContextOptions = {}): RenderContext {
   }
   if (planGroups !== null) {
     cellexiaMetafields.plan_groups = { value: planGroups, type: "json" };
+  }
+  if (options.variantDefaults !== undefined) {
+    cellexiaMetafields.variant_defaults = {
+      value: options.variantDefaults,
+      type: "json",
+    };
   }
 
   const globals: Record<string, unknown> = {
@@ -1255,6 +1272,12 @@ export interface JsonIsland {
       oneTimeCents: number;
       /** v1.6.8 matrix: variant compare-at, formatted; "" when none above the price. */
       compareAt: string;
+      /**
+       * v1.14.0: the plan id this variant's default frequency resolves to
+       * (its cellexia.variant_defaults override, else the folded group
+       * `default`), or "" when neither matches a live plan of our group.
+       */
+      defaultPlan: string | number;
       plans: Record<
         string,
         {

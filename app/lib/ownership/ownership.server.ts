@@ -458,6 +458,14 @@ export interface PublishResult {
    * "ok:true with failed heals" is a dark storefront behind a green line.
    */
   heal?: { stamped: string[]; alreadyStamped: string[]; failed: string[] };
+  /**
+   * The rides-along `cellexia.variant_defaults` publish (v1.14.0 per-variant
+   * default frequency). PRESENTATION, not ownership: its failure never fails
+   * this publish (the widget then preselects the group default), so it is
+   * reported here instead of thrown. Absent when the ownership publish
+   * failed before reaching it.
+   */
+  variantDefaults?: { ok: boolean; error?: string };
 }
 
 /**
@@ -588,7 +596,38 @@ export async function publishOwnGroupsMetafield(
       type: "json",
       value: JSON.stringify(value),
     });
-    return { ok: true, value, heal };
+
+    // Rides-along presentation publish: the per-variant default-frequency
+    // metafield refreshes wherever the allow-list does (sync, delete,
+    // go-live, sweeps), through this one choke point. CONTAINED — its
+    // failure degrades preselection to the group default and must never
+    // taint the ownership publish that just succeeded. Lazy import for the
+    // same module-graph reason as the sellingPlans import above.
+    let variantDefaults: { ok: boolean; error?: string };
+    try {
+      const { publishVariantDefaultsMetafield } = await import(
+        "~/lib/widget/variant-defaults.server"
+      );
+      const published = await publishVariantDefaultsMetafield(
+        adminClient,
+        shop.id,
+      );
+      variantDefaults = published.ok
+        ? { ok: true }
+        : { ok: false, error: published.error };
+    } catch (err) {
+      console.error(
+        "[ownership] variant_defaults rides-along publish failed",
+        shopDomain,
+        err,
+      );
+      variantDefaults = {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+
+    return { ok: true, value, heal, variantDefaults };
   } catch (err) {
     console.error(
       "[ownership] plan_groups metafield publish failed",

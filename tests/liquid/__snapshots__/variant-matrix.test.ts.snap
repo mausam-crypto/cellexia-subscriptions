@@ -42,7 +42,8 @@ exports[`byte-golden island snapshots (jar fixture) > classic (zero-config), thr
 "pd": "CHF 51.20",
 "freq": "8 weeks",
 "savePct": "20%"
-}}
+}},
+"defaultPlan": ""
 },"4411100011202": {
 "available": true,
 "oneTime": "CHF 108.80",
@@ -78,7 +79,8 @@ exports[`byte-golden island snapshots (jar fixture) > classic (zero-config), thr
 "pd": "CHF 87.04",
 "freq": "8 weeks",
 "savePct": "20%"
-}}
+}},
+"defaultPlan": ""
 },"4411100011203": {
 "available": false,
 "oneTime": "CHF 153.60",
@@ -114,7 +116,8 @@ exports[`byte-golden island snapshots (jar fixture) > classic (zero-config), thr
 "pd": "CHF 122.88",
 "freq": "8 weeks",
 "savePct": "20%"
-}}
+}},
+"defaultPlan": ""
 }}
 }
 "
@@ -162,7 +165,8 @@ exports[`byte-golden island snapshots (jar fixture) > subscription_max (the merc
 "pd": "CHF 51.20",
 "freq": "8 weeks",
 "savePct": "20%"
-}}
+}},
+"defaultPlan": ""
 },"4411100011202": {
 "available": true,
 "oneTime": "CHF 108.80",
@@ -198,7 +202,8 @@ exports[`byte-golden island snapshots (jar fixture) > subscription_max (the merc
 "pd": "CHF 87.04",
 "freq": "8 weeks",
 "savePct": "20%"
-}}
+}},
+"defaultPlan": ""
 },"4411100011203": {
 "available": false,
 "oneTime": "CHF 153.60",
@@ -234,7 +239,8 @@ exports[`byte-golden island snapshots (jar fixture) > subscription_max (the merc
 "pd": "CHF 122.88",
 "freq": "8 weeks",
 "savePct": "20%"
-}}
+}},
+"defaultPlan": ""
 }}
 }
 "

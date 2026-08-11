@@ -433,6 +433,17 @@ export async function goLive(
       shifted,
       wentLiveAt: now.toISOString(),
       planGroupsMetafield: planGroupsOutcome(),
+      // The rides-along cellexia.variant_defaults publish (v1.14.0):
+      // presentation-only, so a failure never blocks go-live — but a
+      // merchant who configured per-variant default frequencies deserves an
+      // audit line saying the storefront never received them.
+      variantDefaultsMetafield: !planGroupsSync.ok
+        ? "not reached (allow-list publish failed)"
+        : planGroupsSync.variantDefaults == null
+          ? "not reached"
+          : planGroupsSync.variantDefaults.ok
+            ? "published"
+            : `failed: ${planGroupsSync.variantDefaults.error ?? "unknown error"} — the buy box preselects the group default until a plan re-sync succeeds`,
       ownershipReclassified: ownership
         ? {
             scanned: ownership.scanned,

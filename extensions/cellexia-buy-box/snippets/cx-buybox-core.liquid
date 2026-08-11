@@ -121,6 +121,43 @@ assign cx_variant = product.selected_or_first_available_variant
 if cx_variant == blank
 assign cx_variant = product.variants | first
 endif
+# Per-variant default (v1.14.0): cellexia.variant_defaults maps NUMERIC variant ids to {unit,count}, plus a group-level "default" folded in for variants WITHOUT an override (the revert target — it also makes the admin "Default frequency" setting effective here, above the block's text handle). A matching non-prepay plan of OUR group beats the recommended pick for the first paint (cx_rec_plan_id keeps the planner tag). PRESENTATION only — never decides what renders. Parse mirrors the island: unit word + first numeric token.
+assign cx_vdef = shop.metafields.cellexia.variant_defaults.value
+if cx_vdef and cx_vdef.byVariant
+assign cx_vd_key = cx_variant.id | append: ''
+assign cx_vd = cx_vdef.byVariant[cx_vd_key]
+unless cx_vd
+assign cx_vd = cx_vdef.default
+endunless
+if cx_vd and cx_vd.count and cx_vd.unit
+assign cx_vd_unit = cx_vd.unit | downcase
+assign cx_vd_count = cx_vd.count | plus: 0
+if cx_vd_unit == 'day' or cx_vd_unit == 'week' or cx_vd_unit == 'month'
+for p in cx_group.selling_plans
+assign p_src = p.options | map: 'value' | join: ' ' | append: ' ' | append: p.name | downcase
+if p_src contains 'prepay'
+continue
+endif
+unless p_src contains cx_vd_unit
+continue
+endunless
+assign p_n = 0
+assign p_toks = p_src | split: ' '
+for p_tok in p_toks
+assign p_cand = p_tok | plus: 0
+if p_cand > 0
+assign p_n = p_cand
+break
+endif
+endfor
+if p_n == cx_vd_count
+assign cx_selected_plan = p
+break
+endif
+endfor
+endif
+endif
+endif
 # Allocation for current variant + selected plan (with fallback)
 assign cx_alloc = false
 for a in cx_variant.selling_plan_allocations
@@ -1052,6 +1089,27 @@ data-cellexia-selling-plan
 {%- if v.compare_at_price != blank and v.compare_at_price > v.price -%}
 {%- assign v_compare_raw = v.compare_at_price | money | strip_html | replace: '&nbsp;', ' ' | replace: '&pound;', '£' | replace: '&euro;', '€' | replace: '&yen;', '¥' | replace: '&cent;', '¢' | replace: '&lt;', '<' | replace: '&gt;', '>' | replace: '&quot;', '"' | replace: '&#39;', "'" | replace: '&amp;', '&' -%}
 {%- endif -%}
+{%- liquid
+# v1.14.0 per-variant default: resolved against THIS variant's allocations below (v_dp = the matching plan id, '' when none); group "default" folded in when the variant has no override, so JS reverts to the plan default on switch; JS adopts it unless the shopper chose a cadence.
+assign v_dp = ''
+assign v_vd = false
+if cx_vdef and cx_vdef.byVariant
+assign v_vdk = v.id | append: ''
+assign v_vd = cx_vdef.byVariant[v_vdk]
+unless v_vd
+assign v_vd = cx_vdef.default
+endunless
+if v_vd and v_vd.count and v_vd.unit
+assign v_vd_unit = v_vd.unit | downcase
+assign v_vd_count = v_vd.count | plus: 0
+unless v_vd_unit == 'day' or v_vd_unit == 'week' or v_vd_unit == 'month'
+assign v_vd = false
+endunless
+else
+assign v_vd = false
+endif
+endif
+-%}
 "{{ v.id }}": {
 "available": {% if v.available %}true{% else %}false{% endif %},
 "oneTime": {{ v_onetime_raw | json }},
@@ -1096,6 +1154,12 @@ assign a_n = a_cand
 break
 endif
 endfor
+endif
+# v1.14.0: does THIS allocation match the variant's default {unit,count}? a_n > 0 already excludes prepay (a_noun stayed '' there).
+if v_vd and a_n > 0 and a_n == v_vd_count
+if a_src contains v_vd_unit
+assign v_dp = a.selling_plan.id
+endif
 endif
 if a_n == 1
 assign a_noun = a_noun1
@@ -1184,7 +1248,8 @@ assign a_first_raw = a.price | money | strip_html | replace: '&nbsp;', ' ' | re
 }
 {%- endif -%}
 {%- endfor -%}
-}
+},
+"defaultPlan": {{ v_dp | json }}
 }{%- unless forloop.last -%},{%- endunless -%}
 {%- endfor -%}
 }
