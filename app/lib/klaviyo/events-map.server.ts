@@ -70,17 +70,32 @@ const LINK_BUNDLE_TYPES = new Set([
 ]);
 
 /**
- * Every enqueued event carries this property as the string "true"/"false"
+ * Enqueued events MAY carry this property as the string "true"/"false"
  * (v1.18.0). The auto-created Klaviyo flows (guided setup,
- * app/lib/klaviyo/flows.server.ts) trigger-filter on it, and its meaning is
- * STRICT: "true" = this event carries the app-rendered email
- * (content_subject + content_html) and deserves delivery. Everything else
- * is "false" — canonical state-change events whose metric the router also
- * enqueues with content (the router leg is the delivery vehicle), SMS
- * enqueues (content_text only — an email flow would render blank),
- * confirmation moments that are system-initiated / disabled / app-sent,
- * and setup SEED events (which is what makes metric seeding safe even with
- * every flow live). Flows without the filter behave exactly as before.
+ * app/lib/klaviyo/flows.server.ts) trigger-filter on `equals "true"`, and
+ * the property's meaning is STRICT — when present, it is a VERDICT:
+ *  - "true"  = this event carries the app-rendered email (content_subject
+ *              + content_html) and deserves delivery — the router's EMAIL
+ *              enqueues, and person-initiated + enabled + non-app-sent
+ *              confirmation events;
+ *  - "false" = this event must never trigger the email flow — gated
+ *              confirmation moments (merge-cancels, system transitions,
+ *              disabled/app-sent templates), SMS enqueues (content_text
+ *              only — an email flow would render blank), and setup SEED
+ *              events (which is what makes metric seeding safe even with
+ *              every flow live).
+ *
+ * ABSENT = "no opinion": canonical non-confirmation events (contract
+ * lifecycle, billing.attempt_failed, winback.*, …) deliberately do NOT
+ * stamp the property — several share a metric with a router template, and
+ * the router's content-carrying leg supersedes them via the outbox dedupe
+ * graft. Absent fails the flows' `equals "true"` filter exactly like
+ * "false", so delivery behavior is identical — but the outbox merge rule
+ * can now tell a superseder-expected default (absent) from an explicit
+ * verdict (present) and will never freeze a dual-writer metric's flag at
+ * "false" after content arrived (the v1.18.0 pre-release defect: milestone
+ * / rewards / hard-decline payment-failed emails silently never sending).
+ * Flows without the filter behave exactly as before.
  */
 export const CELLEXIA_SEND_PROPERTY = "cellexia_send";
 
@@ -353,19 +368,25 @@ export async function enqueueKlaviyoForEvent(
       profileAttrs.cellexia_dunning_open = false;
     }
 
-    // ── cellexia_send + confirmation content (v1.18.0) ──────────────────────
-    // DEFAULT FALSE: canonical events are for segments/analytics; delivery
-    // rides the notifications router's enqueue, which carries the rendered
-    // content and stamps "true" itself. Several canonical types share a
-    // metric with router templates (billing.attempt_failed → "Cellexia
-    // Payment Failed", winback.*, lifecycle.*, …) and land OUTSIDE the
-    // 120s dedupe window on ladder days — a "true" here would make the
-    // auto-created flow send a blank email. Only confirmation moments earn
-    // "true", and only when: person-initiated (the SAME provenance gate the
-    // app-sent bridge uses, with the contract mirror as fallback for
-    // webhook-diff twins that carry no cancelSource), enabled in-app, NOT
-    // app-sent (the bridge owns delivery then — one email, never two), and
-    // the content actually rendered.
+    // ── cellexia_send verdict + confirmation content (v1.18.0) ─────────────
+    // Canonical NON-confirmation events stamp NOTHING (absent = "no
+    // opinion"): they exist for segments/analytics, and delivery rides the
+    // notifications router's enqueue, which carries the rendered content
+    // and stamps its own "true". Several canonical types share a metric
+    // with router templates (billing.attempt_failed → "Cellexia Payment
+    // Failed", lifecycle.*, winback.*, …); when the two legs collide inside
+    // the 120s dedupe window the graft supersedes the flag on the surviving
+    // row, and an ABSENT default is what makes that supersession safe —
+    // stamping "false" here once froze dual-writer metrics silent forever
+    // (the pre-release defect). Outside the window the canonical leg
+    // simply fails the flows' `equals "true"` filter, same as before.
+    //
+    // Confirmation moments DO get an explicit verdict — "true" only when:
+    // person-initiated (the SAME provenance gate the app-sent bridge uses,
+    // with the contract mirror as fallback for webhook-diff twins that
+    // carry no cancelSource), enabled in-app, NOT app-sent (the bridge
+    // owns delivery then — one email, never two), and the content actually
+    // rendered. A verdict, once written, is protected from graft flips.
     let cellexiaSend = false;
     let confirmationTemplate: string | null = null;
     try {
@@ -464,7 +485,11 @@ export async function enqueueKlaviyoForEvent(
       }
     }
 
-    properties[CELLEXIA_SEND_PROPERTY] = cellexiaSend ? "true" : "false";
+    // Verdicts only — non-confirmation canonical events stay unstamped
+    // (see the property's contract above).
+    if (confirmationTemplate) {
+      properties[CELLEXIA_SEND_PROPERTY] = cellexiaSend ? "true" : "false";
+    }
 
     await enqueue(event.shopId, {
       eventName: metric,

@@ -122,10 +122,14 @@ const customerSkip: LogEventInput = {
 };
 
 describe("non-confirmation events", () => {
-  it("canonical events carry cellexia_send 'false' — delivery rides the router's content-carrying enqueue", async () => {
+  it("canonical events carry NO cellexia_send — absent means 'no opinion', superseded by the router's graft", async () => {
     // billing.attempt_failed shares the "Cellexia Payment Failed" metric
-    // with the router's payment_failed_1/2/3; a "true" here without content
-    // would make an auto-created flow send a BLANK email on ladder days.
+    // with the router's payment_failed_1/2/3. A "true" here without content
+    // would make an auto-created flow send a BLANK email on ladder days —
+    // and a stamped "false" once FROZE the flag through the dedupe graft
+    // (the pre-release defect that silently killed milestone / rewards /
+    // hard-decline payment-failed flow sends). Absent fails the flows'
+    // `equals "true"` filter identically, and lets the graft supersede.
     await enqueueKlaviyoForEvent({
       shopId: "shop_1",
       contractId: "cm_contract_1",
@@ -134,7 +138,7 @@ describe("non-confirmation events", () => {
       payload: { amountCents: 4999 },
     });
     const properties = enqueuedProperties();
-    expect(properties[CELLEXIA_SEND_PROPERTY]).toBe("false");
+    expect(properties[CELLEXIA_SEND_PROPERTY]).toBeUndefined();
     expect(properties.content_html).toBeUndefined();
   });
 });

@@ -354,17 +354,10 @@ describe("sendNotification — per-template controls (v1.16.0)", () => {
     // enqueue entirely, and a flow built as {{ event.content_html }} would
     // render empty (deterministic for milestone_gift / rewards_unlocked /
     // gift_announcement / webhook-path payment_failed_1).
-    // events-map.server.ts stamps cellexia_send:"false" on every canonical
-    // row unconditionally (never omits it) — the fixture mirrors that real
-    // shape rather than a row that happens to lack the property.
     mocks.dedupeHit = {
       id: "obx_prior",
       status: "PENDING",
-      properties: {
-        event_type: "lifecycle.milestone_reached",
-        contract_id: "ctr_1",
-        cellexia_send: "false",
-      },
+      properties: { event_type: "lifecycle.milestone_reached", contract_id: "ctr_1" },
     };
     const result = await sendNotification({
       shopId: "shop_1",
@@ -377,30 +370,28 @@ describe("sendNotification — per-template controls (v1.16.0)", () => {
     const grafted = mocks.dedupeHit.properties as Row;
     expect(typeof grafted.content_html).toBe("string");
     expect(typeof grafted.content_subject).toBe("string");
-    // The flow-filter verdict rides the graft too (v1.18.0): the prior row
-    // was contentless, so its "false" was never a finalized verdict — the
-    // first content-bearing duplicate legitimately supersedes it. Without
-    // this an auto-created flow would stay silent on the surviving row.
+    // The flow-filter verdict rides the graft too (v1.18.0) — without it an
+    // auto-created flow would stay silent on the surviving row.
     expect(grafted.cellexia_send).toBe("true");
     // Existing event properties survive the graft.
     expect(grafted.event_type).toBe("lifecycle.milestone_reached");
   });
 
-  it("a row that already has content keeps its verdict — no re-graft once finalized", async () => {
-    // Once a row has been finalized with real content, its verdict is
-    // trustworthy and must never move again — e.g. a provenance-gated
-    // "false" twin (a merge-cancel's webhook echo) that already rendered
-    // must keep its verdict even if a later duplicate lands for the same
-    // metric+contract; flipping it would email a customer who never acted.
+  it("the graft SUPERSEDES a dual-writer default flag once content arrives — the flag never freezes at 'false'", async () => {
+    // THE pre-release defect: the canonical lifecycle.milestone_reached leg
+    // landed first stamped with the old default "false"; the router's
+    // content-carrying leg grafted content but an add-only guard froze the
+    // flag — milestone / rewards / hard-decline payment-failed emails then
+    // silently never fired their auto-created flows, while NotificationLog
+    // said SENT. A non-confirmation row's flag is a superseder-expected
+    // default, never a verdict: the graft must flip it with the content.
     mocks.dedupeHit = {
       id: "obx_prior",
       status: "PENDING",
       properties: {
         event_type: "lifecycle.milestone_reached",
         contract_id: "ctr_1",
-        cellexia_send: "false",
-        content_html: "<p>original</p>",
-        content_text: "original",
+        cellexia_send: "false", // legacy default (pre-fix rows still PENDING)
       },
     };
     await sendNotification({
@@ -410,8 +401,8 @@ describe("sendNotification — per-template controls (v1.16.0)", () => {
       vars: { cycleIndex: 6 },
     });
     const grafted = mocks.dedupeHit.properties as Row;
-    expect(grafted.content_html).toBe("<p>original</p>"); // untouched
-    expect(grafted.cellexia_send).toBe("false"); // untouched
+    expect(typeof grafted.content_html).toBe("string");
+    expect(grafted.cellexia_send).toBe("true"); // superseded WITH the content
   });
 
   it("SMS templates carry content_text but no subject/html", async () => {

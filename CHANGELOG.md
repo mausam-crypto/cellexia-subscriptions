@@ -4,6 +4,37 @@ All notable changes to Cellexia Subscriptions. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [SemVer](https://semver.org) as contracted in [docs/UPDATE.md](docs/UPDATE.md).
 
+## [1.18.1] — 2026-08-12
+
+**Patch release** — one bug fix on the v1.18.0 guided Klaviyo delivery.
+No migration, no new env vars, no scope/webhook/theme changes,
+`npm run deploy` NOT required. Rows already queued in the outbox by
+v1.18.0 code self-heal (the merge rule recognizes and supersedes their
+legacy default flag).
+
+### Fixed
+
+- **`cellexia_send` freeze on dual-writer metrics (root-cause fix).** The
+  flag had two writers whose "false" was byte-identical: canonical events
+  (milestone/rewards/gift/webhook-path payment-failed share a metric with a
+  router template) wrote a *default* the router's content-carrying leg was
+  expected to supersede via the outbox dedupe graft, while confirmation
+  events wrote a *verdict* (merge-cancels etc.) the graft must never flip.
+  The graft's add-only guard could not tell them apart and froze the
+  default at "false" on the metrics where the canonical leg
+  deterministically lands first — those emails' auto-created Klaviyo flows
+  then silently never fired while NotificationLog said SENT. Fix in two
+  layers: canonical non-confirmation events no longer stamp the flag at all
+  (ABSENT = "no opinion" — identical behavior under the flows'
+  `equals "true"` filter, but unambiguous data), and the graft guard now
+  keys on the surviving row's own `event_type` (verdict = confirmation
+  event), which also heals legacy default-stamped rows still PENDING across
+  an upgrade. Merge-cancel verdict protection re-verified.
+  `tests/outbox-graft-verdict.test.ts` pins the full dual-writer matrix —
+  every affected metric, both twin orders, legacy rows included.
+  (Equivalent hot fix shipped independently by the merchant's developer;
+  this lands the writer-level root-cause fix and the regression matrix.)
+
 ## [1.18.0] — 2026-08-11
 
 **Guided Klaviyo delivery** — "send every email through Klaviyo" becomes a

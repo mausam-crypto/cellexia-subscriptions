@@ -117,23 +117,22 @@ export async function enqueue(
         // empty. Graft the content keys onto the surviving row while it has
         // not been flushed yet; content-less duplicates (the common case)
         // change nothing. Failure-contained like the rest of this function.
-        // cellexia_send rides along (v1.18.0): the auto-created flows
-        // trigger-filter on it, so a content graft that left the surviving
-        // row without the "true" verdict would render the flow silent.
-        // Both writers (events-map.server.ts, send.server.ts) always stamp
-        // cellexia_send atomically WITH its content — "true" never appears
-        // without content, "false" never appears with it. So a row's
-        // verdict is only trustworthy (and worth protecting) once that row
-        // has actually received content: the add-only guard below is keyed
-        // on `existing.content_text`, not on whether a verdict string is
-        // merely present. A surviving row that is still contentless (e.g.
-        // the canonical event-map's default "false" for milestone_gift /
-        // rewards_unlocked / a hard-decline payment_failed_1, which never
-        // gets content of its own) has no finalized verdict yet, so the
-        // first content-bearing duplicate — router or canonical — legitimately
-        // supersedes it, verdict included. Once a row has real content, its
-        // verdict IS protected (e.g. a merge-cancel twin's provenance-gated
-        // "false" can never be flipped to "true" after the fact).
+        //
+        // cellexia_send rides along (v1.18.0), and its merge rule is the
+        // subtle one — the flag has TWO writers with different intent:
+        //  - on CONFIRMATION events it is a provenance VERDICT ("this
+        //    moment must never be emailed" — merge-cancels, system
+        //    transitions) that a later graft must NEVER flip;
+        //  - on everything else it is at most a default that the router's
+        //    content-carrying leg is EXPECTED to supersede (canonical
+        //    dual-writer metrics: milestone, rewards, gift, webhook-path
+        //    payment-failed). Freezing that default once silently killed
+        //    those emails' flows forever (pre-release defect).
+        // The two are distinguished by the surviving row's own event_type:
+        // only a confirmation-event row's flag is a verdict. Keying on
+        // event_type (not flag presence) also heals rows written by older
+        // code that stamped the ambiguous default "false" and are still
+        // PENDING across an upgrade.
         const CONTENT_KEYS = [
           "content_subject",
           "content_html",
@@ -154,9 +153,19 @@ export async function enqueue(
           duplicate.status === "PENDING" &&
           typeof existing.content_text !== "string"
         ) {
+          const { CONFIRMATION_TEMPLATE_BY_EVENT } = await import(
+            "~/lib/notifications/confirmations.server"
+          );
+          const existingFlagIsVerdict =
+            typeof existing.cellexia_send === "string" &&
+            typeof existing.event_type === "string" &&
+            existing.event_type in CONFIRMATION_TEMPLATE_BY_EVENT;
           const graft: Record<string, unknown> = {};
           for (const k of CONTENT_KEYS) {
             if (typeof incoming[k] !== "string") continue;
+            if (k === "cellexia_send" && existingFlagIsVerdict) {
+              continue; // a verdict is final — never flipped by a graft
+            }
             graft[k] = incoming[k];
           }
           await prisma.klaviyoOutbox.update({
