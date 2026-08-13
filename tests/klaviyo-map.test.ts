@@ -125,6 +125,12 @@ describe("metricForEventType (pure map)", () => {
     expect(metricForEventType("shop.installed")).toBeUndefined();
   });
 
+  it('survey.answered maps to "Cellexia Survey Answered" (v1.21.0 — analytics metric, no flow template, no cellexia_send stamp)', () => {
+    expect(metricForEventType("survey.answered")).toBe(
+      "Cellexia Survey Answered",
+    );
+  });
+
   it("core lifecycle types are mapped to Cellexia-prefixed metrics", () => {
     expect(metricForEventType("contract.cancelled")).toBe(
       "Cellexia Subscription Cancelled",

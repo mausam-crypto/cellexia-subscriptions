@@ -4,6 +4,7 @@ import { z } from "zod";
 import prisma from "~/db.server";
 import { t } from "~/lib/i18n/i18n.server";
 import { formatShopDate } from "~/lib/dates.server";
+import { getSetting } from "~/lib/settings/settings.server";
 import { logEvent } from "~/lib/events/log.server";
 import { sha256 } from "~/lib/crypto/tokens.server";
 import { getPrimaryShop } from "~/lib/shop/install.server";
@@ -348,11 +349,25 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       : null;
     if (lock?.locked && lock.until) {
       await auditInboundSms({ contract, phone, keyword, outcome: "locked" });
+      // Friendly variant (v1.19.0, portal.friendlyLockMessaging): the reply
+      // frames the date as when skips UNLOCK and names what stays possible,
+      // instead of the bare refusal. Failure-contained settings read —
+      // classic copy on any problem.
+      const date = formatShopDate(lock.until, contract.ianaTimezone, locale);
+      let friendly = false;
+      try {
+        friendly = (await getSetting(contract.shopId, "portal"))
+          .friendlyLockMessaging;
+      } catch {
+        friendly = false;
+      }
       return json({
         ok: false,
-        message: t(locale, "magic.sms.locked", {
-          date: formatShopDate(lock.until, contract.ianaTimezone, locale),
-        }),
+        message: t(
+          locale,
+          friendly ? "magic.sms.locked_friendly" : "magic.sms.locked",
+          { date },
+        ),
       });
     }
   }

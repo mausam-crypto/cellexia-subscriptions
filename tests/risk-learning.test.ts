@@ -47,6 +47,10 @@ const mocks = vi.hoisted(() => {
     ),
     eventFindMany: vi.fn(async (_a?: unknown): Promise<unknown[]> => []),
     dunningCaseFindMany: vi.fn(async (_a?: unknown): Promise<unknown[]> => []),
+    // Post-purchase survey rows (v1.21.0): both scorers read linked surveys;
+    // empty = a pre-survey book, which must score byte-identically to
+    // pre-v1.21.0 behavior (pinned in survey-risk-features.test.ts).
+    surveyResponseFindMany: vi.fn(async (_a?: unknown): Promise<unknown[]> => []),
     jobRunFindFirst: vi.fn(async (): Promise<unknown> => null),
     // Predicted-empty-date plumbing (FR-5): anchor groupBy, windowed success
     // list for observed gaps, cadence rows, chunked update transactions.
@@ -91,6 +95,7 @@ vi.mock("~/db.server", () => ({
     },
     subscriberEvent: { findMany: mocks.eventFindMany },
     dunningCase: { findMany: mocks.dunningCaseFindMany },
+    surveyResponse: { findMany: mocks.surveyResponseFindMany },
     billingAttempt: {
       groupBy: mocks.billingAttemptGroupBy,
       findMany: mocks.billingAttemptFindMany,

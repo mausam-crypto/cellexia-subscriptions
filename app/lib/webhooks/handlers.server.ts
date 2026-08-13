@@ -507,6 +507,39 @@ async function handleSubscriptionContractsCreate({
   } catch (err) {
     console.error("[webhooks] acquisition enrichment failed", contract.id, err);
   }
+
+  // Post-purchase survey link: the thank-you page may already have written a
+  // SurveyResponse for this contract's origin order (survey rows are keyed by
+  // order because either side can win the race). Same containment rule as
+  // acquisition: the survey never fails a webhook.
+  try {
+    await linkSurveyOnContractCreate(shop.id, contract.id);
+  } catch (err) {
+    console.error("[webhooks] survey link failed", contract.id, err);
+  }
+}
+
+/**
+ * Shared by the CREATE handler, the UPDATE catch-up branch (a lost create
+ * webhook's catch-up IS the contract's create moment — the acquisition rule)
+ * and nothing else: the daily survey_link_sweep covers every other path.
+ * Ownership/demo gating lives in the survey service's contract lookup.
+ */
+async function linkSurveyOnContractCreate(
+  shopId: string,
+  contractId: string,
+): Promise<void> {
+  const contract = await prisma.subscriptionContract.findUnique({
+    where: { id: contractId },
+  });
+  if (!contract?.originOrderId || contract.isDemo) return;
+  if (!isBillableOwnership(contract.ownership)) return;
+  const row = await prisma.surveyResponse.findUnique({
+    where: { orderId: contract.originOrderId },
+  });
+  if (!row || row.contractId) return;
+  const { linkSurveyForContract } = await import("~/lib/survey/service.server");
+  await linkSurveyForContract(row, contract);
 }
 
 /**
@@ -577,6 +610,13 @@ async function handleSubscriptionContractsUpdate({
         after.id,
         err,
       );
+    }
+    // Same reasoning for the survey link (create-moment side effects must be
+    // mirrored in the catch-up branch — see linkSurveyOnContractCreate).
+    try {
+      await linkSurveyOnContractCreate(shop.id, after.id);
+    } catch (err) {
+      console.error("[webhooks] catch-up survey link failed", after.id, err);
     }
     return;
   }

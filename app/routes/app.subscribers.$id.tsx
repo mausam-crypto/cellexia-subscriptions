@@ -36,6 +36,11 @@ import {
 import { shopDayStartUtc } from "~/lib/dates.server";
 import { resolveLockState } from "~/lib/contracts/lock.server";
 import {
+  LTGP_PREDICTION_HORIZONS,
+  parsePredictedLtgp,
+} from "~/lib/analytics/predicted-ltgp.server";
+import { sanitizeSurveyAnswers } from "~/lib/survey/shared";
+import {
   approxWeeks,
   contractFrequency,
   frequencyLabelEn,
@@ -199,6 +204,12 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
 
   const events = await contractTimeline(contract.id, 200);
 
+  // Post-purchase survey (v1.21.0): one row per contract when the thank-you
+  // page survey was shown for its origin order. Read-only surface here.
+  const surveyRow = await prisma.surveyResponse.findFirst({
+    where: { contractId: contract.id },
+  });
+
   // The engine's vocabulary, not a local copy — what this loader shows as
   // "the open case" must be exactly what the action's guarded transitions
   // will accept.
@@ -289,6 +300,37 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
             )
           : null,
     },
+    // Post-purchase survey card (v1.21.0). Null = never shown (order predates
+    // the survey, or the shopper never saw the thank-you block).
+    survey: surveyRow
+      ? {
+          answers: sanitizeSurveyAnswers(surveyRow.answers),
+          shownAt: surveyRow.shownAt.toISOString(),
+          answeredAt: surveyRow.answeredAt?.toISOString() ?? null,
+          completedAt: surveyRow.completedAt?.toISOString() ?? null,
+          source: surveyRow.source,
+          questionSetVersion: surveyRow.questionSetVersion,
+          holdout: contract.surveyHoldout === true,
+        }
+      : null,
+    // Predicted value card (v1.21.0): the nightly predicted-LTGP output,
+    // parsed defensively — null renders the honest "not scored yet" copy.
+    predictedValue: (() => {
+      const parsed = parsePredictedLtgp(contract.predictedLtgp);
+      if (!parsed) return null;
+      return {
+        computedAt: contract.predictedLtgpAt?.toISOString() ?? parsed.computedAt,
+        riskTilt: parsed.riskTilt,
+        estimatedCosts: parsed.basis.estimatedCosts,
+        horizons: LTGP_PREDICTION_HORIZONS.map(({ key, label }) => ({
+          key,
+          label,
+          amount: formatMoney(parsed.horizons[key].cents, currency),
+          grade: parsed.horizons[key].grade,
+          expectedCycles: parsed.horizons[key].expectedCycles,
+        })),
+      };
+    })(),
     address,
     lines: contract.lines.map((l) => ({
       id: l.id,
@@ -1172,6 +1214,59 @@ function timeAgo(iso: string): string {
   if (days < 60) return `${days}d ago`;
   return formatDate(iso);
 }
+
+/**
+ * Admin-facing labels for the survey card. Keys mirror the frozen instrument
+ * (app/lib/survey/shared.ts); an unknown stored key renders as itself rather
+ * than crashing the card (forward compatibility across instrument versions).
+ */
+const SURVEY_CARD_ROWS: Array<{
+  key: "plannedDuration" | "motive" | "expectedSpeed" | "routine";
+  label: string;
+  options: Record<string, string>;
+}> = [
+  {
+    key: "plannedDuration",
+    label: "Planned duration",
+    options: {
+      trying: "Trying it out",
+      few_months: "A few months",
+      six_months_plus: "Six months or more",
+      permanent: "Permanent part of routine",
+    },
+  },
+  {
+    key: "motive",
+    label: "Motive",
+    options: {
+      fast_wrinkles: "Fast wrinkle reduction",
+      prevention: "Long-term prevention",
+      daily_care: "Daily care",
+      occasion: "Upcoming occasion",
+    },
+  },
+  {
+    key: "expectedSpeed",
+    label: "Expected results",
+    options: {
+      days: "Within days",
+      weeks: "Within weeks",
+      one_two_months: "In 1–2 months",
+      three_months_plus: "3+ months",
+      not_sure: "Not sure",
+    },
+  },
+  {
+    key: "routine",
+    label: "Current routine",
+    options: {
+      full: "Full routine (AM+PM)",
+      most_days: "A few products, most days",
+      on_off: "On and off",
+      minimal: "Minimal",
+    },
+  },
+];
 
 /** "browse-to-buy" latency for the Acquisition card: 90s → "2m", 2d → "2 days". */
 function humanizeSeconds(seconds: number): string {
@@ -2069,6 +2164,113 @@ export default function SubscriberDetailPage() {
                             : ""}
                         </Text>
                       ) : null}
+                    </BlockStack>
+                  )}
+                </BlockStack>
+              </Card>
+
+              {/* Post-purchase survey (v1.21.0) */}
+              <Card>
+                <BlockStack gap="300">
+                  <Text as="h2" variant="headingMd">
+                    Survey
+                  </Text>
+                  {data.survey == null ? (
+                    <Text as="p" tone="subdued">
+                      No post-purchase survey for this subscription. It is
+                      shown on the order confirmation page of new subscription
+                      orders; older contracts predate it.
+                    </Text>
+                  ) : data.survey.answeredAt == null ? (
+                    <Text as="p" tone="subdued">
+                      Shown on the confirmation page but not answered —
+                      skipping the survey is itself a churn signal the risk
+                      score already reflects.
+                    </Text>
+                  ) : (
+                    <BlockStack gap="150">
+                      {SURVEY_CARD_ROWS.map(({ key, label, options }) => {
+                        const answer = data.survey?.answers?.[key];
+                        return (
+                          <Text as="p" variant="bodySm" key={key}>
+                            <Text as="span" fontWeight="semibold">
+                              {label}:
+                            </Text>{" "}
+                            {answer ? (options[answer] ?? answer) : "—"}
+                          </Text>
+                        );
+                      })}
+                      {!data.survey.completedAt ? (
+                        <Text as="p" variant="bodySm" tone="subdued">
+                          Partially answered — missing answers are shown as —.
+                        </Text>
+                      ) : null}
+                      {data.survey.holdout ? (
+                        <InlineStack gap="200">
+                          <Badge tone="attention">Holdout</Badge>
+                          <Text as="p" variant="bodySm" tone="subdued">
+                            Excluded from survey-triggered flows (untreated
+                            comparison group).
+                          </Text>
+                        </InlineStack>
+                      ) : null}
+                    </BlockStack>
+                  )}
+                </BlockStack>
+              </Card>
+
+              {/* Predicted value (v1.21.0) */}
+              <Card>
+                <BlockStack gap="300">
+                  <Text as="h2" variant="headingMd">
+                    Predicted value
+                  </Text>
+                  {data.predictedValue == null ? (
+                    <Text as="p" tone="subdued">
+                      Not scored yet. Predicted lifetime gross profit is
+                      computed nightly for active subscriptions once the
+                      analytics jobs have run.
+                    </Text>
+                  ) : (
+                    <BlockStack gap="150">
+                      {data.predictedValue.horizons.map((h) => (
+                        <InlineStack
+                          key={h.key}
+                          align="space-between"
+                          blockAlign="center"
+                        >
+                          <Text as="p" variant="bodySm">
+                            <Text as="span" fontWeight="semibold">
+                              {h.label}:
+                            </Text>{" "}
+                            {h.amount}
+                          </Text>
+                          <Badge
+                            tone={
+                              h.grade === "A" || h.grade === "B"
+                                ? "success"
+                                : h.grade === "C"
+                                  ? "attention"
+                                  : "warning"
+                            }
+                          >
+                            {`Grade ${h.grade}`}
+                          </Badge>
+                        </InlineStack>
+                      ))}
+                      <Text as="p" variant="bodySm" tone="subdued">
+                        Expected cumulative gross profit from subscription
+                        start, given the store&apos;s retention curve and this
+                        subscriber&apos;s risk score
+                        {data.predictedValue.riskTilt !== 1
+                          ? ` (risk tilt ×${data.predictedValue.riskTilt})`
+                          : ""}
+                        . Grades reflect how much history backs each horizon —
+                        long horizons on a young store are directional only.
+                        {data.predictedValue.estimatedCosts
+                          ? " Partly estimated costs (COGS fallback or flat VAT) are included."
+                          : ""}
+                      </Text>
                     </BlockStack>
                   )}
                 </BlockStack>

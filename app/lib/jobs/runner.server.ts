@@ -361,6 +361,38 @@ export async function runChurnRiskJob(now: Date): Promise<unknown> {
   ]);
 }
 
+/**
+ * survey_link_sweep body: links straggler SurveyResponse rows to their
+ * contract mirror and flushes stale partial-answer emissions. Ungated:
+ * derives internal state, and the Klaviyo enqueue it can trigger is already
+ * suppressed at source in setup mode. Exported for tests.
+ */
+export async function runSurveyLinkJob(now: Date): Promise<unknown> {
+  const shop = await getPrimaryShop();
+  if (!shop) return { skipped: "no_shop" };
+  const { runSurveyLinkSweep } = await import("~/lib/survey/service.server");
+  return runSurveyLinkSweep(shop.id, now);
+}
+
+/**
+ * predicted_ltgp_run body: per-contract predicted LTGP (nightly, after
+ * churn_risk_run so the tilt reads fresh risk scores), then the accuracy
+ * pass comparing matured actuals against frozen day-one predictions. Step
+ * containment so a scoring failure cannot starve the accuracy ledger.
+ * Exported for tests.
+ */
+export async function runPredictedLtgpJob(now: Date): Promise<unknown> {
+  const shop = await getPrimaryShop();
+  if (!shop) return { skipped: "no_shop" };
+  const { runPredictedLtgpScoring, runLtgpAccuracy } = await import(
+    "~/lib/analytics/predicted-ltgp.server"
+  );
+  return runStepsContained([
+    ["scoring", () => runPredictedLtgpScoring(shop.id, now)],
+    ["accuracy", () => runLtgpAccuracy(shop.id, now)],
+  ]);
+}
+
 // ── Registry ─────────────────────────────────────────────────────────────────
 
 const registry: JobDef[] = [
@@ -524,6 +556,21 @@ const registry: JobDef[] = [
     name: "churn_risk_run",
     everyMinutes: 1440,
     fn: (now) => runChurnRiskJob(now),
+  },
+  {
+    // AFTER churn_risk_run (registry position = run order): the LTGP tilt
+    // reads the risk scores that job just refreshed. Ungated: derives
+    // analytics state, touches no customer.
+    name: "predicted_ltgp_run",
+    everyMinutes: 1440,
+    fn: (now) => runPredictedLtgpJob(now),
+  },
+  {
+    // Straggler survey→contract links + stale partial-answer emissions.
+    // Ungated: internal state; Klaviyo is suppressed at source in setup mode.
+    name: "survey_link_sweep",
+    everyMinutes: 1440,
+    fn: (now) => runSurveyLinkJob(now),
   },
   {
     name: "retention_90d_run",

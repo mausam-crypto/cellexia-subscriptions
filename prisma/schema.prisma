@@ -49,9 +49,10 @@ model Shop {
   enabledLocales Json? // [{locale:"en", primary:true}, ...] synced from shop
   lastFullSyncAt DateTime?
 
-  settings    Setting[]
-  contracts   SubscriptionContract[]
-  planConfigs SellingPlanConfig[]
+  settings        Setting[]
+  contracts       SubscriptionContract[]
+  planConfigs     SellingPlanConfig[]
+  surveyResponses SurveyResponse[]
 }
 
 // Typed key/value settings; keys + defaults defined in app/lib/settings/registry.server.ts
@@ -330,6 +331,25 @@ model SubscriptionContract {
   // Risk & prediction (analytics jobs keep these fresh)
   churnRiskScore                  Float?    @default(0)
   predictedEmptyDate              DateTime?
+  // Predicted LTGP (migration 0020): written nightly by predicted_ltgp_run
+  // (app/lib/analytics/predicted-ltgp.server.ts) for countable ACTIVE/PAUSED
+  // contracts. Shape predictedLtgpSchema {v:1, horizons:{d90|d180|y1|y3|y5:
+  // {cents, grade}}, basis} — see the module for the honest-disclosure rules
+  // (grades, estimated flags). Null = never scored (foreign/demo/terminal).
+  predictedLtgp                   Json?
+  predictedLtgpAt                 DateTime?
+  // Day-one snapshot: stamped ONCE the first time the job scores a contract
+  // younger than 8 days, never overwritten. ltgp_accuracy_run compares these
+  // frozen predictions against matured actuals (machine setting
+  // `ltgpAccuracy`) so the model grades its own homework.
+  predictedLtgpInitial            Json?
+  // Survey-intervention holdout (migration 0020): deterministically assigned
+  // when a survey links to this contract (hash of contract id vs the
+  // survey.holdoutPct setting). TRUE = survey-answer-triggered flows must
+  // exclude this contract, so each answer segment's measured churn stays
+  // uncontaminated by the interventions the answers trigger. Assigned once,
+  // never reshuffled; null = pre-feature row or no survey.
+  surveyHoldout                   Boolean?
   skipCount                       Int       @default(0)
   lastSkippedAt                   DateTime?
   // Skips initiated by the merchant/admin (migration 0016), counted apart
@@ -373,6 +393,7 @@ model SubscriptionContract {
   discountGrants  DiscountGrant[]
   cancelSessions  CancelSession[]
   events          SubscriberEvent[]
+  surveyResponses SurveyResponse[]
 
   @@index([shopId, status])
   @@index([shopId, nextBillingDate])
@@ -1059,4 +1080,46 @@ model ImportBatch {
   createdAt  DateTime  @default(now())
   finishedAt DateTime?
   errors     Json?
+}
+
+// Post-purchase survey (migration 0020, v1.21.0): one row per checkout order
+// shown the thank-you / order-status survey (extensions/cellexia-survey).
+// Keyed by the ORDER because the contract mirror may not exist yet when the
+// thank-you page renders (the survey POST usually races the
+// SUBSCRIPTION_CONTRACTS_CREATE webhook). Linked to the contract by whichever
+// side arrives second — the survey endpoint (mirror already exists), the
+// contract-sync CREATE tail, or the daily survey_link_sweep job.
+model SurveyResponse {
+  id                 String    @id @default(cuid())
+  shopId             String
+  // gid://shopify/Order/... — the extension reads it from OrderConfirmationApi
+  // (Thank You page) / OrderStatusApi (Order status page). One survey per order.
+  orderId            String    @unique
+  contractId         String?
+  customerId         String? // gid://shopify/Customer/... from the session token `sub` claim; null on guest revisit
+  source             String // THANK_YOU | ORDER_STATUS — the surface that created the row
+  locale             String?
+  // Instrument version (survey.questionSetVersion setting at impression time).
+  // Wording/options are frozen per version; analytics must never merge answer
+  // distributions across versions (the measurement-instrument rule).
+  questionSetVersion Int
+  // {plannedDuration?, motive?, expectedSpeed?, routine?} — option KEYS from
+  // surveyAnswersSchema (app/lib/survey/shared.ts), merged progressively as
+  // the shopper taps so partial answers survive abandonment.
+  answers            Json?
+  shownAt            DateTime  @default(now())
+  // First answer write; null with a shownAt = shown-but-skipped, itself a
+  // churn signal (the survey_skipped risk feature).
+  answeredAt         DateTime?
+  // Every question answered.
+  completedAt        DateTime?
+  linkedAt           DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  shop     Shop                  @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  contract SubscriptionContract? @relation(fields: [contractId], references: [id], onDelete: SetNull)
+
+  @@index([shopId, answeredAt])
+  @@index([contractId])
 }

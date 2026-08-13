@@ -820,6 +820,7 @@ describe("migration 0003 backfills fail-SAFE and stays additive", () => {
       "0017_plan_lock_window",
       "0018_variant_default_frequencies",
       "0019_vat_reporting_cost",
+      "0020_survey_predicted_ltgp",
     ]);
   });
 });
@@ -1459,6 +1460,65 @@ describe("migration 0019 (VAT reporting cost) stays additive and leaves ownershi
         );
       }
     }
+  });
+
+  it("never touches the ownership column or any existing default", () => {
+    expect(sql).not.toMatch(/ownership/i);
+    expect(sql).not.toMatch(/SET DEFAULT/i);
+  });
+});
+
+describe("migration 0020 (survey + predicted LTGP) stays additive and leaves ownership alone", () => {
+  const sql = read("prisma/migrations/0020_survey_predicted_ltgp/migration.sql")
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("is additive only — no destructive verb anywhere in it", () => {
+    for (const verb of [
+      /\bDROP\b/i,
+      /\bTRUNCATE\b/i,
+      /\bDELETE\s+FROM\b/i,
+      /\bUPDATE\s+"/i,
+      /\bRENAME\b/i,
+      /\bALTER\s+TYPE\b/i,
+      /\bALTER\s+COLUMN\s+"\w+"\s+TYPE\b/i,
+    ]) {
+      expect(sql, String(verb)).not.toMatch(verb);
+    }
+  });
+
+  it("adds exactly four NULLABLE contract columns — null IS the pre-0020 behavior", () => {
+    // Null = never scored / no survey / holdout unassigned: precisely what
+    // every pre-upgrade row must read, so no backfill and no default rewrite.
+    const contractAdds =
+      sql.match(/ALTER TABLE "SubscriptionContract" ADD COLUMN [^;]+;/g) ?? [];
+    expect(contractAdds).toHaveLength(4);
+    for (const add of contractAdds) {
+      expect(add).not.toMatch(/NOT NULL/);
+      expect(add).not.toMatch(/DEFAULT/);
+    }
+    for (const column of [
+      "predictedLtgp",
+      "predictedLtgpAt",
+      "predictedLtgpInitial",
+      "surveyHoldout",
+    ]) {
+      expect(sql).toContain(`ADD COLUMN "${column}"`);
+    }
+  });
+
+  it("the new SurveyResponse table cascades from Shop and SetNulls from contracts (demo-reset safe)", () => {
+    expect(sql).toMatch(/CREATE TABLE "SurveyResponse"/);
+    expect(sql).toMatch(
+      /"SurveyResponse_shopId_fkey"[^;]+ON DELETE CASCADE/,
+    );
+    // Demo contracts are the only contracts ever deleted; a linked survey row
+    // must survive as unlinked data, never vanish with the contract.
+    expect(sql).toMatch(
+      /"SurveyResponse_contractId_fkey"[^;]+ON DELETE SET NULL/,
+    );
+    expect(sql).toMatch(/"SurveyResponse_orderId_key"/);
   });
 
   it("never touches the ownership column or any existing default", () => {

@@ -30,6 +30,10 @@ import type { LocalContractWithLines } from "~/lib/contracts/shared.server";
 import { contractFrequency, formatFrequency } from "~/lib/frequency";
 import { OURS_ONLY } from "~/lib/ownership/ownership.server";
 import { getLockRules, lockStateFor } from "~/lib/contracts/lock.server";
+import {
+  memberSavingsCents,
+  milestoneRemaining,
+} from "~/lib/portal/growth.server";
 
 /**
  * Portal home: every subscription the signed-in customer has, with one-tap
@@ -140,6 +144,12 @@ function contractCardHtml(params: {
   promptDelayWeeks: number;
   /** Plan lock window — hides the one-tap skip/delay while it runs. */
   locked: boolean;
+  /** portalGrowth.homeValueCard — value-first card (v1.20.0). */
+  valueCard: boolean;
+  /** Money-true captured member savings for this contract (0 = hide tile). */
+  savedCents: number;
+  /** Deliveries to the milestone gift; null = off/reached. */
+  milestoneAway: number | null;
 }): string {
   const { contract, locale, tz, csrf, preview } = params;
   const api = (action: string) => apiPath(locale, action, preview);
@@ -193,11 +203,42 @@ function contractCardHtml(params: {
     )}</div>`;
   }
 
+  // Value-first card (portalGrowth.homeValueCard, v1.20.0): the list card
+  // leads with what the membership has EARNED — money-true captured savings
+  // (endowment) and milestone proximity (goal gradient) — and its actions
+  // are add-products + manage. One-tap skip/delay disappear from here (a
+  // button on every visit is an advertisement for skipping — availability
+  // priming), but both remain two calm taps away on the Manage page: the
+  // salience changes, the capability never does.
+  const valueCard = params.valueCard && contract.status === "ACTIVE";
+  let valueHtml = "";
+  if (valueCard) {
+    const cells: string[] = [];
+    if (params.savedCents > 0) {
+      cells.push(
+        `<div class="cxs-rewards__cell"><div class="cxs-rewards__num">${escapeHtml(formatMoney(params.savedCents, contract.currencyCode, locale))}</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.value.saved"))}</div></div>`,
+      );
+    }
+    cells.push(
+      `<div class="cxs-rewards__cell"><div class="cxs-rewards__num">${escapeHtml(formatShopDate(contract.firstChargeAt ?? contract.createdAt, tz, locale))}</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.value.member_since"))}</div></div>`,
+    );
+    if (params.milestoneAway != null) {
+      cells.push(
+        `<div class="cxs-rewards__cell"><div class="cxs-rewards__num">${params.milestoneAway}</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.value.milestone_away"))}</div></div>`,
+      );
+    }
+    valueHtml = `<div class="cxs-rewards__grid" style="margin-top:12px">${cells.join("")}</div>`;
+  }
+
   const actions: string[] = [];
   // Lock window: the one-tap skip/delay are hidden while it runs (the api
   // action refuses them server-side regardless) — the manage link below
   // stays, and the detail page explains the window with its unlock date.
-  if (contract.status === "ACTIVE" && !params.locked) {
+  if (contract.status === "ACTIVE" && valueCard) {
+    actions.push(
+      `<a class="cxs-btn cxs-btn--small" href="${manageHref}#cxs-add">${escapeHtml(t(locale, "portal.actions.add_products"))}</a>`,
+    );
+  } else if (contract.status === "ACTIVE" && !params.locked) {
     actions.push(
       postForm(
         api("skip"),
@@ -270,6 +311,7 @@ function contractCardHtml(params: {
     ${scheduleHtml}
     <div><span class="cxs-label">${escapeHtml(t(locale, "portal.index.order_total"))}</span><strong class="cxs-price">${escapeHtml(total)}</strong></div>
   </div>
+  ${valueHtml}
   ${promptHtml}
   <div class="cxs-actions">${actions.join("")}</div>
 </section>`;
@@ -434,7 +476,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }
   }
 
-  const [contracts, portalSettings, lifecycle, lockRules] = await Promise.all([
+  const [contracts, portalSettings, lifecycle, growth, lockRules] =
+    await Promise.all([
     prisma.subscriptionContract.findMany({
       // OURS_ONLY: a customer who also subscribes through the store's other
       // subscription app must never see (let alone manage) that contract here.
@@ -448,6 +491,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }),
     getSetting(shop.id, "portal"),
     getSetting(shop.id, "lifecycle"),
+    getSetting(shop.id, "portalGrowth"),
     // Plan lock window rules, fetched once and applied per contract card.
     getLockRules(shop.id),
   ]);
@@ -510,6 +554,20 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         milestoneGrant !== null || maxOrders >= lifecycle.milestoneGiftCycle,
     });
 
+    // Value-first cards (portalGrowth.homeValueCard, v1.20.0): the card
+    // leads with captured member savings + milestone proximity instead of
+    // one-tap skip/delay. Savings are money-true captured discounts — one
+    // batched query for the whole page, contained (a value tile is never
+    // worth failing the portal home for).
+    let savingsByContract = new Map<string, number>();
+    if (growth.homeValueCard) {
+      try {
+        savingsByContract = await memberSavingsCents(contracts.map((c) => c.id));
+      } catch (err) {
+        console.error("[portal] member savings scan failed", err);
+      }
+    }
+
     for (const contract of contracts) {
       body += contractCardHtml({
         contract,
@@ -521,6 +579,12 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         promptBufferDays: portalSettings.contextualPromptBufferDays,
         promptDelayWeeks: portalSettings.contextualPromptDelayWeeks,
         locked: lockStateFor(lockRules, contract, shop.ianaTimezone).locked,
+        valueCard: growth.homeValueCard,
+        savedCents: savingsByContract.get(contract.id) ?? 0,
+        milestoneAway: milestoneRemaining(
+          contract.ordersCount,
+          lifecycle.milestoneGiftCycle,
+        ),
       });
     }
   }

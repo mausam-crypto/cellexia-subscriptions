@@ -1,0 +1,10 @@
+{
+  "name": "cellexia-survey",
+  "private": true,
+  "description": "Cellexia post-purchase survey — checkout UI extension (thank-you + order-status blocks).",
+  "dependencies": {
+    "@shopify/ui-extensions": "~2025.1.0",
+    "@shopify/ui-extensions-react": "~2025.1.0",
+    "react": "^18.2.0"
+  }
+}

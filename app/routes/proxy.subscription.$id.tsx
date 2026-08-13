@@ -7,7 +7,7 @@ import { requireShop } from "~/lib/shop/install.server";
 import { getSetting } from "~/lib/settings/settings.server";
 import { t } from "~/lib/i18n/i18n.server";
 import { formatMoney } from "~/lib/money";
-import { addDaysTz, formatShopDate } from "~/lib/dates.server";
+import { addDaysTz, addIntervalTz, formatShopDate } from "~/lib/dates.server";
 import { isSetupMode } from "~/lib/launch/launch.server";
 import { logEvent } from "~/lib/events/log.server";
 import {
@@ -46,6 +46,14 @@ import {
 } from "~/lib/frequency";
 import { OURS_ONLY } from "~/lib/ownership/ownership.server";
 import { resolveLockState, type LockState } from "~/lib/contracts/lock.server";
+import {
+  MOMENTUM_TOAST_KEYS,
+  milestoneRemaining,
+  nextSlowerFrequency,
+  popularAddonProductIds,
+  recentSkipCount,
+  runsOutBeforeNextDelivery,
+} from "~/lib/portal/growth.server";
 
 /**
  * Full subscription management: items (swap / quantity / remove), add a
@@ -254,16 +262,29 @@ interface AddProductSection {
   offered: Array<{ variantId: string; productId: string }>;
 }
 
-function addProductHtml(
+async function addProductHtml(
   ctx: PageContext,
   catalog: CatalogProduct[],
   discountByProduct: Map<string, number>,
-): AddProductSection {
+  growth: { upsell: boolean; shopId: string },
+): Promise<AddProductSection> {
   const { locale, contract } = ctx;
   const inContract = new Set(
     contract.lines.filter((l) => !l.isOneTimeAddon).map((l) => l.variantId),
   );
   const offered: AddProductSection["offered"] = [];
+
+  // Honest social proof (portalGrowth.addonUpsell): "popular add-on" only on
+  // products with enough REAL cycle.addon_added events behind them — an
+  // empty set means no badge anywhere, never an invented one.
+  let popular = new Set<string>();
+  if (growth.upsell) {
+    const variantToProduct = new Map<string, string>();
+    for (const product of catalog) {
+      for (const v of product.variants) variantToProduct.set(v.id, product.id);
+    }
+    popular = await popularAddonProductIds(growth.shopId, variantToProduct);
+  }
 
   const cards = catalog
     .map((product) => {
@@ -298,14 +319,29 @@ function addProductHtml(
         ? `<img class="cxs-thumb" src="${escapeHtml(product.imageUrl)}" alt="" loading="lazy">`
         : `<div class="cxs-thumb cxs-thumb--placeholder">C</div>`;
 
+      const popularBadge =
+        growth.upsell && popular.has(product.id)
+          ? `<span class="cxs-chip cxs-chip--active" style="margin:0 0 4px">${escapeHtml(t(locale, "portal.add.popular"))}</span>`
+          : "";
+
+      // Button order is the foot-in-the-door lever (portalGrowth.addonUpsell):
+      // the low-commitment one-time "try it" leads, the recurring add stays
+      // one visual step behind — a used trial converts itself. Classic mode
+      // keeps the original recurring-first order.
+      const buttons = growth.upsell
+        ? `<button type="submit" class="cxs-btn cxs-btn--small cxs-btn--full" formaction="${api(ctx, "addon")}">${escapeHtml(t(locale, "portal.add.try_once"))}</button>
+        <button type="submit" class="cxs-btn cxs-btn--ghost cxs-btn--small cxs-btn--full">${escapeHtml(t(locale, "portal.add.every_time"))}</button>`
+        : `<button type="submit" class="cxs-btn cxs-btn--small cxs-btn--full">${escapeHtml(t(locale, "portal.add.recurring"))}</button>
+        <button type="submit" class="cxs-btn cxs-btn--ghost cxs-btn--small cxs-btn--full" formaction="${api(ctx, "addon")}">${escapeHtml(t(locale, "portal.add.one_time"))}</button>`;
+
       return `<form method="post" action="${api(ctx, "add_line")}" class="cxs-card">
         ${hiddenFields([...baseFields(ctx), ["quantity", "1"]])}
         ${thumb}
+        ${popularBadge}
         <p class="cxs-item__title" style="margin:0">${escapeHtml(product.title)}</p>
         <p class="cxs-price cxs-small" style="margin:0">${priceHtml}</p>
         ${variantField}
-        <button type="submit" class="cxs-btn cxs-btn--small cxs-btn--full">${escapeHtml(t(locale, "portal.add.recurring"))}</button>
-        <button type="submit" class="cxs-btn cxs-btn--ghost cxs-btn--small cxs-btn--full" formaction="${api(ctx, "addon")}">${escapeHtml(t(locale, "portal.add.one_time"))}</button>
+        ${buttons}
       </form>`;
     })
     .filter(Boolean)
@@ -313,14 +349,54 @@ function addProductHtml(
 
   if (!cards) return { html: "", offered: [] };
 
-  const html = `<details class="cxs-acc">
+  // Zero-transaction-cost framing: the add-on rides a delivery that is
+  // already coming — no extra shipping moment to mentally pay for.
+  const shipsWith =
+    growth.upsell && contract.nextBillingDate
+      ? `<p class="cxs-muted cxs-small" style="margin:0 0 6px">${escapeHtml(
+          t(locale, "portal.add.ships_with", {
+            date: formatShopDate(contract.nextBillingDate, ctx.tz, locale),
+          }),
+        )}</p>`
+      : "";
+
+  const html = `<details class="cxs-acc" id="cxs-add"${growth.upsell ? " open" : ""}>
   <summary>${escapeHtml(t(locale, "portal.add.title"))}</summary>
   <div class="cxs-acc__body">
+    ${shipsWith}
     <p class="cxs-muted cxs-small" style="margin:0 0 14px">${escapeHtml(t(locale, "portal.add.intro"))}</p>
     <div class="cxs-grid">${cards}</div>
   </div>
 </details>`;
   return { html, offered };
+}
+
+/**
+ * First addable candidate for the momentum slot: the catalog's first
+ * available variant the contract doesn't already hold as a recurring line,
+ * at its member (ongoing-discount) price — the same price addOneTimeAddon
+ * will actually charge.
+ */
+function firstAddableCandidate(
+  contract: LocalContractWithLines,
+  catalog: CatalogProduct[],
+  discountByProduct: Map<string, number>,
+): { variantId: string; title: string; priceCents: number } | null {
+  const inContract = new Set(
+    contract.lines.filter((l) => !l.isOneTimeAddon).map((l) => l.variantId),
+  );
+  for (const product of catalog) {
+    const pct = discountByProduct.get(product.id) ?? 0;
+    for (const variant of product.variants) {
+      if (inContract.has(variant.id) || !variant.availableForSale) continue;
+      return {
+        variantId: variant.id,
+        title: product.title,
+        priceCents: discountedCents(variant.priceCents, pct),
+      };
+    }
+  }
+  return null;
 }
 
 /**
@@ -388,6 +464,12 @@ function scheduleHtml(
   ctx: PageContext,
   frequencies: Frequency[],
   allowFrequencyChoice: boolean,
+  /** portalGrowth.concessionLadder inputs; null = classic quick actions. */
+  ladder: {
+    slower: Frequency | null;
+    skipDate: string | null;
+    milestoneNote: boolean;
+  } | null,
 ): string {
   const { locale, tz, contract } = ctx;
   const tr = (key: string, vars?: Record<string, string | number>) =>
@@ -433,23 +515,84 @@ function scheduleHtml(
   const expectedNext: Array<[string, string]> = [
     ["expected_next", contract.nextBillingDate?.toISOString() ?? ""],
   ];
-  const skipForm = `<form method="post" action="${api(ctx, "skip")}">${hiddenFields([...baseFields(ctx), ...expectedNext])}<button type="submit" class="cxs-btn cxs-btn--quiet cxs-btn--small">${escapeHtml(t(locale, "portal.actions.skip"))}</button></form>`;
-  const delayForm = `<form method="post" action="${api(ctx, "delay")}" class="cxs-row cxs-row--wrap">${hiddenFields([...baseFields(ctx), ...expectedNext])}
+
+  // Concession ladder (portalGrowth.concessionLadder, v1.20.0): the quick
+  // actions become an ORDERED menu — delay first (revenue shifts, nothing is
+  // lost), the plan's next-slower cadence second (continuity survives where
+  // repeated skips erode it), skip last, quiet but fully present with its
+  // concrete consequence date. Every option remains one tap; only the
+  // hierarchy and the honesty of consequences change — reactance-safe
+  // choice architecture, not friction.
+  let quickActions: string;
+  if (ladder) {
+    const delayRow = `<div style="border:1px solid var(--cxs-accent);border-radius:8px;padding:10px 12px">
+      <p style="margin:0;font-weight:500">${escapeHtml(t(locale, "portal.ladder.delay_title"))}</p>
+      <p class="cxs-muted cxs-small" style="margin:2px 0 8px">${escapeHtml(t(locale, "portal.ladder.delay_sub"))}</p>
+      <form method="post" action="${api(ctx, "delay")}" class="cxs-row cxs-row--wrap">${hiddenFields([...baseFields(ctx), ...expectedNext])}
+        <button type="submit" class="cxs-btn cxs-btn--ghost cxs-btn--small" name="weeks" value="1">${escapeHtml(t(locale, "portal.schedule.delay_weeks", { weeks: 1 }))}</button>
+        <button type="submit" class="cxs-btn cxs-btn--ghost cxs-btn--small" name="weeks" value="2">${escapeHtml(t(locale, "portal.schedule.delay_weeks", { weeks: 2 }))}</button>
+        <button type="submit" class="cxs-btn cxs-btn--ghost cxs-btn--small" name="weeks" value="3">${escapeHtml(t(locale, "portal.schedule.delay_weeks", { weeks: 3 }))}</button>
+      </form>
+    </div>`;
+    const slowerRow =
+      ladder.slower && parseFrequencyToken(frequencyToken(ladder.slower)) !== null
+        ? `<div style="border:1px solid var(--cxs-line);border-radius:8px;padding:10px 12px">
+      <div class="cxs-row cxs-row--between">
+        <div>
+          <p style="margin:0;font-weight:500">${escapeHtml(t(locale, "portal.ladder.slower_title"))}</p>
+          <p class="cxs-muted cxs-small" style="margin:2px 0 0">${escapeHtml(
+            t(locale, "portal.ladder.slower_sub", {
+              frequency: formatFrequency(tr, "every", ladder.slower),
+            }),
+          )}</p>
+        </div>
+        <form method="post" action="${api(ctx, "frequency")}">${hiddenFields([...baseFields(ctx), ["frequency", frequencyToken(ladder.slower)]])}<button type="submit" class="cxs-btn cxs-btn--ghost cxs-btn--small">${escapeHtml(t(locale, "portal.ladder.slower_cta"))}</button></form>
+      </div>
+    </div>`
+        : "";
+    const skipConsequence = [
+      ladder.skipDate
+        ? t(locale, "portal.ladder.skip_sub", { date: ladder.skipDate })
+        : "",
+      // Truthful loss note: milestones count ORDERS, so a skip genuinely
+      // pushes the gift back one delivery. Shown only while one is pending.
+      ladder.milestoneNote ? t(locale, "portal.ladder.skip_milestone") : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+    const skipRow = `<div style="border:1px solid var(--cxs-line);border-radius:8px;padding:10px 12px">
+      <div class="cxs-row cxs-row--between">
+        <div>
+          <p style="margin:0">${escapeHtml(t(locale, "portal.ladder.skip_title"))}</p>
+          ${skipConsequence ? `<p class="cxs-muted cxs-small" style="margin:2px 0 0">${escapeHtml(skipConsequence)}</p>` : ""}
+        </div>
+        <form method="post" action="${api(ctx, "skip")}">${hiddenFields([...baseFields(ctx), ...expectedNext])}<button type="submit" class="cxs-btn cxs-btn--quiet cxs-btn--small">${escapeHtml(t(locale, "portal.actions.skip"))}</button></form>
+      </div>
+    </div>`;
+    quickActions = `<div>
+      <span class="cxs-label">${escapeHtml(t(locale, "portal.ladder.title"))}</span>
+      <div class="cxs-stack" style="margin-top:6px">${delayRow}${slowerRow}${skipRow}</div>
+    </div>`;
+  } else {
+    const skipForm = `<form method="post" action="${api(ctx, "skip")}">${hiddenFields([...baseFields(ctx), ...expectedNext])}<button type="submit" class="cxs-btn cxs-btn--quiet cxs-btn--small">${escapeHtml(t(locale, "portal.actions.skip"))}</button></form>`;
+    const delayForm = `<form method="post" action="${api(ctx, "delay")}" class="cxs-row cxs-row--wrap">${hiddenFields([...baseFields(ctx), ...expectedNext])}
     <button type="submit" class="cxs-btn cxs-btn--quiet cxs-btn--small" name="weeks" value="1">${escapeHtml(t(locale, "portal.schedule.delay_weeks", { weeks: 1 }))}</button>
     <button type="submit" class="cxs-btn cxs-btn--quiet cxs-btn--small" name="weeks" value="2">${escapeHtml(t(locale, "portal.schedule.delay_weeks", { weeks: 2 }))}</button>
     <button type="submit" class="cxs-btn cxs-btn--quiet cxs-btn--small" name="weeks" value="3">${escapeHtml(t(locale, "portal.schedule.delay_weeks", { weeks: 3 }))}</button>
   </form>`;
+    quickActions = `<div>
+      <span class="cxs-label">${escapeHtml(t(locale, "portal.schedule.quick_label"))}</span>
+      <div class="cxs-actions" style="margin-top:4px">${skipForm}${delayForm}</div>
+      <p class="cxs-muted cxs-small" style="margin:10px 0 0">${escapeHtml(t(locale, "portal.schedule.skip_hint"))}</p>
+    </div>`;
+  }
 
   return `<details class="cxs-acc" open>
   <summary>${escapeHtml(t(locale, "portal.schedule.title"))}</summary>
   <div class="cxs-acc__body cxs-stack">
     ${nextDateForm}
     ${frequencyForm}
-    <div>
-      <span class="cxs-label">${escapeHtml(t(locale, "portal.schedule.quick_label"))}</span>
-      <div class="cxs-actions" style="margin-top:4px">${skipForm}${delayForm}</div>
-      <p class="cxs-muted cxs-small" style="margin:10px 0 0">${escapeHtml(t(locale, "portal.schedule.skip_hint"))}</p>
-    </div>
+    ${quickActions}
   </div>
 </details>`;
 }
@@ -604,12 +747,15 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     );
   }
 
-  const [portalSettings, pauseSettings, frequency, lock] = await Promise.all([
-    getSetting(shop.id, "portal"),
-    getSetting(shop.id, "pause"),
-    frequencyOptionsForContract(shop.id, contract),
-    resolveLockState(shop.id, contract, shop.ianaTimezone),
-  ]);
+  const [portalSettings, pauseSettings, growth, lifecycle, frequency, lock] =
+    await Promise.all([
+      getSetting(shop.id, "portal"),
+      getSetting(shop.id, "pause"),
+      getSetting(shop.id, "portalGrowth"),
+      getSetting(shop.id, "lifecycle"),
+      frequencyOptionsForContract(shop.id, contract),
+      resolveLockState(shop.id, contract, shop.ianaTimezone),
+    ]);
 
   // Catalog + discount map (cached, degrade-to-empty) for swap/add sections.
   let catalog: CatalogProduct[] = [];
@@ -646,6 +792,52 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const isFailed = contract.status === "FAILED";
   const editable = isActive || isPaused;
 
+  // ── Portal growth inputs (v1.20.0, each behind its portalGrowth toggle) ───
+  // All derived from data the page already holds or one cheap query each;
+  // every claim they power is computed, never asserted (growth.server.ts).
+  const currentFrequency = contractFrequency(contract);
+  const slowerOption =
+    (growth.concessionLadder || growth.cadenceNudge) && frequency.allowChoice
+      ? nextSlowerFrequency(frequency.options, currentFrequency)
+      : null;
+  const milestoneAway = milestoneRemaining(
+    contract.ordersCount,
+    lifecycle.milestoneGiftCycle,
+  );
+  const skipConsequenceDate =
+    isActive && contract.nextBillingDate
+      ? formatShopDate(
+          addIntervalTz(
+            contract.nextBillingDate,
+            currentFrequency.unit,
+            currentFrequency.count,
+            ctx.tz,
+          ),
+          ctx.tz,
+          locale,
+        )
+      : null;
+  let repeatedSkips = false;
+  if (growth.cadenceNudge && isActive && slowerOption && !lock.locked) {
+    try {
+      repeatedSkips = (await recentSkipCount(contract.id, new Date())) >= 2;
+    } catch (err) {
+      console.error("[portal] skip-count scan failed", err);
+    }
+  }
+  const runoutDue =
+    growth.runoutPrompt &&
+    isActive &&
+    !lock.locked &&
+    runsOutBeforeNextDelivery(
+      contract.predictedEmptyDate,
+      contract.nextBillingDate,
+      new Date(),
+    );
+  // The toast key drives the momentum slot; the toast itself renders as
+  // today. Resolved once here so both consumers agree.
+  const resolvedToast = resolveToast(request, locale);
+
   let body = "";
 
   // Status banner for anything that is not simply active.
@@ -670,18 +862,141 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   // Plan lock window notice: shown while the window runs, with the exact
   // unlock date — the controls it disables are hidden below, and the api
   // action refuses them server-side regardless of what a stale page posts.
+  // Two renderings of the SAME mechanic (portal.friendlyLockMessaging,
+  // v1.19.0): the friendly default is a "welcome period" progress card —
+  // benefit-first copy, endowed progress (day X of Y), and an explicit
+  // can-do list, never naming the blocked verbs (reactance/priming
+  // hygiene); off = the original factual notice. Either way the date is the
+  // exact shop-tz unlock promise.
   if (lock.locked && lock.until && (isActive || isPaused)) {
-    body += `<div class="cxs-note" style="margin:0 0 16px">${escapeHtml(
-      t(locale, "portal.locked.notice", {
-        date: formatShopDate(lock.until, ctx.tz, locale),
-      }),
-    )}</div>`;
+    const unlockDate = formatShopDate(lock.until, ctx.tz, locale);
+    if (portalSettings.friendlyLockMessaging && lock.lockDays > 0) {
+      // Display-only arithmetic: ±1h around DST shifts is acceptable here —
+      // the enforced boundary stays resolveLockState's shop-tz midnight.
+      const daysToGo = Math.max(
+        1,
+        Math.ceil((lock.until.getTime() - Date.now()) / 86_400_000),
+      );
+      const dayOfWindow = Math.min(
+        lock.lockDays,
+        Math.max(1, lock.lockDays - daysToGo + 1),
+      );
+      const pct = Math.min(
+        100,
+        Math.max(4, Math.round((dayOfWindow / lock.lockDays) * 100)),
+      );
+      // The can-do list must promise only what THIS page can deliver: add
+      // and quantity are ACTIVE-only actions, so a paused-and-locked
+      // subscriber is promised address/payment changes only.
+      const canDo = (
+        isActive
+          ? [
+              "portal.locked.friendly_can_add",
+              "portal.locked.friendly_can_details",
+              "portal.locked.friendly_can_qty",
+            ]
+          : ["portal.locked.friendly_can_details"]
+      )
+        .map(
+          (key) =>
+            `<span style="white-space:nowrap"><span style="color:var(--cxs-accent)" aria-hidden="true">&#10003;</span> ${escapeHtml(t(locale, key))}</span>`,
+        )
+        .join(" ");
+      body += `<div class="cxs-card">
+        <div class="cxs-row cxs-row--between">
+          <strong>${escapeHtml(t(locale, "portal.locked.friendly_title"))}</strong>
+          <span class="cxs-small cxs-muted">${escapeHtml(
+            t(locale, "portal.locked.friendly_progress", {
+              day: dayOfWindow,
+              days: lock.lockDays,
+            }),
+          )}</span>
+        </div>
+        <div style="height:6px;background:var(--cxs-accent-soft);border-radius:999px;margin:10px 0;overflow:hidden"><div style="width:${pct}%;height:100%;background:var(--cxs-accent);border-radius:999px"></div></div>
+        <p class="cxs-small cxs-muted" style="margin:0 0 10px">${escapeHtml(
+          t(locale, "portal.locked.friendly_body", { date: unlockDate }),
+        )}</p>
+        <p class="cxs-small" style="margin:0;display:flex;gap:6px 14px;flex-wrap:wrap">${canDo}</p>
+      </div>`;
+    } else {
+      body += `<div class="cxs-note" style="margin:0 0 16px">${escapeHtml(
+        t(locale, "portal.locked.notice", { date: unlockDate }),
+      )}</div>`;
+    }
+  }
+
+  // Momentum upsell (portalGrowth.postActionUpsell, v1.20.0): a customer who
+  // just did something positive for their subscription is in the cheapest
+  // yes-state the portal ever sees (commitment consistency) — offer ONE
+  // add-on, one tap, at the member price. POSITIVE moments only
+  // (MOMENTUM_TOAST_KEYS): after a skip this slot would read as tone-deaf
+  // and stays empty.
+  if (
+    growth.postActionUpsell &&
+    isActive &&
+    portalSettings.allowAddProducts &&
+    resolvedToast &&
+    MOMENTUM_TOAST_KEYS.has(resolvedToast.key)
+  ) {
+    const candidate = firstAddableCandidate(contract, catalog, discountByProduct);
+    if (candidate) {
+      const price = formatMoney(
+        candidate.priceCents,
+        contract.currencyCode,
+        locale,
+      );
+      body += `<div class="cxs-card">
+        <p class="cxs-small" style="margin:0 0 10px">${escapeHtml(t(locale, "portal.momentum.title"))}</p>
+        <div class="cxs-row cxs-row--between">
+          <div><p class="cxs-item__title" style="margin:0">${escapeHtml(candidate.title)}</p><p class="cxs-muted cxs-small" style="margin:0">${escapeHtml(t(locale, "portal.add.ships_with", { date: contract.nextBillingDate ? formatShopDate(contract.nextBillingDate, ctx.tz, locale) : "" }))}</p></div>
+          <form method="post" action="${api(ctx, "addon")}">${hiddenFields([...baseFields(ctx), ["variantId", candidate.variantId], ["quantity", "1"]])}<button type="submit" class="cxs-btn cxs-btn--small">${escapeHtml(t(locale, "portal.momentum.cta", { price }))}</button></form>
+        </div>
+      </div>`;
+    }
+  }
+
+  // Cadence-fix nudge (portalGrowth.cadenceNudge): two or more skips in the
+  // trailing window is a cadence mismatch, not two coincidences — fixing the
+  // cadence keeps continuity where repeated skips erode it. Truthful framing:
+  // price and rewards genuinely survive a frequency change.
+  if (repeatedSkips && slowerOption) {
+    const phrase = formatFrequency(
+      (key, vars) => t(locale, key, vars),
+      "every",
+      slowerOption,
+    );
+    body += `<div class="cxs-banner"><p>${escapeHtml(t(locale, "portal.nudge.cadence", { frequency: phrase }))}</p><form method="post" action="${api(ctx, "frequency")}">${hiddenFields([...baseFields(ctx), ["frequency", frequencyToken(slowerOption)]])}<button type="submit" class="cxs-btn cxs-btn--small">${escapeHtml(t(locale, "portal.nudge.cadence_cta"))}</button></form></div>`;
+  }
+
+  // Runout prompt (portalGrowth.runoutPrompt): the churn model predicts the
+  // customer runs OUT before the next box lands — the inverse of the
+  // standing "running low later? push it back" prompt. Both CTAs grow or
+  // protect the relationship: move the delivery up, or add one more unit.
+  if (runoutDue && contract.predictedEmptyDate && contract.nextBillingDate) {
+    const tomorrow = addDaysTz(new Date(), 1, ctx.tz);
+    const moveUpTo =
+      contract.predictedEmptyDate.getTime() > tomorrow.getTime()
+        ? contract.predictedEmptyDate
+        : tomorrow;
+    const moveUpValue = dateInputValue(moveUpTo, ctx.tz);
+    const moveUpLabel = formatShopDate(moveUpTo, ctx.tz, locale);
+    const firstRecurring = contract.lines.find(
+      (l) => !l.isGift && !l.isOneTimeAddon,
+    );
+    const addOneForm =
+      firstRecurring && firstRecurring.quantity < ctx.maxQuantity
+        ? `<form method="post" action="${api(ctx, "quantity")}">${hiddenFields([...baseFields(ctx), ["lineId", firstRecurring.id], ["quantity", String(firstRecurring.quantity + 1)]])}<button type="submit" class="cxs-btn cxs-btn--ghost cxs-btn--small">${escapeHtml(t(locale, "portal.nudge.runout_add"))}</button></form>`
+        : "";
+    body += `<div class="cxs-banner"><p>${escapeHtml(t(locale, "portal.nudge.runout"))}</p><div class="cxs-actions" style="margin:0"><form method="post" action="${api(ctx, "next_date")}">${hiddenFields([...baseFields(ctx), ["date", moveUpValue]])}<button type="submit" class="cxs-btn cxs-btn--small">${escapeHtml(t(locale, "portal.nudge.runout_moveup", { date: moveUpLabel }))}</button></form>${addOneForm}</div></div>`;
   }
 
   body += itemsCardHtml(ctx, catalog, discountByProduct, isActive);
 
   if (isActive && portalSettings.allowAddProducts) {
-    const addSection = addProductHtml(ctx, catalog, discountByProduct);
+    const addSection = await addProductHtml(ctx, catalog, discountByProduct, {
+      upsell: growth.addonUpsell,
+      shopId: shop.id,
+    });
     body += addSection.html;
     // Impressions: real customers only — the admin preview and the demo
     // fixture must never inflate the offer-shown denominator.
@@ -692,7 +1007,18 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   if (isActive && !lock.locked) {
     // The schedule and pause cards hold only locked controls (next date,
     // frequency, skip, delay, pause) — hidden wholesale during the window.
-    body += scheduleHtml(ctx, frequency.options, frequency.allowChoice);
+    body += scheduleHtml(
+      ctx,
+      frequency.options,
+      frequency.allowChoice,
+      growth.concessionLadder
+        ? {
+            slower: slowerOption,
+            skipDate: skipConsequenceDate,
+            milestoneNote: milestoneAway != null,
+          }
+        : null,
+    );
     body += pauseHtml(ctx, pauseSettings.maxMonths);
   }
   if (editable) {
@@ -710,7 +1036,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     body += `<p style="text-align:center;margin:24px 0 0"><a href="${withLocale(`${PORTAL_BASE_PATH}/cancel/${contract.id}`, locale, ctx.preview)}" class="cxs-muted cxs-small" style="color:var(--cxs-muted)">${escapeHtml(t(locale, "portal.detail.cancel_link"))}</a></p>`;
   }
 
-  const toast = resolveToast(request, locale)?.toast ?? null;
+  const toast = resolvedToast?.toast ?? null;
   const toastWithUndo: PortalToast | null = toast;
   if (
     toastWithUndo &&

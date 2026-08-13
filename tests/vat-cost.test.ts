@@ -275,16 +275,18 @@ describe("country-rates codec + costModel.vat schema", () => {
     }
   });
 
-  it("vat defaults ON at 8.1% (merchant decision, v1.16.0 — flipped before any subscription existed)", () => {
+  it("vat defaults ON at 20% (merchant decision, v1.21.0 — raised from the 8.1% default; explicitly saved settings keep their stored rate)", () => {
     const parsed = settingsSchemas.costModel.parse(undefined);
     expect(parsed.vat).toEqual({
       enabled: true,
-      defaultRatePct: 8.1,
+      defaultRatePct: 20,
       countryRatesPct: {},
     });
     // A stored pre-0019 costModel (no vat key) still parses — and flips ON
     // via the field-level default (same merchant decision; the book was
-    // empty at flip time, so no historical figure is rewritten).
+    // empty at flip time, so no historical figure is rewritten). It reads
+    // the CURRENT default rate: only shops that never saved a vat block are
+    // affected by a default change, which is the documented semantics.
     const legacy = settingsSchemas.costModel.safeParse({
       paymentFeePct: 2.9,
       paymentFeeFixedCents: 30,
@@ -296,9 +298,23 @@ describe("country-rates codec + costModel.vat schema", () => {
     if (legacy.success) {
       expect(legacy.data.vat).toEqual({
         enabled: true,
-        defaultRatePct: 8.1,
+        defaultRatePct: 20,
         countryRatesPct: {},
       });
+    }
+    // A shop that explicitly saved a vat block keeps its stored rate — the
+    // default never rewrites a saved value.
+    const savedAtOldDefault = settingsSchemas.costModel.safeParse({
+      paymentFeePct: 2.9,
+      paymentFeeFixedCents: 30,
+      fulfillmentCostPerShipmentCents: 0,
+      shippingCostPerShipmentCents: { mode: "flat", flatCents: 0 },
+      cogsFallbackPctOfPrice: 25,
+      vat: { enabled: true, defaultRatePct: 8.1, countryRatesPct: {} },
+    });
+    expect(savedAtOldDefault.success).toBe(true);
+    if (savedAtOldDefault.success) {
+      expect(savedAtOldDefault.data.vat.defaultRatePct).toBe(8.1);
     }
   });
 });

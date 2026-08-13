@@ -1,0 +1,37 @@
+{
+  "introTitle": "Pomóż nam dobrze zaplanować Twoje dostawy",
+  "progress": "Pytanie {{current}} z {{total}} — jedno dotknięcie",
+  "doneTitle": "Dziękujemy!",
+  "doneBody": "Wykorzystamy Twoje odpowiedzi, aby dopasować dostawy i porady pielęgnacyjne.",
+  "q": {
+    "plannedDuration": {
+      "title": "Żebyśmy mogli planować — jak zamierzasz korzystać z tego produktu?",
+      "trying": "Testuję — zdecyduję po pierwszej dostawie",
+      "few_months": "Kilka miesięcy — tyle, by ocenić prawdziwe efekty",
+      "six_months_plus": "Sześć miesięcy lub dłużej",
+      "permanent": "Taki produkt to stały element mojej rutyny"
+    },
+    "motive": {
+      "title": "Czego przede wszystkim oczekujesz od tego produktu?",
+      "fast_wrinkles": "Widocznie zredukować zmarszczki i oznaki starzenia, jak najszybciej",
+      "prevention": "Spowolnić starzenie w dłuższej perspektywie — profilaktyka",
+      "daily_care": "Codzienna pielęgnacja — zdrowa skóra i włosy",
+      "occasion": "Wyglądać najlepiej na nadchodzącą okazję"
+    },
+    "expectedSpeed": {
+      "title": "Jak szybko spodziewasz się efektów, na których Ci zależy?",
+      "days": "W ciągu kilku dni",
+      "weeks": "W ciągu dwóch–trzech tygodni",
+      "one_two_months": "W 1–2 miesiące",
+      "three_months_plus": "Po 3 miesiącach lub później — prawdziwa zmiana wymaga czasu",
+      "not_sure": "Jeszcze nie wiem"
+    },
+    "routine": {
+      "title": "Jak dziś wygląda Twoja rutyna pielęgnacyjna?",
+      "full": "Pełna rutyna, rano i wieczorem",
+      "most_days": "Kilka produktów, przez większość dni",
+      "on_off": "Używam produktów okresowo",
+      "minimal": "Bardzo skromnie — to jeden z moich pierwszych"
+    }
+  }
+}

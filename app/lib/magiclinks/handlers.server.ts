@@ -79,6 +79,39 @@ interface MagicContext {
 const MAGIC_OPTS = { source: "MAGIC_LINK" as const, actor: "customer" };
 
 /**
+ * Headline + sub for a lock-refused link, in the merchant's chosen register
+ * (portal.friendlyLockMessaging, v1.19.0): the friendly default reads as
+ * "almost there" with the benefit framing; off = the original factual copy.
+ * Falls back to the classic keys when the unlock date could not be resolved
+ * (the friendly headline embeds the date). Failure-contained: a broken
+ * settings read must never break the locked page — classic copy applies.
+ */
+async function lockedCopy(
+  shopId: string,
+  locale: string,
+  date: string,
+): Promise<{ headline: string; sub?: string }> {
+  let friendly = false;
+  if (date) {
+    try {
+      friendly = (await getSetting(shopId, "portal")).friendlyLockMessaging;
+    } catch {
+      friendly = false;
+    }
+  }
+  if (friendly) {
+    return {
+      headline: t(locale, "magic.locked_friendly", { date }),
+      sub: t(locale, "magic.locked_friendly_sub"),
+    };
+  }
+  return {
+    headline: t(locale, "magic.locked"),
+    sub: date ? t(locale, "magic.locked_sub", { date }) : undefined,
+  };
+}
+
+/**
  * LOGIN hand-off code TTL. The code exists only for the duration of one 303
  * redirect (magic route → portal), is single-use, and is exchanged server-side
  * for the HttpOnly session cookie — see exchangeLoginHandoff.
@@ -277,8 +310,7 @@ export async function describeMagicAction(
       const date = fmtDate(lock.until, shop, locale);
       lockedResult = {
         locale,
-        headline: t(locale, "magic.locked"),
-        sub: date ? t(locale, "magic.locked_sub", { date }) : undefined,
+        ...(await lockedCopy(shop.id, locale, date)),
         portalUrl: (await safePortalUrl(shop.id)) ?? undefined,
       };
     }
@@ -362,8 +394,7 @@ export async function executeMagicAction(
       const date = fmtDate(lock.until, shop, locale);
       return {
         locale,
-        headline: t(locale, "magic.locked"),
-        sub: date ? t(locale, "magic.locked_sub", { date }) : undefined,
+        ...(await lockedCopy(shop.id, locale, date)),
         portalUrl,
       };
     }

@@ -1,0 +1,37 @@
+{
+  "introTitle": "Helfen Sie uns, Ihre Lieferungen richtig zu planen",
+  "progress": "Frage {{current}} von {{total}} — je ein Tipp",
+  "doneTitle": "Vielen Dank!",
+  "doneBody": "Wir stimmen Ihre Lieferungen und Pflegetipps darauf ab.",
+  "q": {
+    "plannedDuration": {
+      "title": "Damit wir planen können — wie möchten Sie das Produkt nutzen?",
+      "trying": "Erst einmal ausprobieren — ich schaue nach der ersten Lieferung",
+      "few_months": "Einige Monate — genug, um echte Ergebnisse zu beurteilen",
+      "six_months_plus": "Sechs Monate oder länger",
+      "permanent": "So ein Produkt gehört fest zu meiner Routine"
+    },
+    "motive": {
+      "title": "Was soll das Produkt vor allem für Sie tun?",
+      "fast_wrinkles": "Falten und Alterszeichen sichtbar reduzieren, so schnell wie möglich",
+      "prevention": "Hautalterung langfristig verlangsamen — Vorbeugung",
+      "daily_care": "Tägliche Pflege — Haut und Haar gesund halten",
+      "occasion": "Für einen besonderen Anlass gut aussehen"
+    },
+    "expectedSpeed": {
+      "title": "Wie schnell erwarten Sie die gewünschten Ergebnisse?",
+      "days": "Innerhalb von Tagen",
+      "weeks": "Innerhalb von zwei bis drei Wochen",
+      "one_two_months": "In 1–2 Monaten",
+      "three_months_plus": "In 3 Monaten oder mehr — echte Veränderung braucht Zeit",
+      "not_sure": "Noch nicht sicher"
+    },
+    "routine": {
+      "title": "Wie sieht Ihre Pflegeroutine heute aus?",
+      "full": "Eine vollständige Routine, morgens und abends",
+      "most_days": "Ein paar Produkte, an den meisten Tagen",
+      "on_off": "Ich nutze Produkte mal mehr, mal weniger",
+      "minimal": "Sehr überschaubar — das ist eines meiner ersten"
+    }
+  }
+}

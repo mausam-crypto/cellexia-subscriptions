@@ -4,6 +4,231 @@ All notable changes to Cellexia Subscriptions. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [SemVer](https://semver.org) as contracted in [docs/UPDATE.md](docs/UPDATE.md).
 
+## [1.21.0] — 2026-08-12
+
+**Post-purchase survey + predicted LTGP** — new subscribers answer four
+one-tap questions on the order confirmation page (a new checkout UI
+extension, `extensions/cellexia-survey`); the answers attach to the
+subscription, feed the self-learning churn-risk score, and power a new
+per-subscriber **predicted lifetime gross profit** at 90 days / 180 days /
+1 / 3 / 5 years — computed nightly from the store's censoring-corrected
+retention curve, each contract's real per-cycle margin (the shared cost
+model) and its churn-risk tilt, with per-horizon honesty grades, frozen
+day-one predictions, and a self-measuring accuracy ledger. Survey on/off,
+the intervention-holdout share and a write-rate cap live in **Settings →
+Post-purchase survey** (`survey` group, **ON by default**). **Migration
+0020 required** (one new table + four nullable contract columns, additive
+only). **`npm run deploy` required** (new extension), plus a one-time
+placement of the survey block in the checkout editor — see Update notes.
+No new env vars, no scope or webhook changes, the theme/buy box is
+untouched. Rollback-safe: older code ignores the new table/columns.
+
+### Added
+
+- **Checkout UI extension `cellexia-survey`** (Thank You +
+  customer-account Order Status targets): renders only for orders with a
+  subscription line, one question per screen, single-tap answers POSTed
+  progressively (partials survive abandonment), localized (en + de, es, fr,
+  it, nl, pl, pt-PT, pt-BR), server-checked so a revisit from another
+  device never re-asks, and fail-quiet — a survey must never degrade a
+  confirmation page. The question set is a FROZEN measurement instrument
+  (`app/lib/survey/shared.ts`, mirrored in the extension;
+  `tests/survey-instrument.test.ts` pins the mirror): planned duration,
+  motive, expected result speed, current routine.
+- **`POST /api/survey`** — session-token-verified (HS256 against the app
+  secret, audience pinned, shop resolved from the token's `dest` claim
+  only), CORS-handled, zod-validated; per-order unique rows, shop-wide
+  hourly write cap (`survey.writesPerHour`), business refusals as 200s so
+  the extension never retry-storms.
+- **`SurveyResponse` table** (migration 0020) keyed by ORDER — the
+  thank-you page races the contract webhook, so linking runs from
+  whichever side arrives second (endpoint, contract-create webhook tail +
+  catch-up branch, and the daily `survey_link_sweep` job). Only countable
+  OURS contracts ever link (the other subscription app's orders may render
+  the survey; their rows stay inert).
+- **`survey.answered` canonical event** → Klaviyo metric **`Cellexia
+  Survey Answered`** with flattened answer properties and
+  `survey_holdout` — flows triggered on it MUST filter
+  `survey_holdout equals false`: a deterministic slice of surveyed
+  subscribers (`survey.holdoutPct`, default 15%) is held out of
+  survey-triggered interventions so each answer segment's measured churn
+  stays uncontaminated (the untreated comparison group).
+- **Survey features in churn risk**: the heuristic gains bounded,
+  presence-gated priors (trial intent, "results within days" impatience,
+  occasion/fast-fix motives, inconsistent routines raise risk; permanence,
+  patience, established routines lower it) and `RISK_FEATURE_NAMES` gains
+  nine survey features (ordinal scales + motive one-hots +
+  `survey_missing`/`survey_skipped` — shown-but-skipped is itself a
+  signal). Note: widening the feature space demotes any previously
+  promoted learned model to the heuristic until the nightly
+  `risk_learning_run` re-qualifies one over the new space — expected,
+  documented behavior of the feature-name match.
+- **Predicted LTGP engine** (`app/lib/analytics/predicted-ltgp.server.ts`,
+  nightly `predicted_ltgp_run` after `churn_risk_run`): expected
+  cumulative gross profit from subscription start at d90/d180/y1/y3/y5 =
+  conditional Kaplan-Meier survival (from each contract's current cycle,
+  geometric tail beyond observed depth) tilted by the contract's risk
+  score vs the book mean (clamped ×0.25–×4), × per-cycle gross profit
+  through the shared cost model (COGS/shipping/fees/VAT), with the
+  refund-exclusion setting honored as a disclosed expected-refund haircut
+  (the setting's FIFTH lockstep consumer — registry comment updated).
+  Every horizon carries an A–D grade capped by how much calendar history
+  backs it; estimated costs are flagged through.
+- **Frozen day-one predictions + accuracy ledger**: a contract scored
+  within its first 8 days gets `predictedLtgpInitial` stamped once, never
+  rewritten; the nightly accuracy pass compares matured horizons against
+  actual realized gross profit (origin payment once + successful renewals
+  through stored cost snapshots) into the machine-written `ltgpAccuracy`
+  setting. The UI never claims accuracy without matured samples.
+- **Admin surfaces**: Subscriber page gains a read-only **Survey** card
+  (answers, shown-but-skipped state, holdout badge) and a **Predicted
+  value** card (five horizons with grade badges and the honesty
+  explainer); Analytics → Cohorts & LTGP gains **"Predicted LTGP — where
+  the young cohorts are heading"** (per-cohort averages, segment-filter
+  aware, with the measured-accuracy line once cohorts mature).
+
+### Changed
+
+- **Default VAT rate is now 20%** (previously 8.1% since v1.16.0). Applies
+  only to shops that never explicitly saved Settings → Costs & profit — a
+  saved `vat` block keeps its stored rate. All analytics VAT semantics are
+  unchanged (flat % of kept money, reporting only, billing untouched).
+- `package.json` gains a single literal workspace
+  (`extensions/cellexia-survey`) so the extension's own dependencies
+  (`@shopify/ui-extensions-react`) install with `npm ci`.
+
+> Update notes: **run `npx prisma migrate deploy`** (migration 0020,
+> additive — one table, four nullable columns) and **`npm run deploy`**
+> (uploads the new extension). Then one-time setup: Shopify admin →
+> Settings → Checkout → customize the **Thank you** page → add the
+> "Cellexia Post-purchase Survey" block and set its **App URL** setting to
+> your app host (the `SHOPIFY_APP_URL` value, no trailing slash); repeat
+> on the **Order status** page in the checkout-and-accounts editor. The
+> store must be on the upgraded Thank You / Order Status pages (mandatory
+> for all stores since 2026-08-26). If your live VAT rate should stay
+> 8.1%, save Settings → Costs & profit once with that value — a saved
+> setting is never touched by the default change.
+
+## [1.20.0] — 2026-08-12
+
+**Portal growth system** — six behavioral-design features on the customer
+portal, each merchant-toggleable and **ON by default** (`portalGrowth`
+settings group, Settings → Portal growth), built to grow lifetime gross
+profit: fewer cancellations, more add-ons, skip intent converted into
+cheaper concessions. Every feature reframes or reorders EXISTING mechanics —
+none removes a customer capability (skip, delay, pause and cancel stay
+within two taps everywhere), every displayed number is computed from real
+captured data, and the growth copy never names cancellation (both rules
+pinned by tests). **No migration**, no new env vars, no scope, webhook or
+theme changes, `npm run deploy` NOT required. Rollback-safe: the new
+settings group simply goes unread by older code.
+
+### Added
+
+- **Value-first subscription cards** (`homeValueCard`): the portal home
+  card leads with member value — money-true captured savings (settlement
+  discounts + origin discount; hidden when zero, never invented) and
+  deliveries-to-milestone — plus an "Add products" button linking straight
+  into the add section. The one-tap skip/delay buttons leave the list (a
+  skip button on every visit advertises skipping); both remain on the
+  Manage page. Off = the classic card, unchanged.
+- **Add-a-product emphasis** (`addonUpsell`): the add section opens
+  expanded, leads with the one-time "Try it in the next delivery"
+  (foot-in-the-door; the recurring add stays one step behind), frames every
+  add-on as riding a delivery that is already coming ("no extra shipping" —
+  true by construction), and badges "Popular add-on" only on products with
+  ≥3 real `cycle.addon_added` events in the trailing 180 days (demo and
+  foreign contracts never vote; a failed scan means no badges, never fake
+  ones).
+- **Post-action add-on offer** (`postActionUpsell`): after unskip, resume
+  or an address update — the portal's cheapest yes-moments — the page
+  offers ONE add-on at the member price. Deliberately never after a skip.
+- **Skip alternatives ladder** (`concessionLadder`): the schedule card's
+  quick actions become an ordered menu — delay first (accented; "nothing
+  else changes"), the plan's next-slower cadence second ("your price and
+  rewards stay" — truthful: frequency changes keep both), skip last, quiet
+  but one tap, with its concrete consequence date and — only while a
+  milestone gift is actually pending — the truthful note that it moves back
+  one delivery. Off = the classic skip/delay row.
+- **Repeated-skip cadence nudge** (`cadenceNudge`): two or more skips in
+  the trailing 120 days suggests switching to the plan's closest slower
+  cadence in one tap — a cadence mismatch fixed beats repeated skips and
+  the cancellation they often precede.
+- **Running-out prompt** (`runoutPrompt`): when the churn model's
+  predicted-empty date lands ≥2 days BEFORE the next delivery, the page
+  offers "Move it up to {date}" (one tap, bounded by the standing
+  next-date rules) or "Add one more" — the inverse of the existing
+  "running low later? push it back" prompt. Hidden during a lock window
+  (next-date is a locked action).
+- 24 new customer-facing strings across all 22 locale catalogs, in each
+  catalog's register; `app/lib/portal/growth.server.ts` (savings,
+  milestone, slower-cadence, runout, skip-count and popularity helpers with
+  their honesty rules documented as load-bearing) and
+  `tests/portal-growth.test.ts` (registry defaults, helper honesty, source
+  pins — including "skip is reordered, never removed" — and copy hygiene:
+  no cancellation naming, no pressure words).
+
+> Update notes: `npx prisma migrate deploy` is a no-op. One new settings
+> group with safe defaults; nothing to do. The cancel flow's loss-aversion
+> entry screen (savings, tenure, milestone and rewards at risk, pause as
+> the default alternative) already ships since v1.10.0 and is unchanged.
+> Measure the system against the analytics you already have: skip:cancel
+> ratio, add-on attach rate, weekly churn and cohort LTGP.
+
+## [1.19.0] — 2026-08-12
+
+**Friendly commitment-period messaging** — what subscribers read during a
+plan's lock window is now merchant-switchable
+(`portal.friendlyLockMessaging`, Settings → Customer portal, **ON by
+default**): instead of a plain restriction notice, the portal shows a
+benefit-first "welcome period" progress card, and the blocked-action toast,
+one-click email-link page and SMS reply use matching reassuring copy — all
+still carrying the exact unlock date. The lock MECHANIC (blocked set,
+server-side guards, shop-tz midnight release) is byte-identical either way.
+**No migration**, no new env vars, no scope, webhook or theme changes,
+`npm run deploy` NOT required (the extension is untouched). Rollback-safe:
+the new settings field simply goes unread by older code, and the classic
+copy keys are untouched.
+
+### Added
+
+- **"Welcome period" progress card** (portal subscription page, friendly
+  mode): title + "day X of Y" with a progress bar (endowed progress / goal
+  gradient), benefit-first body — "your welcome price stays protected …
+  that's what makes your intro offer possible" (reciprocity + honest
+  reason-giving) — the exact unlock date, and an explicit can-do list (add
+  products, change address and payment, increase quantities — autonomy
+  affirmation). The card never names the blocked verbs and never mentions
+  cancellation (reactance / priming hygiene — pinned by a copy-hygiene
+  test). Neutral card styling replaces the warning note.
+- **Friendly blocked-action toast**: "Schedule changes unlock on {date} —
+  {days} day(s) to go …" — the refusing writers (portal api dispatcher,
+  cancel choke point) append the unlock day label and countdown to the
+  redirect only when the option is on; `resolveToast` validates the params
+  as untrusted input and falls back to the classic factual toast on
+  anything malformed.
+- **Friendly one-click email-link page** ("Almost there — this unlocks on
+  {date}") and **friendly SMS reply** ("skips unlock on {date}, when your
+  welcome period completes …"), both switching on the same setting with
+  failure-contained settings reads (classic copy on any problem).
+- Ten new i18n keys (`portal.locked.friendly_*`,
+  `portal.toast.locked_friendly`, `magic.locked_friendly*`,
+  `magic.sms.locked_friendly`) across all 22 locale catalogs, matching each
+  catalog's existing register (du/vous/tú/Ön/…).
+
+### Changed
+
+- Settings → Customer portal gains the "Friendly commitment-period
+  messaging" toggle. The friendly copy assumes the locked plan came with an
+  intro/welcome offer (the reason `lockDays` exists); the help text tells
+  merchants locking plans without intro pricing to switch it off. Turning
+  it off restores the original factual notice everywhere, byte-identical.
+
+> Update notes: `npx prisma migrate deploy` is a no-op (no new migration).
+> One new optional settings field with a safe default; nothing to do. If
+> your plans use `lockDays` and you prefer the original plain notice, turn
+> the toggle off in Settings → Customer portal.
+
 ## [1.18.1] — 2026-08-12
 
 **Patch release** — one bug fix on the v1.18.0 guided Klaviyo delivery.

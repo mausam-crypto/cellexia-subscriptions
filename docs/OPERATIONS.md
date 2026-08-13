@@ -806,6 +806,67 @@ Hover any cell for the plain-English sentence. Color intensity is absolute
 for retention (0–100%) and normalized to the largest value in view for the
 money measures; negative cells are flagged.
 
+### Predicted LTGP — the forward-looking overlay (v1.21.0)
+
+Beside the cohort *actuals*, Analytics → Cohorts & LTGP shows **predicted
+LTGP**: expected cumulative gross profit per subscriber at **90 days / 180
+days / 1 / 3 / 5 years from signup**, recomputed nightly for every active
+subscription and shown per subscriber on their cockpit page.
+
+> **Predicted LTGP** = the store's censoring-corrected retention curve,
+> conditioned on the cycles the subscriber has already reached and tilted by
+> their churn-risk score (survey answers included), × their current
+> per-cycle gross profit through the exact same cost model as the actuals —
+> COGS, shipping, fees, VAT, and the refund-exclusion setting applied as a
+> disclosed expected-refund haircut.
+
+How to read it honestly:
+
+- **Every horizon carries a grade (A–D)** capped by how much calendar
+  history the store actually has relative to that horizon. A 5-year number
+  on a young store grades D — *directional only* — by construction. Grades
+  climb on their own as the store ages; nothing to configure.
+- **The model grades its own homework.** Each subscriber scored within
+  their first 8 days gets that day-one prediction frozen forever; once
+  their 90-day (then 180-day, then 1-year) window has fully elapsed, the
+  nightly job compares prediction to what actually happened and shows the
+  measured error on the card. Until the first cohorts mature, the card
+  says so instead of claiming accuracy.
+- **Interventions don't fool it.** Survey-triggered flows must exclude the
+  holdout slice (`survey_holdout` property, Settings → Post-purchase
+  survey) — that untreated comparison group is what keeps the measured
+  churn per answer segment (and therefore these predictions) honest.
+- **Partly estimated costs flag through**: where COGS falls back to the
+  percentage estimate or VAT is rate-derived, the prediction is marked
+  estimated, exactly like the actuals' banner.
+- Predictions live on the contract row (`predictedLtgp`), recomputed
+  nightly by `predicted_ltgp_run`; PAUSED contracts keep their last value
+  (billing is stopped — extrapolating a paused clock would be fiction) and
+  its timestamp shows the staleness.
+
+### The post-purchase survey — where the day-one signal comes from (v1.21.0)
+
+Four one-tap questions on the order confirmation page (subscription orders
+only): planned duration, motive, expected result speed, current routine.
+Answers attach to the subscription, appear on the subscriber page, feed the
+risk score and predicted LTGP, and fire the `Cellexia Survey Answered`
+Klaviyo metric for answer-routed onboarding flows
+([docs/KLAVIYO_SETUP.md](KLAVIYO_SETUP.md) §3.12). Three rules keep the
+data trustworthy:
+
+- **The instrument is frozen.** Question and option KEYS are versioned
+  (`questionSetVersion`); wording lives in the extension's locale files,
+  but changing an option's meaning requires a version bump — coefficients
+  are estimated per option key over months of matured labels, and pooling
+  two instruments corrupts both silently.
+- **Skipping is a signal.** Shown-but-unanswered is stored and feeds the
+  risk score (silence at checkout predicts silence at renewal); don't
+  chase completion with incentives — a discount for answering attracts
+  careless taps and trains deal-seeking in the exact people being scored.
+- **Never message the holdout.** Every survey-triggered flow filters
+  `survey_holdout equals false`. Changing the holdout percentage only
+  affects future subscribers; assigned flags are never reshuffled.
+
 ### The forecast tab — models and trust
 
 Five models compete: **naive** (last value carried forward), **damped trend**

@@ -156,6 +156,20 @@ export const settingsSchemas = {
       contextualPromptBufferDays: z.number().int().min(1).max(60).default(10),
       /** Contextual "push it back" prompt: weeks the one-tap delay applies. */
       contextualPromptDelayWeeks: z.number().int().min(1).max(12).default(3),
+      /**
+       * Friendly lock-window messaging (v1.19.0, ON by default). The plan
+       * lock MECHANIC is untouched either way — this only reframes what the
+       * customer reads while it runs. On: the portal shows a "welcome
+       * period" progress card (day X of Y, benefit-first copy, what stays
+       * available) instead of the plain restriction notice, and the
+       * blocked-action toast, magic-link page and SMS reply use matching
+       * reassuring copy with the unlock date. Off: the original factual
+       * notice everywhere. The friendly copy assumes the locked plan came
+       * with an intro/welcome offer ("your welcome price stays protected"),
+       * which is the reason lockDays exists — merchants locking plans with
+       * no intro pricing should turn this off.
+       */
+      friendlyLockMessaging: z.boolean().default(true),
     })
     .default({
       contextualPrompts: true,
@@ -170,6 +184,7 @@ export const settingsSchemas = {
       otpVerifyMaxAttempts: 5,
       contextualPromptBufferDays: 10,
       contextualPromptDelayWeeks: 3,
+      friendlyLockMessaging: true,
     }),
 
   // NOTE deliberately NO "buyBox" group here: buy-box presentation (savings
@@ -362,8 +377,9 @@ export const settingsSchemas = {
    * - vat: VAT / sales tax as a reporting cost. When enabled, both
    *   gross-profit surfaces subtract a flat percentage of each charge's kept
    *   money — kept × rate/100, VAT as a straight expense on revenue
-   *   (merchant-defined model, v1.16.0; a CHF 100 charge at 8.1% books
-   *   CHF 8.10) — at the contract's delivery-country rate (countryRatesPct,
+   *   (merchant-defined model, v1.16.0; a £100 charge at 20% books
+   *   £20.00 — the default rate is 20% since v1.21.0, previously 8.1%) —
+   *   at the contract's delivery-country rate (countryRatesPct,
    *   ISO alpha-2 keys) falling back to defaultRatePct. Captured order tax
    *   (BillingAttempt.taxCents / originOrderTaxCents) keeps being collected
    *   but no longer drives the deduction — it is the tax-extracted-from-
@@ -394,7 +410,7 @@ export const settingsSchemas = {
             z.number().min(0).max(50),
           ),
         })
-        .default({ enabled: true, defaultRatePct: 8.1, countryRatesPct: {} }),
+        .default({ enabled: true, defaultRatePct: 20, countryRatesPct: {} }),
     })
     .default({
       paymentFeePct: 2.9,
@@ -406,10 +422,13 @@ export const settingsSchemas = {
       cogsFallbackPctOfPrice: 25,
       // ON by default (merchant decision, v1.16.0 — flipped from the v1.15.0
       // off-default before any subscription existed, so nothing is rewritten):
-      // VAT is subtracted as a flat 8.1% of revenue until per-country rates
-      // are configured. Both defaults (this one and the field-level one
-      // above) must stay in sync.
-      vat: { enabled: true, defaultRatePct: 8.1, countryRatesPct: {} },
+      // VAT is subtracted as a flat 20% of revenue (merchant decision,
+      // v1.21.0 — raised from the 8.1% Swiss-rate default; a shop that
+      // explicitly SAVED the costModel setting keeps its stored rate, only
+      // never-saved shops read the new default) until per-country rates are
+      // configured. Both defaults (this one and the field-level one above)
+      // must stay in sync.
+      vat: { enabled: true, defaultRatePct: 20, countryRatesPct: {} },
     }),
 
   /**
@@ -424,8 +443,11 @@ export const settingsSchemas = {
    *   refunded rebill — most often the surprise first renewal that gets
    *   cancelled — is noise the merchant wants out of LTV data, not revenue
    *   to be netted. Consumed by runDailyRollup, computeCohortRows (and
-   *   therefore every segment view), getForecast and getSegmentForecast —
-   *   the four must stay in lockstep to avoid double-subtraction (see the
+   *   therefore every segment view), getForecast, getSegmentForecast and —
+   *   since v1.21.0 — the predicted-LTGP engine (predicted-ltgp.server.ts:
+   *   forward predictions apply it as a disclosed expected-refund haircut,
+   *   and the accuracy pass applies it to realized actuals) — the five must
+   *   stay in lockstep to avoid double-subtraction (see the
    *   estGrossProfitCents doc in rollup.server.ts). The daily rollup
    *   additionally repairs the charge-day rows of refunded payments inside
    *   the standing 90-day window (repairRefundAffectedRollupDays,
@@ -443,6 +465,91 @@ export const settingsSchemas = {
       excludeRefundedPayments: z.boolean(),
     })
     .default({ excludeRefundedPayments: true }),
+
+  /**
+   * Post-purchase survey (v1.21.0, Settings → Post-purchase survey) — the
+   * thank-you / order-status page survey (extensions/cellexia-survey) that
+   * feeds churn-risk features and the predicted-LTGP engine.
+   *
+   * - enabled: master switch consumed by the survey API
+   *   (app/routes/api.survey.tsx). OFF = the endpoint's status read reports
+   *   disabled (the extension then renders nothing) and answer writes are
+   *   refused. Already-stored responses are kept and keep feeding analytics.
+   * - holdoutPct: percentage of survey-linked contracts deterministically
+   *   assigned surveyHoldout = TRUE at link time (hash of the contract id —
+   *   stable, no RNG; app/lib/survey/link.server.ts). Holdout contracts are
+   *   excluded from survey-answer-triggered Klaviyo flows (the
+   *   `survey_holdout` event property) so each answer segment's measured
+   *   churn stays uncontaminated by the interventions the answers trigger.
+   *   Changing the percentage only affects FUTURE assignments — an assigned
+   *   flag is never reshuffled, or the untreated comparison group would be
+   *   worthless.
+   *
+   * - writesPerHour: abuse ceiling on survey writes per rolling hour across
+   *   the shop (the endpoint is public-with-session-token, so any buyer can
+   *   reach it; the per-order unique key bounds rows per real order and this
+   *   cap bounds synthetic-order spam). Refusals are business-level 200s so
+   *   the extension never retry-storms.
+   *
+   * The question set itself (wording, option keys, version) is deliberately
+   * NOT a setting: it is a frozen measurement instrument
+   * (SURVEY_QUESTION_SET_VERSION in app/lib/survey/shared.ts, mirrored in
+   * the extension source) — editing wording mid-stream would silently pool
+   * answers from different instruments.
+   */
+  survey: z
+    .object({
+      enabled: z.boolean(),
+      holdoutPct: z.number().min(0).max(50),
+      writesPerHour: z.number().int().min(100).max(20000),
+    })
+    .default({ enabled: true, holdoutPct: 15, writesPerHour: 2000 }),
+
+  /**
+   * Portal growth features (v1.20.0, all ON by default) — behavioral-design
+   * levers on the customer portal, each independently toggleable. All of
+   * them reframe or reorder EXISTING mechanics; none removes a customer
+   * capability (skip, delay, pause and cancel stay reachable within two
+   * taps everywhere — the honesty rules in portal/growth.server.ts are
+   * load-bearing).
+   *
+   * - homeValueCard: the subscriptions-list card leads with member value
+   *   (captured savings, milestone proximity) and an add-products CTA
+   *   instead of one-tap skip/delay buttons (which advertise skipping);
+   *   skip/delay live on the Manage page.
+   * - addonUpsell: the add-a-product section opens expanded with
+   *   ships-with-your-delivery framing, the one-time "try it" as the
+   *   primary action (foot-in-the-door), and a "popular add-on" badge
+   *   backed by real cycle.addon_added counts (threshold ≥3, else no badge).
+   * - postActionUpsell: after a positive action (unskip, resume, address
+   *   update) the success moment offers one add-on — never after a skip.
+   * - concessionLadder: the schedule card's quick actions become an ordered
+   *   ladder — delay (accented) → deliver less often (kept price/rewards) →
+   *   skip (quiet but present) — each row with its concrete consequence
+   *   date, milestone note only when truthfully applicable.
+   * - cadenceNudge: two or more skips in the trailing 120 days suggests the
+   *   plan's next-slower cadence ("your price and rewards stay").
+   * - runoutPrompt: when the churn model predicts the customer runs out
+   *   BEFORE the next delivery, offer move-it-up / add-one-more — the
+   *   inverse of the standing "running low later? push it back" prompt.
+   */
+  portalGrowth: z
+    .object({
+      homeValueCard: z.boolean().default(true),
+      addonUpsell: z.boolean().default(true),
+      postActionUpsell: z.boolean().default(true),
+      concessionLadder: z.boolean().default(true),
+      cadenceNudge: z.boolean().default(true),
+      runoutPrompt: z.boolean().default(true),
+    })
+    .default({
+      homeValueCard: true,
+      addonUpsell: true,
+      postActionUpsell: true,
+      concessionLadder: true,
+      cadenceNudge: true,
+      runoutPrompt: true,
+    }),
 
   /**
    * Per-template email customization (v1.16.0, admin Emails tab).
@@ -661,6 +768,38 @@ export const settingsSchemas = {
       evaluation: null,
       promoted: false,
     }),
+
+  /**
+   * INTERNAL / MACHINE-WRITTEN — predicted-LTGP accuracy ledger. Written
+   * exclusively by the nightly predicted_ltgp_run job
+   * (app/lib/analytics/predicted-ltgp.server.ts, accuracy pass); never
+   * edited by hand and not rendered on the Settings page. For every horizon
+   * whose calendar window has fully elapsed for at least one initially-
+   * scored contract, compares the FROZEN day-one prediction
+   * (SubscriptionContract.predictedLtgpInitial) against the contract's
+   * actual realized gross profit over that window: `matured` = contracts
+   * measured, `mapePct` = mean absolute percentage error, `biasPct` =
+   * signed mean error (positive = the model over-promised). The admin
+   * Cohorts & LTGP tab renders these as the honesty chip next to predicted
+   * figures — the UI never claims accuracy without matured measurements
+   * (the getRiskModelStatus convention).
+   */
+  ltgpAccuracy: z
+    .object({
+      version: z.literal(1),
+      updatedAt: z.string().nullable(),
+      horizons: z
+        .record(
+          z.enum(["d90", "d180", "y1", "y3", "y5"]),
+          z.object({
+            matured: z.number().int().min(0),
+            mapePct: z.number().nullable(),
+            biasPct: z.number().nullable(),
+          }),
+        )
+        .default({}),
+    })
+    .default({ version: 1, updatedAt: null, horizons: {} }),
 
   /**
    * INTERNAL / MACHINE-WRITTEN — rolling per-model forecast error history

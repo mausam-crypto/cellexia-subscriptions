@@ -360,7 +360,8 @@ export function vatRatePctForCountry(
  *
  * The model (v1.16.0, merchant-defined): VAT is a flat percentage of revenue,
  * subtracted exactly like any other expense — kept money × rate/100, so a
- * CHF 100.00 charge at 8.1% books CHF 8.10. This deliberately replaces BOTH
+ * £100.00 charge at 20% books £20.00 (default rate 20% since v1.21.0,
+ * previously 8.1%). This deliberately replaces BOTH
  * v1.15.0 paths (captured order tax, and the net × rate/(100+rate)
  * extraction): each produced the tax-extracted-from-gross figure (CHF 7.49
  * on that example), which is not the model the merchant runs their P&L on.

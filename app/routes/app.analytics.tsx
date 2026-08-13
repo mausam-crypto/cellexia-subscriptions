@@ -30,6 +30,7 @@ import {
   getForecast,
   getFunnelMetrics,
   getLtgpSummary,
+  getPredictedLtgpSummary,
   getRiskModelStatus,
   getSegmentChurnSeries,
   getSegmentCohortData,
@@ -405,6 +406,16 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       c.ltgpM12Cents != null ? (rawTotals.get(c.cohortMonth)?.get(12) ?? null) : null,
   }));
 
+  // ── Predicted LTGP (v1.21.0): forward-looking overlay for the same tab.
+  // Contained — a scoring gap must never blank the actuals beside it.
+  const predictedLtgp = await getPredictedLtgpSummary(shop.id, {
+    contractIds: segmentActive ? segmentIds : null,
+    now,
+  }).catch((err) => {
+    console.error("[analytics] predicted ltgp summary failed", err);
+    return null;
+  });
+
   return json({
     ready: true as const,
     rangeDays,
@@ -430,6 +441,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     segmentChurnSeries,
     ltgpRows,
     ltgpWeightedAvg: ltgp.weightedAvg,
+    predictedLtgp,
     heatmap: { rows: heatmapSource, maxOffset: heatmapMaxOffset },
     survival,
     decidedContracts,
@@ -1170,7 +1182,130 @@ function CohortsTab({ data }: { data: ReadyData }) {
           )}
         </BlockStack>
       </Card>
+
+      <PredictedLtgpCard data={data} />
     </BlockStack>
+  );
+}
+
+/**
+ * Predicted LTGP (v1.21.0) — the forward-looking overlay on the actuals
+ * above: average predicted cumulative gross profit per subscriber at fixed
+ * horizons from signup, by signup-month cohort. Labels are local constants
+ * (never import the .server module into a tab component — the ownership
+ * shared.ts client-bundle rule).
+ */
+const PREDICTED_HORIZONS = [
+  { key: "d90", label: "90d" },
+  { key: "d180", label: "180d" },
+  { key: "y1", label: "1y" },
+  { key: "y3", label: "3y" },
+  { key: "y5", label: "5y" },
+] as const;
+
+function PredictedLtgpCard({ data }: { data: ReadyData }) {
+  const { predictedLtgp, currencyCode } = data;
+  const money = (cents: number | null | undefined) =>
+    cents == null ? "—" : formatMoney(cents, currencyCode);
+
+  const maturedEntries = predictedLtgp
+    ? PREDICTED_HORIZONS.flatMap(({ key, label }) => {
+        const acc = predictedLtgp.accuracy.horizons[key];
+        return acc && acc.matured > 0 && acc.mapePct != null
+          ? [{ key, label, matured: acc.matured, mapePct: acc.mapePct, biasPct: acc.biasPct }]
+          : [];
+      })
+    : [];
+
+  return (
+    <Card>
+      <BlockStack gap="300">
+        <Text as="h3" variant="headingMd">
+          Predicted LTGP — where the young cohorts are heading
+        </Text>
+        <Text as="p" variant="bodySm" tone="subdued">
+          Expected cumulative gross profit per subscriber at fixed horizons
+          from signup, averaged per cohort over live predictions (recomputed
+          nightly: the store&rsquo;s retention curve, each subscriber&rsquo;s
+          risk score — survey answers included — and their current per-cycle
+          margin). Unlike the actuals above, these are forecasts: short
+          horizons firm up first, and 3y/5y on a young store are directional
+          only. Each subscriber&rsquo;s day-one prediction is frozen and later
+          compared against what really happened — the accuracy line below
+          appears once the first cohorts mature, and stays honest because
+          matured predictions are never rewritten.
+        </Text>
+        {!predictedLtgp || predictedLtgp.overall.contracts === 0 ? (
+          <Text as="p" variant="bodySm" tone="subdued">
+            No predictions yet — they appear after the nightly analytics job
+            first scores active subscriptions.
+          </Text>
+        ) : (
+          <>
+            <DataTable
+              columnContentTypes={[
+                "text",
+                "numeric",
+                "numeric",
+                "numeric",
+                "numeric",
+                "numeric",
+                "numeric",
+              ]}
+              headings={[
+                "Cohort",
+                "Scored",
+                ...PREDICTED_HORIZONS.map((h) => `${h.label} / sub`),
+              ]}
+              rows={[
+                ...predictedLtgp.cohorts.map((cohort) => [
+                  cohort.cohortMonth,
+                  cohort.contracts.toLocaleString("en"),
+                  ...PREDICTED_HORIZONS.map(({ key }) =>
+                    money(cohort.avgCents[key]),
+                  ),
+                ]),
+                [
+                  <Text as="span" fontWeight="semibold" key="all">
+                    All scored
+                  </Text>,
+                  <Text as="span" fontWeight="semibold" key="count">
+                    {predictedLtgp.overall.contracts.toLocaleString("en")}
+                  </Text>,
+                  ...PREDICTED_HORIZONS.map(({ key }) => (
+                    <Text as="span" fontWeight="semibold" key={key}>
+                      {money(predictedLtgp.overall.avgCents[key])}
+                    </Text>
+                  )),
+                ],
+              ]}
+            />
+            {maturedEntries.length > 0 ? (
+              <Text as="p" variant="bodySm" tone="subdued">
+                Prediction accuracy so far (day-one predictions vs matured
+                actuals):{" "}
+                {maturedEntries
+                  .map(
+                    (e) =>
+                      `${e.label}: ±${e.mapePct}% over ${e.matured} subscriber${e.matured === 1 ? "" : "s"}${
+                        e.biasPct != null && Math.abs(e.biasPct) >= 1
+                          ? ` (${e.biasPct > 0 ? "over" : "under"}-promising ${Math.abs(e.biasPct)}%)`
+                          : ""
+                      }`,
+                  )
+                  .join(" · ")}
+              </Text>
+            ) : (
+              <Text as="p" variant="bodySm" tone="subdued">
+                No matured predictions to grade yet — the first accuracy
+                readings appear once day-one-scored subscribers pass their
+                90-day mark.
+              </Text>
+            )}
+          </>
+        )}
+      </BlockStack>
+    </Card>
   );
 }
 

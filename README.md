@@ -93,6 +93,14 @@ conversion; minimise voluntary and involuntary churn.**
   shape captured (sanitized — never an IP or full user-agent) on every new
   subscription and erased on GDPR redact, so channel-quality analysis has
   history from day one ([docs/DATA_FOUNDATION.md](docs/DATA_FOUNDATION.md)).
+- **Post-purchase survey & predicted LTGP** — four one-tap questions on the
+  order confirmation page (checkout UI extension, subscription orders only)
+  feed a nightly per-subscriber predicted lifetime gross profit at
+  90d/180d/1y/3y/5y with honesty grades, frozen day-one predictions and a
+  self-measuring accuracy ledger; answers route Klaviyo onboarding flows
+  with a built-in intervention holdout. See
+  [docs/OPERATIONS.md](docs/OPERATIONS.md) §19 and
+  [docs/DATA_FOUNDATION.md](docs/DATA_FOUNDATION.md) Part 3.
 - **Ops** — health endpoint, alerting (billing failures, webhook spikes, stuck
   contracts, churn spikes), full audit event log, bulk operations (stockout
   actions, price changes with notice), subscriber import.

@@ -129,7 +129,7 @@ const COST_MODEL = {
   shippingCostPerShipmentCents: { mode: "flat", flatCents: 200 },
   cogsFallbackPctOfPrice: 25,
   // Explicitly OFF: this suite pins the vat-less formulas. Without this key
-  // the registry's field-level default (enabled at 8.1% since v1.16.0)
+  // the registry's field-level default (enabled since v1.16.0; 20% since v1.21.0)
   // would silently enter every golden number below.
   vat: { enabled: false, defaultRatePct: 0, countryRatesPct: {} },
 };

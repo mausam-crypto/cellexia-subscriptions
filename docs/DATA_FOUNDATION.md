@@ -218,3 +218,22 @@ personal data).
 
 The rule stands: consumers read these columns read-only, and any new signal
 lands additively.
+
+## Part 3 — Post-purchase survey (v1.21.0, migration 0020)
+
+The second behavioral foundation surface: `SurveyResponse` rows (one per
+checkout ORDER shown the thank-you/order-status survey) plus four nullable
+`SubscriptionContract` columns — `predictedLtgp`, `predictedLtgpAt`,
+`predictedLtgpInitial` (frozen day-one prediction, never rewritten) and
+`surveyHoldout` (deterministic intervention holdout, assigned once, never
+reshuffled). The same additive rule applies verbatim: answer OPTION KEYS are
+a frozen measurement instrument versioned by `questionSetVersion`
+(`app/lib/survey/shared.ts` is the authority; the extension bundles a
+pinned mirror) — a wording change that alters an option's meaning is a new
+version with new keys, never an in-place edit, because churn/LTGP
+coefficients are estimated per option key over months of matured labels.
+Consumers today: churn-risk features (`learning.server.ts`), predicted
+LTGP (`predicted-ltgp.server.ts`), the subscriber-page survey card and the
+`survey.answered` Klaviyo metric. GDPR: survey rows carry no free text and
+no PII beyond the customer GID; contract deletion is impossible outside
+demo resets, whose contracts never link surveys.

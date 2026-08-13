@@ -1,0 +1,37 @@
+{
+  "introTitle": "Aiutaci a organizzare al meglio le tue consegne",
+  "progress": "Domanda {{current}} di {{total}} — basta un tocco",
+  "doneTitle": "Grazie!",
+  "doneBody": "Useremo le tue risposte per personalizzare consegne e consigli di bellezza.",
+  "q": {
+    "plannedDuration": {
+      "title": "Per aiutarci a pianificare — come pensi di usare questo prodotto?",
+      "trying": "Lo sto provando — deciderò dopo la prima consegna",
+      "few_months": "Qualche mese — il tempo di valutare i risultati veri",
+      "six_months_plus": "Sei mesi o più",
+      "permanent": "Questo tipo di prodotto fa parte stabile della mia routine"
+    },
+    "motive": {
+      "title": "Qual è la cosa principale che vuoi ottenere?",
+      "fast_wrinkles": "Ridurre visibilmente rughe e segni dell'età, il prima possibile",
+      "prevention": "Rallentare l'invecchiamento nel lungo periodo — prevenzione",
+      "daily_care": "Cura quotidiana — mantenere pelle e capelli sani",
+      "occasion": "Essere al meglio per un'occasione in arrivo"
+    },
+    "expectedSpeed": {
+      "title": "In quanto tempo ti aspetti di vedere i risultati che cerchi?",
+      "days": "In pochi giorni",
+      "weeks": "In un paio di settimane",
+      "one_two_months": "In 1–2 mesi",
+      "three_months_plus": "In 3 mesi o più — i veri cambiamenti richiedono tempo",
+      "not_sure": "Non lo so ancora"
+    },
+    "routine": {
+      "title": "Com'è la tua routine di bellezza oggi?",
+      "full": "Una routine completa, mattina e sera",
+      "most_days": "Qualche prodotto, quasi tutti i giorni",
+      "on_off": "Uso prodotti a fasi alterne",
+      "minimal": "Molto essenziale — questo è uno dei miei primi"
+    }
+  }
+}

@@ -307,8 +307,33 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   ) {
     lock = await resolveLockState(shop.id, contract, shop.ianaTimezone);
   }
-  if (lock.locked && LOCK_BLOCKED.has(actionName)) {
+  // Friendly lock refusals (v1.19.0): when the merchant's friendly messaging
+  // is on, the redirect carries the unlock day (shop-tz calendar label) and
+  // the remaining-day count so the toast can say WHEN and what remains
+  // available instead of a bare refusal. resolveToast treats the params as
+  // untrusted and falls back to the classic copy on anything malformed.
+  const lockedBack = () => {
+    if (portalSettings.friendlyLockMessaging && lock.until) {
+      const label = new Intl.DateTimeFormat("en-CA", {
+        timeZone: shop.ianaTimezone,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }).format(lock.until);
+      const daysToGo = Math.max(
+        1,
+        Math.ceil((lock.until.getTime() - Date.now()) / 86_400_000),
+      );
+      return back("locked", {
+        locked_until: label,
+        locked_days: String(daysToGo),
+      });
+    }
     return back("locked");
+  };
+
+  if (lock.locked && LOCK_BLOCKED.has(actionName)) {
+    return lockedBack();
   }
 
   const ownedLine = (lineId: string) =>
@@ -399,7 +424,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         // Lock window blocks only the reducing direction — an increase is
         // additive and stays available.
         if (lock.locked && quantity.data < line.quantity) {
-          return back("locked");
+          return lockedBack();
         }
         await changeLineQuantity(
           shopDomain,
@@ -433,7 +458,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         // Lock window blocks removing recurring lines (a plan reduction);
         // removing a one-time addon undoes an addition and stays available.
         if (lock.locked && !line.isOneTimeAddon) {
-          return back("locked");
+          return lockedBack();
         }
         if (!line.isOneTimeAddon) {
           const recurring = contract.lines.filter(

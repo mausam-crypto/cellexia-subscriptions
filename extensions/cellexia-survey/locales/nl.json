@@ -1,0 +1,37 @@
+{
+  "introTitle": "Help ons je leveringen goed te plannen",
+  "progress": "Vraag {{current}} van {{total}} — één tik per vraag",
+  "doneTitle": "Dank je wel!",
+  "doneBody": "We gebruiken je antwoorden om leveringen en verzorgingstips op jou af te stemmen.",
+  "q": {
+    "plannedDuration": {
+      "title": "Zodat we kunnen plannen — hoe denk je dit product te gebruiken?",
+      "trying": "Uitproberen — ik kijk na de eerste levering verder",
+      "few_months": "Een paar maanden — genoeg om echte resultaten te beoordelen",
+      "six_months_plus": "Zes maanden of langer",
+      "permanent": "Dit soort producten hoort vast bij mijn routine"
+    },
+    "motive": {
+      "title": "Wat moet dit product vooral voor je doen?",
+      "fast_wrinkles": "Rimpels en tekenen van veroudering zichtbaar verminderen, zo snel mogelijk",
+      "prevention": "Huidveroudering op de lange termijn vertragen — preventie",
+      "daily_care": "Dagelijkse verzorging — gezonde huid en gezond haar",
+      "occasion": "Op mijn best zijn voor iets dat eraan komt"
+    },
+    "expectedSpeed": {
+      "title": "Hoe snel verwacht je de resultaten te zien die je zoekt?",
+      "days": "Binnen enkele dagen",
+      "weeks": "Binnen twee à drie weken",
+      "one_two_months": "Binnen 1–2 maanden",
+      "three_months_plus": "Na 3 maanden of langer — echte verandering kost tijd",
+      "not_sure": "Weet ik nog niet"
+    },
+    "routine": {
+      "title": "Hoe ziet je verzorgingsroutine er nu uit?",
+      "full": "Een volledige routine, 's ochtends en 's avonds",
+      "most_days": "Een paar producten, de meeste dagen",
+      "on_off": "Ik gebruik producten met tussenpozen",
+      "minimal": "Heel basic — dit is een van mijn eerste"
+    }
+  }
+}

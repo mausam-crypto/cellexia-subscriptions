@@ -352,6 +352,13 @@ const SECTION_DEFS: SectionDef[] = [
         type: "toggle",
       },
       {
+        path: "friendlyLockMessaging",
+        label: "Friendly commitment-period messaging",
+        helpText:
+          "On by default. While a plan's lock window runs, the portal shows a warm “welcome period” progress card (day X of Y, what stays available) instead of a plain restriction notice, and the blocked-action toast, email-link page and SMS reply use matching reassuring copy with the unlock date. The lock itself is unchanged either way. The friendly copy says the customer's welcome price is being protected — if you set a lock window on a plan with no intro offer, turn this off.",
+        type: "toggle",
+      },
+      {
         path: "otpCodeTtlMinutes",
         label: "OTP code lifetime (minutes)",
         helpText: "Login code validity (5–30).",
@@ -692,7 +699,7 @@ const SECTION_DEFS: SectionDef[] = [
         path: "vat.defaultRatePct",
         label: "Default VAT rate",
         helpText:
-          "Applied when a charge's country has no rate below (or the country is unknown). VAT is a straight percentage of revenue — an 8.1% rate on a CHF 100.00 charge subtracts CHF 8.10.",
+          "Applied when a charge's country has no rate below (or the country is unknown). VAT is a straight percentage of revenue — a 20% rate on a £100.00 charge subtracts £20.00.",
         type: "float",
         min: 0,
         max: 50,
@@ -709,6 +716,56 @@ const SECTION_DEFS: SectionDef[] = [
     ],
   },
   {
+    key: "portalGrowth",
+    title: "Portal growth",
+    description:
+      "Behavioral-design levers on the customer portal — each reframes or reorders existing controls to grow lifetime gross profit; none removes a customer capability (skip, delay, pause and cancel always stay within two taps).",
+    fields: [
+      {
+        path: "homeValueCard",
+        label: "Value-first subscription cards",
+        helpText:
+          "The subscriptions list leads with member value (real captured savings, milestone proximity) and an add-products button instead of one-tap skip/delay — a skip button on every visit is an advertisement for skipping. Skip and delay stay on the Manage page.",
+        type: "toggle",
+      },
+      {
+        path: "addonUpsell",
+        label: "Add-a-product emphasis",
+        helpText:
+          "Opens the add-a-product section expanded, leads with the one-time “try it in the next delivery” (low commitment converts, and a used trial sells itself), frames add-ons as riding a delivery that is already coming, and badges genuinely popular add-ons (real add counts, never invented).",
+        type: "toggle",
+      },
+      {
+        path: "postActionUpsell",
+        label: "Post-action add-on offer",
+        helpText:
+          "After a positive action (unskip, resume, address update) the success moment offers one add-on at the member price — never after a skip.",
+        type: "toggle",
+      },
+      {
+        path: "concessionLadder",
+        label: "Skip alternatives ladder",
+        helpText:
+          "The schedule card orders the quick actions: delay first (nothing is lost), the plan's next-slower cadence second (keeps price and rewards), skip last — still one tap, with its concrete consequence date. Converts skip intent into cheaper concessions without hiding anything.",
+        type: "toggle",
+      },
+      {
+        path: "cadenceNudge",
+        label: "Repeated-skip cadence suggestion",
+        helpText:
+          "Two or more skips in the last 120 days suggests the plan's next-slower delivery cadence — a cadence mismatch fixed beats repeated skips and the cancellation they often precede.",
+        type: "toggle",
+      },
+      {
+        path: "runoutPrompt",
+        label: "Running-out prompt",
+        helpText:
+          "When the churn model predicts the customer runs out BEFORE the next delivery, offer to move it up or add one more unit — the inverse of the standing “running low later?” prompt.",
+        type: "toggle",
+      },
+    ],
+  },
+  {
     key: "analytics",
     title: "Analytics data",
     description:
@@ -720,6 +777,41 @@ const SECTION_DEFS: SectionDef[] = [
         helpText:
           "On by default. Payments with ANY refund — full or partial — are removed from the analytics entirely, revenue and costs alike (a refunded rebill is usually a surprise renewal that got cancelled: noise, not revenue). Turn off to instead net refunds against revenue while keeping the payment's costs. Saving recomputes the cohort history AND rewrites every refund-affected day of the daily ledger under the new mode immediately; the nightly job keeps repairing new refunds' charge days within its 90-day window.",
         type: "toggle",
+      },
+    ],
+  },
+  {
+    key: "survey",
+    title: "Post-purchase survey",
+    description:
+      "The four-question survey new subscribers answer on the order confirmation page. Answers attach to the subscription, feed the churn-risk score and the predicted-LTGP forecast, and route onboarding flows in Klaviyo.",
+    fields: [
+      {
+        path: "enabled",
+        label: "Show the survey",
+        helpText:
+          "On by default. Off stops the survey from rendering and refuses new answers; answers already collected are kept and keep feeding analytics.",
+        type: "toggle",
+      },
+      {
+        path: "holdoutPct",
+        label: "Intervention holdout",
+        helpText:
+          "Percentage of surveyed subscribers deterministically held out of survey-triggered Klaviyo flows (the survey_holdout event property is true for them — filter them out in the flow). Without this untreated comparison group you cannot tell whether answer-triggered flows save customers or those customers would have stayed anyway. Changing it only affects future subscribers; assigned holdouts are never reshuffled.",
+        type: "float",
+        min: 0,
+        max: 50,
+        suffix: "%",
+      },
+      {
+        path: "writesPerHour",
+        label: "Write rate cap",
+        helpText:
+          "Abuse ceiling on survey submissions per hour across the whole store. The default is far above any real order volume — raise it only if a promotion makes legitimate submissions hit the cap (the audit log shows refusals).",
+        type: "int",
+        min: 100,
+        max: 20000,
+        suffix: "/hour",
       },
     ],
   },

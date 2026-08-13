@@ -114,8 +114,45 @@ export function resolveToast(
   request: Request,
   locale: string,
 ): { key: string; toast: PortalToast } | null {
-  const key = new URL(request.url).searchParams.get("toast");
+  const url = new URL(request.url);
+  const key = url.searchParams.get("toast");
   if (!key || !TOAST_KEYS.has(key)) return null;
+  // Friendly lock toast (v1.19.0): the refusing writer appends the unlock
+  // day label + remaining days ONLY when portal.friendlyLockMessaging is on
+  // (the writers hold the lock state and the setting; this resolver holds
+  // neither), so valid params select the friendly copy and their absence —
+  // or any tampered value — falls back to the classic factual toast. The
+  // label is the shop-tz calendar day, formatted here as a UTC-midnight
+  // date so no second timezone conversion can shift the promised day.
+  if (key === "locked") {
+    const label = url.searchParams.get("locked_until") ?? "";
+    const days = Number(url.searchParams.get("locked_days") ?? "");
+    // The shape regex alone is NOT enough: "2026-99-99" matches it but parses
+    // to Invalid Date — and Intl.format THROWS RangeError on Invalid Date, so
+    // a crafted URL would 500 the page. The round-trip equality additionally
+    // rejects day roll-overs ("2026-02-30" parses as March 2 in V8), which
+    // would otherwise render a date no writer ever promised.
+    const parsed = new Date(`${label}T00:00:00Z`);
+    if (
+      /^\d{4}-\d{2}-\d{2}$/.test(label) &&
+      Number.isFinite(parsed.getTime()) &&
+      parsed.toISOString().slice(0, 10) === label &&
+      Number.isInteger(days) &&
+      days > 0 &&
+      days <= 730
+    ) {
+      const date = new Intl.DateTimeFormat(locale, {
+        dateStyle: "long",
+        timeZone: "UTC",
+      }).format(parsed);
+      return {
+        key,
+        toast: {
+          text: t(locale, "portal.toast.locked_friendly", { date, days }),
+        },
+      };
+    }
+  }
   return { key, toast: { text: t(locale, `portal.toast.${key}`) } };
 }
 

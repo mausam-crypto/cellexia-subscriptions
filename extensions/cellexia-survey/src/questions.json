@@ -1,0 +1,10 @@
+{
+  "__comment": "MIRROR of app/lib/survey/shared.ts — the frozen measurement instrument. tests/survey-instrument.test.ts pins this file's questionSetVersion, question keys, option keys and ORDER to exact equality with the app-side vocabulary. Never edit one side alone, and never rename/reorder/merge option keys within a version: answers are only comparable inside one questionSetVersion (see shared.ts header). Extension sources cannot import app code, hence the mirror.",
+  "questionSetVersion": 1,
+  "questions": [
+    { "key": "plannedDuration", "options": ["trying", "few_months", "six_months_plus", "permanent"] },
+    { "key": "motive", "options": ["fast_wrinkles", "prevention", "daily_care", "occasion"] },
+    { "key": "expectedSpeed", "options": ["days", "weeks", "one_two_months", "three_months_plus", "not_sure"] },
+    { "key": "routine", "options": ["full", "most_days", "on_off", "minimal"] }
+  ]
+}

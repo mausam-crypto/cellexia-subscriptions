@@ -14,6 +14,7 @@ import {
   predictProbability,
   type RiskFeatureInput,
 } from "./learning.server";
+import { sanitizeSurveyAnswers } from "~/lib/survey/shared";
 
 /**
  * Churn-risk scoring + predicted-empty-date computation.
@@ -91,7 +92,7 @@ export async function runChurnRiskScoring(
 ): Promise<{ scored: number; updated: number; scorer: "heuristic" | "learned" }> {
   const loginCutoff = subDays(now, LOGIN_LOOKBACK_DAYS);
 
-  const [contracts, openCases, logins] = await Promise.all([
+  const [contracts, openCases, logins, surveyRows] = await Promise.all([
     prisma.subscriptionContract.findMany({
       where: { shopId, status: "ACTIVE", ...COUNTABLE_CONTRACT },
       select: {
@@ -126,6 +127,17 @@ export async function runChurnRiskScoring(
         createdAt: true,
       },
     }),
+    // Linked post-purchase surveys (v1.21.0): answers + shown-but-skipped
+    // feed both scorers. One row per contract (orderId-unique, linked once).
+    prisma.surveyResponse.findMany({
+      where: { shopId, contractId: { not: null } },
+      select: {
+        contractId: true,
+        shownAt: true,
+        answeredAt: true,
+        answers: true,
+      },
+    }),
     // Stale-score hygiene: contracts no longer ACTIVE are out of the risk
     // universe — zero their scores so nothing segments on dead data.
     prisma.subscriptionContract.updateMany({
@@ -140,6 +152,9 @@ export async function runChurnRiskScoring(
 
   const learnedModel = await loadPromotedModel(shopId);
 
+  const surveyByContract = new Map(
+    surveyRows.map((row) => [row.contractId as string, row]),
+  );
   const openDunningContractIds = new Set(openCases.map((c) => c.contractId));
   // Latest login instant per matching key (contractId / customerId / email) —
   // the heuristic only needs "logged in within the lookback", the learned
@@ -176,6 +191,7 @@ export async function runChurnRiskScoring(
       loginCandidates.length > 0 ? Math.max(...loginCandidates) : null;
 
     const acq = acquisitionSignals(contract);
+    const surveyRow = surveyByContract.get(contract.id);
     const input: RiskFeatureInput = {
       openDunning: openDunningContractIds.has(contract.id),
       skippedLastCycle:
@@ -190,6 +206,12 @@ export async function runChurnRiskScoring(
       intervalWeeks: contract.intervalWeeks,
       acqRevenueCents: acq.acqRevenueCents,
       acqDiscountPct: acq.acqDiscountPct,
+      survey: surveyRow
+        ? {
+            shown: true,
+            answers: sanitizeSurveyAnswers(surveyRow.answers),
+          }
+        : null,
     };
 
     const score = learnedModel

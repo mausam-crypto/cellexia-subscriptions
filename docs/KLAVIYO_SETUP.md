@@ -165,6 +165,7 @@ Every contract-scoped event also carries the **standard snapshot properties**
 | `Cellexia Incentive Announced` | Early-cycle incentive announced (orders 1–2) | snapshot, incentive details* |
 | `Cellexia Price Change Notice` | Price change applied/announced to a contract | snapshot, old/new price* |
 | `Cellexia Stockout Delay` | Renewal delayed because an item is out of stock | snapshot, `delayDays`* |
+| `Cellexia Survey Answered` | Post-purchase survey linked to the subscription and answered (v1.21.0; partials flush via the daily sweep) | snapshot, `survey_planned_duration`*, `survey_motive`*, `survey_expected_speed`*, `survey_routine`*, `survey_completed`*, `survey_holdout`* |
 
 \* = passed through from the internal event payload; exact keys depend on the
 emitting module. Build flows against the snapshot + the explicitly named
@@ -441,6 +442,29 @@ by phone number and skips the next cycle, logging `cycle.skipped` — which in
 turn fires `Cellexia Order Skipped` back into Klaviyo for your records.
 
 ---
+
+### 3.12 Survey-routed onboarding (v1.21.0)
+
+- **Trigger:** metric `Cellexia Survey Answered`
+- **MANDATORY first filter:** `survey_holdout` equals `false` — the holdout
+  slice (Settings → Post-purchase survey) is the untreated comparison group
+  that keeps answer-segment churn measurable. Never message it from any
+  survey-triggered flow.
+- Branch on the answer properties and send the matching onboarding track:
+  - `survey_expected_speed` equals `days` (or `weeks`) → expectation-reset
+    email on day 1–2: the honest results timeline for their product, what
+    week 3 actually looks like, before disappointment sets in.
+  - `survey_planned_duration` equals `trying` → proof track inside the
+    first 60 days (clinical percentages, before/afters with real
+    timelines) — their renewal decision happens early.
+  - `survey_motive` equals `occasion` → after-the-event conversion: turn
+    the event win into a routine (time by their cadence, not a fixed day).
+  - `survey_motive` equals `prevention` / `survey_routine` equals `full` →
+    long-horizon track, light cadence, **no discounts** (they told you
+    they'd stay; discounting is margin burn).
+- Notes: partial answers fire too (`survey_completed` `false`) — branch
+  guards should treat a missing property as "unknown", not "no". One event
+  per subscription (deduped server-side per order).
 
 ## 4. Segments
 

@@ -100,9 +100,45 @@ export async function requireCancelContext(
   if (!portalSession.isPreview) {
     const lock = await resolveLockState(shop.id, contract, shop.ianaTimezone);
     if (lock.locked) {
+      // Friendly variant (v1.19.0): carry the unlock day + countdown so the
+      // toast explains WHEN instead of a bare refusal — same param contract
+      // as the api dispatcher's lockedBack (resolveToast validates them).
+      let params = "toast=locked";
+      if (lock.until) {
+        // Failure-contained like every other v1.19.0 surface: a broken
+        // settings read degrades to the classic plain toast — the redirect
+        // itself (the enforcement) must never be lost to a copy decision.
+        let friendly = false;
+        try {
+          const { getSetting } = await import(
+            "~/lib/settings/settings.server"
+          );
+          friendly = (await getSetting(shop.id, "portal"))
+            .friendlyLockMessaging;
+        } catch {
+          friendly = false;
+        }
+        if (friendly) {
+          const label = new Intl.DateTimeFormat("en-CA", {
+            timeZone: shop.ianaTimezone,
+            year: "numeric",
+            month: "2-digit",
+            day: "2-digit",
+          }).format(lock.until);
+          const daysToGo = Math.max(
+            1,
+            Math.ceil((lock.until.getTime() - Date.now()) / 86_400_000),
+          );
+          params = new URLSearchParams({
+            toast: "locked",
+            locked_until: label,
+            locked_days: String(daysToGo),
+          }).toString();
+        }
+      }
       throw redirect(
         withLocale(
-          `${PORTAL_BASE_PATH}/subscription/${contract.id}?toast=locked`,
+          `${PORTAL_BASE_PATH}/subscription/${contract.id}?${params}`,
           locale,
         ),
       );

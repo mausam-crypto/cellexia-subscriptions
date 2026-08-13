@@ -1,0 +1,37 @@
+{
+  "introTitle": "Help us get your deliveries right",
+  "progress": "Question {{current}} of {{total}} — one tap each",
+  "doneTitle": "Thank you!",
+  "doneBody": "We'll use this to tailor your deliveries and skincare tips to you.",
+  "q": {
+    "plannedDuration": {
+      "title": "So we can plan ahead — how do you see yourself using this?",
+      "trying": "Trying it out — I'll see how the first delivery goes",
+      "few_months": "A few months — enough to judge real results",
+      "six_months_plus": "Six months or more",
+      "permanent": "This kind of product is a permanent part of my routine"
+    },
+    "motive": {
+      "title": "What's the main thing you want it to do for you?",
+      "fast_wrinkles": "Visibly reduce wrinkles and aging signs, as fast as possible",
+      "prevention": "Slow down aging long-term — prevention",
+      "daily_care": "Daily care — keeping my skin and hair healthy",
+      "occasion": "Looking my best for something coming up"
+    },
+    "expectedSpeed": {
+      "title": "How quickly do you expect to see the results you're after?",
+      "days": "Within days",
+      "weeks": "Within a couple of weeks",
+      "one_two_months": "In 1–2 months",
+      "three_months_plus": "In 3 months or more — real change takes time",
+      "not_sure": "Not sure yet"
+    },
+    "routine": {
+      "title": "What does your beauty routine look like today?",
+      "full": "A full routine, morning and evening",
+      "most_days": "A few products, most days",
+      "on_off": "I use products on and off",
+      "minimal": "Pretty minimal — this is one of my first"
+    }
+  }
+}

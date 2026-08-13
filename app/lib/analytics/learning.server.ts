@@ -3,6 +3,7 @@ import { COUNTABLE_CONTRACT } from "./queries.server";
 import { logEvent } from "~/lib/events/log.server";
 import { getSetting, setSetting } from "~/lib/settings/settings.server";
 import type { SettingsValue } from "~/lib/settings/registry.server";
+import { sanitizeSurveyAnswers } from "~/lib/survey/shared";
 
 /**
  * Self-improving churn-risk core — "as we get more subscribers it should
@@ -90,6 +91,31 @@ export const RISK_FEATURE_NAMES = [
   "acq_revenue",
   "acq_discount_pct",
   "acq_present",
+  // Post-purchase survey (v1.21.0). NOTE: extending this list demotes any
+  // previously stored learned model — risk.server.ts refuses stored models
+  // whose featureNames don't exactly match, so scoring falls back to the
+  // heuristic until the nightly risk_learning_run trains and re-qualifies a
+  // model over the widened space. Deliberate: a model validated on other
+  // features is not the model we validated (see the doc above).
+  //
+  // Encodings (see surveySignals): the three attitude scales are ordinal in
+  // [0,1] — plannedDuration and routine increase with commitment/habit,
+  // expected_speed_risk increases with impatience (merchant decision:
+  // monotone across ALL products — no product performs miracles in days).
+  // Motive is unordered → one-hot. Absence is explicit, in two flavors the
+  // model must never conflate: survey_missing (never linked/shown — the
+  // whole pre-feature book) vs survey_skipped (shown, answered nothing —
+  // itself a disengagement signal). Ordinals read 0 when unanswered; the
+  // two flags carry the missingness so 0 is never mistaken for "trying".
+  "survey_missing",
+  "survey_skipped",
+  "survey_planned_duration",
+  "survey_expected_speed_risk",
+  "survey_routine_strength",
+  "survey_motive_fast_fix",
+  "survey_motive_prevention",
+  "survey_motive_daily_care",
+  "survey_motive_occasion",
 ] as const;
 
 /**
@@ -116,6 +142,77 @@ export interface RiskFeatureInput {
    */
   acqRevenueCents?: number | null;
   acqDiscountPct?: number | null;
+  /**
+   * Post-purchase survey state AS OF the snapshot instant (v1.21.0).
+   * undefined/null = no linked survey row existed yet (survey_missing);
+   * shown=true with empty answers = shown-but-skipped (survey_skipped).
+   * Answer values are the frozen option keys from app/lib/survey/shared.ts.
+   */
+  survey?: {
+    shown: boolean;
+    answers: Partial<
+      Record<"plannedDuration" | "motive" | "expectedSpeed" | "routine", string>
+    >;
+  } | null;
+}
+
+/**
+ * Ordinal/one-hot encodings for the survey answers — the single place the
+ * option-key → number mapping lives, shared by extractFeatures and the
+ * heuristic so training and serving cannot diverge. Values are priors only
+ * in DIRECTION (the logistic model refits magnitudes from outcomes); the
+ * ordinal SPACING is part of the frozen instrument semantics:
+ *  - plannedDuration: stated horizon, longer = stickier.
+ *  - expectedSpeedRisk: impatience — "days" is the worst answer on every
+ *    product (merchant decision, no product-relative scoring); "not_sure"
+ *    sits mid-scale (unformed expectations are steerable, not safe).
+ *  - routineStrength: existing consistent habit; "on_off" ranks BELOW
+ *    "minimal" (demonstrated inconsistency beats no history at predicting
+ *    non-adherence).
+ */
+export function surveySignals(survey: RiskFeatureInput["survey"]): {
+  missing: number;
+  skipped: number;
+  plannedDuration: number;
+  expectedSpeedRisk: number;
+  routineStrength: number;
+  motive: string | null;
+} {
+  if (!survey) {
+    return {
+      missing: 1,
+      skipped: 0,
+      plannedDuration: 0,
+      expectedSpeedRisk: 0,
+      routineStrength: 0,
+      motive: null,
+    };
+  }
+  const a = survey.answers ?? {};
+  const answeredAny = Object.values(a).some((v) => typeof v === "string");
+  const planned =
+    { trying: 0, few_months: 1 / 3, six_months_plus: 2 / 3, permanent: 1 }[
+      a.plannedDuration ?? ""
+    ] ?? 0;
+  const speed =
+    {
+      days: 1,
+      weeks: 0.75,
+      one_two_months: 0.5,
+      not_sure: 0.4,
+      three_months_plus: 0,
+    }[a.expectedSpeed ?? ""] ?? 0;
+  const routine =
+    { full: 1, most_days: 2 / 3, minimal: 1 / 3, on_off: 0 }[a.routine ?? ""] ??
+    0;
+  return {
+    missing: 0,
+    skipped: survey.shown && !answeredAny ? 1 : 0,
+    plannedDuration: planned,
+    expectedSpeedRisk: speed,
+    routineStrength: routine,
+    motive: a.motive ?? null,
+  };
 }
 
 /**
@@ -157,6 +254,8 @@ export function extractFeatures(input: RiskFeatureInput): number[] {
       : 0;
   const acqPresent = input.acqRevenueCents != null ? 1 : 0;
 
+  const survey = surveySignals(input.survey);
+
   return [
     input.openDunning ? 1 : 0,
     input.skippedLastCycle ? 1 : 0,
@@ -171,6 +270,15 @@ export function extractFeatures(input: RiskFeatureInput): number[] {
     acqPresent ? (input.acqRevenueCents ?? 0) / 100 : 0,
     acqPresent ? (input.acqDiscountPct ?? 0) : 0,
     acqPresent,
+    survey.missing,
+    survey.skipped,
+    survey.plannedDuration,
+    survey.expectedSpeedRisk,
+    survey.routineStrength,
+    survey.motive === "fast_wrinkles" ? 1 : 0,
+    survey.motive === "prevention" ? 1 : 0,
+    survey.motive === "daily_care" ? 1 : 0,
+    survey.motive === "occasion" ? 1 : 0,
   ];
 }
 
@@ -195,6 +303,33 @@ export function heuristicRiskScore(input: RiskFeatureInput): number {
     input.accountAgeDays >= DISENGAGED_MIN_ACCOUNT_AGE_DAYS
   ) {
     score += 0.15;
+  }
+
+  // Post-purchase survey priors (v1.21.0) — bounded, presence-gated
+  // adjustments; a contract with no linked survey is scored exactly as
+  // before this feature existed. Directions mirror the documented plan
+  // (docs/OPERATIONS.md § Predicted LTGP): stated-trial intent, impatient
+  // expectations, occasion/fast-fix motives and inconsistent routines raise
+  // risk; permanence, patience and an established routine lower it. These
+  // are educated-guess magnitudes by design — the learned model replaces
+  // them with fitted weights once outcomes mature (shadow-until-promoted).
+  if (input.survey) {
+    const answers = input.survey.answers ?? {};
+    const answeredAny = Object.values(answers).some(
+      (v) => typeof v === "string",
+    );
+    if (!answeredAny && input.survey.shown) {
+      // Shown-but-skipped: silence at checkout predicts silence at renewal.
+      score += 0.05;
+    }
+    if (answers.plannedDuration === "trying") score += 0.1;
+    if (answers.plannedDuration === "permanent") score -= 0.05;
+    if (answers.expectedSpeed === "days") score += 0.1;
+    if (answers.expectedSpeed === "weeks") score += 0.05;
+    if (answers.motive === "occasion") score += 0.08;
+    if (answers.motive === "fast_wrinkles") score += 0.05;
+    if (answers.routine === "on_off") score += 0.05;
+    if (answers.routine === "full") score -= 0.05;
   }
 
   return Math.min(1, Math.max(0, score));
@@ -375,6 +510,16 @@ export interface SnapshotContractRow {
   email: string | null;
   originOrderTotalCents?: number | null;
   originOrderDiscountCents?: number | null;
+  /**
+   * Linked post-purchase survey (v1.21.0), when one exists. Snapshots apply
+   * the usual time-antecedence: the shown flag counts only when shownAt ≤ T
+   * and answers only when answeredAt ≤ T (a sweep-linked late survey must
+   * not leak into earlier grid times). Answers are the raw stored Json —
+   * sanitized to the frozen key space at feature time.
+   */
+  surveyShownAt?: Date | null;
+  surveyAnsweredAt?: Date | null;
+  surveyAnswers?: unknown;
 }
 
 export interface SnapshotEventRow {
@@ -653,6 +798,22 @@ export function buildRiskSnapshots(input: {
         inWindow(failedMs) ||
         exhaustedTimes.some((exhaustedMs) => inWindow(exhaustedMs));
 
+      // Survey state as of T (time-antecedent: shown/answers only count once
+      // their own timestamps have passed — a late sweep-link cannot leak
+      // answers into grid times before they existed).
+      const surveyShownMs = contract.surveyShownAt?.getTime() ?? null;
+      const surveyAnsweredMs = contract.surveyAnsweredAt?.getTime() ?? null;
+      const survey =
+        surveyShownMs != null && surveyShownMs <= t
+          ? {
+              shown: true,
+              answers:
+                surveyAnsweredMs != null && surveyAnsweredMs <= t
+                  ? sanitizeSurveyAnswers(contract.surveyAnswers)
+                  : {},
+            }
+          : null;
+
       snapshots.push({
         contractId: contract.id,
         snapshotAt: new Date(t),
@@ -667,6 +828,7 @@ export function buildRiskSnapshots(input: {
           intervalWeeks: contract.intervalWeeks,
           acqRevenueCents: acq.acqRevenueCents,
           acqDiscountPct: acq.acqDiscountPct,
+          survey,
         },
         label: voluntaryOrInvoluntary ? 1 : 0,
       });
@@ -762,7 +924,7 @@ export async function runRiskLearning(
     now.getTime() - (SNAPSHOT_LOOKBACK_DAYS + LOGIN_LOOKBACK_DAYS) * DAY_MS,
   );
 
-  const [contracts, events] = await Promise.all([
+  const [contractRows, events, surveyRows] = await Promise.all([
     prisma.subscriptionContract.findMany({
       where: { shopId, ...COUNTABLE_CONTRACT },
       select: {
@@ -796,7 +958,29 @@ export async function runRiskLearning(
       },
       orderBy: { createdAt: "asc" },
     }),
+    prisma.surveyResponse.findMany({
+      where: { shopId, contractId: { not: null } },
+      select: {
+        contractId: true,
+        shownAt: true,
+        answeredAt: true,
+        answers: true,
+      },
+    }),
   ]);
+
+  const surveyByContract = new Map(
+    surveyRows.map((row) => [row.contractId as string, row]),
+  );
+  const contracts: SnapshotContractRow[] = contractRows.map((row) => {
+    const survey = surveyByContract.get(row.id);
+    return {
+      ...row,
+      surveyShownAt: survey?.shownAt ?? null,
+      surveyAnsweredAt: survey?.answeredAt ?? null,
+      surveyAnswers: survey?.answers ?? null,
+    };
+  });
 
   const snapshots = buildRiskSnapshots({ contracts, events, now });
 

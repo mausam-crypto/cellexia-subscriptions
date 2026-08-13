@@ -60,6 +60,16 @@ const EVENT_METRIC_MAP: Record<string, string> = {
   "lifecycle.incentive_announced": "Cellexia Incentive Announced",
   "contract.price_propagated": "Cellexia Price Change Notice",
   "stockout.delayed": "Cellexia Stockout Delay",
+  // Post-purchase survey (v1.21.0). Analytics/segmentation metric ONLY — no
+  // notification template, so it never enters the guided-flow specs or the
+  // KLAVIYO_FLOW_COVERAGE check (the "Cellexia Subscription Started"
+  // family). Properties carry the flattened answer keys plus survey_holdout;
+  // merchant-built flows triggered on this metric MUST filter
+  // survey_holdout equals false, or the untreated comparison group the
+  // holdout exists for is silently contaminated. No cellexia_send stamp:
+  // canonical non-confirmation events stay verdict-absent (the frozen-flag
+  // lesson pinned by tests/outbox-graft-verdict.test.ts).
+  "survey.answered": "Cellexia Survey Answered",
 };
 
 /** Event types whose flows need one-tap action links (dunning family). */

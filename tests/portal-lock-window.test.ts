@@ -39,6 +39,10 @@ const mocks = vi.hoisted(() => {
   return {
     shop,
     setupMode: { value: false },
+    // portal.friendlyLockMessaging as the settings mock serves it. Default
+    // FALSE here so the classic-copy tests above keep pinning the plain
+    // behavior; the friendly describe flips it per test (ships ON).
+    friendlyLock: { value: false },
     shopFindUnique: vi.fn(async (): Promise<unknown> => ({ id: shop.id })),
     portalSessionFindUnique: vi.fn(async (): Promise<unknown> => null),
     contractFindFirst: vi.fn(async (): Promise<unknown> => null),
@@ -116,6 +120,7 @@ vi.mock("~/lib/settings/settings.server", () => ({
         maxLineQuantity: 20,
         contextualPromptBufferDays: 10,
         contextualPromptDelayWeeks: 3,
+        friendlyLockMessaging: mocks.friendlyLock.value,
       };
     }
     if (key === "pause") return { maxMonths: 3 };
@@ -169,6 +174,8 @@ vi.mock("~/lib/portal/catalog.server", () => ({
 import { action as apiAction } from "~/routes/proxy.api.$action";
 import { requireCancelContext } from "~/lib/cancel/portal.server";
 import { getPortalSession } from "~/lib/portal/session.server";
+import { resolveToast } from "~/lib/portal/layout.server";
+import { settingsSchemas } from "~/lib/settings/registry.server";
 import { PORTAL_PROXY_BASE } from "~/lib/portal/proxy-path";
 import {
   lockStateFor,
@@ -307,6 +314,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   delete process.env.PORTAL_COOKIE_DEV;
   mocks.setupMode.value = false;
+  mocks.friendlyLock.value = false;
   mocks.shopFindUnique.mockResolvedValue({ id: mocks.shop.id });
   mocks.portalSessionFindUnique.mockResolvedValue(null);
   mocks.subscriberEventCount.mockResolvedValue(1);
@@ -553,6 +561,154 @@ describe("requireCancelContext inside the lock window", () => {
 });
 
 // ── 5. Source pins on every other enforcement surface ────────────────────────
+
+// ── Friendly lock messaging (portal.friendlyLockMessaging, v1.19.0) ──────────
+// Same mechanic, reframed surfaces: a "welcome period" progress card and
+// benefit-first copy instead of a plain restriction notice. ON by default in
+// the registry; the behavior tests above run with the mock OFF so the classic
+// copy stays pinned too.
+
+describe("friendly lock messaging (v1.19.0)", () => {
+  it("ships ON by default in the settings registry", () => {
+    const parsed = settingsSchemas.portal.parse(undefined);
+    expect(parsed.friendlyLockMessaging).toBe(true);
+    // A stored pre-v1.19.0 portal value (no key) flips on via the
+    // field-level default — the additive-settings pattern.
+    const legacy = settingsSchemas.portal.safeParse({
+      contextualPrompts: true,
+      allowAddProducts: true,
+      otpCodeTtlMinutes: 10,
+      sessionTtlDays: 30,
+      magicLinkTtlDays: 14,
+    });
+    expect(legacy.success).toBe(true);
+    if (legacy.success) expect(legacy.data.friendlyLockMessaging).toBe(true);
+  });
+
+  it("a refused action redirects with the unlock day + countdown when friendly is ON", async () => {
+    mocks.friendlyLock.value = true;
+    const response = await postAction("skip", {});
+    expect(response.status).toBe(302);
+    const location = new URL(
+      response.headers.get("Location") ?? "",
+      "https://cellexialabs.com",
+    );
+    expect(location.searchParams.get("toast")).toBe("locked");
+    // Contract is 5 days into a 30-day window → unlock ~25 days out.
+    expect(location.searchParams.get("locked_until")).toMatch(
+      /^\d{4}-\d{2}-\d{2}$/,
+    );
+    const days = Number(location.searchParams.get("locked_days"));
+    expect(days).toBeGreaterThanOrEqual(24);
+    expect(days).toBeLessThanOrEqual(26);
+    expect(mocks.skipNextCycle).not.toHaveBeenCalled();
+  });
+
+  it("a refused action carries NO friendly params when the toggle is off", async () => {
+    const response = await postAction("skip", {});
+    const location = response.headers.get("Location") ?? "";
+    expect(location).toContain("toast=locked");
+    expect(location).not.toContain("locked_until");
+    expect(location).not.toContain("locked_days");
+  });
+
+  it("resolveToast renders the friendly copy from valid params and falls back on tampered ones", () => {
+    const url = (qs: string) =>
+      new Request(`https://cellexialabs.com/portal/?${qs}`);
+    const friendly = resolveToast(
+      url("toast=locked&locked_until=2026-09-10&locked_days=18"),
+      "en",
+    );
+    expect(friendly?.toast.text).toContain("unlock on September 10, 2026");
+    expect(friendly?.toast.text).toContain("18 day(s) to go");
+    // The classic factual copy stays reachable on any malformed input —
+    // resolveToast trusts nothing from the URL.
+    for (const qs of [
+      "toast=locked",
+      "toast=locked&locked_until=tomorrow&locked_days=18",
+      "toast=locked&locked_until=2026-09-10&locked_days=-3",
+      "toast=locked&locked_until=2026-09-10&locked_days=9999",
+      // Regex-valid but calendar-invalid: Invalid Date must fall back, not
+      // reach Intl.format (which THROWS RangeError → a 500 on the page).
+      "toast=locked&locked_until=2026-99-99&locked_days=18",
+      "toast=locked&locked_until=2026-02-30&locked_days=18",
+    ]) {
+      const classic = resolveToast(url(qs), "en");
+      expect(classic?.toast.text).toBe(
+        "This isn't available yet — your plan's minimum commitment period is still running.",
+      );
+    }
+  });
+
+  it("source pin: the subscription page keys the progress card on the toggle, keeps the classic note, and scopes the can-do list by status", () => {
+    const source = readSource("app/routes/proxy.subscription.$id.tsx");
+    expect(source).toContain("portalSettings.friendlyLockMessaging");
+    expect(source).toContain("portal.locked.friendly_title");
+    expect(source).toContain("portal.locked.friendly_progress");
+    // The classic note stays reachable as the else branch.
+    expect(source).toContain("portal.locked.notice");
+    // A PAUSED contract is only ever promised what this page can deliver
+    // for it: add/quantity are ACTIVE-only actions, so the can-do list must
+    // branch on isActive and keep the details entry for the paused case.
+    const canDoBranch = source.slice(
+      source.indexOf("const canDo ="),
+      source.indexOf("portal.locked.friendly_title"),
+    );
+    expect(canDoBranch).toContain("isActive");
+    expect(canDoBranch).toContain("portal.locked.friendly_can_details");
+  });
+
+  it("the cancel choke point carries the friendly params when the toggle is on", async () => {
+    mocks.friendlyLock.value = true;
+    const request = new Request(
+      proxyUrl("/cancel/ctr_1", { logged_in_customer_id: "1" }),
+    );
+    const thrown = await requireCancelContext(request, "ctr_1").then(
+      () => null,
+      (reason) => reason,
+    );
+    expect(thrown).toBeInstanceOf(Response);
+    const location = (thrown as Response).headers.get("Location") ?? "";
+    expect(location).toContain("toast=locked");
+    expect(location).toMatch(/locked_until=\d{4}-\d{2}-\d{2}/);
+    expect(location).toMatch(/locked_days=\d+/);
+  });
+
+  it("magic links and SMS switch copy on the same setting", () => {
+    const handlers = readSource("app/lib/magiclinks/handlers.server.ts");
+    expect(handlers).toContain("friendlyLockMessaging");
+    expect(handlers).toContain("magic.locked_friendly");
+    const sms = readSource("app/routes/api.sms.inbound.tsx");
+    expect(sms).toContain("friendlyLockMessaging");
+    expect(sms).toContain("magic.sms.locked_friendly");
+  });
+
+  it("friendly copy never names cancellation and always names the unlock date — the whole point", () => {
+    const catalog = JSON.parse(
+      readSource("app/lib/i18n/locales/en.json"),
+    ) as Record<string, string>;
+    const friendlyKeys = Object.keys(catalog).filter(
+      (key) => key.includes("friendly") && key.includes("locked"),
+    );
+    // All ten shipped keys are present…
+    expect(friendlyKeys.length).toBeGreaterThanOrEqual(10);
+    for (const key of friendlyKeys) {
+      // …none of them primes the exit (reactance/priming hygiene — the
+      // psychological rationale for the whole feature)…
+      expect(catalog[key], key).not.toMatch(/cancel/i);
+      expect(catalog[key], key).not.toMatch(/can't|cannot|not available/i);
+    }
+    // …and every dated surface keeps the exact unlock promise.
+    for (const key of [
+      "portal.locked.friendly_body",
+      "portal.toast.locked_friendly",
+      "magic.locked_friendly",
+      "magic.sms.locked_friendly",
+    ]) {
+      expect(catalog[key], key).toContain("{date}");
+    }
+  });
+});
 
 describe("lock window source pins", () => {
   it("the api dispatcher's blocked set is exactly the reducing actions", () => {
