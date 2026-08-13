@@ -75,51 +75,37 @@ export interface SurveyWriteResult {
 }
 
 /**
- * Upsert one impression or answer write. Answer merges are last-write-wins
- * per question (taps are sequential in the UI; a lost race between two taps
- * on DIFFERENT questions is repaired by the next write because the client
- * always sends its full local answer state — see `answers` below carrying
- * the merged object).
+ * Upsert one impression or answer write — RACE-SAFE on the create side.
+ *
+ * The impression beacon (render) and the first tap land within milliseconds
+ * of each other on every order, so create-vs-create is the COMMON case, not
+ * an edge: both writers see no row, both insert, and the orderId unique
+ * constraint kills the loser with P2002. A naive check-then-create surfaced
+ * that as a 500 the fail-quiet extension swallowed — the first (highest
+ * signal) answer silently dropped. The loser therefore re-reads the winner's
+ * row and MERGES into it instead, so both arrival orders converge on
+ * impression metadata + the answer.
+ *
+ * Two further rules close the remaining windows:
+ * - an impression against an EXISTING row never rewrites `answers` (its
+ *   read-merge-write would clobber a tap that committed in between); it
+ *   only fills customerId when absent.
+ * - answer merges stay last-write-wins PER QUESTION: each write carries one
+ *   {question, option} and taps are sequential in the UI, so concurrent
+ *   answer-vs-answer writes on different questions do not occur from one
+ *   shopper's device.
  */
-/** Merges one impression/answer write onto an already-existing row. */
-async function mergeSurveyWrite(
-  existing: SurveyResponse,
-  input: SurveyWriteInput,
-  now: Date,
-): Promise<SurveyResponse> {
-  const merged: SurveyAnswers = sanitizeSurveyAnswers(existing.answers);
-  if (input.answer) {
-    const addition = sanitizeSurveyAnswers({
-      [input.answer.question]: input.answer.option,
-    });
-    Object.assign(merged, addition);
-  }
-  const complete = isCompleteSurvey(merged);
-  return prisma.surveyResponse.update({
-    where: { id: existing.id },
-    data: {
-      answers: merged,
-      // Keep the earliest customerId we ever saw; fill if absent.
-      customerId: existing.customerId ?? input.customerId ?? null,
-      answeredAt: existing.answeredAt ?? (input.answer ? now : null),
-      completedAt: existing.completedAt ?? (complete ? now : null),
-    },
-  });
-}
-
 export async function recordSurveyWrite(
   shopId: string,
   input: SurveyWriteInput,
 ): Promise<SurveyWriteResult> {
   const now = new Date();
-  const existing = await prisma.surveyResponse.findUnique({
+  let existing = await prisma.surveyResponse.findUnique({
     where: { orderId: input.orderId },
   });
 
-  let row: SurveyResponse;
-  if (existing) {
-    row = await mergeSurveyWrite(existing, input, now);
-  } else {
+  let row: SurveyResponse | null = null;
+  if (!existing) {
     try {
       row = await prisma.surveyResponse.create({
         data: {
@@ -136,23 +122,58 @@ export async function recordSurveyWrite(
         },
       });
     } catch (err) {
+      // Unique-violation = a concurrent writer created the row between our
+      // read and insert. Fall through to the merge path against THEIR row —
+      // anything else is a real failure and must surface.
       if (
-        err instanceof Prisma.PrismaClientKnownRequestError &&
-        err.code === "P2002"
+        !(
+          err instanceof Prisma.PrismaClientKnownRequestError &&
+          err.code === "P2002"
+        )
       ) {
-        // Lost the race: the impression beacon and the first answer tap (or
-        // two racing impressions) both saw no row and both tried to create
-        // one. The winner already committed — reload it and merge this
-        // write onto it instead of losing it silently.
-        const winner = await prisma.surveyResponse.findUnique({
-          where: { orderId: input.orderId },
-        });
-        if (!winner) throw err;
-        row = await mergeSurveyWrite(winner, input, now);
-      } else {
         throw err;
       }
+      existing = await prisma.surveyResponse.findUnique({
+        where: { orderId: input.orderId },
+      });
+      if (!existing) throw err; // row vanished — genuinely broken, surface it
     }
+  }
+
+  if (!row && existing) {
+    if (!input.answer) {
+      // Impression on an existing row: fill-only. Rewriting `answers` from a
+      // pre-tap read would clobber a concurrently committed answer.
+      row =
+        existing.customerId === null && input.customerId
+          ? await prisma.surveyResponse.update({
+              where: { id: existing.id },
+              data: { customerId: input.customerId },
+            })
+          : existing;
+    } else {
+      const merged: SurveyAnswers = sanitizeSurveyAnswers(existing.answers);
+      Object.assign(
+        merged,
+        sanitizeSurveyAnswers({ [input.answer.question]: input.answer.option }),
+      );
+      const complete = isCompleteSurvey(merged);
+      row = await prisma.surveyResponse.update({
+        where: { id: existing.id },
+        data: {
+          answers: merged,
+          // Keep the earliest customerId we ever saw; fill if absent.
+          customerId: existing.customerId ?? input.customerId ?? null,
+          answeredAt: existing.answeredAt ?? now,
+          completedAt: existing.completedAt ?? (complete ? now : null),
+        },
+      });
+    }
+  }
+  if (!row) {
+    // Unreachable by construction (create succeeded, or existing was set) —
+    // typed narrow for the compiler.
+    throw new Error(`survey write resolved no row for ${input.orderId}`);
   }
 
   // Link immediately when the mirror already exists (the common case for

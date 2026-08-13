@@ -4,6 +4,92 @@ All notable changes to Cellexia Subscriptions. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [SemVer](https://semver.org) as contracted in [docs/UPDATE.md](docs/UPDATE.md).
 
+## [1.21.2] — 2026-08-13
+
+**Survey block invisible on the Thank You page (theme editor included) —
+root-caused and fixed.** No migration, no new env vars. **`npm run deploy`
+IS required** (the survey extension changed).
+
+### Fixed
+
+- **The extension's JSX never rendered**: the extension had no tsconfig, so
+  the CLI's esbuild compiled its JSX with the CLASSIC transform
+  (`React.createElement`) instead of the Preact runtime. The bundle built
+  and deployed cleanly — but produced React element objects that Preact's
+  `render` cannot paint (or crashed outright where `react` isn't
+  resolvable), and extension sandboxes swallow errors: the block registered
+  in the checkout editor's sidebar while painting nothing, anywhere. Fix:
+  `extensions/cellexia-survey/tsconfig.json` with `"jsx": "react-jsx"` /
+  `"jsxImportSource": "preact"` — load-bearing for rendering, not a
+  types-only file (documented inside it). A new test bundles BOTH entry
+  points under the CLI's default settings (no jsx flags) and asserts no
+  `React.createElement` survives — mutation-verified by deleting the
+  tsconfig. This also closes (for this extension) the standing gap that
+  `npm run verify` never bundles extensions.
+- **The block was invisible in the checkout editor even with rendering
+  fixed**: inside the editor every production gate fails by design — the
+  sample order carries no selling-plan line, the backend status call cannot
+  answer, and the App URL may not be saved yet — so merchants could neither
+  see nor position the block. The survey now detects the editor
+  (`shopify.extension.editor`) and renders a LOCAL demo: the real question
+  flow, taps advance locally, and no network request of any kind is made
+  from an editor session (no status read, no impression, no answer rows).
+  Real thank-you/order-status pages keep the exact same strict gating as
+  before. Pinned comment-stripped in tests (editor detection, demo
+  activation, and the never-posts-from-editor rules).
+
+## [1.21.1] — 2026-08-13
+
+**Three v1.19.0/v1.21.0 defects root-caused and fixed** — a dead settings
+toggle, a data-loss race in the survey write path, and two deploy blockers
+in the survey checkout extension. No migration, no new env vars, no scope or
+webhook changes. **`npm run deploy` IS required** (the survey extension
+changed — its two deploy blockers are only fixed once the extension is
+re-pushed).
+
+### Fixed
+
+- **`portal.friendlyLockMessaging` was dead code**: the subscription page's
+  branch had been replaced with a literal `if (true)` (the intended
+  condition survived only in a comment above it), so every merchant got the
+  friendly welcome-period card regardless of the setting; turning it off
+  did nothing. The condition is restored
+  (`portalSettings.friendlyLockMessaging && lock.lockDays > 0`). Root cause
+  of the escape: the source pin asserted the setting's NAME appeared
+  somewhere in the file — the dead comment satisfied it. The pin now strips
+  comments before matching, requires the executable conditional itself, and
+  bans `if (true)` / `if (false)` outright; the hardened test was
+  mutation-verified against the original defect.
+- **Survey create race lost first answers**: `recordSurveyWrite` was
+  check-then-create. The confirmation-page impression beacon and the first
+  tap land within milliseconds on EVERY order, so both writers regularly saw
+  "no row", both inserted, and the `orderId` unique constraint killed the
+  loser with a P2002 that surfaced as a 500 the fail-quiet extension
+  swallowed — silently dropping whichever write lost (often the
+  highest-signal first answer). The loser now re-reads the winner's row and
+  merges into it (both arrival orders converge), and an impression against
+  an existing row no longer rewrites `answers` at all (its read-merge-write
+  could clobber a concurrently committed tap) — it only fills a missing
+  customerId. Non-P2002 create failures still surface. Regression tests
+  drive both interleavings through a fake db that now enforces the unique
+  constraint.
+- **Survey extension deploy blockers**: `api_version = "2025-01"` (copied
+  from the Admin API pin) is not an accepted checkout-extension version, and
+  the React bindings required `react-reconciler` as an undeclared peer —
+  either alone hard-rejected `npm run deploy`. Root cause beneath both:
+  `@shopify/ui-extensions-react` has NO release for any API version Shopify
+  still accepts (React bindings ended at 2025-07), so a version bump could
+  not fix it — the extension is now migrated to the current Preact component
+  model (`s-*` elements, the injected `shopify` signals global,
+  `@shopify/ui-extensions` ~2026.1 + `preact`, api_version 2026-01), with
+  behavior, locales and the frozen question instrument unchanged. New pins
+  in `tests/survey-instrument.test.ts` enforce a supported quarterly
+  api_version (≥ 2025-10) and ban the dead React bindings — comment-stripped
+  in both directions, the same lesson as the toggle pin. Systemic note: the
+  `npm run verify` gate never bundles extensions, which is why the missing
+  dependency only surfaced at deploy time; both entry points were
+  esbuild-bundle-verified as part of this fix.
+
 ## [1.21.0] — 2026-08-12
 
 **Post-purchase survey + predicted LTGP** — new subscribers answer four

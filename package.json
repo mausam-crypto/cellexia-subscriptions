@@ -1,6 +1,6 @@
 {
   "name": "cellexia-subscriptions",
-  "version": "1.21.0",
+  "version": "1.21.2",
   "private": true,
   "workspaces": [
     "extensions/cellexia-survey"

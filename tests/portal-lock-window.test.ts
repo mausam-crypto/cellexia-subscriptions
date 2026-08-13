@@ -642,11 +642,27 @@ describe("friendly lock messaging (v1.19.0)", () => {
 
   it("source pin: the subscription page keys the progress card on the toggle, keeps the classic note, and scopes the can-do list by status", () => {
     const source = readSource("app/routes/proxy.subscription.$id.tsx");
-    expect(source).toContain("portalSettings.friendlyLockMessaging");
-    expect(source).toContain("portal.locked.friendly_title");
-    expect(source).toContain("portal.locked.friendly_progress");
+    // COMMENT-STRIPPED before every assertion: a `toContain` on the raw
+    // source was once satisfied by a leftover `// was: portalSettings…`
+    // comment while the executable check had been replaced with `if (true)`
+    // — the toggle shipped dead and this suite stayed green. The pins below
+    // must only ever match CODE.
+    const code = source
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .split("\n")
+      .map((line) => line.replace(/(^|[^:])\/\/.*$/, "$1"))
+      .join("\n");
+    // The toggle must gate the branch as an executable conditional…
+    expect(code).toMatch(
+      /if \(\s*portalSettings\.friendlyLockMessaging\s*&&\s*lock\.lockDays > 0\s*\)/,
+    );
+    // …and no debug override may ever stand in for a condition.
+    expect(code).not.toMatch(/if \(\s*true\s*\)/);
+    expect(code).not.toMatch(/if \(\s*false\s*\)/);
+    expect(code).toContain("portal.locked.friendly_title");
+    expect(code).toContain("portal.locked.friendly_progress");
     // The classic note stays reachable as the else branch.
-    expect(source).toContain("portal.locked.notice");
+    expect(code).toContain("portal.locked.notice");
     // A PAUSED contract is only ever promised what this page can deliver
     // for it: add/quantity are ACTIVE-only actions, so the can-do list must
     // branch on isActive and keep the details entry for the paused case.

@@ -5,6 +5,7 @@
  * assignment, and the one-shot survey.answered emission (per-order dedupe).
  */
 
+import { Prisma } from "@prisma/client";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 interface SurveyRow {
@@ -54,6 +55,18 @@ vi.mock("~/db.server", () => ({
         return db.surveys.get(where.id ?? "") ?? null;
       },
       create: async ({ data }: { data: Partial<SurveyRow> }) => {
+        // Enforce the schema's orderId @unique like the real database: the
+        // create race (impression beacon vs first tap) is only testable when
+        // the loser actually gets its P2002.
+        if (
+          [...db.surveys.values()].some((r) => r.orderId === data.orderId)
+        ) {
+          throw new Prisma.PrismaClientKnownRequestError("unique violation", {
+            code: "P2002",
+            clientVersion: "test",
+            meta: { target: "SurveyResponse_orderId_key" },
+          });
+        }
         const row: SurveyRow = {
           id: `sr_${db.nextId++}`,
           shopId: data.shopId as string,
@@ -204,6 +217,83 @@ describe("recordSurveyWrite", () => {
       expectedSpeed: "three_months_plus",
       routine: "full",
     });
+  });
+
+  it("REGRESSION: the impression-vs-first-tap create race loses no answer, in either arrival order", async () => {
+    // Both writers read "no row" before either insert — the exact
+    // interleaving of the confirmation-page beacon and the first tap, which
+    // land within milliseconds on EVERY order. The unique orderId kills one
+    // create with P2002; the loser must merge into the winner's row, never
+    // surface a 500 the fail-quiet extension swallows.
+    const impression = () =>
+      recordSurveyWrite(SHOP, {
+        orderId: ORDER,
+        source: "THANK_YOU",
+        answer: null,
+      });
+    const tap = () =>
+      recordSurveyWrite(SHOP, {
+        orderId: ORDER,
+        source: "THANK_YOU",
+        answer: { question: "plannedDuration", option: "permanent" },
+      });
+
+    // Simultaneous start = both see the empty table before either commits.
+    await Promise.all([impression(), tap()]);
+    expect(db.surveys.size).toBe(1);
+    let row = [...db.surveys.values()][0];
+    expect(row.answers).toEqual({ plannedDuration: "permanent" });
+    expect(row.answeredAt).not.toBeNull();
+
+    // Opposite arrival order (tap's create wins, impression loses).
+    db.surveys.clear();
+    await Promise.all([tap(), impression()]);
+    expect(db.surveys.size).toBe(1);
+    row = [...db.surveys.values()][0];
+    expect(row.answers).toEqual({ plannedDuration: "permanent" });
+    expect(row.answeredAt).not.toBeNull();
+  });
+
+  it("REGRESSION: an impression against an existing row never rewrites answers (no clobber window)", async () => {
+    await recordSurveyWrite(SHOP, {
+      orderId: ORDER,
+      source: "THANK_YOU",
+      answer: { question: "plannedDuration", option: "permanent" },
+    });
+    const before = [...db.surveys.values()][0];
+    const answersRef = before.answers;
+    await recordSurveyWrite(SHOP, {
+      orderId: ORDER,
+      source: "ORDER_STATUS",
+      answer: null,
+    });
+    const after = [...db.surveys.values()][0];
+    // Same object, untouched — the impression path may only fill customerId.
+    expect(after.answers).toBe(answersRef);
+    expect(after.answers).toEqual({ plannedDuration: "permanent" });
+    expect(after.answeredAt).toBe(before.answeredAt);
+  });
+
+  it("a non-P2002 create failure still surfaces (fail-quiet must not hide real breakage)", async () => {
+    db.surveys.clear();
+    const dbModule = (await import("~/db.server")).default as {
+      surveyResponse: { create: (args: unknown) => Promise<unknown> };
+    };
+    const realCreate = dbModule.surveyResponse.create;
+    dbModule.surveyResponse.create = async () => {
+      throw new Error("connection reset");
+    };
+    try {
+      await expect(
+        recordSurveyWrite(SHOP, {
+          orderId: ORDER,
+          source: "THANK_YOU",
+          answer: null,
+        }),
+      ).rejects.toThrow("connection reset");
+    } finally {
+      dbModule.surveyResponse.create = realCreate;
+    }
   });
 
   it("invalid answers are dropped by sanitization, never stored", async () => {

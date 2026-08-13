@@ -2,26 +2,19 @@
  * Thank You page target (purchase.thank-you.block.render). Shopify shows the
  * Thank You page exactly once — revisits land on the Order Status page, whose
  * sibling target (OrderStatus.jsx) carries the survey from there.
+ *
+ * Preact entry (v1.21.1): `@shopify/ui-extensions/preact` wires the injected
+ * `shopify` global's signals into Preact, and the default export renders the
+ * shared component into the extension's root.
  */
 
-import {
-  reactExtension,
-  useApi,
-  useSubscription,
-  BlockStack,
-  Button,
-  Heading,
-  Text,
-  View,
-} from "@shopify/ui-extensions-react/checkout";
-import { useEffect, useMemo, useState } from "react";
-import { createSurveyBlock } from "./survey-core.jsx";
+import "@shopify/ui-extensions/preact";
+import { render } from "preact";
+import { Survey } from "./survey-core.jsx";
 
-export default createSurveyBlock({
-  reactExtension,
-  target: "purchase.thank-you.block.render",
-  source: "THANK_YOU",
-  orderSource: "confirmation",
-  ui: { BlockStack, Button, Heading, Text, View },
-  hooks: { useApi, useSubscription, useEffect, useMemo, useState },
-});
+export default async () => {
+  render(
+    <Survey source="THANK_YOU" orderSource="confirmation" />,
+    document.body,
+  );
+};

@@ -1,0 +1,16 @@
+{
+  "//": "JSX runtime wiring — LOAD-BEARING for rendering, not just types. The Shopify CLI bundles extension sources with esbuild, and esbuild takes its JSX transform from this file. Without it, .jsx compiles with the CLASSIC transform (React.createElement): the bundle still builds and deploys, but `React` doesn't exist in the extension sandbox, the module throws on first render, the sandbox swallows the error — and the block registers in the checkout editor while painting nothing, anywhere. Pinned (with a real bundle) by tests/survey-instrument.test.ts.",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "jsxImportSource": "preact",
+    "target": "es2022",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "allowJs": true,
+    "checkJs": false,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "lib": ["es2022", "dom"]
+  },
+  "include": ["src"]
+}

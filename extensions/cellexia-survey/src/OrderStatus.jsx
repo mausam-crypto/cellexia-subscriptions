@@ -3,26 +3,15 @@
  * Renders on every revisit of the order page, so the backend status read
  * (already completed? survey disabled?) is what keeps it from re-asking —
  * device-local flags alone would re-ask on a second device.
+ *
+ * Preact entry (v1.21.1): same shared component as the Thank You target —
+ * the s-* elements and the `shopify` global are identical across surfaces.
  */
 
-import {
-  reactExtension,
-  useApi,
-  useSubscription,
-  BlockStack,
-  Button,
-  Heading,
-  Text,
-  View,
-} from "@shopify/ui-extensions-react/customer-account";
-import { useEffect, useMemo, useState } from "react";
-import { createSurveyBlock } from "./survey-core.jsx";
+import "@shopify/ui-extensions/preact";
+import { render } from "preact";
+import { Survey } from "./survey-core.jsx";
 
-export default createSurveyBlock({
-  reactExtension,
-  target: "customer-account.order-status.block.render",
-  source: "ORDER_STATUS",
-  orderSource: "order",
-  ui: { BlockStack, Button, Heading, Text, View },
-  hooks: { useApi, useSubscription, useEffect, useMemo, useState },
-});
+export default async () => {
+  render(<Survey source="ORDER_STATUS" orderSource="order" />, document.body);
+};
