@@ -1568,9 +1568,11 @@
     /**
      * Undo everything this widget wrote into the theme's form. Called when it
      * turns out to be hidden (gate still closed, embed unmounted, a section
-     * re-render in the theme editor): an input we created is removed, an
-     * input we adopted from the theme is emptied, the design property is
-     * disabled. The form is left exactly as a widget-less page would have it.
+     * re-render in the theme editor): an input we created is removed, a field
+     * we adopted from the theme — hidden input OR native <select>, the same
+     * two shapes sellingPlanField() adopts — is emptied, the design property
+     * is disabled. The form is left exactly as a widget-less page would have
+     * it.
      */
     function releaseForm() {
       if (!form) {
@@ -1582,7 +1584,9 @@
            and clearing it here would drop a plan the shopper can see. */
         return;
       }
-      var input = form.querySelector('input[data-cellexia-plan-input]');
+      var input = form.querySelector(
+        'input[data-cellexia-plan-input], select[data-cellexia-plan-input]'
+      );
       if (input) {
         if (
           input.getAttribute('data-cellexia-plan-input') === 'own' &&

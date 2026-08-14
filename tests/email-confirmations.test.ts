@@ -11,7 +11,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  *  - PROVENANCE: only person-initiated moments send. SYSTEM/SCHEDULER
  *    events (consolidation, stockout evaluation, auto-resume, dunning),
  *    non-CUSTOMER skip initiators, MERGED cancels and DUNNING/SYSTEM
- *    cancels never claim "as requested".
+ *    cancels never claim "as requested". A cancel's provenance-less
+ *    webhook twin consults the contract mirror — the SAME fallback the
+ *    Klaviyo events-map applies — so a consolidation merge-cancel can
+ *    never email from either path.
  *  - Dedupe is an ATOMIC claim (transient CLAIMED NotificationLog row),
  *    not check-then-act: a SENT row or an earlier rival claim inside the
  *    window backs the bridge off; the claim is deleted after the send.
@@ -36,6 +39,9 @@ const mocks = vi.hoisted(() => ({
     klaviyoEnqueued: false,
     directEmailSent: true,
   })),
+  // Contract mirror consulted by the provenance gate's fallback — the same
+  // fallback the Klaviyo events-map applies. Default: no mirror data.
+  contractFindUnique: vi.fn(async (): Promise<unknown> => null),
   emailsSetting: {
     templates: {} as Record<
       string,
@@ -92,6 +98,9 @@ vi.mock("~/db.server", () => ({
     subscriberEvent: {
       create: vi.fn(async () => ({})),
     },
+    subscriptionContract: {
+      findUnique: mocks.contractFindUnique,
+    },
   },
 }));
 vi.mock("~/lib/klaviyo/events-map.server", () => ({
@@ -117,6 +126,7 @@ beforeEach(() => {
   store.logs = [];
   store.seq = 0;
   mocks.emailsSetting.templates = {};
+  mocks.contractFindUnique.mockResolvedValue(null);
 });
 
 const skipEvent = {
@@ -243,6 +253,10 @@ describe("provenance gate", () => {
   });
 
   it("a webhook-observed cancel without a cancelSource (Shopify admin) sends", async () => {
+    // The payload carries no provenance, so the gate consults the contract
+    // mirror (same fallback as the Klaviyo events-map) — which here holds
+    // nothing that gates it. A cancel with no non-person stamp ANYWHERE is
+    // a real cancellation.
     await maybeSendConfirmationForEvent({
       shopId: "shop_1",
       contractId: "ctr_1",
@@ -250,6 +264,79 @@ describe("provenance gate", () => {
       source: "WEBHOOK",
       payload: {},
     });
+    expect(mocks.contractFindUnique).toHaveBeenCalledTimes(1);
+    expect(mocks.sendNotification).toHaveBeenCalledTimes(1);
+  });
+
+  it("a consolidation merge-cancel's webhook twin (empty payload) consults the contract mirror and never sends", async () => {
+    // mergeContracts cancels the source contract with reason MERGED /
+    // cancelSource SYSTEM, but its Shopify mutation lands BEFORE the local
+    // mirror write commits — so the SUBSCRIPTION_CONTRACTS_UPDATE status
+    // diff can log a WEBHOOK contract.cancelled twin whose payload carries
+    // NO provenance. The SYSTEM service leg was gated before it could
+    // claim, so the atomic dedupe offers no protection: the mirror
+    // fallback is the only gate between this twin and "your subscription
+    // is cancelled" landing for a customer who never left.
+    mocks.contractFindUnique.mockResolvedValue({
+      cancelReason: "MERGED",
+      cancelSource: "SYSTEM",
+    });
+    await maybeSendConfirmationForEvent({
+      shopId: "shop_1",
+      contractId: "ctr_1",
+      type: "contract.cancelled",
+      source: "WEBHOOK",
+      payload: { previousStatus: "ACTIVE", status: "CANCELLED" },
+    });
+    expect(mocks.sendNotification).not.toHaveBeenCalled();
+  });
+
+  it("the race-window mirror stamp (sync's first-observed EXTERNAL) blocks the twin too", async () => {
+    // When the webhook beats the service's own mirror write, the sync
+    // stamps cancelSource EXTERNAL (prior source null) — also a non-person
+    // source, so the twin is blocked whichever side of the race the mirror
+    // read lands on.
+    mocks.contractFindUnique.mockResolvedValue({
+      cancelReason: null,
+      cancelSource: "EXTERNAL",
+    });
+    await maybeSendConfirmationForEvent({
+      shopId: "shop_1",
+      contractId: "ctr_1",
+      type: "contract.cancelled",
+      source: "WEBHOOK",
+      payload: { previousStatus: "ACTIVE", status: "CANCELLED" },
+    });
+    expect(mocks.sendNotification).not.toHaveBeenCalled();
+  });
+
+  it("a webhook twin whose mirror shows the customer's own cancel still sends (the atomic dedupe owns the double)", async () => {
+    // The mirror fallback must not over-block: when the service write won
+    // the race the mirror says CUSTOMER, the twin passes, and the
+    // 10-minute claim window dedupes it against the service leg's send.
+    mocks.contractFindUnique.mockResolvedValue({
+      cancelReason: "TOO_MUCH_PRODUCT",
+      cancelSource: "CUSTOMER",
+    });
+    await maybeSendConfirmationForEvent({
+      shopId: "shop_1",
+      contractId: "ctr_1",
+      type: "contract.cancelled",
+      source: "WEBHOOK",
+      payload: { previousStatus: "ACTIVE", status: "CANCELLED" },
+    });
+    expect(mocks.sendNotification).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancel events whose payload carries full provenance never read the mirror", async () => {
+    await maybeSendConfirmationForEvent({
+      shopId: "shop_1",
+      contractId: "ctr_1",
+      type: "contract.cancelled",
+      source: "CUSTOMER_PORTAL",
+      payload: { reason: "TOO_MUCH_PRODUCT", cancelSource: "CUSTOMER" },
+    });
+    expect(mocks.contractFindUnique).not.toHaveBeenCalled();
     expect(mocks.sendNotification).toHaveBeenCalledTimes(1);
   });
 });

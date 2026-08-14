@@ -28,7 +28,7 @@ import { createHash } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import type { SubscriptionContract, SurveyResponse } from "@prisma/client";
 import prisma from "~/db.server";
-import { logEvent } from "~/lib/events/log.server";
+import { logEvent, logEventOrThrow } from "~/lib/events/log.server";
 import { OURS_ONLY } from "~/lib/ownership/ownership.server";
 import { getSetting } from "~/lib/settings/settings.server";
 import {
@@ -210,6 +210,45 @@ export async function linkSurveyForContract(
   response: SurveyResponse,
   contract: SubscriptionContract,
 ): Promise<SurveyResponse> {
+  // Identity guard (the endpoint's order↔customer binding, enforced again at
+  // the analytics gate): a row claimed by one customer must never link to —
+  // and so never feed the risk features / predicted LTGP / Klaviyo events of
+  // — a contract belonging to another. The endpoint rejects these writes
+  // when the mirror already exists; this closes the webhook-race window for
+  // rows written before the mirror arrived. Logged once per order (the
+  // maybeEmitAnswered dedupe convention) so the daily sweep cannot spam.
+  if (
+    response.customerId &&
+    contract.customerId &&
+    response.customerId !== contract.customerId
+  ) {
+    const already = await prisma.subscriberEvent.findFirst({
+      where: {
+        shopId: response.shopId,
+        type: "admin.action",
+        payload: { path: ["action"], equals: "survey_link_customer_mismatch" },
+        AND: { payload: { path: ["orderId"], equals: response.orderId } },
+      },
+      select: { id: true },
+    });
+    if (!already) {
+      await logEvent({
+        shopId: response.shopId,
+        contractId: contract.id,
+        type: "admin.action",
+        source: "SYSTEM",
+        actor: "system",
+        payload: {
+          action: "survey_link_customer_mismatch",
+          orderId: response.orderId,
+          rowCustomerId: response.customerId,
+          contractCustomerId: contract.customerId,
+        },
+      });
+    }
+    return response;
+  }
+
   // Atomic claim so two racing linkers (endpoint + webhook) converge.
   await prisma.surveyResponse.updateMany({
     where: { id: response.id, contractId: null },
@@ -244,14 +283,24 @@ export async function linkSurveyForContract(
 /**
  * One-shot survey.answered emission. Fires when a row is linked AND either
  * complete or being flushed by the sweep (partial answers from abandoners
- * still carry signal — the sweep emits them once the row is stale). Deduped
- * on event existence per orderId, the handlers.server.ts convention.
+ * still carry signal — the sweep emits them once the row is stale).
+ *
+ * Emission state is the row's `emittedAt` (migration 0021), claimed
+ * atomically inside the same transaction the event insert rides
+ * (logEventOrThrow — the event IS the load-bearing state here, so a failed
+ * insert must roll the claim back, never strand a stamped-but-silent row).
+ * The pre-0021 event-existence check is retained as the upgrade heal: rows
+ * whose event was emitted before the column existed carry emittedAt NULL,
+ * and the check stamps them without re-emitting — after which the sweep's
+ * emittedAt:null filter never scans them again (the take(200) starvation
+ * this column exists to end).
  */
 export async function maybeEmitAnswered(
   response: SurveyResponse,
   opts: { allowPartial?: boolean } = {},
 ): Promise<boolean> {
   if (!response.contractId || !response.answeredAt) return false;
+  if (response.emittedAt) return false;
   const answers = sanitizeSurveyAnswers(response.answers);
   const complete = isCompleteSurvey(answers);
   if (!complete && !opts.allowPartial) return false;
@@ -262,37 +311,59 @@ export async function maybeEmitAnswered(
       type: SURVEY_ANSWERED_EVENT,
       payload: { path: ["orderId"], equals: response.orderId },
     },
-    select: { id: true },
+    select: { id: true, createdAt: true },
   });
-  if (already) return false;
+  if (already) {
+    // Pre-upgrade row: the event exists but the marker predates the column.
+    // Stamp it (null-claimed, so racing healers converge) and report
+    // not-emitted-now.
+    await prisma.surveyResponse.updateMany({
+      where: { id: response.id, emittedAt: null },
+      data: { emittedAt: already.createdAt },
+    });
+    return false;
+  }
 
   const contract = await prisma.subscriptionContract.findUnique({
     where: { id: response.contractId },
   });
   if (!contract) return false;
 
-  await logEvent({
-    shopId: response.shopId,
-    contractId: contract.id,
-    customerId: contract.customerId,
-    email: contract.email,
-    type: SURVEY_ANSWERED_EVENT,
-    source: "SYSTEM",
-    actor: "customer",
-    payload: {
-      orderId: response.orderId,
-      question_set_version: response.questionSetVersion,
-      survey_planned_duration: answers.plannedDuration ?? null,
-      survey_motive: answers.motive ?? null,
-      survey_expected_speed: answers.expectedSpeed ?? null,
-      survey_routine: answers.routine ?? null,
-      survey_completed: complete,
-      // Flows filter on this: holdout contracts must be EXCLUDED from
-      // survey-triggered sends so answer-segment churn stays measurable.
-      survey_holdout: contract.surveyHoldout === true,
-    },
+  const emitted = await prisma.$transaction(async (tx) => {
+    // Atomic claim: exactly one of two racing linkers (endpoint + webhook
+    // tail / sweep) wins the null → now flip; the loser emits nothing.
+    const claimed = await tx.surveyResponse.updateMany({
+      where: { id: response.id, emittedAt: null },
+      data: { emittedAt: new Date() },
+    });
+    if (claimed.count === 0) return false;
+    await logEventOrThrow(
+      {
+        shopId: response.shopId,
+        contractId: contract.id,
+        customerId: contract.customerId,
+        email: contract.email,
+        type: SURVEY_ANSWERED_EVENT,
+        source: "SYSTEM",
+        actor: "customer",
+        payload: {
+          orderId: response.orderId,
+          question_set_version: response.questionSetVersion,
+          survey_planned_duration: answers.plannedDuration ?? null,
+          survey_motive: answers.motive ?? null,
+          survey_expected_speed: answers.expectedSpeed ?? null,
+          survey_routine: answers.routine ?? null,
+          survey_completed: complete,
+          // Flows filter on this: holdout contracts must be EXCLUDED from
+          // survey-triggered sends so answer-segment churn stays measurable.
+          survey_holdout: contract.surveyHoldout === true,
+        },
+      },
+      { tx },
+    );
+    return true;
   });
-  return true;
+  return emitted;
 }
 
 /**
@@ -328,13 +399,16 @@ export async function runSurveyLinkSweep(
     linked += 1;
   }
 
-  // Linked, answered, stale, still without an emitted event (partials).
+  // Linked, answered, stale, still owing their event (emittedAt null — rows
+  // emitted pre-0021 are healed to a stamp on first scan, so the take(CAP)
+  // window can never permanently fill with already-emitted rows again).
   const staleBefore = new Date(now.getTime() - STALE_MS);
   const pending = await prisma.surveyResponse.findMany({
     where: {
       shopId,
       contractId: { not: null },
       answeredAt: { not: null, lt: staleBefore },
+      emittedAt: null,
     },
     orderBy: { answeredAt: "asc" },
     take: CAP,
@@ -352,19 +426,31 @@ export interface SurveyOrderStatus {
   completed: boolean;
 }
 
-/** Status read for the extension: is the survey on, what did this order already answer. */
+/**
+ * Status read for the extension: is the survey on, what did this order
+ * already answer. `requesterCustomerId` is the session token's customer (null
+ * on a logged-out revisit): a requester who provably is NOT the row's
+ * customer gets the empty-row shape — another customer's answers are their
+ * data, and order ids are guessable.
+ */
 export async function getSurveyOrderStatus(
   shopId: string,
   orderId: string,
+  requesterCustomerId: string | null = null,
 ): Promise<SurveyOrderStatus> {
   const settings = await getSetting(shopId, "survey");
   const row = await prisma.surveyResponse.findUnique({
     where: { orderId },
   });
-  const answers = row ? sanitizeSurveyAnswers(row.answers) : {};
+  // Fail-closed: any mismatch hides the row, including an anonymous
+  // requester (requesterCustomerId null) reading a row that has an owner —
+  // a null-vs-null "not foreign" reading here would let anyone with a
+  // guessed orderId and no customer claim read a stranger's answers.
+  const foreign = row != null && row.customerId !== requesterCustomerId;
+  const answers = row && !foreign ? sanitizeSurveyAnswers(row.answers) : {};
   return {
     enabled: settings.enabled,
     answered: answers,
-    completed: Boolean(row?.completedAt),
+    completed: !foreign && Boolean(row?.completedAt),
   };
 }

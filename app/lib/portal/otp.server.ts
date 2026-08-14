@@ -6,6 +6,7 @@ import { getSetting } from "~/lib/settings/settings.server";
 import { defaultFor } from "~/lib/settings/registry.server";
 import { sha256 } from "~/lib/crypto/tokens.server";
 import { sendNotification } from "~/lib/notifications/send.server";
+import { getPrimaryShop } from "~/lib/shop/install.server";
 import { createPortalSession } from "./session.server";
 import { OURS_ONLY } from "~/lib/ownership/ownership.server";
 
@@ -26,6 +27,13 @@ import { OURS_ONLY } from "~/lib/ownership/ownership.server";
  * though the page looked neutral. The email is now fire-and-forget and every
  * return path waits out a jittered constant-time floor that dominates the
  * remaining DB-write delta.
+ *
+ * Content: the reported ttlMinutes must ALSO be identical on every path — the
+ * step-2 page prints "expires in N minutes", so returning the merchant's
+ * configured value for known emails but the registry default for unknown ones
+ * was an enumeration oracle whenever the merchant changed the TTL setting.
+ * The value is resolved once, before the contract lookup, and returned from
+ * every path.
  */
 
 const CODE_PATTERN = /^\d{6}$/;
@@ -89,19 +97,35 @@ export async function requestOtp(
   locale?: string | null,
 ): Promise<RequestOtpResult> {
   const started = Date.now();
-  const neutralTtl = defaultFor("portal").otpCodeTtlMinutes;
+
+  // Anti-enumeration: resolve the reported TTL ONCE, before any contract
+  // lookup, so known, unknown, empty and throttled paths all return the SAME
+  // value — the merchant's configured setting (registry default when no shop
+  // is installed). A per-path value is a content-level oracle even with
+  // identical timing and copy templates. Contained: a broken settings read
+  // must never break login — the default applies, still on every path alike.
+  let ttlMinutes = defaultFor("portal").otpCodeTtlMinutes;
+  try {
+    const primaryShop = await getPrimaryShop();
+    if (primaryShop) {
+      ttlMinutes = (await getSetting(primaryShop.id, "portal"))
+        .otpCodeTtlMinutes;
+    }
+  } catch (err) {
+    console.error("[portal] otp ttl settings read failed", err);
+  }
+
   const emailNorm = normalizeEmail(email);
-  if (!emailNorm) return timingFloor(started, { ok: true as const, ttlMinutes: neutralTtl });
+  if (!emailNorm) return timingFloor(started, { ok: true as const, ttlMinutes });
 
   // Unknown email: same response, no row, no send (no account enumeration) —
   // and, via the timing floor, no faster than the known path either.
   const contract = await newestContractForEmail(emailNorm);
   if (!contract) {
-    return timingFloor(started, { ok: true as const, ttlMinutes: neutralTtl });
+    return timingFloor(started, { ok: true as const, ttlMinutes });
   }
 
   const portalSettings = await getSetting(contract.shopId, "portal");
-  const ttlMinutes = portalSettings.otpCodeTtlMinutes;
 
   // Rolling per-email request limit, counted on stored OtpCode rows.
   const hourAgo = new Date(Date.now() - 3600_000);
@@ -122,7 +146,7 @@ export async function requestOtp(
       actor: "customer",
       payload: { recentRequests: recent, limit: portalSettings.otpRequestsPerHour },
     });
-    return timingFloor(started, { ok: true as const, ttlMinutes: neutralTtl });
+    return timingFloor(started, { ok: true as const, ttlMinutes });
   }
 
   const code = crypto.randomInt(0, 1_000_000).toString().padStart(6, "0");

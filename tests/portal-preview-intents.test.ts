@@ -22,6 +22,9 @@ const mocks = vi.hoisted(() => {
     customerId: "gid://shopify/Customer/999",
     email: "demo@example.com",
     isDemo: true,
+    // The route loads the lines to detect a demo fixture that would open an
+    // empty portal (and needs recreating).
+    lines: [{ id: "line_demo_1" }],
   };
   return {
     shop,
@@ -38,6 +41,9 @@ const mocks = vi.hoisted(() => {
     })),
     markChecklist: vi.fn(async (): Promise<void> => {}),
     createDemoContract: vi.fn(async (): Promise<unknown> => ({
+      contractId: "ctr_demo",
+    })),
+    resetDemoContract: vi.fn(async (): Promise<unknown> => ({
       contractId: "ctr_demo",
     })),
   };
@@ -89,6 +95,7 @@ vi.mock("~/lib/launch/doctor.server", () => ({
 
 vi.mock("~/lib/portal/demo.server", () => ({
   createDemoContract: mocks.createDemoContract,
+  resetDemoContract: mocks.resetDemoContract,
 }));
 
 vi.mock("~/lib/klaviyo/client.server", () => ({
@@ -136,6 +143,9 @@ async function runIntent(fields: Record<string, string>): Promise<{
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.contractFindFirst.mockResolvedValue(mocks.demoContract);
+  mocks.contractFindUniqueOrThrow.mockResolvedValue(mocks.demoContract);
+  mocks.createDemoContract.mockResolvedValue({ contractId: "ctr_demo" });
+  mocks.resetDemoContract.mockResolvedValue({ contractId: "ctr_demo" });
 });
 
 describe("preview-portal-demo", () => {
@@ -172,6 +182,50 @@ describe("preview-portal-demo", () => {
     expect(event.payload.action).toBe("portal_preview_created");
     expect(event.payload.mode).toBe("demo");
     expect(event.payload.via).toBe("cx_pp");
+  });
+
+  it("always goes through createDemoContract, so a stuck demo row is repaired before the preview opens", async () => {
+    // The route used to do its own findFirst({ isDemo: true }) and call
+    // createDemoContract only when NO demo row existed — which made the
+    // ownership-repair branch in demo.server.ts (a pre-migration-0003 demo
+    // backfilled to UNKNOWN, which the portal's OURS-only filter hides)
+    // unreachable from its only production caller: an empty portal preview
+    // that still ticked the "Portal previewed" checklist, forever. The
+    // portal_preview_ready self-check promises the merchant it
+    // "self-repairs on the next preview click"; this pins that promise.
+    const data = await runIntent({ intent: "preview-portal-demo" });
+
+    expect(data.ok).toBe(true);
+    expect(mocks.createDemoContract).toHaveBeenCalledWith("shop_1");
+    // No bare findFirst bypassing the repair path.
+    expect(mocks.contractFindFirst).not.toHaveBeenCalled();
+  });
+
+  it("recreates a demo contract that lost its lines instead of opening an empty portal", async () => {
+    // The other empty-portal shape portal_preview_ready warns about: a demo
+    // row with zero lines. The preview click recreates it from the current
+    // catalog via resetDemoContract (which also deletes the fixture's events
+    // with it).
+    mocks.contractFindUniqueOrThrow
+      .mockResolvedValueOnce({ ...mocks.demoContract, lines: [] })
+      .mockResolvedValueOnce({
+        ...mocks.demoContract,
+        id: "ctr_demo_fresh",
+        lines: [{ id: "line_fresh_1" }],
+      });
+    mocks.resetDemoContract.mockResolvedValue({ contractId: "ctr_demo_fresh" });
+
+    const data = await runIntent({ intent: "preview-portal-demo" });
+
+    expect(data.ok).toBe(true);
+    expect(mocks.resetDemoContract).toHaveBeenCalledWith("shop_1");
+    const url = new URL(data.url as string);
+    const payload = verifyPreviewToken(
+      url.searchParams.get("cx_pp") as string,
+      "shop_1",
+    );
+    // The token points at the recreated fixture, not the gutted one.
+    expect(payload?.contractId).toBe("ctr_demo_fresh");
   });
 });
 

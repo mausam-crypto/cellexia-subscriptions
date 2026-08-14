@@ -15,12 +15,14 @@ import {
   readLaunchMetafield,
   type LaunchState,
 } from "~/lib/launch/launch.server";
+import { STOREFRONT_MARKERS } from "~/lib/launch/doctor.server";
 import {
   OURS_ONLY,
   OWNERSHIP_OURS,
   OWNERSHIP_UNKNOWN,
   PLAN_GROUPS_METAFIELD_KEY,
   PLAN_GROUPS_METAFIELD_NAMESPACE,
+  parsePlanIdsJson,
 } from "~/lib/ownership/ownership.server";
 import {
   mintPreviewToken,
@@ -28,8 +30,22 @@ import {
 } from "~/lib/portal/previewToken.server";
 import { PORTAL_PROXY_BASE } from "~/lib/portal/proxy-path";
 import { verifyMailer } from "~/lib/notifications/mailer.server";
-import { isKlaviyoConfigured } from "~/lib/klaviyo/client.server";
-import { JOB_SCHEDULE } from "~/lib/jobs/runner.server";
+import {
+  isKlaviyoConfigured,
+  probeKlaviyoKey,
+  resolveKlaviyoAuth,
+} from "~/lib/klaviyo/client.server";
+import { UNCOVERED_STATUSES } from "~/lib/klaviyo/flows.server";
+import {
+  renderEmail,
+  TEMPLATES,
+  type TemplateKey,
+} from "~/lib/notifications/templates.server";
+import { previewSampleVars } from "~/lib/notifications/preview.server";
+import { normalizeEmailDesign } from "~/lib/notifications/format";
+import { isEncryptedSecret, revealSecret } from "~/lib/crypto/secrets.server";
+import { getProducts } from "~/lib/graphql/products.server";
+import { JOB_SCHEDULE, LOCK_LEASE_MS } from "~/lib/jobs/runner.server";
 
 /**
  * Live self-check — the engine behind the admin Debug tab.
@@ -100,9 +116,13 @@ export const SELF_CHECK_ALERT_TYPE = "SELF_CHECK_FAILED";
 // Freshness / staleness thresholds. Where a threshold mirrors another
 // module's behavior, the source is named — drift here makes the check lie.
 const BILLING_FRESH_MINUTES = 30; // matches /api/health BILLING_FRESHNESS_MS
-const PENDING_STUCK_HOURS = 24; // scheduler STALE_EXPIRE_HOURS — the stale
-// sweep EXPIREs unresolved PENDING attempts at 24h, so any PENDING row older
-// than that means the sweep itself is not doing its job.
+const PENDING_STUCK_HOURS = 25; // scheduler STALE_EXPIRE_HOURS (24h) + the
+// stale_attempt_sweep's 30-min cadence (runner registry) + slack. The sweep
+// only becomes ELIGIBLE to expire an unresolved PENDING attempt at exactly
+// 24h and runs on its own tick, so a check at the bare 24h boundary FAILs
+// attempts the very next sweep tick expires on schedule — a false CRITICAL
+// that self-resolves minutes later. Only older than expiry + a full cadence
+// means the sweep itself is not doing its job.
 const SETTLEMENT_LAG_HOURS = 26; // SUCCESS_REDRIVE_MIN_AGE_MS (24h30m) + slack
 const FAILED_UNSETTLED_MINUTES = 60; // DUNNING_CLAIM_LEASE_MS (10m) + slack
 const OVERDUE_SLACK_HOURS = 48; // shop-tz day semantics + dunning-held cycles
@@ -115,6 +135,19 @@ const CLOCK_SKEW_WARN_MS = 60_000;
 const CLOCK_SKEW_FAIL_MS = 300_000;
 const STOREFRONT_FETCH_TIMEOUT_MS = 6_000;
 const DB_SLOW_MS = 1_000;
+// Flow coverage is refreshed at most daily (KLAVIYO_FLOW_COVERAGE alert
+// budget) — a cache older than two of those windows means the refresh died.
+const FLOW_COVERAGE_STALE_HOURS = 48;
+// A lease can never legitimately reach further than LOCK_LEASE_MS into the
+// future (acquire and every renewal set now + LOCK_LEASE_MS); 2× is the
+// unambiguous "no code path wrote this" line.
+const WEDGED_LOCK_MS = LOCK_LEASE_MS * 2;
+// How many plan products to read when picking a live PDP to probe.
+const STOREFRONT_PROBE_PRODUCTS = 5;
+// The exact gate attribute cx-buybox-core.liquid renders while the
+// cellexia.launch_status metafield is anything but byte-exact "live"
+// (tests/liquid/render.test.ts pins the Liquid half).
+const LAUNCH_GATED_ATTR = 'data-cellexia-gated="true"';
 
 /** A normal desktop browser UA — storefront CDNs vary responses on UA. */
 const DESKTOP_UA =
@@ -671,6 +704,111 @@ const CHECKS: CheckDef[] = [
       return { status: "PASS", detail: `Storefront answered 200 at ${url}.` };
     },
   },
+  {
+    key: "storefront_widget",
+    label: "Buy box present on a live product page",
+    category: "Launch & storefront",
+    remediation:
+      "Confirm the app embed/block is still enabled on the PUBLISHED theme (Theme editor → App embeds) and the extension is deployed (`npm run deploy`) — a theme publish or editor change can silently remove the widget. The Preview Doctor on Preview & launch names the exact broken gate per product.",
+    run: async (ctx) => {
+      // End-to-end proof the merchant cannot get locally: fetch a REAL plan
+      // product's page off the live theme and verify our markup is there,
+      // gated exactly as the launch mode demands. Catches the failure
+      // shapes only a deployed store exhibits — a theme publish that
+      // dropped the app embed, an undeployed extension, a launch-status
+      // metafield the THEME sees differently than the API reports.
+      const configs = await prisma.sellingPlanConfig.findMany({
+        where: {
+          shopId: ctx.shop.id,
+          active: true,
+          syncStatus: "SYNCED",
+          shopifyGroupId: { not: null },
+        },
+        orderBy: { createdAt: "asc" },
+        select: { productIds: true },
+      });
+      const productIds = [
+        ...new Set(configs.flatMap((c) => parsePlanIdsJson(c.productIds))),
+      ];
+      if (productIds.length === 0) {
+        return {
+          status: "SKIP",
+          detail:
+            "No synced plan with products yet — nothing to probe (the selling_plans check owns that half).",
+        };
+      }
+      const products = await getProducts(
+        await ctx.admin(),
+        productIds.slice(0, STOREFRONT_PROBE_PRODUCTS),
+      );
+      const probeable = products.find(
+        (p) => (p.status ?? "").toUpperCase() === "ACTIVE" && p.handle,
+      );
+      if (!probeable) {
+        return {
+          status: "WARN",
+          detail: `None of the first ${Math.min(productIds.length, STOREFRONT_PROBE_PRODUCTS)} plan product(s) is ACTIVE with a handle — no live product page exists to probe.`,
+          remediation:
+            "Set at least one plan product to Active in Shopify — a plan whose products are all draft/archived can never sell.",
+        };
+      }
+      const url = `https://${ctx.storefrontHost()}/products/${encodeURIComponent(
+        probeable.handle as string,
+      )}`;
+      let response: Response;
+      try {
+        response = await fetchWithTimeout(url, "follow");
+      } catch (err) {
+        return {
+          status: "WARN",
+          detail: `Could not fetch ${url}: ${errorMessage(err)} — inconclusive from this host; open the page in a browser to verify the widget.`,
+        };
+      }
+      if ((response.url ?? "").includes("/password")) {
+        return {
+          status: "WARN",
+          detail:
+            "The product page redirected to the storefront password page — inconclusive from this host; check the widget in a browser after entering the password.",
+        };
+      }
+      if (!response.ok) {
+        return {
+          status: "WARN",
+          detail: `${url} answered HTTP ${response.status} — could be bot protection or a storefront hiccup; inconclusive. Verify the widget in a browser.`,
+        };
+      }
+      const html = await response.text();
+      const marker = STOREFRONT_MARKERS.find((m) => html.includes(m));
+      const live = (await ctx.launch()).mode === "LIVE";
+      if (!marker) {
+        return {
+          status: live ? "FAIL" : "WARN",
+          detail: live
+            ? `Fetched ${url} and found none of our markup — the buy box is NOT on the live product page, so it sells nothing.`
+            : `Our markup is not on ${url} yet — enable the app block/embed on the published theme before go-live (the go-live checklist tracks this).`,
+        };
+      }
+      const gated = html.includes(LAUNCH_GATED_ATTR);
+      if (live && gated) {
+        return {
+          status: "FAIL",
+          detail: `The widget on ${url} is still launch-gated (hidden from every visitor) although the app is LIVE — the theme is reading a launch flag other than "live". If you went live moments ago this can be page caching; re-run in a few minutes, then use “Re-sync storefront flag” on Preview & launch.`,
+        };
+      }
+      if (!live && !gated) {
+        return {
+          status: "FAIL",
+          detail: `The widget on ${url} is NOT launch-gated although the app is in SETUP — visitors can see (and subscribe through) a widget that is supposed to be dark. Re-sync the storefront flag on Preview & launch.`,
+        };
+      }
+      return {
+        status: "PASS",
+        detail: `Widget markup found on ${url} (“${marker}”), ${
+          live ? "visible as expected for a LIVE store" : "launch-gated as expected in SETUP"
+        }.`,
+      };
+    },
+  },
 
   // ── Customer portal ────────────────────────────────────────────────────────
   {
@@ -850,8 +988,9 @@ const CHECKS: CheckDef[] = [
     run: async (ctx) => {
       const [stuckPending, unsettledSuccess, unsettledFailed] =
         await Promise.all([
-          // PENDING older than the stale sweep's own 24h expiry means the
-          // sweep is not doing its job (age basis: startedAt ?? scheduledFor,
+          // PENDING older than the stale sweep's 24h expiry plus one sweep
+          // cadence of slack (PENDING_STUCK_HOURS above) means the sweep is
+          // not doing its job (age basis: startedAt ?? scheduledFor,
           // mirroring sweepStalePendingAttempts).
           prisma.billingAttempt.count({
             where: {
@@ -997,6 +1136,39 @@ const CHECKS: CheckDef[] = [
       };
     },
   },
+  {
+    key: "renewal_readiness",
+    label: "Every active subscription can renew",
+    category: "Billing",
+    remediation:
+      "Open the affected subscribers — the billing sweep selects due contracts BY nextBillingDate, so an ACTIVE contract without one is silently never billed again. “Sync from Shopify” on the contract (or the nightly full_sync_reconcile) restores the schedule; if Shopify also has no date, set one on the subscriber page.",
+    run: async (ctx) => {
+      // Dunning-held cycles keep an OVERDUE date by design and PAUSED
+      // contracts are a different status — an ACTIVE row with a NULL date is
+      // the one shape no sweep can ever pick up: a paying subscriber who
+      // silently stops receiving orders, with no error anywhere.
+      const dateless = await prisma.subscriptionContract.count({
+        where: {
+          shopId: ctx.shop.id,
+          status: "ACTIVE",
+          isDemo: false,
+          ...OURS_ONLY,
+          nextBillingDate: null,
+        },
+      });
+      if (dateless > 0) {
+        const live = (await ctx.launch()).mode === "LIVE";
+        return {
+          status: live ? "FAIL" : "WARN",
+          detail: `${dateless} ACTIVE contract(s) have no next billing date — the billing sweep can never select them, so they will never renew and the customer sees no error.`,
+        };
+      }
+      return {
+        status: "PASS",
+        detail: "Every active contract carries a next billing date.",
+      };
+    },
+  },
 
   // ── Dunning & retries ──────────────────────────────────────────────────────
   {
@@ -1118,6 +1290,54 @@ const CHECKS: CheckDef[] = [
       };
     },
   },
+  {
+    key: "dunning_config",
+    label: "Retry ladder configuration coherent",
+    category: "Dunning & retries",
+    remediation:
+      "Adjust the retry schedule on Settings → Failed payments — steps scheduled on/after the exhaust cutoff never run, which quietly shortens the recovery ladder the merchant thinks they configured.",
+    run: async (ctx) => {
+      // The schema validates each field alone; the cross-field trap is a
+      // ladder that reaches past cancelAfterFailedDays — those steps are cut
+      // off by exhaustion and never fire, invisibly, only on a live decline
+      // playing out over weeks.
+      const dunning = await getSetting(ctx.shop.id, "dunning");
+      const problems: string[] = [];
+      const deadRetries = dunning.softRetryDays.filter(
+        (d) => d >= dunning.cancelAfterFailedDays,
+      );
+      if (deadRetries.length > 0) {
+        problems.push(
+          `retry day(s) ${deadRetries.join(", ")} fall on/after the ${dunning.cancelAfterFailedDays}-day exhaust cutoff and will never fire`,
+        );
+      }
+      const deadEmails = dunning.emailLadderDays.filter(
+        (d) => d >= dunning.cancelAfterFailedDays,
+      );
+      if (deadEmails.length > 0) {
+        problems.push(
+          `recovery email day(s) ${deadEmails.join(", ")} fall on/after the exhaust cutoff and will never send`,
+        );
+      }
+      if (dunning.smsDay >= dunning.cancelAfterFailedDays) {
+        problems.push(
+          `the SMS day (${dunning.smsDay}) falls on/after the exhaust cutoff and will never send`,
+        );
+      }
+      if (dunning.paydayAlign && dunning.paydaysOfMonth.length === 0) {
+        problems.push(
+          "payday alignment is on but no paydays are configured — retries fall back to raw offsets",
+        );
+      }
+      if (problems.length > 0) {
+        return { status: "WARN", detail: `${problems.join("; ")}.` };
+      }
+      return {
+        status: "PASS",
+        detail: `Ladder coherent: ${dunning.softRetryDays.length} retries, ${dunning.emailLadderDays.length} emails and the SMS all inside the ${dunning.cancelAfterFailedDays}-day window.`,
+      };
+    },
+  },
 
   // ── Jobs ───────────────────────────────────────────────────────────────────
   {
@@ -1176,6 +1396,41 @@ const CHECKS: CheckDef[] = [
       return {
         status: "PASS",
         detail: `All ${JOB_SCHEDULE.length} jobs ran within their cadence.`,
+      };
+    },
+  },
+  {
+    key: "job_locks",
+    label: "No wedged job locks",
+    category: "Jobs",
+    remediation:
+      "Delete the named JobLock row (its job re-creates it on the next tick) and check the database clock — the runner can only reclaim leases that have expired, so a lease stamped far in the future stops that job permanently and silently.",
+    run: async (ctx) => {
+      // acquire and every heartbeat renewal set lockedUntil = now +
+      // LOCK_LEASE_MS, so a lease beyond 2× that horizon was not written by
+      // any code path (DB clock jump, manual edit, corruption). Nothing can
+      // reclaim it: jobs_health would only notice the symptom 3 cadences
+      // later — for a daily job, three days of silent stoppage.
+      const wedged = await prisma.jobLock.findMany({
+        where: {
+          lockedUntil: { gt: new Date(ctx.now.getTime() + WEDGED_LOCK_MS) },
+        },
+        select: { name: true, lockedUntil: true },
+      });
+      if (wedged.length > 0) {
+        return {
+          status: "FAIL",
+          detail: `Job lock(s) leased impossibly far into the future: ${wedged
+            .map(
+              (l) =>
+                `${l.name} (until ${l.lockedUntil.toISOString()})`,
+            )
+            .join(", ")} — the lease horizon is ${LOCK_LEASE_MS / 60_000}m, so these can never be reclaimed and the jobs are stopped.`,
+        };
+      }
+      return {
+        status: "PASS",
+        detail: "No job lock is leased beyond the runner's horizon.",
       };
     },
   },
@@ -1289,6 +1544,184 @@ const CHECKS: CheckDef[] = [
       };
     },
   },
+  {
+    key: "klaviyo_key_live",
+    label: "Klaviyo accepts the API key",
+    category: "Notifications",
+    remediation:
+      "Re-enter the key under Settings → Klaviyo connection (or fix KLAVIYO_PRIVATE_API_KEY) — a revoked/rotated key means every lifecycle flow silently stops, and queued events age out DEAD after 24h.",
+    run: async (ctx) => {
+      // app_secrets only checks that a key EXISTS; this proves Klaviyo still
+      // accepts it — a key revoked in Klaviyo's dashboard is invisible
+      // locally until events start dying in the outbox.
+      const auth = await resolveKlaviyoAuth(ctx.shop.id);
+      if (!auth.apiKey) {
+        return {
+          status: "SKIP",
+          detail:
+            "No Klaviyo key configured — the required-configuration check reports this; nothing to probe.",
+        };
+      }
+      const probe = await probeKlaviyoKey(auth.apiKey);
+      const sourceLabel =
+        auth.source === "settings"
+          ? "stored on the Settings page"
+          : "from the environment";
+      if (probe.ok) {
+        return {
+          status: "PASS",
+          detail: `Klaviyo accepted the key ${sourceLabel}. ${probe.detail}`,
+        };
+      }
+      if (probe.transient) {
+        return {
+          status: "WARN",
+          detail: `Klaviyo unreachable from this host — inconclusive; the key itself is unproven. ${probe.detail}`,
+        };
+      }
+      return {
+        status: "FAIL",
+        detail: `Klaviyo rejected the key ${sourceLabel} — every flow-delivered email/SMS is silently dead. ${probe.detail}`,
+      };
+    },
+  },
+  {
+    key: "klaviyo_flow_coverage",
+    label: "Klaviyo flows cover the delivery metrics",
+    category: "Notifications",
+    remediation:
+      "Open Emails → Set up my flows and re-run the guided setup — an uncovered metric means those customer emails fire an event that no flow delivers, so the customer receives nothing.",
+    run: async (ctx) => {
+      // Reads the machine-written cache (the guided setup / daily
+      // KLAVIYO_FLOW_COVERAGE sweep own the Klaviyo API budget) — this check
+      // makes the cached verdict visible every 30 minutes instead of only on
+      // the Emails page.
+      const setup = await getSetting(ctx.shop.id, "klaviyoFlowSetup");
+      if (!setup.setupRanAt) {
+        return {
+          status: "SKIP",
+          detail:
+            "The guided flow setup has not been run — coverage is not tracked until it is (Emails → Set up my flows).",
+        };
+      }
+      const uncovered = setup.rows.filter((r) =>
+        UNCOVERED_STATUSES.has(r.status),
+      );
+      const errored = setup.rows.filter((r) => r.status === "error");
+      const problems: string[] = [];
+      if (uncovered.length > 0) {
+        problems.push(
+          `${uncovered.length} metric(s) have no live flow delivering them: ${uncovered
+            .map((r) => r.metric)
+            .join(", ")}`,
+        );
+      }
+      if (errored.length > 0) {
+        problems.push(
+          `${errored.length} metric(s) failed their last setup attempt: ${errored
+            .map((r) => r.metric)
+            .join(", ")}`,
+        );
+      }
+      if (problems.length > 0) {
+        return { status: "WARN", detail: `${problems.join("; ")}.` };
+      }
+      const checkedAgeHours = setup.checkedAt
+        ? (ctx.now.getTime() - new Date(setup.checkedAt).getTime()) / 3_600_000
+        : Number.POSITIVE_INFINITY;
+      if (
+        checkedAgeHours > FLOW_COVERAGE_STALE_HOURS &&
+        (await isKlaviyoConfigured(ctx.shop.id))
+      ) {
+        return {
+          status: "WARN",
+          detail: `The coverage cache is ${
+            Number.isFinite(checkedAgeHours)
+              ? `${Math.round(checkedAgeHours)}h old`
+              : "missing a successful verification"
+          } — the daily refresh is not completing, so this verdict may be stale.`,
+          remediation:
+            "Open Emails to trigger a fresh verification, and check the alerts_run job on the Audit page.",
+        };
+      }
+      return {
+        status: "PASS",
+        detail: `All ${setup.rows.length} delivery metrics are covered (cached verdict${
+          setup.checkedAt ? `, verified ${Math.round(checkedAgeHours)}h ago` : ""
+        }).`,
+      };
+    },
+  },
+  {
+    key: "email_templates",
+    label: "Every email template renders cleanly",
+    category: "Notifications",
+    remediation:
+      "Open the named template on the Emails page — its live preview shows exactly what broke. Built-in copy is pinned by tests; this almost always means a merchant override references a placeholder that template never receives.",
+    run: async (ctx) => {
+      // The tests pin built-in copy; the merchant's stored overrides are the
+      // uncovered surface. Render every template through the REAL pipeline
+      // (renderEmail — the same code both delivery shapes use) with the
+      // shop's overrides and design applied: a throw here is a send-time
+      // failure, a leftover {placeholder} reaches the customer as literal
+      // braces.
+      const [emails, designRaw] = await Promise.all([
+        getSetting(ctx.shop.id, "emails"),
+        getSetting(ctx.shop.id, "emailDesign"),
+      ]);
+      const design = normalizeEmailDesign(designRaw);
+      const templates = emails.templates ?? {};
+      const broken: string[] = [];
+      const strays: string[] = [];
+      for (const template of Object.keys(TEMPLATES) as TemplateKey[]) {
+        const override = templates[template];
+        try {
+          const rendered = renderEmail(
+            template,
+            "en",
+            previewSampleVars(template),
+            {
+              subject: override?.subject ?? "",
+              body: override?.body ?? "",
+            },
+            design,
+          );
+          const strayTokens = [
+            ...new Set(
+              [
+                ...`${rendered.subject}\n${rendered.text}`.matchAll(
+                  /\{([a-z0-9_]+)\}/gi,
+                ),
+              ]
+                .map((m) => m[1])
+                .filter((token) => token !== "cta"),
+            ),
+          ];
+          if (strayTokens.length > 0) {
+            strays.push(`${template} ({${strayTokens.join("}, {")}})`);
+          }
+        } catch (err) {
+          broken.push(`${template}: ${errorMessage(err)}`);
+        }
+      }
+      if (broken.length > 0) {
+        return {
+          status: "FAIL",
+          detail: `Template(s) throw on render — a real send will fail identically: ${broken.join("; ")}.`,
+        };
+      }
+      if (strays.length > 0) {
+        return {
+          status: "WARN",
+          detail: `Template(s) render with unresolved placeholders that customers would see as literal braces: ${strays.join("; ")}.`,
+        };
+      }
+      return {
+        status: "PASS",
+        detail: `All ${Object.keys(TEMPLATES).length} templates render placeholder-free with the merchant's overrides and design applied.`,
+      };
+    },
+  },
 
   // ── Data integrity ─────────────────────────────────────────────────────────
   {
@@ -1317,6 +1750,87 @@ const CHECKS: CheckDef[] = [
       return {
         status: "PASS",
         detail: `${rows.length} stored setting group(s) all parse.`,
+      };
+    },
+  },
+  {
+    key: "stored_secrets",
+    label: "Stored credentials decrypt",
+    category: "Data integrity",
+    remediation:
+      "Re-enter the named credential on the Settings page — an APP_SIGNING_SECRET rotation makes stored secrets undecryptable, and delivery silently falls back to the environment variables (which may be absent or stale).",
+    run: async (ctx) => {
+      // revealSecret never throws; a failed decrypt is exactly the silent
+      // degradation the Klaviyo/mailer resolvers log-and-swallow. Surface it
+      // where a human looks.
+      const [klaviyo, mail] = await Promise.all([
+        getSetting(ctx.shop.id, "klaviyo"),
+        getSetting(ctx.shop.id, "mailTransport"),
+      ]);
+      const broken: string[] = [];
+      if (
+        klaviyo.privateApiKey &&
+        isEncryptedSecret(klaviyo.privateApiKey) &&
+        !revealSecret(klaviyo.privateApiKey).ok
+      ) {
+        broken.push("the Klaviyo private API key (Settings → Klaviyo connection)");
+      }
+      if (
+        mail.smtpPass &&
+        isEncryptedSecret(mail.smtpPass) &&
+        !revealSecret(mail.smtpPass).ok
+      ) {
+        broken.push("the SMTP password (Settings → Email delivery)");
+      }
+      if (broken.length > 0) {
+        return {
+          status: "FAIL",
+          detail: `Stored credential(s) can no longer be decrypted (APP_SIGNING_SECRET rotated?): ${broken.join("; ")} — delivery has silently fallen back to environment variables.`,
+        };
+      }
+      const stored = [
+        klaviyo.privateApiKey ? "Klaviyo key" : null,
+        mail.smtpPass ? "SMTP password" : null,
+      ].filter(Boolean);
+      return {
+        status: "PASS",
+        detail:
+          stored.length > 0
+            ? `Stored credential(s) decrypt cleanly: ${stored.join(", ")}.`
+            : "No credentials stored in Settings — environment variables are in use.",
+      };
+    },
+  },
+  {
+    key: "event_provenance",
+    label: "Contract events keep their contract link",
+    category: "Data integrity",
+    remediation:
+      "Investigate on the Audit page — contract-scoped events with no contract mean a contract row was deleted outside the demo-reset path (real mirrors are history and must never be deleted), or a demo reset failed to delete its events with it.",
+    run: async (ctx) => {
+      // SubscriberEvent.contractId is onDelete:SetNull, and the ONLY legal
+      // deleter is the demo reset — which must delete the demo's events too
+      // (an orphaned event has lost its demo provenance forever). Any
+      // contract-family event with a NULL contractId is therefore integrity
+      // damage, not data.
+      const orphaned = await prisma.subscriberEvent.count({
+        where: {
+          shopId: ctx.shop.id,
+          contractId: null,
+          OR: ["contract.", "cycle.", "billing.", "dunning."].map((prefix) => ({
+            type: { startsWith: prefix },
+          })),
+        },
+      });
+      if (orphaned > 0) {
+        return {
+          status: "WARN",
+          detail: `${orphaned} contract-scoped event(s) have lost their contract link — the audit timeline can no longer attribute them, and contract-less counters cannot filter them.`,
+        };
+      }
+      return {
+        status: "PASS",
+        detail: "Every contract-scoped event still points at its contract.",
       };
     },
   },

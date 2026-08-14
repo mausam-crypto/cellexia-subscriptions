@@ -564,14 +564,21 @@ describe("ownership filters are present in every gating query", () => {
 
   it("the billing due-query itself carries the filter, not just the file", () => {
     const source = stripComments(read("app/lib/billing/scheduler.server.ts"));
-    // The one query that creates charges. Anchored on its own shape so a
-    // stray OURS_ONLY elsewhere in the file cannot satisfy the rule.
-    const due = source.slice(
-      source.indexOf("const candidates = await prisma.subscriptionContract"),
+    // The one query that creates charges. Since v1.22.0 its where lives in
+    // `dueWhere`, shared by the candidate scan AND the mid-sweep batch
+    // refetch (so a contract cancelled/reclassified between scan and batch
+    // drops out). Anchor on the constant's own shape so a stray OURS_ONLY
+    // elsewhere in the file cannot satisfy the rule — then pin that BOTH
+    // consumers actually use it.
+    const def = source.slice(source.indexOf("const dueWhere = {"));
+    expect(def.length).toBeGreaterThan(0);
+    const defBlock = def.slice(0, def.indexOf("satisfies"));
+    expect(defBlock).toContain("OURS_ONLY");
+    expect(defBlock).toContain('status: "ACTIVE"');
+    expect(source).toMatch(
+      /const candidates = await prisma\.subscriptionContract\.findMany\(\{\s*where: dueWhere,/,
     );
-    const whereBlock = due.slice(0, due.indexOf("orderBy"));
-    expect(whereBlock).toContain("OURS_ONLY");
-    expect(whereBlock).toContain('status: "ACTIVE"');
+    expect(source).toMatch(/where: \{ id: \{ in: batchIds \}, \.\.\.dueWhere \}/);
   });
 
   it("the stale-attempt sweep restricts to our contracts", () => {
@@ -821,6 +828,8 @@ describe("migration 0003 backfills fail-SAFE and stays additive", () => {
       "0018_variant_default_frequencies",
       "0019_vat_reporting_cost",
       "0020_survey_predicted_ltgp",
+      "0021_survey_emitted_marker",
+      "0022_billing_attempt_created_at",
     ]);
   });
 });
@@ -1524,6 +1533,83 @@ describe("migration 0020 (survey + predicted LTGP) stays additive and leaves own
   it("never touches the ownership column or any existing default", () => {
     expect(sql).not.toMatch(/ownership/i);
     expect(sql).not.toMatch(/SET DEFAULT/i);
+  });
+});
+
+describe("migration 0021 (survey emitted marker) stays additive and leaves ownership alone", () => {
+  const sql = read("prisma/migrations/0021_survey_emitted_marker/migration.sql")
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("is additive only — no destructive verb anywhere in it", () => {
+    for (const verb of [
+      /\bDROP\b/i,
+      /\bTRUNCATE\b/i,
+      /\bDELETE\s+FROM\b/i,
+      /\bUPDATE\s+"/i,
+      /\bRENAME\b/i,
+      /\bALTER\s+TYPE\b/i,
+      /\bALTER\s+COLUMN\s+"\w+"\s+TYPE\b/i,
+    ]) {
+      expect(sql, String(verb)).not.toMatch(verb);
+    }
+  });
+
+  it("adds exactly one NULLABLE SurveyResponse column — null IS the pre-0021 state", () => {
+    // Null = event not yet emitted under the new marker; pre-upgrade rows
+    // whose event already exists are healed to a stamp by the retained
+    // event-existence check, so no backfill and no default.
+    const adds = sql.match(/ALTER TABLE [^;]+;/g) ?? [];
+    expect(adds).toHaveLength(1);
+    expect(adds[0]).toContain('ALTER TABLE "SurveyResponse" ADD COLUMN "emittedAt"');
+    expect(adds[0]).not.toMatch(/NOT NULL/);
+    expect(adds[0]).not.toMatch(/DEFAULT/);
+  });
+
+  it("never touches the ownership column or any existing default", () => {
+    expect(sql).not.toMatch(/ownership/i);
+    expect(sql).not.toMatch(/SET DEFAULT/i);
+  });
+});
+
+describe("migration 0022 (billing attempt createdAt) stays additive and leaves ownership alone", () => {
+  const sql = read(
+    "prisma/migrations/0022_billing_attempt_created_at/migration.sql",
+  )
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("is additive only — no destructive verb anywhere in it", () => {
+    for (const verb of [
+      /\bDROP\b/i,
+      /\bTRUNCATE\b/i,
+      /\bDELETE\s+FROM\b/i,
+      /\bUPDATE\s+"/i,
+      /\bRENAME\b/i,
+      /\bALTER\s+TYPE\b/i,
+      /\bALTER\s+COLUMN\s+"\w+"\s+TYPE\b/i,
+    ]) {
+      expect(sql, String(verb)).not.toMatch(verb);
+    }
+  });
+
+  it("adds exactly one BillingAttempt column with a constant-foldable default (fast default, no rewrite)", () => {
+    // NOT NULL DEFAULT CURRENT_TIMESTAMP is metadata-only on PG 11+; existing
+    // rows read back migration-time, which only ever GRANTS residue rows more
+    // resume time (the safe direction for the stale sweep's expiry basis).
+    const adds = sql.match(/ALTER TABLE [^;]+;/g) ?? [];
+    expect(adds).toHaveLength(1);
+    expect(adds[0]).toContain('ALTER TABLE "BillingAttempt" ADD COLUMN "createdAt"');
+    expect(adds[0]).toMatch(/DEFAULT CURRENT_TIMESTAMP/);
+  });
+
+  it("never touches the ownership column or any existing column's default", () => {
+    expect(sql).not.toMatch(/ownership/i);
+    // SET DEFAULT (altering an EXISTING column's default) stays banned; the
+    // new column's own inline DEFAULT above is not that.
+    expect(sql).not.toMatch(/ALTER\s+COLUMN[^;]*SET DEFAULT/i);
   });
 });
 

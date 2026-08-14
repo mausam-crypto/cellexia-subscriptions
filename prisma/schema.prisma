@@ -481,6 +481,10 @@ model BillingAttempt {
   cycleIndex        Int // Shopify billing cycle index
   attemptNumber     Int                  @default(1) // 1 = scheduled charge, >1 = dunning retry
   status            BillingAttemptStatus @default(PENDING)
+  // Row-insert instant (migration 0022) — the stale sweep's age basis for
+  // un-started residue rows, where scheduledFor (= nextBillingDate, possibly
+  // days past on an overdue contract) would expire them at birth.
+  createdAt         DateTime             @default(now())
   scheduledFor      DateTime
   startedAt         DateTime?
   completedAt       DateTime?
@@ -1114,6 +1118,10 @@ model SurveyResponse {
   // Every question answered.
   completedAt        DateTime?
   linkedAt           DateTime?
+  // When the one-shot survey.answered event was emitted (migration 0021).
+  // The atomic emission claim AND the sweep's "still owes its event" filter —
+  // null on pre-upgrade rows whose event already exists (healed on next scan).
+  emittedAt          DateTime?
   createdAt          DateTime  @default(now())
   updatedAt          DateTime  @updatedAt
 

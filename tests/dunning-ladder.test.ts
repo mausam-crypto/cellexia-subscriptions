@@ -348,4 +348,15 @@ describe("cross-cycle case scoping (source contract)", () => {
   it("late failures for an already-succeeded cycle never open a case", () => {
     expect(engineSource).toContain('reason: "cycle_already_succeeded"');
   });
+
+  it("the challenged path only reuses a case anchored to the attempt's own cycle", () => {
+    // onBillingAttemptChallenged must never hijack an older cycle's open case
+    // (cancelling its scheduled retry and inheriting its stale openedAt) — a
+    // cross-cycle case falls through to ensureOpenCase's supersede, exactly
+    // like the failure path. Behavior pinned by
+    // tests/dunning-challenged-cross-cycle.test.ts.
+    expect(engineSource).toMatch(
+      /sameCycleCase \?\?\s*\(await ensureOpenCase\(attempt, "AUTH_REQUIRED", "WEBHOOK"\)\)/,
+    );
+  });
 });

@@ -12,10 +12,7 @@ import { addDaysTz, formatShopDate } from "~/lib/dates.server";
 import { contractFrequency, formatFrequency } from "~/lib/frequency";
 import { t } from "~/lib/i18n/i18n.server";
 import { applyDiscountPct, formatMoney } from "~/lib/money";
-import {
-  hasSentForCycle,
-  sendNotification,
-} from "~/lib/notifications/send.server";
+import { sendNotification } from "~/lib/notifications/send.server";
 import { getActiveDiscountForCycle } from "./discounts.server";
 import { OURS_ONLY } from "~/lib/ownership/ownership.server";
 
@@ -24,7 +21,9 @@ import { OURS_ONLY } from "~/lib/ownership/ownership.server";
  *
  * - `runUpcomingOrderReminders`: "your order ships soon" N days before each
  *   renewal (N = settings.notifications.upcomingOrderDaysBefore), exactly once
- *   per cycle (NotificationLog dedupe via hasSentForCycle). The notifications
+ *   per billing occasion (NotificationLog dedupe keyed on the shop-tz day the
+ *   charge is due — a skipped/delayed cycle never suppresses the reminder for
+ *   the charge that actually happens). The notifications
  *   layer attaches the one-tap magic-link bundle (skip / delay / pause /
  *   update-card), which is where most churn-preventing engagement happens.
  *   Each reminder also carries a one-tap ADD-ON suggestion (`addon_variant_id`
@@ -154,6 +153,20 @@ function pickAddonForContract(
   return null;
 }
 
+/**
+ * Shop-tz calendar day (YYYY-MM-DD) of a billing date — the schedule-anchored
+ * component of the upcoming-order dedupe key. en-CA formats as ISO-ordered
+ * YYYY-MM-DD (same convention as the test helpers).
+ */
+function shopDayKey(date: Date, tz: string): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+}
+
 // ── Upcoming order reminders ─────────────────────────────────────────────────
 
 export interface UpcomingReminderStats {
@@ -224,9 +237,44 @@ export async function runUpcomingOrderReminders(
       const nextBillingDate = contract.nextBillingDate;
       if (!nextBillingDate) continue;
 
-      // One reminder per cycle, across restarts and re-runs.
+      // One reminder per BILLING OCCASION, across restarts and re-runs.
+      // `ordersCount + 1` alone is NOT a stable occasion key: ordersCount
+      // only moves on a successful charge, so after a skip the next real
+      // cycle recomputes the SAME index and the pre-skip reminder's SENT row
+      // would suppress the reminder for the charge that actually happens —
+      // hitting exactly the customers who tapped this reminder's own one-tap
+      // skip link (the winback engine documents the same ordersCount/cycle
+      // divergence). The dedupe key therefore carries the shop-tz day the
+      // charge is due: skip/delay move nextBillingDate, so the rescheduled
+      // charge gets its own reminder, while re-runs quoting the same due day
+      // still dedupe. Pre-key rows (no reminder_dedupe var) are matched by
+      // the exact billing date they quoted (next_date_iso), which moves with
+      // the schedule the same way — no duplicate across the upgrade.
       const cycleIndex = contract.ordersCount + 1;
-      if (await hasSentForCycle(contract.id, "upcoming_order", cycleIndex)) {
+      const reminderDedupe = `upcoming_order:${shopDayKey(nextBillingDate, tz)}`;
+      const alreadySent = await prisma.notificationLog.findFirst({
+        where: {
+          contractId: contract.id,
+          template: "upcoming_order",
+          status: "SENT",
+          OR: [
+            {
+              payload: {
+                path: ["vars", "reminder_dedupe"],
+                equals: reminderDedupe,
+              },
+            },
+            {
+              payload: {
+                path: ["vars", "next_date_iso"],
+                equals: nextBillingDate.toISOString(),
+              },
+            },
+          ],
+        },
+        select: { id: true },
+      });
+      if (alreadySent) {
         stats.alreadySent += 1;
         continue;
       }
@@ -265,6 +313,9 @@ export async function runUpcomingOrderReminders(
         locale: contract.locale,
         vars: {
           cycleIndex,
+          // Persistent occasion dedupe (see the alreadySent check above) —
+          // lands in the SENT row's payload.vars like dunning_dedupe does.
+          reminder_dedupe: reminderDedupe,
           items_summary: itemsSummary,
           item_count: contract.lines.length,
           total_estimate: formatMoney(

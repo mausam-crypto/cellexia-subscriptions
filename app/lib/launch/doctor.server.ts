@@ -93,7 +93,7 @@ const DESKTOP_UA =
  * the embed/block is enabled on the published theme, and the product carries
  * selling plan groups (the Liquid renders nothing otherwise).
  */
-const STOREFRONT_MARKERS = [
+export const STOREFRONT_MARKERS = [
   "cx-buybox",
   "data-cellexia-embed",
   "BEGIN app snippet: cx-buybox-core",

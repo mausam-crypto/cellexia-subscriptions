@@ -3,7 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 /**
  * Preview-feature tests: the PREVIEW magic token (signature-verified, never
  * consumed — the buy-box reveal must survive PDP → cart navigation), the
- * go-live stagger math, and the local-only demo contract invariants.
+ * go-live stagger math, the local-only demo contract invariants, and the
+ * proxy-identity probe's verdict taxonomy (OK / MISMATCH / UNREACHABLE —
+ * including the storefront password page, which is inconclusive, never a
+ * MISMATCH).
  *
  * DB-free: an in-memory MagicLinkToken store (tokens.test.ts pattern) plus
  * capture stubs for the shop/contract tables stand in for prisma; the Shopify
@@ -147,8 +150,10 @@ import {
   buildStorefrontPreviewToken,
   buildStorefrontPreviewUrl,
   computeStaggeredDates,
+  probeProxyIdentity,
 } from "~/lib/launch/launch.server";
 import { createDemoContract } from "~/lib/portal/demo.server";
+import { PORTAL_PROXY_BASE } from "~/lib/portal/proxy-path";
 
 const T0 = new Date("2026-07-23T12:00:00Z");
 const DAY_MS = 86_400_000;
@@ -176,6 +181,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllGlobals();
 });
 
 /** Flip the final character of the signature segment, keeping its length. */
@@ -288,6 +294,113 @@ describe("storefront preview URL", () => {
     const url = new URL(await buildStorefrontPreviewUrl("shop_1"));
     expect(url.pathname).toBe("/");
     expect(url.searchParams.get("cx_preview")).toBeTruthy();
+  });
+});
+
+// ── Proxy-identity probe ─────────────────────────────────────────────────────
+
+/**
+ * The launch-checklist probe behind "Portal proxy answers as Cellexia" —
+ * also what the self-check's app_proxy row and the Preview Doctor's proxy
+ * step run. Its verdict taxonomy is load-bearing: MISMATCH is treated as
+ * deterministic proof downstream (the self-check FAILs hard → CRITICAL
+ * admin email; the doctor BLOCKS the preview), while UNREACHABLE is
+ * inconclusive (retry once, then WARN). A password-protected storefront —
+ * the normal pre-launch state — 302s every store-domain path to /password,
+ * which answers 200 HTML: that landing proves nothing about who owns the
+ * proxy path and must never read as MISMATCH.
+ */
+describe("probeProxyIdentity", () => {
+  const PROBE_URL = `https://www.cellexia.example${PORTAL_PROXY_BASE}/preview/validate`;
+
+  /** A fetch Response whose final (post-redirect) URL is `finalUrl`. */
+  function responseAt(
+    finalUrl: string,
+    body: string,
+    contentType: string,
+  ): Response {
+    const response = new Response(body, {
+      status: 200,
+      headers: { "content-type": contentType },
+    });
+    // Response.url is read-only and empty on constructed responses; the
+    // probe reads it to detect where `redirect: "follow"` actually landed.
+    Object.defineProperty(response, "url", { value: finalUrl });
+    return response;
+  }
+
+  it("classifies the storefront password page as UNREACHABLE (inconclusive), never MISMATCH", async () => {
+    // Password-protected store: the proxy path 302s to /password → 200 HTML.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        responseAt(
+          "https://www.cellexia.example/password",
+          "<html><body>Enter store password</body></html>",
+          "text/html",
+        ),
+      ),
+    );
+
+    const probe = await probeProxyIdentity("shop_1");
+
+    // MISMATCH here would page the merchant with a false "another app owns
+    // the path" CRITICAL and a bogus npm-run-deploy remediation; the sibling
+    // probes (portal_endtoend, storefront_markup) already pin this hop as
+    // inconclusive, and the self-check grades UNREACHABLE WARN after retry.
+    expect(probe.status).toBe("UNREACHABLE");
+    expect(probe.detail).toContain("password page");
+    expect(probe.url).toBe(PROBE_URL);
+  });
+
+  it("keeps a non-JSON 200 that is NOT the password page as MISMATCH — the guard must not widen", async () => {
+    // A colliding app serving HTML on our path is a real answer from the
+    // wrong app: exactly what MISMATCH exists for.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        responseAt(
+          `${PROBE_URL}?token=x`,
+          "<html><body>someone else's page</body></html>",
+          "text/html",
+        ),
+      ),
+    );
+
+    const probe = await probeProxyIdentity("shop_1");
+    expect(probe).toMatchObject({
+      status: "MISMATCH",
+      detail: "non-JSON response body",
+    });
+  });
+
+  it("returns OK for this app's own { ok: true } answer", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        responseAt(
+          `${PROBE_URL}?token=x`,
+          JSON.stringify({ ok: true }),
+          "application/json",
+        ),
+      ),
+    );
+
+    const probe = await probeProxyIdentity("shop_1");
+    expect(probe).toEqual({ status: "OK", url: PROBE_URL, detail: null });
+  });
+
+  it("grades a network failure UNREACHABLE with the error as detail", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("socket hang up");
+      }),
+    );
+
+    const probe = await probeProxyIdentity("shop_1");
+    expect(probe.status).toBe("UNREACHABLE");
+    expect(probe.detail).toContain("socket hang up");
   });
 });
 

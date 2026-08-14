@@ -44,7 +44,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock("~/db.server", () => {
   const client = {
     klaviyoOutbox: {
-      findFirst: vi.fn(async (): Promise<Row | null> => null),
+      findMany: vi.fn(async (): Promise<Row[]> => []),
       create: vi.fn(
         async (args: { data: Record<string, unknown> }): Promise<Row> => {
           const row: Row = { id: `obx_${++store.seq}`, status: "PENDING", ...args.data };

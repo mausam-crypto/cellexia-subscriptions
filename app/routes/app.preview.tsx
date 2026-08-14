@@ -52,7 +52,10 @@ import {
   type DoctorStep,
 } from "~/lib/launch/doctor.server";
 import { PORTAL_PROXY_BASE } from "~/lib/portal/proxy-path";
-import { createDemoContract } from "~/lib/portal/demo.server";
+import {
+  createDemoContract,
+  resetDemoContract,
+} from "~/lib/portal/demo.server";
 import { buildPortalUrl } from "~/lib/magiclinks/builder.server";
 import {
   PORTAL_PREVIEW_TTL_SECONDS,
@@ -743,14 +746,29 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   if (intent === "preview-portal-demo") {
     try {
-      let contract = await prisma.subscriptionContract.findFirst({
-        where: { shopId: shop.id, isDemo: true },
-        orderBy: { createdAt: "desc" },
+      // ALWAYS through the demo module — never a bare findFirst here.
+      // createDemoContract reuses an existing demo row and repairs its
+      // ownership: a demo created before migration 0003 was backfilled to
+      // UNKNOWN (and the reclassify pass skips demo fixtures on purpose),
+      // and the portal renders OURS contracts only — reused as-is it opens
+      // an EMPTY preview while this action still ticks "Portal previewed".
+      // The route used to do its own findFirst, which bypassed that repair
+      // branch entirely and made the portal_preview_ready self-check's
+      // "self-repairs on the next preview click" copy false.
+      let { contractId } = await createDemoContract(shop.id);
+      let contract = await prisma.subscriptionContract.findUniqueOrThrow({
+        where: { id: contractId },
+        include: { lines: { select: { id: true } } },
       });
-      if (!contract) {
-        const { contractId } = await createDemoContract(shop.id);
+      // A demo row that lost its lines shows the same empty portal — the
+      // other WARN portal_preview_ready can report. Recreate it from the
+      // merchant's current catalog (resetDemoContract deletes the fixture
+      // together with its events, then rebuilds).
+      if (contract.lines.length === 0) {
+        ({ contractId } = await resetDemoContract(shop.id));
         contract = await prisma.subscriptionContract.findUniqueOrThrow({
           where: { id: contractId },
+          include: { lines: { select: { id: true } } },
         });
       }
       const url = await buildPortalPreviewUrl(shop.id, contract);

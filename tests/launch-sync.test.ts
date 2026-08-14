@@ -17,9 +17,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  *    LIVE flip ahead of a minutes-long stagger loop hands the next sweep
  *    every not-yet-shifted overdue contract in one same-day burst.
  *  - launchFlagDiverged compares the flag exactly the way Liquid does.
+ *  - markChecklist can never clobber a concurrent goLive mode flip: the
+ *    checklist write is a mode-guarded compare-and-swap on the Setting row,
+ *    so the flip always wins and the checkbox re-applies on the fresh value.
  *
  * DB-free: every seam is mocked (klaviyo-map.test.ts / preview.test.ts
- * pattern) — an in-memory settings store stands in for prisma.
+ * pattern) — an in-memory settings store stands in for prisma, including the
+ * Setting-row CAS semantics markChecklist's conditional updateMany relies on.
  */
 
 interface LaunchSettingValue {
@@ -40,10 +44,77 @@ const mocks = vi.hoisted(() => {
     previewedStorefront: false,
     previewedPortal: false,
   };
+  const settings = new Map<string, unknown>();
+  const settingKeyOf = (shopId: string, key: string) => `${shopId}:${key}`;
+
+  /**
+   * The Setting-row semantics markChecklist's conflict-safe write depends on,
+   * against the same in-memory map the settings.server mock serves:
+   *  - findUnique: does the row exist at all?
+   *  - create: fails with P2002 when a concurrent writer created it first.
+   *  - updateMany with a { path: ["mode"], equals } JSON filter: the
+   *    compare-and-swap — count 0 (no write) unless the STORED mode still
+   *    matches, exactly like Postgres evaluating the filter atomically.
+   */
+  const applySettingUpdateMany = async (args: {
+    where: {
+      shopId: string;
+      key: string;
+      value?: { path?: string[]; equals?: unknown };
+    };
+    data: { value: unknown };
+  }): Promise<{ count: number }> => {
+    const k = settingKeyOf(args.where.shopId, args.where.key);
+    if (!settings.has(k)) return { count: 0 };
+    const guard = args.where.value;
+    if (guard?.path) {
+      const stored = settings.get(k) as Record<string, unknown> | undefined;
+      const current = guard.path.reduce<unknown>(
+        (acc, part) =>
+          acc && typeof acc === "object"
+            ? (acc as Record<string, unknown>)[part]
+            : undefined,
+        stored,
+      );
+      if (current !== guard.equals) return { count: 0 };
+    }
+    settings.set(k, args.data.value);
+    return { count: 1 };
+  };
+  const applySettingCreate = async (args: {
+    data: { shopId: string; key: string; value: unknown };
+  }): Promise<unknown> => {
+    const k = settingKeyOf(args.data.shopId, args.data.key);
+    if (settings.has(k)) {
+      // Deferred import shape: constructed lazily at call time (imports are
+      // resolved by then), mirroring Prisma's unique-violation error.
+      const { Prisma } = await import("@prisma/client");
+      throw new Prisma.PrismaClientKnownRequestError("unique violation", {
+        code: "P2002",
+        clientVersion: "test",
+      });
+    }
+    settings.set(k, args.data.value);
+    return args.data;
+  };
   return {
     DEFAULT_LAUNCH,
-    settings: new Map<string, unknown>(),
+    settings,
     setSettingCalls: [] as unknown[],
+    applySettingUpdateMany,
+    applySettingCreate,
+    settingFindUnique: vi.fn(
+      async (args: {
+        where: { shopId_key: { shopId: string; key: string } };
+      }): Promise<unknown> =>
+        settings.has(
+          settingKeyOf(args.where.shopId_key.shopId, args.where.shopId_key.key),
+        )
+          ? { id: "setting_launch_1" }
+          : null,
+    ),
+    settingUpdateMany: vi.fn(applySettingUpdateMany),
+    settingCreate: vi.fn(applySettingCreate),
     setShopMetafield: vi.fn(async (): Promise<unknown> => ({ id: "gid://mf/1" })),
     getShopMetafield: vi.fn(async (): Promise<unknown> => null),
     setNextBillingDate: vi.fn(async (): Promise<unknown> => ({})),
@@ -74,6 +145,11 @@ vi.mock("~/db.server", () => ({
   default: {
     subscriptionContract: { findMany: mocks.contractFindMany },
     shop: { findUnique: vi.fn(async (): Promise<unknown> => null) },
+    setting: {
+      findUnique: mocks.settingFindUnique,
+      create: mocks.settingCreate,
+      updateMany: mocks.settingUpdateMany,
+    },
   },
 }));
 
@@ -134,6 +210,7 @@ import {
   getOverdueContracts,
   goLive,
   launchFlagDiverged,
+  markChecklist,
   readLaunchMetafield,
   revertToSetup,
   syncLaunchMetafield,
@@ -159,6 +236,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.settings.clear();
   mocks.setSettingCalls.length = 0;
+  mocks.settingUpdateMany.mockImplementation(mocks.applySettingUpdateMany);
+  mocks.settingCreate.mockImplementation(mocks.applySettingCreate);
   mocks.setShopMetafield.mockImplementation(async () => ({ id: "gid://mf/1" }));
   mocks.setNextBillingDate.mockImplementation(async () => ({}));
   mocks.contractFindMany.mockImplementation(async () => []);
@@ -592,6 +671,114 @@ describe("revertToSetup", () => {
     // Storefront is still live, so the app must be too — never divergent.
     expect(storedLaunch().mode).toBe("LIVE");
     expect(mocks.logEvent).not.toHaveBeenCalled();
+  });
+});
+
+// ── markChecklist — the checkbox that must never move the mode ───────────────
+
+/**
+ * markChecklist used to be a whole-object read-modify-write, so a goLive()
+ * committing between its read and its write was clobbered back to SETUP by
+ * the stale snapshot — while goLive went on to push "live" into the
+ * storefront metafield: widget selling subscriptions, billing/dunning/
+ * notifications gated dark. These tests pin the conflict-safe replacement:
+ * a mode-guarded compare-and-swap on the Setting row, retried on the fresh
+ * value when it loses.
+ */
+describe("markChecklist", () => {
+  it("ticks the one field and leaves the mode (and the rest) alone", async () => {
+    seedLaunch("LIVE");
+    const next = await markChecklist(
+      "shop_1",
+      "previewedPortal",
+      true,
+      "admin@x",
+    );
+    expect(next.previewedPortal).toBe(true);
+    expect(next.mode).toBe("LIVE");
+    expect(storedLaunch()).toMatchObject({
+      mode: "LIVE",
+      wentLiveAt: "2026-07-01T09:00:00.000Z",
+      previewedPortal: true,
+      previewedStorefront: false,
+    });
+  });
+
+  it("is a pure no-op when the field already holds the value — no write at all", async () => {
+    seedLaunch("SETUP");
+    mocks.settings.set(SETTING_KEY, {
+      ...storedLaunch(),
+      previewedStorefront: true,
+    });
+    await markChecklist("shop_1", "previewedStorefront", true, "admin@x");
+    expect(mocks.settingUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.settingCreate).not.toHaveBeenCalled();
+  });
+
+  it("creates the launch row on a fresh install (no Setting row yet)", async () => {
+    // Nothing seeded: getLaunchState serves the default, and there is no row
+    // for a conditional update to land on.
+    const next = await markChecklist("shop_1", "confirmedKlaviyo", true);
+    expect(mocks.settingCreate).toHaveBeenCalledTimes(1);
+    expect(mocks.settingUpdateMany).not.toHaveBeenCalled();
+    expect(next.mode).toBe("SETUP");
+    expect(storedLaunch()).toMatchObject({
+      mode: "SETUP",
+      confirmedKlaviyo: true,
+    });
+  });
+
+  it("THE race: a goLive landing mid-write is never clobbered — the flip wins, the tick re-applies", async () => {
+    seedLaunch("SETUP");
+    // Simulate goLive's setSetting(mode: LIVE) committing in the window
+    // between markChecklist's read and its conditional write: the flip lands
+    // first, THEN the CAS is evaluated against the flipped row — count 0.
+    mocks.settingUpdateMany.mockImplementationOnce(async (args) => {
+      mocks.settings.set(SETTING_KEY, {
+        ...storedLaunch(),
+        mode: "LIVE",
+        wentLiveAt: "2026-08-13T09:00:00.000Z",
+      });
+      return mocks.applySettingUpdateMany(args);
+    });
+
+    const next = await markChecklist(
+      "shop_1",
+      "previewedStorefront",
+      true,
+      "admin@x",
+    );
+
+    // The old read-modify-write restored mode: "SETUP" here — a diverged
+    // storefront flag (metafield "live", setting SETUP) with billing dark.
+    expect(storedLaunch().mode).toBe("LIVE");
+    expect(storedLaunch().wentLiveAt).toBe("2026-08-13T09:00:00.000Z");
+    // …and the checkbox still landed, on top of the fresh value.
+    expect(storedLaunch().previewedStorefront).toBe(true);
+    expect(next.mode).toBe("LIVE");
+    // Lost round + winning retry.
+    expect(mocks.settingUpdateMany).toHaveBeenCalledTimes(2);
+  });
+
+  it("loses a fresh-install create race gracefully and retries on the winner's value", async () => {
+    // No row. A concurrent writer (say goLive on an eager admin) creates the
+    // row LIVE between markChecklist's existence probe and its create — the
+    // create must surface P2002 and the loop must re-apply on THAT value,
+    // never overwrite it.
+    mocks.settingCreate.mockImplementationOnce(async (args) => {
+      mocks.settings.set(SETTING_KEY, {
+        ...mocks.DEFAULT_LAUNCH,
+        mode: "LIVE",
+        wentLiveAt: "2026-08-13T09:00:00.000Z",
+      });
+      return mocks.applySettingCreate(args); // now throws P2002
+    });
+
+    const next = await markChecklist("shop_1", "previewedPortal", true);
+
+    expect(storedLaunch().mode).toBe("LIVE");
+    expect(storedLaunch().previewedPortal).toBe(true);
+    expect(next.mode).toBe("LIVE");
   });
 });
 

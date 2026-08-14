@@ -25,6 +25,7 @@ api_version = "2026-01"
 [[extensions]]
 name = "Cellexia Post-purchase Survey"
 handle = "cellexia-survey"
+uid = "12ae066e-4b1c-f032-811d-9258aea9ef30e01457a1"
 type = "ui_extension"
 
   [[extensions.targeting]]

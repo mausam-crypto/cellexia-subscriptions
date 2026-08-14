@@ -46,10 +46,37 @@ const MAX_BACKOFF_MINUTES = 6 * 60; // cap 6h
 const MAX_EVENT_AGE_MS = 24 * 60 * 60 * 1000;
 /**
  * Duplicate-suppression window. The same metric for the same profile+contract
- * enqueued twice within this window is treated as one customer-facing moment
- * (e.g. the event log and the notifications router both reacting to one skip).
+ * ON THE SAME DELIVERY LEG (see deliveryLeg) enqueued twice within this
+ * window is treated as one customer-facing moment (e.g. the event log and
+ * the notifications router both reacting to one skip).
  */
 const DEDUPE_WINDOW_MS = 120_000;
+
+/**
+ * Which delivery leg an enqueue (or a stored row) belongs to, for dedupe
+ * purposes. The outbox has no channel column; the legs are recognizable by
+ * content shape (send.server.ts renders content_subject/content_html only
+ * for EMAIL templates, and every metric template carries content_text):
+ *  - SMS leg: content_text WITHOUT content_subject (payment_failed_sms —
+ *    the short body, stamped cellexia_send "false");
+ *  - EMAIL leg: everything else — the router's EMAIL enqueues (full
+ *    content_*) AND the canonical event-map rows (no content at all), which
+ *    are the same customer moment the EMAIL leg supersedes via the content
+ *    graft below.
+ * Distinct legs are never duplicates of each other: the dunning EMAIL rung
+ * and the dunning SMS share the "Cellexia Payment Failed" metric for the
+ * same profile+contract seconds apart, but they are two DISTINCT
+ * customer-facing messages. Keying the dedupe without the leg silently
+ * dropped whichever leg enqueued second (classically the SMS: its body
+ * never reached Klaviyo while its NotificationLog rode the email row as
+ * SENT and the sweep froze smsSent forever).
+ */
+function deliveryLeg(props: Record<string, unknown>): "EMAIL" | "SMS" {
+  return typeof props.content_text === "string" &&
+    typeof props.content_subject !== "string"
+    ? "SMS"
+    : "EMAIL";
+}
 
 export interface EnqueueKlaviyoInput {
   eventName: string;
@@ -90,11 +117,12 @@ export async function enqueue(
 
     if (options.dedupe !== false) {
       const since = new Date(Date.now() - DEDUPE_WINDOW_MS);
+      const incoming = input.properties ?? {};
       const contractId =
-        typeof input.properties?.contract_id === "string"
-          ? input.properties.contract_id
+        typeof incoming.contract_id === "string"
+          ? incoming.contract_id
           : undefined;
-      const duplicate = await prisma.klaviyoOutbox.findFirst({
+      const candidates = await prisma.klaviyoOutbox.findMany({
         where: {
           shopId,
           eventName: input.eventName,
@@ -106,7 +134,31 @@ export async function enqueue(
             : {}),
         },
         select: { id: true, status: true, properties: true },
+        orderBy: { eventTime: "asc" },
+        take: 10,
       });
+      // Rows are duplicates only within the same delivery leg (deliveryLeg
+      // above) — an SMS enqueue never dedupes against the EMAIL/canonical
+      // rows of the same metric, and vice versa.
+      const incomingLeg = deliveryLeg(incoming);
+      const legRows = candidates.filter(
+        (row) =>
+          deliveryLeg((row.properties ?? {}) as Record<string, unknown>) ===
+          incomingLeg,
+      );
+      // The surviving duplicate, in preference order: a row Klaviyo has not
+      // accepted yet (still graftable — PENDING, or FAILED awaiting its
+      // retry), else one that already delivered WITH content (a true
+      // duplicate: the flow fired), else whatever is left (rows delivered
+      // content-less — see the SENT-swallow rule below).
+      const duplicate =
+        legRows.find((row) => row.status !== "SENT") ??
+        legRows.find(
+          (row) =>
+            typeof ((row.properties ?? {}) as Record<string, unknown>)
+              .content_text === "string",
+        ) ??
+        legRows[0];
       if (duplicate) {
         // Content graft (v1.16.0): the router's enqueue carries the
         // ready-rendered content_subject/content_html/content_text (Emails
@@ -115,8 +167,9 @@ export async function enqueue(
         // and this dedupe would silently discard the content-carrying twin.
         // A flow built as `{{ event.content_html }}` would then render
         // empty. Graft the content keys onto the surviving row while it has
-        // not been flushed yet; content-less duplicates (the common case)
-        // change nothing. Failure-contained like the rest of this function.
+        // not been delivered yet (PENDING, or FAILED and still retrying);
+        // content-less duplicates (the common case) change nothing.
+        // Failure-contained like the rest of this function.
         //
         // cellexia_send rides along (v1.18.0), and its merge rule is the
         // subtle one — the flag has TWO writers with different intent:
@@ -140,7 +193,6 @@ export async function enqueue(
           "template",
           "cellexia_send",
         ] as const;
-        const incoming = input.properties ?? {};
         const hasContent = CONTENT_KEYS.some(
           (k) => k !== "cellexia_send" && typeof incoming[k] === "string",
         );
@@ -148,11 +200,8 @@ export async function enqueue(
           string,
           unknown
         >;
-        if (
-          hasContent &&
-          duplicate.status === "PENDING" &&
-          typeof existing.content_text !== "string"
-        ) {
+        const existingHasContent = typeof existing.content_text === "string";
+        if (hasContent && !existingHasContent && duplicate.status !== "SENT") {
           const { CONFIRMATION_TEMPLATE_BY_EVENT } = await import(
             "~/lib/notifications/confirmations.server"
           );
@@ -176,8 +225,38 @@ export async function enqueue(
               ) as object,
             },
           });
+          return { id: duplicate.id };
         }
-        return { id: duplicate.id };
+        // SENT-swallow rule: when the surviving duplicate already delivered
+        // WITHOUT the content (the canonical event-map row flushed — the
+        // 1-minute klaviyo_flush tick easily beats the 10-minute dunning
+        // sweep inside the 120s window), it can never carry the router's
+        // email: the delivered event has no content and no cellexia_send,
+        // so every auto-created flow's `equals "true"` filter already
+        // rejected it. Returning its id here swallowed the customer's email
+        // outright — NotificationLog said SENT (riding a live row), the
+        // DEAD reconcile never fires on a SENT row, and dunning's
+        // persistent dedupe advanced past the rung forever. The
+        // content-carrying enqueue must instead proceed as its own row.
+        // Confirmation-event survivors are the one exception: their flag is
+        // a provenance verdict that owns the moment (the content twin is
+        // the webhook double-log race, pinned in
+        // tests/outbox-graft-verdict.test.ts) — a gated twin must stay
+        // suppressed, never escape as a fresh deliverable row.
+        if (hasContent && !existingHasContent && duplicate.status === "SENT") {
+          const { CONFIRMATION_TEMPLATE_BY_EVENT } = await import(
+            "~/lib/notifications/confirmations.server"
+          );
+          const survivorIsVerdictRow =
+            typeof existing.event_type === "string" &&
+            existing.event_type in CONFIRMATION_TEMPLATE_BY_EVENT;
+          if (survivorIsVerdictRow) {
+            return { id: duplicate.id };
+          }
+          // fall through to create a fresh row carrying the content
+        } else {
+          return { id: duplicate.id };
+        }
       }
     }
 

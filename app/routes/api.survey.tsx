@@ -22,6 +22,14 @@
  * via contained logEvent. Answer values are validated against the frozen
  * instrument in app/lib/survey/shared.ts — unknown questions/options are
  * rejected, never stored.
+ *
+ * Order↔customer binding (v1.22.0): body.orderId is client-supplied and
+ * guessable, so writes are bound to the token's customer — a row or contract
+ * claimed by a different customer rejects with `not_your_order`, tokens
+ * without a customer may only merge into existing rows (never create), and
+ * the status read hides another customer's answers. linkSurveyForContract
+ * re-enforces the identity at the analytics gate for rows written inside the
+ * webhook race window.
  */
 
 import { json, type ActionFunctionArgs } from "@remix-run/node";
@@ -112,13 +120,55 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   try {
     const surveySettings = await getSetting(shop.id, "survey");
 
+    // Customer identity from the verified token only — never from the body.
+    const sub = typeof sessionToken.sub === "string" ? sessionToken.sub : null;
+    const customerId =
+      sub && sub.startsWith("gid://shopify/Customer/") ? sub : null;
+
     if (body.kind === "status") {
-      const status = await getSurveyOrderStatus(shop.id, body.orderId);
+      const status = await getSurveyOrderStatus(shop.id, body.orderId, customerId);
       return cors(json({ ok: true, ...status }));
     }
 
     if (!surveySettings.enabled) {
       return cors(json({ ok: false, message: "disabled" }));
+    }
+
+    // ── Order↔customer binding ────────────────────────────────────────────
+    // The token authenticates a SHOPPER; body.orderId is client-supplied and
+    // numeric order ids are guessable. Without this binding any shopper
+    // could write answers against another customer's order — poisoning that
+    // contract's churn-risk features, predicted LTGP and the survey.answered
+    // Klaviyo event (which emails the VICTIM). Fail-closed, no anonymous
+    // exception: a token with no customer claim proves nothing about WHICH
+    // order it belongs to (Shopify's checkout session token is not
+    // order-scoped), so an attacker's own anonymous session could otherwise
+    // merge a poisoned answer into a stranger's already-created row, or
+    // (see getSurveyOrderStatus) read one back. A subscription checkout
+    // always carries a customer, so requiring one here costs a legitimate
+    // shopper nothing except a logged-out Order Status revisit no longer
+    // being able to add further answers — an acceptable degradation next to
+    // the alternative. linkSurveyForContract enforces the same identity at
+    // link time, so a row that slips through the race window still never
+    // reaches analytics.
+    if (!customerId) {
+      return cors(json({ ok: false, message: "not_your_order" }));
+    }
+    const [existingRow, orderContract] = await Promise.all([
+      prisma.surveyResponse.findUnique({
+        where: { orderId: body.orderId },
+        select: { customerId: true },
+      }),
+      prisma.subscriptionContract.findFirst({
+        where: { shopId: shop.id, originOrderId: body.orderId, isDemo: false },
+        select: { customerId: true },
+      }),
+    ]);
+    if (existingRow?.customerId && existingRow.customerId !== customerId) {
+      return cors(json({ ok: false, message: "not_your_order" }));
+    }
+    if (orderContract?.customerId && orderContract.customerId !== customerId) {
+      return cors(json({ ok: false, message: "not_your_order" }));
     }
 
     // Abuse ceiling: shop-wide writes per rolling hour. The per-order unique
@@ -141,10 +191,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     if (body.kind === "answer" && !isValidSurveyAnswer(body.question, body.option)) {
       return cors(json({ ok: false, message: "unknown_answer" }));
     }
-
-    // Customer identity from the verified token only — never from the body.
-    const sub = typeof sessionToken.sub === "string" ? sessionToken.sub : null;
-    const customerId = sub && sub.startsWith("gid://shopify/Customer/") ? sub : null;
 
     const { response } = await recordSurveyWrite(shop.id, {
       orderId: body.orderId,

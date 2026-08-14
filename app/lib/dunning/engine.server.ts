@@ -523,6 +523,12 @@ export async function changePaymentMethodToBackup(
     where: { id: contract.id },
     data: { paymentMethodId: backupId },
   });
+  // Keep the in-memory contract consistent, mirroring the revert path:
+  // callers notify the customer right after the switch, and stale in-memory
+  // card metadata would name the OLD (just-failed) card in the "your payment
+  // method was updated" email. Callers needing the pre-switch id capture it
+  // BEFORE calling (handleSoftFailure's dunning.backup_used payload does).
+  contract.paymentMethodId = backupId;
   await refreshCardMirror(contract, backupId);
 }
 
@@ -787,13 +793,17 @@ async function handleSoftFailure(
         // the column existed (null) get it stamped here with the precise
         // pre-switch instrument; newer cases already carry their case-open
         // snapshot from ensureOpenCase.
-        if (kase.originalPaymentMethodId == null && contract.paymentMethodId) {
+        const previousPaymentMethodId = contract.paymentMethodId;
+        if (kase.originalPaymentMethodId == null && previousPaymentMethodId) {
           await prisma.dunningCase.update({
             where: { id: kase.id },
-            data: { originalPaymentMethodId: contract.paymentMethodId },
+            data: { originalPaymentMethodId: previousPaymentMethodId },
           });
-          kase.originalPaymentMethodId = contract.paymentMethodId;
+          kase.originalPaymentMethodId = previousPaymentMethodId;
         }
+        // The switch syncs the in-memory contract onto the backup card
+        // (pointer + card mirror) — the event payload below must carry the
+        // id captured BEFORE it.
         await changePaymentMethodToBackup(contract);
         viaBackup = true;
         await logEvent({
@@ -804,7 +814,7 @@ async function handleSoftFailure(
             dunningCaseId: kase.id,
             cycleIndex: attempt.cycleIndex,
             backupPaymentMethodId: contract.backupPaymentMethodId,
-            previousPaymentMethodId: contract.paymentMethodId,
+            previousPaymentMethodId,
           },
         });
         // The instrument the renewals charge just changed — tell the customer
@@ -940,7 +950,13 @@ async function revertToOriginalPaymentMethod(
   }
 }
 
-/** Best-effort mirror refresh of card metadata for the given method. */
+/**
+ * Best-effort mirror refresh of card metadata for the given method — DB row
+ * AND the in-memory contract, so notifications sent later in the same handler
+ * (notifyPaymentMethodChanged, failure emails) describe the card actually
+ * being charged rather than the instrument that just failed. A failed refresh
+ * leaves both untouched (the old behavior).
+ */
 async function refreshCardMirror(
   contract: ContractWithShop,
   paymentMethodId: string,
@@ -959,12 +975,22 @@ async function refreshCardMirror(
         cardExpiryYear: method.instrument.expiryYear,
       },
     });
+    contract.cardBrand = method.instrument.brand;
+    contract.cardLast4 = method.instrument.lastDigits;
+    contract.cardExpiryMonth = method.instrument.expiryMonth;
+    contract.cardExpiryYear = method.instrument.expiryYear;
   } catch (err) {
     console.error("[dunning] card mirror refresh failed", contract.id, err);
   }
 }
 
-/** Notify the customer that renewals now charge a different stored card. */
+/**
+ * Notify the customer that renewals now charge a different stored card. Reads
+ * the contract's mirrored card fields, so it must run AFTER
+ * changePaymentMethodToBackup (which syncs the in-memory contract via
+ * refreshCardMirror) — the whole point of this email is naming the card
+ * actually being charged, never the one that just failed.
+ */
 async function notifyPaymentMethodChanged(
   contract: ContractWithShop,
 ): Promise<void> {
@@ -1236,8 +1262,25 @@ export async function onBillingAttemptChallenged(
     return;
   }
 
+  // Cycle scoping, mirroring the failure path (ensureOpenCase): an open case
+  // is only REUSED when it is anchored to THIS attempt's billing cycle
+  // (legacy cases without a trigger attempt count as any-cycle). A challenge
+  // on cycle N must never hijack an open case for an older cycle M — flipping
+  // that case to AWAITING_3DS with nextRetryAt null would silently cancel
+  // cycle M's scheduled retry, and the case's stale openedAt anchor would let
+  // the sweep's cancelAfterFailedDays timeout exhaust it while the customer
+  // is mid-3DS on cycle N (with the 3DS success then closing the case
+  // CUSTOMER_FIXED and stranding cycle M behind the scheduler's b2 guard).
+  // A cross-cycle case instead falls through to ensureOpenCase below, which
+  // supersedes it (dunning.case_superseded) and opens a fresh cycle-anchored
+  // case with a fresh openedAt — exactly like a cross-cycle failure.
   const existing = await findOpenCase(contract.id);
-  if (attempt.status === "CHALLENGED" && existing?.state === "AWAITING_3DS") {
+  const existingCycle = existing ? await caseCycleIndex(existing) : null;
+  const sameCycleCase =
+    existing && (existingCycle == null || existingCycle === attempt.cycleIndex)
+      ? existing
+      : null;
+  if (attempt.status === "CHALLENGED" && sameCycleCase?.state === "AWAITING_3DS") {
     return; // webhook redelivery — link already sent
   }
 
@@ -1272,7 +1315,7 @@ export async function onBillingAttemptChallenged(
   if (claimed.count === 0) return; // settled concurrently — nothing to dun
 
   const kase =
-    existing ?? (await ensureOpenCase(attempt, "AUTH_REQUIRED", "WEBHOOK"));
+    sameCycleCase ?? (await ensureOpenCase(attempt, "AUTH_REQUIRED", "WEBHOOK"));
   await prisma.dunningCase.update({
     where: { id: kase.id },
     data: {

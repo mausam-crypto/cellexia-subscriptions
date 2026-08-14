@@ -148,41 +148,46 @@ export async function runBillingSweep(now: Date): Promise<BillingSweepStats> {
 
   // Due = nextBillingDate on or before today's end in the shop timezone.
   const dueBefore = addDaysTz(shopDayStartUtc(now, tz), 1, tz);
-  const candidates = await prisma.subscriptionContract.findMany({
-    where: {
-      shopId: shop.id,
-      // Only OUR contracts are ever charged. The shop may run a second
-      // subscription app whose contracts arrive on the same webhooks and get
-      // mirrored here; billing one of those would charge the customer twice
-      // (once by us, once by the other app). UNKNOWN is unbillable too.
-      ...OURS_ONLY,
-      status: "ACTIVE",
-      isDemo: false, // portal-preview fixtures are never billed
-      nextBillingDate: { not: null, lt: dueBefore },
-      // No in-flight attempt may block a contract twice — but an un-started
-      // SCHEDULER residue row (PENDING, never confirmed by Shopify: transport
-      // error or crash between the local insert and the API call) is exactly
-      // what the sweep must come back for, so it does NOT exclude. Dunning's
-      // un-started PENDING rows (fireRetry backoff) still exclude: their
-      // pacing belongs to the dunning engine.
-      billingAttempts: {
-        none: {
-          status: "PENDING",
-          OR: [
-            { startedAt: { not: null } },
-            { originatingAction: { not: "SCHEDULER" } },
-          ],
-        },
+  const dueWhere = {
+    shopId: shop.id,
+    // Only OUR contracts are ever charged. The shop may run a second
+    // subscription app whose contracts arrive on the same webhooks and get
+    // mirrored here; billing one of those would charge the customer twice
+    // (once by us, once by the other app). UNKNOWN is unbillable too.
+    ...OURS_ONLY,
+    status: "ACTIVE",
+    isDemo: false, // portal-preview fixtures are never billed
+    nextBillingDate: { not: null, lt: dueBefore },
+    // No in-flight attempt may block a contract twice — but an un-started
+    // SCHEDULER residue row (PENDING, never confirmed by Shopify: transport
+    // error or crash between the local insert and the API call) is exactly
+    // what the sweep must come back for, so it does NOT exclude. Dunning's
+    // un-started PENDING rows (fireRetry backoff) still exclude: their
+    // pacing belongs to the dunning engine.
+    billingAttempts: {
+      none: {
+        status: "PENDING",
+        OR: [
+          { startedAt: { not: null } },
+          { originatingAction: { not: "SCHEDULER" } },
+        ],
       },
     },
+  } satisfies Prisma.SubscriptionContractWhereInput;
+  const candidates = await prisma.subscriptionContract.findMany({
+    where: dueWhere,
     orderBy: { nextBillingDate: "asc" },
     select: { id: true },
   });
 
   for (let i = 0; i < candidates.length; i += BATCH_SIZE) {
     const batchIds = candidates.slice(i, i + BATCH_SIZE).map((c) => c.id);
+    // Re-apply the FULL due conditions, not just ownership: a launch-scale
+    // sweep runs for minutes, and a contract cancelled, paused, webhook-
+    // reclassified or given an in-flight attempt after the candidate scan
+    // must drop out at its batch — refetching by id alone would bill it.
     const batch = await prisma.subscriptionContract.findMany({
-      where: { id: { in: batchIds }, ...OURS_ONLY },
+      where: { id: { in: batchIds }, ...dueWhere },
       include: { lines: true },
     });
 
@@ -1105,7 +1110,20 @@ async function resolveStaleAttempt(
     stats.unresolved += 1;
     return;
   }
-  const ageBasis = attempt.startedAt ?? attempt.scheduledFor;
+  // Age basis: a STARTED attempt ages from its real start. An un-started
+  // residue row (f1 transient — Shopify never confirmed the attempt) ages
+  // from max(scheduledFor, createdAt) — never scheduledFor alone: that is
+  // the contract's nextBillingDate, arbitrarily far in the past on an
+  // overdue contract, and the documented 24h of 5-minute resume retries
+  // would collapse to zero (one transient error → EXPIRED on the sweep's
+  // first tick → the b2 cycle-history guard holds the cycle forever). The
+  // max() keeps dunning-retry semantics: a retry enqueued days before its
+  // scheduledFor still ages from its due instant, not from ladder insert.
+  const ageBasis =
+    attempt.startedAt ??
+    new Date(
+      Math.max(attempt.scheduledFor.getTime(), attempt.createdAt.getTime()),
+    );
   const expireBefore = new Date(now.getTime() - STALE_EXPIRE_HOURS * 3_600_000);
   if (ageBasis > expireBefore) {
     stats.unresolved += 1;

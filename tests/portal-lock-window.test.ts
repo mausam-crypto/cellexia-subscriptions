@@ -43,6 +43,9 @@ const mocks = vi.hoisted(() => {
     // FALSE here so the classic-copy tests above keep pinning the plain
     // behavior; the friendly describe flips it per test (ships ON).
     friendlyLock: { value: false },
+    // portal.allowAddProducts as the settings mock serves it. Default TRUE
+    // (the registry default); the merchant-switch describe flips it OFF.
+    allowAdd: { value: true },
     shopFindUnique: vi.fn(async (): Promise<unknown> => ({ id: shop.id })),
     portalSessionFindUnique: vi.fn(async (): Promise<unknown> => null),
     contractFindFirst: vi.fn(async (): Promise<unknown> => null),
@@ -62,6 +65,7 @@ const mocks = vi.hoisted(() => {
     removeLine: vi.fn(async (): Promise<unknown> => ({})),
     unskipNextCycle: vi.fn(async (): Promise<unknown> => ({})),
     addOneTimeAddon: vi.fn(async (): Promise<unknown> => ({ lines: [] })),
+    addLine: vi.fn(async (): Promise<unknown> => ({ lines: [] })),
   };
 });
 
@@ -112,7 +116,7 @@ vi.mock("~/lib/settings/settings.server", () => ({
     if (key === "portal") {
       return {
         contextualPrompts: false,
-        allowAddProducts: true,
+        allowAddProducts: mocks.allowAdd.value,
         otpCodeTtlMinutes: 10,
         sessionTtlDays: 30,
         mutationsPerHour: 30,
@@ -137,7 +141,7 @@ vi.mock("~/lib/crypto/tokens.server", () => ({
 }));
 
 vi.mock("~/lib/contracts/service.server", () => ({
-  addLine: vi.fn(),
+  addLine: mocks.addLine,
   addOneTimeAddon: mocks.addOneTimeAddon,
   changeFrequency: mocks.changeFrequency,
   changeLineQuantity: mocks.changeLineQuantity,
@@ -315,6 +319,7 @@ beforeEach(() => {
   delete process.env.PORTAL_COOKIE_DEV;
   mocks.setupMode.value = false;
   mocks.friendlyLock.value = false;
+  mocks.allowAdd.value = true;
   mocks.shopFindUnique.mockResolvedValue({ id: mocks.shop.id });
   mocks.portalSessionFindUnique.mockResolvedValue(null);
   mocks.subscriberEventCount.mockResolvedValue(1);
@@ -526,6 +531,67 @@ describe("proxy.api outside the lock window", () => {
     const response = await postAction("skip", {});
     expectToast(response, "skipped");
     expect(mocks.skipNextCycle).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── portal.allowAddProducts merchant switch ──────────────────────────────────
+// Settings, not accidents (golden rule 7): the OFF switch must hold at the
+// POST dispatcher for BOTH add-product endpoints the detail page drives —
+// "add_line" (recurring) always had the gate, "addon" (one-time) was
+// bypassable by a direct POST with a stale page or replayed form.
+
+describe("portal.allowAddProducts OFF", () => {
+  beforeEach(() => {
+    mocks.allowAdd.value = false;
+  });
+
+  it("refuses addon with toast=error and no service call", async () => {
+    const response = await postAction("addon", {
+      variantId: "gid://shopify/ProductVariant/333",
+      quantity: "1",
+    });
+    expectToast(response, "error");
+    expect(mocks.addOneTimeAddon).not.toHaveBeenCalled();
+  });
+
+  it("refuses add_line the same way (the sibling gate)", async () => {
+    const response = await postAction("add_line", {
+      variantId: "gid://shopify/ProductVariant/333",
+      quantity: "1",
+    });
+    expectToast(response, "error");
+    expect(mocks.addLine).not.toHaveBeenCalled();
+  });
+
+  it("both execute again once the switch is back ON", async () => {
+    mocks.allowAdd.value = true;
+    const addon = await postAction("addon", {
+      variantId: "gid://shopify/ProductVariant/333",
+      quantity: "1",
+    });
+    expectToast(addon, "addon_added");
+    expect(mocks.addOneTimeAddon).toHaveBeenCalledTimes(1);
+
+    const addLine = await postAction("add_line", {
+      variantId: "gid://shopify/ProductVariant/333",
+      quantity: "1",
+    });
+    expectToast(addLine, "line_added");
+    expect(mocks.addLine).toHaveBeenCalledTimes(1);
+  });
+
+  it("source pin: the addon case opens with the same gate as add_line", () => {
+    const source = readSource("app/routes/proxy.api.$action.tsx");
+    const gate = 'if (!portalSettings.allowAddProducts) return back("error");';
+    const addLineCase = source.indexOf('case "add_line": {');
+    const addonCase = source.indexOf('case "addon": {');
+    expect(addLineCase).toBeGreaterThan(-1);
+    expect(addonCase).toBeGreaterThan(-1);
+    // The gate appears inside BOTH case bodies, before any service call.
+    expect(source.indexOf(gate, addLineCase)).toBeGreaterThan(addLineCase);
+    const addonGate = source.indexOf(gate, addonCase);
+    expect(addonGate).toBeGreaterThan(addonCase);
+    expect(addonGate).toBeLessThan(source.indexOf("addOneTimeAddon(", addonCase));
   });
 });
 

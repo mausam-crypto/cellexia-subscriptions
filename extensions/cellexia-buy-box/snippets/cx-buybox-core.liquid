@@ -333,7 +333,7 @@ endif
 if cx_cfg.style.fontScale and cx_cfg.style.fontScale != 1
 assign cx_style_extra = cx_style_extra | append: ' --cx-font-scale: ' | append: cx_cfg.style.fontScale | append: ';'
 endif
-if cx_cfg.layout.radiusPx != blank and cx_cfg.layout.radiusPx != 12
+if cx_cfg.layout.radiusPx != blank and cx_cfg.layout.radiusPx != 0
 assign cx_style_extra = cx_style_extra | append: ' --cx-radius: ' | append: cx_cfg.layout.radiusPx | append: 'px;'
 endif
 if cx_cfg.layout.borderWidthPx != blank and cx_cfg.layout.borderWidthPx != 1

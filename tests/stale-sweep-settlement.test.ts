@@ -264,6 +264,7 @@ function staleAttemptRow() {
     status: "PENDING",
     cycleIndex: 5,
     attemptNumber: 1,
+    createdAt: OLD,
     startedAt: OLD,
     scheduledFor: OLD,
     completedAt: null,
@@ -671,5 +672,61 @@ describe("settlement money capture (cost snapshot + order breakdown)", () => {
       lifetimeRevenueCents: { increment: 0 },
     });
     expect(counterWrite?.lifetimeDiscountCents).toBeUndefined();
+  });
+});
+
+describe("REGRESSION: expiry age basis for un-started residue rows (v1.22.0)", () => {
+  // f1 (attempt-create transient) leaves a PENDING row with startedAt null
+  // and scheduledFor = nextBillingDate. On an OVERDUE contract that date is
+  // arbitrarily far in the past — the old `startedAt ?? scheduledFor` basis
+  // expired the row on the sweep's FIRST tick, collapsing the documented 24h
+  // of 5-minute resume retries to zero and parking the cycle forever behind
+  // the b2 cycle-history guard.
+  function residueRow(createdAgoMs: number) {
+    return {
+      ...staleAttemptRow(),
+      shopifyAttemptId: null, // Shopify never confirmed the attempt
+      startedAt: null,
+      scheduledFor: OLD, // months-overdue contract
+      createdAt: new Date(Date.now() - createdAgoMs),
+    };
+  }
+
+  it("a fresh residue row on an overdue contract is NOT expired — the resume window survives", async () => {
+    mocks.attemptFindMany.mockResolvedValue([residueRow(3 * 3_600_000)]);
+
+    const stats = await sweepStalePendingAttempts(2);
+
+    expect(stats.expired).toBe(0);
+    expect(stats.unresolved).toBe(1);
+    const expiredWrites = mocks.attemptUpdateMany.mock.calls.filter(
+      (c) =>
+        (c[0] as { data?: { status?: string } })?.data?.status === "EXPIRED",
+    );
+    expect(expiredWrites).toHaveLength(0);
+  });
+
+  it("a residue row genuinely unresolved past 24h still expires", async () => {
+    mocks.attemptFindMany.mockResolvedValue([residueRow(26 * 3_600_000)]);
+
+    const stats = await sweepStalePendingAttempts(2);
+
+    expect(stats.expired).toBe(1);
+    const expiredWrites = mocks.attemptUpdateMany.mock.calls.filter(
+      (c) =>
+        (c[0] as { data?: { status?: string } })?.data?.status === "EXPIRED",
+    );
+    expect(expiredWrites).toHaveLength(1);
+  });
+
+  it("a STARTED attempt keeps aging from its real start (no behavior change)", async () => {
+    mocks.gql.mockResolvedValue({ subscriptionBillingAttempt: null });
+    mocks.attemptFindMany.mockResolvedValue([
+      { ...staleAttemptRow(), createdAt: new Date() }, // startedAt = OLD
+    ]);
+
+    const stats = await sweepStalePendingAttempts(2);
+
+    expect(stats.expired).toBe(1);
   });
 });

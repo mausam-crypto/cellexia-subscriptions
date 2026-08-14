@@ -387,6 +387,43 @@ describe("the billing sweep's due-contract query", () => {
     }
   });
 
+  it("REGRESSION (v1.22.0): the batch refetch re-applies the FULL due conditions", async () => {
+    mocks.contractFindMany
+      .mockImplementationOnce(async (args: unknown) => {
+        captured.contractFindMany.push(args);
+        return [{ id: "c_ours_due" }];
+      })
+      .mockImplementationOnce(async (args: unknown) => {
+        captured.contractFindMany.push(args);
+        return []; // cancelled/paused mid-sweep → the refetch drops it
+      });
+
+    await runBillingSweep(NOW);
+
+    expect(captured.contractFindMany.length).toBe(2);
+    const candidateWhere = (
+      captured.contractFindMany[0] as { where: Record<string, unknown> }
+    ).where;
+    const batchWhere = (
+      captured.contractFindMany[1] as { where: Record<string, unknown> }
+    ).where;
+    expect(batchWhere.id).toEqual({ in: ["c_ours_due"] });
+    // A launch-scale sweep runs for minutes: a contract cancelled, paused,
+    // reclassified or given an in-flight attempt AFTER the candidate scan
+    // must drop out at its batch. Refetching by id + ownership alone would
+    // bill it — every candidate guard must survive into the refetch.
+    for (const key of [
+      "shopId",
+      "ownership",
+      "status",
+      "isDemo",
+      "nextBillingDate",
+      "billingAttempts",
+    ]) {
+      expect(batchWhere[key], key).toEqual(candidateWhere[key]);
+    }
+  });
+
   it("MUTATION GUARD: dropping the ownership key lets Joy's contract through", async () => {
     /* Every assertion above is "FOREIGN was not selected", which would also
        hold if some *other* clause happened to exclude those rows — or if the

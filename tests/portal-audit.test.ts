@@ -15,7 +15,10 @@ import { fileURLToPath } from "node:url";
  *  3. The portal renders lang/dir on its root so RTL locales (ar) lay out
  *     correctly inside the merchant's LTR theme.
  *  4. requestOtp must not leak subscriber membership through response timing
- *     (fire-and-forget email send + constant-time floor).
+ *     (fire-and-forget email send + constant-time floor) NOR through response
+ *     content: the reported ttlMinutes is the merchant's configured value on
+ *     EVERY path (known / unknown / throttled), never a per-path mix of the
+ *     live setting and the registry default.
  *  5. Static pins: session tokens are only read from the signed cookie, and
  *     the api dispatcher gates/dedupes the way the audit requires.
  */
@@ -44,9 +47,13 @@ const mocks = vi.hoisted(() => {
     lines: [],
     shop,
   };
+  // portal.otpCodeTtlMinutes as the settings mock serves it. Default 10 (the
+  // registry default); the TTL-parity tests flip it to a non-default value.
+  const otpTtl = { value: 10 };
   return {
     shop,
     contract,
+    otpTtl,
     contractFindUnique: vi.fn(async (): Promise<unknown> => contract),
     contractFindFirst: vi.fn(async (): Promise<unknown> => null),
     subscriberEventCount: vi.fn(async (): Promise<number> => 1),
@@ -78,7 +85,7 @@ const mocks = vi.hoisted(() => {
         return {
           contextualPrompts: true,
           allowAddProducts: true,
-          otpCodeTtlMinutes: 10,
+          otpCodeTtlMinutes: otpTtl.value,
           sessionTtlDays: 30,
           magicLinkTtlDays: 14,
           mutationsPerHour: 30,
@@ -111,7 +118,7 @@ const mocks = vi.hoisted(() => {
     buildMagicUrl: vi.fn(
       async (): Promise<string> => "https://app.example/magic/tok",
     ),
-    sendNotification: vi.fn(async (): Promise<unknown> => ({ ok: true })),
+    sendNotification: vi.fn(async (_input?: unknown): Promise<unknown> => ({ ok: true })),
     getPrimaryShop: vi.fn(async (): Promise<unknown> => shop),
   };
 });
@@ -197,6 +204,7 @@ function payload(
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.otpTtl.value = 10;
   mocks.contractFindUnique.mockResolvedValue(mocks.contract);
   mocks.subscriberEventCount.mockResolvedValue(1);
 });
@@ -388,6 +396,56 @@ describe("requestOtp anti-enumeration timing", () => {
     expect(elapsed).toBeGreaterThanOrEqual(330);
     expect(mocks.otpCodeCreate).not.toHaveBeenCalled();
     expect(mocks.sendNotification).not.toHaveBeenCalled();
+  });
+});
+
+// ── OTP content parity ───────────────────────────────────────────────────────
+// The step-2 login page prints "expires in {minutes} minutes" from
+// result.ttlMinutes. Known emails used to get the merchant's configured
+// setting while unknown/throttled ones got the registry default — with the
+// setting changed away from the default, the visible minute count enumerated
+// subscriber emails despite identical timing and copy templates.
+
+describe("requestOtp ttlMinutes anti-enumeration parity", () => {
+  it("reports the merchant's configured TTL for known, unknown and throttled emails alike", async () => {
+    mocks.otpTtl.value = 15; // non-default (registry default is 10)
+
+    mocks.contractFindFirst.mockResolvedValueOnce(mocks.contract);
+    const known = await requestOtp("sub@example.com");
+
+    mocks.contractFindFirst.mockResolvedValueOnce(null);
+    const unknown = await requestOtp("stranger@example.com");
+
+    mocks.contractFindFirst.mockResolvedValueOnce(mocks.contract);
+    mocks.otpCodeCount.mockResolvedValueOnce(3); // at the cap → throttled
+    const throttled = await requestOtp("sub@example.com");
+
+    expect(known.ttlMinutes).toBe(15);
+    expect(unknown.ttlMinutes).toBe(known.ttlMinutes);
+    expect(throttled.ttlMinutes).toBe(known.ttlMinutes);
+  }, 6000);
+
+  it("the stored code and the emailed copy carry the same TTL the page displays", async () => {
+    mocks.otpTtl.value = 15;
+    mocks.contractFindFirst.mockResolvedValueOnce(mocks.contract);
+
+    const before = Date.now();
+    const result = await requestOtp("sub@example.com");
+    expect(result.ttlMinutes).toBe(15);
+
+    // The code actually expires when the page said it would…
+    const created = mocks.otpCodeCreate.mock.calls[0]?.[0] as {
+      data: { expiresAt: Date };
+    };
+    const ttlMs = created.data.expiresAt.getTime() - before;
+    expect(ttlMs).toBeGreaterThan(14 * 60_000);
+    expect(ttlMs).toBeLessThanOrEqual(16 * 60_000);
+
+    // …and the email promises the same minute count.
+    const sent = mocks.sendNotification.mock.calls[0]?.[0] as {
+      vars: { minutes: number };
+    };
+    expect(sent.vars.minutes).toBe(15);
   });
 });
 

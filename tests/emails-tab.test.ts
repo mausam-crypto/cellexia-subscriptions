@@ -43,8 +43,8 @@ const mocks = vi.hoisted(() => ({
 vi.mock("~/db.server", () => {
   const client = {
     klaviyoOutbox: {
-      findFirst: vi.fn(
-        async (): Promise<Row | null> => mocks.dedupeHit ?? null,
+      findMany: vi.fn(
+        async (): Promise<Row[]> => (mocks.dedupeHit ? [mocks.dedupeHit] : []),
       ),
       create: vi.fn(
         async (args: { data: Record<string, unknown> }): Promise<Row> => {

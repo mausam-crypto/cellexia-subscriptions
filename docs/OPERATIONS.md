@@ -20,11 +20,16 @@ Subscriptions) unless a shell command is shown.
    90-day MRR trend, the 12-week new-vs-churned chart, the forecast teaser
    (with its accuracy grade chip) and the top open failed payments.
 2. **Debug** — the self-check verdict chip should read **Healthy**. The same
-   28 checks re-run automatically every 30 minutes (`selfcheck_run`, also in
+   37 checks re-run automatically every 30 minutes (`selfcheck_run`, also in
    setup mode); a **Broken** verdict raises one CRITICAL `SELF_CHECK_FAILED`
    alert (emailed to Settings → alerts → `emailTo`) and every failing row on
    the page carries a named fix. The alert auto-resolves when a later run
    comes back clean — the checks page, not the alert row, is the live truth.
+   Since v1.22.0 the sweep also probes the live PDP for the widget, the
+   Klaviyo key against Klaviyo, every email template with your overrides
+   applied, renewal readiness, ladder coherence, job locks, stored-secret
+   decryption, flow coverage and event provenance — the shapes that only
+   break on the deployed store.
 3. **Alerts** — unresolved alerts (`BILLING_RUN_FAILED`, `WEBHOOK_FAILURES`,
    `ORIGIN_BACKFILL_FAILURES`, `STUCK_CONTRACTS`, `FAILURE_SPIKE`,
    `CHURN_SPIKE`, `FAST_SHIPPING_SKIPS`, `STOCKOUT_RENEWALS`,

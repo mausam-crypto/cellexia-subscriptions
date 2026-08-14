@@ -40,7 +40,10 @@ interface JobDef {
   fn: JobFn;
 }
 
-const LOCK_LEASE_MS = 10 * 60_000;
+/** Exported for the self-check's wedged-lock detection — a JobLock whose
+ * lease reaches further into the future than this module could ever have set
+ * it can never be reclaimed by acquireLock. */
+export const LOCK_LEASE_MS = 10 * 60_000;
 /**
  * While a job body runs, its lease is re-extended on this heartbeat. Without
  * renewal, any job that outlives LOCK_LEASE_MS (a launch-scale billing sweep,
@@ -846,10 +849,21 @@ function sanitizeStats(result: unknown): object | undefined {
 }
 
 async function runJob(job: JobDef, now: Date, setupMode: boolean): Promise<void> {
-  if (!(await isDue(job, now))) return;
+  // WALL time vs LOGICAL time: `now` is the tick-start timestamp and stays
+  // the logical time job BODIES receive (schedule math must see one coherent
+  // instant per tick). Everything that guards CONCURRENCY — dueness, the
+  // lease horizon, the RUNNING row's startedAt — must use fresh wall time
+  // instead: jobs run sequentially, so by the time job N acquires its lock,
+  // real time is tick-start + (jobs 1..N-1). A lease anchored to the stale
+  // tick start can be expired before the first heartbeat renewal (renewals
+  // use Date.now()), and a backdated startedAt makes a rival invocation
+  // classify the live run as crash residue — both of which hand a second
+  // runner the lock mid-flight, the exact race the lease exists to prevent
+  // (duplicate dunning emails, double ladder increments).
+  if (!(await isDue(job, new Date()))) return;
 
   const owner = randomUUID();
-  if (!(await acquireLock(job.name, now, owner))) return;
+  if (!(await acquireLock(job.name, new Date(), owner))) return;
 
   let runId: string | null = null;
   // Keep the lease alive for as long as the body runs — a sweep that outlives
@@ -862,10 +876,10 @@ async function runJob(job: JobDef, now: Date, setupMode: boolean): Promise<void>
   try {
     // Re-check under the lock: another instance may have started this job
     // between our due-check and the lease.
-    if (!(await isDue(job, now))) return;
+    if (!(await isDue(job, new Date()))) return;
 
     const run = await prisma.jobRun.create({
-      data: { jobName: job.name, status: "RUNNING", startedAt: now },
+      data: { jobName: job.name, status: "RUNNING", startedAt: new Date() },
     });
     runId = run.id;
 

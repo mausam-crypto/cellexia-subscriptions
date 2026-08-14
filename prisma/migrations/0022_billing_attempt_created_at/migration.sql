@@ -1,0 +1,21 @@
+-- 0022_billing_attempt_created_at (v1.22.0)
+-- One column on "BillingAttempt".
+--
+-- ADDITIVE ONLY: ADD COLUMN with a constant-foldable DEFAULT is metadata-only
+-- on PG 11+ (fast default), so existing rows are untouched on disk and the
+-- previous release runs unchanged against this schema (UPDATE.md §2.3 /
+-- §5.2). Existing rows read back migration-time as their createdAt — the
+-- safe direction for the consumer below (at worst one extra day of resume
+-- attempts on a pre-upgrade residue row).
+--
+-- "BillingAttempt"."createdAt": when the local attempt row was inserted.
+--   The stale-attempt sweep's expiry clock previously used
+--   startedAt ?? scheduledFor, and scheduledFor is the contract's
+--   nextBillingDate — arbitrarily far in the past on an overdue contract.
+--   One transient attempt-create error there produced an un-started residue
+--   row that the sweep judged >24h old ON ITS FIRST TICK and EXPIRED,
+--   collapsing the documented 24h of 5-minute resume retries to zero and
+--   parking the cycle forever behind the cycle-history guard. The sweep now
+--   ages un-started rows by max(scheduledFor, createdAt).
+
+ALTER TABLE "BillingAttempt" ADD COLUMN "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP;

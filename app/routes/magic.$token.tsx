@@ -25,9 +25,14 @@ import {
  *
  * GET verifies the signature ONLY (email scanners prefetch GETs — consuming
  * here would burn single-use tokens) and renders a standalone branded confirm
- * page whose form auto-submits after 1200ms. POST verifies AND consumes, then
- * executes the verb. Resource route: it owns its full HTML shell — no theme,
- * no root layout, robots noindex.
+ * page. The confirm form is submitted ONLY by the customer's own tap on the
+ * confirm button — never by a timer or any other script-driven submit:
+ * corporate mail scanners (SafeLinks / Proofpoint / Mimecast) detonate links
+ * in JS-capable sandboxes, so a timed auto-submit would let them consume the
+ * single-use token AND execute the verb (skip/pause/delay…) before the
+ * customer ever saw the email. POST verifies AND consumes, then executes the
+ * verb. Resource route: it owns its full HTML shell — no theme, no root
+ * layout, robots noindex.
  */
 
 // ── HTML helpers ─────────────────────────────────────────────────────────────
@@ -140,42 +145,28 @@ function confirmPage(desc: MagicActionDescription): string {
       desc.confirmLabel,
     )}</button>
   </form>
-  <p class="note" id="auto-note" hidden>${esc(
-    t(locale, "magic.confirm.auto_note"),
-  )}</p>
   ${cancelHtml}
 </div>
 <script>
 (function () {
   var form = document.getElementById("magic-form");
   var btn = document.getElementById("confirm-btn");
-  var note = document.getElementById("auto-note");
   if (!form || !btn) return;
-  if (note) note.hidden = false;
   var confirming = ${jsStr(t(locale, "magic.confirm.confirming"))};
   var submitted = false;
-  function go() {
-    if (submitted) return;
-    submitted = true;
-    btn.disabled = true;
-    btn.textContent = confirming;
-    if (typeof form.requestSubmit === "function") form.requestSubmit();
-    else form.submit();
-  }
-  var timer = setTimeout(go, 1200);
-  form.addEventListener("submit", function () {
-    clearTimeout(timer);
+  // Double-submit guard + button feedback ONLY. The POST is caused solely by
+  // the customer's tap on the confirm button: no timer, no programmatic
+  // submit — a script-driven POST here is exactly what lets email-security
+  // sandboxes burn the token and execute the verb (see the module doc).
+  form.addEventListener("submit", function (event) {
+    if (submitted) {
+      event.preventDefault();
+      return;
+    }
     submitted = true;
     btn.disabled = true;
     btn.textContent = confirming;
   });
-  var cancel = document.getElementById("cancel-link");
-  if (cancel) {
-    cancel.addEventListener("click", function () {
-      clearTimeout(timer);
-      submitted = true;
-    });
-  }
 })();
 </script>`;
 
@@ -280,9 +271,10 @@ export const loader = async ({ params }: LoaderFunctionArgs) => {
 
   try {
     const desc = await describeMagicAction(verified.payload);
-    // Plan lock window: render the honest refusal INSTEAD of the promise +
-    // auto-submit confirm page. Nothing is consumed on GET, so the same link
-    // works normally once the window has passed.
+    // Plan lock window / setup-mode launch gate: render the honest refusal
+    // INSTEAD of the promise + confirm form. Nothing is consumed on GET, so
+    // the same link works normally once the window has passed (or the store
+    // is LIVE again).
     if (desc.lockedResult) return html(successPage(desc.lockedResult));
     return html(confirmPage(desc));
   } catch (err) {

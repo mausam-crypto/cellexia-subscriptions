@@ -22,6 +22,7 @@ import {
 } from "~/lib/contracts/service.server";
 import { OURS_ONLY, isBillableOwnership } from "~/lib/ownership/ownership.server";
 import { resolveLockState } from "~/lib/contracts/lock.server";
+import { isSetupMode } from "~/lib/launch/launch.server";
 
 /**
  * Magic link execution. `executeMagicAction` is called by the /magic/:token
@@ -56,11 +57,11 @@ export interface MagicActionDescription {
   confirmLabel: string;
   portalUrl: string | null;
   /**
-   * Set when the plan lock window refuses this verb RIGHT NOW: the GET
-   * confirm page must render this terminal refusal instead of the promise +
-   * auto-submit — otherwise the customer watches "Skip your next order"
-   * confirm itself, burns the token's single use on a refusal, and the link
-   * is dead by the time the window opens.
+   * Set when the plan lock window — or the setup-mode launch gate — refuses
+   * this verb RIGHT NOW: the GET confirm page must render this terminal
+   * refusal instead of the promise + confirm form — otherwise the customer
+   * taps "Confirm", burns the token's single use on a refusal, and the link
+   * is dead by the time the window opens (or the store is LIVE again).
    */
   lockedResult?: MagicActionResult;
 }
@@ -255,7 +256,14 @@ const REDIRECT_ACTIONS = new Set<MagicPayload["action"]>([
   "LOGIN",
 ]);
 
-/** Verbs that mutate a contract — these share the portal's hourly ceiling. */
+/**
+ * Verbs that mutate a contract — these share the portal's hourly ceiling AND
+ * the setup-mode launch gate. The complement (LOGIN / UPDATE_CARD /
+ * CONFIRM_3DS / PREVIEW) never edits a contract from here: card + 3DS
+ * hand-offs land on Shopify-hosted pages (dunning is gated at its own
+ * source), LOGIN opens the portal (which enforces its own launch gate), and
+ * preview is the whole point of setup mode.
+ */
 const MUTATING_MAGIC_ACTIONS = new Set<MagicPayload["action"]>([
   "SKIP_NEXT",
   "UNSKIP_NEXT",
@@ -280,6 +288,23 @@ const LOCKED_MAGIC_ACTIONS = new Set<MagicPayload["action"]>([
   "SWAP",
 ]);
 
+/**
+ * Terminal refusal for the setup-mode launch gate. Reuses the portal's
+ * closed-portal copy (portal.setup.*): the magic page and the portal the
+ * customer lands on next must tell the same story during the same freeze.
+ */
+function setupGateResult(
+  locale: string,
+  portalUrl: string | undefined,
+): MagicActionResult {
+  return {
+    locale,
+    headline: t(locale, "portal.setup.title"),
+    sub: t(locale, "portal.setup.body"),
+    portalUrl,
+  };
+}
+
 export async function describeMagicAction(
   payload: MagicPayload,
 ): Promise<MagicActionDescription> {
@@ -300,11 +325,26 @@ export async function describeMagicAction(
       ? "magic.confirm.desc.APPLY_WINBACK_GIFT"
       : `magic.confirm.desc.${payload.action}`;
 
-  // Plan lock window, checked at DESCRIBE time too: the GET page must tell
-  // the truth before the auto-submit fires (see lockedResult's doc). The
-  // execute-time check below stays as the enforcement backstop.
+  // Setup-mode launch gate, checked at DESCRIBE time: while the store is in
+  // SETUP (install-dark, or an emergency revertToSetup) the GET page must
+  // render the refusal INSTEAD of the confirm form so nothing is consumed
+  // and the same link works again once the store is LIVE (see lockedResult's
+  // doc). Mutating verbs only; executeMagicAction holds the enforcement.
   let lockedResult: MagicActionResult | undefined;
-  if (contract && LOCKED_MAGIC_ACTIONS.has(payload.action)) {
+  if (
+    MUTATING_MAGIC_ACTIONS.has(payload.action) &&
+    (await isSetupMode(shop.id))
+  ) {
+    lockedResult = setupGateResult(
+      locale,
+      (await safePortalUrl(shop.id)) ?? undefined,
+    );
+  }
+
+  // Plan lock window, checked at DESCRIBE time too: the GET page must tell
+  // the truth before the customer taps confirm (see lockedResult's doc). The
+  // execute-time check below stays as the enforcement backstop.
+  if (!lockedResult && contract && LOCKED_MAGIC_ACTIONS.has(payload.action)) {
     const lock = await resolveLockState(shop.id, contract, shop.ianaTimezone);
     if (lock.locked) {
       const date = fmtDate(lock.until, shop, locale);
@@ -355,6 +395,24 @@ export async function executeMagicAction(
   });
 
   const portalUrl = (await safePortalUrl(shop.id)) ?? undefined;
+
+  // ── Launch gate: a store in SETUP takes no zero-login mutations ────────────
+  // Every other customer surface enforces its own SETUP gate (portal
+  // dispatcher, jobs, notifications, Klaviyo, buy box). Magic links minted
+  // while LIVE sit in inboxes for up to portal.magicLinkTtlDays days, so
+  // after an emergency revertToSetup() they would keep mutating live Shopify
+  // contracts while everything else is frozen — and goLive()'s overdue
+  // stagger would later sweep the result into an unannounced charge. Same
+  // terminal-refusal family as rate_limited/locked: the audit event above
+  // already recorded the tap, nothing mutates. Hand-off verbs (LOGIN /
+  // UPDATE_CARD / CONFIRM_3DS) and PREVIEW stay available — dunning/3DS is
+  // gated at its own source, and preview is the whole point of setup mode.
+  if (
+    MUTATING_MAGIC_ACTIONS.has(payload.action) &&
+    (await isSetupMode(shop.id))
+  ) {
+    return setupGateResult(locale, portalUrl);
+  }
 
   // ── Throttle mutating verbs (insert-then-count) ────────────────────────────
   // Portal POSTs are rate limited per customer; magic links used to bypass

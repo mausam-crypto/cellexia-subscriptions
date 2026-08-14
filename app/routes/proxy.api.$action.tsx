@@ -472,6 +472,11 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       }
 
       case "addon": {
+        // Same merchant switch as add_line: the one-time add-on is the other
+        // POST endpoint the add-products UI drives, and the OFF setting must
+        // hold against a direct POST (stale page, replayed form), not just
+        // hide the buttons.
+        if (!portalSettings.allowAddProducts) return back("error");
         const variantId = variantGidSchema.safeParse(form.get("variantId"));
         const quantity = quantitySchema.safeParse(form.get("quantity") ?? "1");
         if (!variantId.success || !quantity.success) return back("error");

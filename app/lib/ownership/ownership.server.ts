@@ -700,11 +700,27 @@ export async function claimContracts(
     select: { id: true, shopifyContractId: true, email: true, customerId: true },
   });
 
+  let claimed = 0;
   for (const contract of claimable) {
-    await prisma.subscriptionContract.update({
-      where: { id: contract.id },
+    // UNKNOWN → OURS is enforced AT THE WRITE, not just at the findMany
+    // above: the loop awaits one logEvent per row, so a big bulk claim
+    // holds the read open for seconds — long enough for a concurrent
+    // webhook sync to land a fresh FOREIGN verdict (positive evidence:
+    // every line carries a selling plan, none ours) on a selected row. An
+    // unconditional update({ where: { id } }) stomped that verdict with
+    // OURS and put the other app's contract into every OURS_ONLY billing
+    // sweep — the double-charge case this module exists to prevent. The
+    // conditional updateMany makes the promotion atomic (the monotonic
+    // ownership-write pattern in app/lib/contracts/sync.server.ts): a row
+    // that stopped being UNKNOWN between the read and the write is never
+    // promoted, and no claim event is logged for a promotion that never
+    // happened.
+    const promoted = await prisma.subscriptionContract.updateMany({
+      where: { id: contract.id, shopId, ownership: OWNERSHIP_UNKNOWN },
       data: { ownership: OWNERSHIP_OURS },
     });
+    if (promoted.count === 0) continue;
+    claimed += 1;
     await logEvent({
       shopId,
       contractId: contract.id,
@@ -722,7 +738,7 @@ export async function claimContracts(
     });
   }
 
-  return { claimed: claimable.length, skipped: ids.length - claimable.length };
+  return { claimed, skipped: ids.length - claimed };
 }
 
 /**

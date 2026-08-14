@@ -20,6 +20,9 @@ const mocks = vi.hoisted(() => ({
   ),
   contractFindMany: vi.fn(async (_args?: unknown): Promise<unknown[]> => []),
   contractUpdate: vi.fn(async (_args?: unknown): Promise<unknown> => ({})),
+  contractUpdateMany: vi.fn(
+    async (_args?: unknown): Promise<{ count: number }> => ({ count: 1 }),
+  ),
   contractGroupBy: vi.fn(async (_args?: unknown): Promise<unknown[]> => []),
   contractCount: vi.fn(async (_args?: unknown): Promise<number> => 0),
   syncContractFromShopify: vi.fn(
@@ -67,8 +70,10 @@ vi.mock("~/db.server", () => ({
     subscriptionContract: {
       findMany: mocks.contractFindMany,
       update: mocks.contractUpdate,
-      // No updateMany: this module has no bulk contract writer, and the guard
-      // in "claimContracts is the only bulk writer of OURS" keeps it that way.
+      // The ONE updateMany is claimContracts' atomic UNKNOWN-guarded claim;
+      // the guard in "claimContracts is the only bulk writer of OURS" pins
+      // that no second one appears.
+      updateMany: mocks.contractUpdateMany,
       groupBy: mocks.contractGroupBy,
       count: mocks.contractCount,
     },
@@ -130,6 +135,7 @@ beforeEach(() => {
   mocks.planConfigFindFirst.mockResolvedValue(null);
   mocks.shopFindUnique.mockResolvedValue({ id: "shop_1" });
   mocks.contractFindMany.mockResolvedValue([]);
+  mocks.contractUpdateMany.mockResolvedValue({ count: 1 });
   mocks.contractGroupBy.mockResolvedValue([]);
   mocks.contractCount.mockResolvedValue(0);
   mocks.syncContractFromShopify.mockResolvedValue({});
@@ -582,7 +588,7 @@ describe("recordSellingPlanSync", () => {
 });
 
 describe("claimContracts", () => {
-  it("promotes UNKNOWN to OURS and logs the admin action", async () => {
+  it("promotes UNKNOWN to OURS atomically and logs the admin action", async () => {
     mocks.contractFindMany.mockResolvedValue([
       {
         id: "c1",
@@ -596,11 +602,62 @@ describe("claimContracts", () => {
       claimed: 1,
       skipped: 1,
     });
-    expect(mocks.contractUpdate).toHaveBeenCalledWith({
-      where: { id: "c1" },
+    // The write itself re-asserts UNKNOWN (and the shop scope): the
+    // conditional updateMany is what makes UNKNOWN → OURS atomic instead of
+    // trusting the findMany read above it.
+    expect(mocks.contractUpdateMany).toHaveBeenCalledWith({
+      where: { id: "c1", shopId: "shop_1", ownership: OWNERSHIP_UNKNOWN },
       data: { ownership: OWNERSHIP_OURS },
     });
+    expect(mocks.contractUpdate).not.toHaveBeenCalled();
     expect(mocks.logEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it("never stomps a verdict that landed between the read and the write — no claim event either", async () => {
+    // THE race: a bulk claim's loop awaits one logEvent per row, holding the
+    // findMany read open for seconds. A SUBSCRIPTION_CONTRACTS_UPDATE webhook
+    // sync landing in that window can classify a selected contract FOREIGN on
+    // positive evidence (it is the other app's). An unconditional per-row
+    // update would overwrite that fresh verdict with OURS and put the other
+    // app's contract into every OURS_ONLY billing sweep — a real customer
+    // double-billed, with an audit event claiming a legitimate claim. The
+    // conditional write finds no UNKNOWN row and skips it.
+    mocks.contractFindMany.mockResolvedValue([
+      {
+        id: "c1",
+        shopifyContractId: "gid://shopify/SubscriptionContract/1",
+        email: "a@b.c",
+        customerId: "gid://shopify/Customer/1",
+      },
+      {
+        id: "c2",
+        shopifyContractId: "gid://shopify/SubscriptionContract/2",
+        email: "d@e.f",
+        customerId: "gid://shopify/Customer/2",
+      },
+    ]);
+    // c1 stopped being UNKNOWN mid-loop (the concurrent sync wrote FOREIGN),
+    // so its guarded write matches nothing; c2 is still UNKNOWN.
+    mocks.contractUpdateMany.mockImplementation(
+      async (args?: unknown): Promise<{ count: number }> => ({
+        count: (args as { where: { id: string } }).where.id === "c1" ? 0 : 1,
+      }),
+    );
+
+    await expect(claimContracts("shop_1", ["c1", "c2"], "admin@x")).resolves.toEqual({
+      claimed: 1,
+      skipped: 1,
+    });
+    // Only the promotion that actually happened is on the audit trail.
+    expect(mocks.logEvent).toHaveBeenCalledTimes(1);
+    expect(mocks.logEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        contractId: "c2",
+        payload: expect.objectContaining({
+          action: "contract_ownership_claimed",
+        }),
+      }),
+    );
   });
 
   it("only ever looks at UNKNOWN rows — a FOREIGN contract cannot be claimed", async () => {
@@ -645,9 +702,11 @@ describe("claimContracts is the only bulk writer of OURS", () => {
    * prevent — and it carried no `shopId`, so it reached across installations.
    *
    * Dead code passes every behavioural test it does not have, so the guard is
-   * on the source: no bulk update in this module may write OURS, and none may
-   * select rows by "not OURS". Repairing such a helper would make it a
-   * duplicate of claimContracts anyway, minus the audit event.
+   * on the source: the ONLY bulk update in this module is claimContracts'
+   * atomic claim — its write re-asserts UNKNOWN in its own WHERE, so a row
+   * that stopped being UNKNOWN between read and write is never promoted —
+   * and none may select rows by "not OURS". Repairing such a helper would
+   * make it a duplicate of claimContracts anyway, minus the audit event.
    */
   const source = readFileSync(
     new URL("../app/lib/ownership/ownership.server.ts", import.meta.url),
@@ -659,7 +718,17 @@ describe("claimContracts is the only bulk writer of OURS", () => {
 
   it("exports no other function that stamps OURS in bulk", () => {
     expect(source).not.toContain("markContractsOurs");
-    expect(source).not.toMatch(/updateMany/);
+    // Exactly one bulk write in the module: the claim below.
+    expect(source.match(/updateMany/g)).toHaveLength(1);
+  });
+
+  it("the one bulk write is the atomic UNKNOWN-guarded claim", () => {
+    // The WHERE of the write itself carries the UNKNOWN condition (and the
+    // shop scope) — the DB-enforced UNKNOWN → OURS rule, not a pre-read the
+    // write then trusts.
+    expect(source).toMatch(
+      /updateMany\(\{\s*where:\s*\{\s*id:\s*contract\.id,\s*shopId,\s*ownership:\s*OWNERSHIP_UNKNOWN\s*\},\s*data:\s*\{\s*ownership:\s*OWNERSHIP_OURS\s*\}/,
+    );
   });
 
   it("never selects contracts by 'anything that is not OURS'", () => {

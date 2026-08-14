@@ -739,6 +739,36 @@ describe("inline style attribute", () => {
     );
   });
 
+  /**
+   * layout.radiusPx must reach the page for EVERY configured value that
+   * differs from the stylesheet's real default. The Liquid skips the token
+   * when it equals that default (like borderWidthPx 1 and fontScale 1, each
+   * matching its CSS fallback) — but the skip constant was still 12, the
+   * pre-v1.2.0 default, after buy-box.css moved to square 0px cards: a
+   * merchant publishing exactly 12px saw rounded cards in the designer
+   * preview (which emits the token unconditionally) and square corners on
+   * the storefront, silently.
+   */
+  it("emits --cx-radius for a configured 12px (the retired default is not a skip value)", async () => {
+    const html = await renderWidget({
+      config: designConfig("classic", { radiusPx: 12 }),
+      launchStatus: "live",
+    });
+    expect(declaredValue(html, "--cx-radius")).toBe("12px");
+  });
+
+  it("omits --cx-radius only at the stylesheet's own default (0px), where the omission is a no-op", async () => {
+    // Non-vacuity: the skip is only safe while the CSS root default IS 0px.
+    // If buy-box.css moves the default again, this pin fails before the
+    // Liquid's skip constant can go stale a second time.
+    expect(readAsset("buy-box.css")).toMatch(/--cx-radius:\s*0px;/);
+    const html = await renderWidget({
+      config: designConfig("classic", { radiusPx: 0 }),
+      launchStatus: "live",
+    });
+    expect(declaredValue(html, "--cx-radius")).toBeNull();
+  });
+
   it("matches the admin preview's rule (bgTint || accent at 7%)", () => {
     // The designer's live preview must not disagree with the storefront about
     // which of the two values wins, or the merchant designs against a lie.

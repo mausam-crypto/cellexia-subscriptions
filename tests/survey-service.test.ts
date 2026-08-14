@@ -22,6 +22,7 @@ interface SurveyRow {
   answeredAt: Date | null;
   completedAt: Date | null;
   linkedAt: Date | null;
+  emittedAt: Date | null;
 }
 
 interface ContractRow {
@@ -42,8 +43,8 @@ const db = {
   nextId: 1,
 };
 
-vi.mock("~/db.server", () => ({
-  default: {
+vi.mock("~/db.server", () => {
+  const client = {
     surveyResponse: {
       findUnique: async ({ where }: { where: { orderId?: string; id?: string } }) => {
         if (where.orderId) {
@@ -81,6 +82,7 @@ vi.mock("~/db.server", () => ({
           answeredAt: data.answeredAt ?? null,
           completedAt: null,
           linkedAt: null,
+          emittedAt: null,
         };
         db.surveys.set(row.id, row);
         return row;
@@ -91,13 +93,54 @@ vi.mock("~/db.server", () => ({
         Object.assign(row, data);
         return row;
       },
-      updateMany: async ({ where, data }: { where: { id: string; contractId: null }; data: Partial<SurveyRow> }) => {
+      updateMany: async ({
+        where,
+        data,
+      }: {
+        where: { id: string; contractId?: null; emittedAt?: null };
+        data: Partial<SurveyRow>;
+      }) => {
+        // Null-claim semantics like the real DB: each null condition present
+        // in the where must hold on the row or the update matches nothing.
         const row = db.surveys.get(where.id);
-        if (!row || row.contractId !== null) return { count: 0 };
+        if (!row) return { count: 0 };
+        if ("contractId" in where && row.contractId !== where.contractId) {
+          return { count: 0 };
+        }
+        if ("emittedAt" in where && row.emittedAt !== where.emittedAt) {
+          return { count: 0 };
+        }
         Object.assign(row, data);
         return { count: 1 };
       },
-      findMany: async () => [...db.surveys.values()],
+      findMany: async (args?: {
+        where?: {
+          contractId?: null | { not: null };
+          emittedAt?: null;
+          answeredAt?: { not: null; lt: Date };
+        };
+      }) => {
+        let rows = [...db.surveys.values()];
+        const where = args?.where;
+        if (where) {
+          if (where.contractId === null) {
+            rows = rows.filter((r) => r.contractId === null);
+          } else if (where.contractId && "not" in where.contractId) {
+            rows = rows.filter((r) => r.contractId !== null);
+          }
+          if ("emittedAt" in where && where.emittedAt === null) {
+            rows = rows.filter((r) => r.emittedAt === null);
+          }
+          if (where.answeredAt) {
+            rows = rows.filter(
+              (r) =>
+                r.answeredAt !== null &&
+                r.answeredAt.getTime() < where.answeredAt!.lt.getTime(),
+            );
+          }
+        }
+        return rows;
+      },
     },
     subscriptionContract: {
       findFirst: async ({ where }: { where: { originOrderId?: string } }) => {
@@ -120,26 +163,55 @@ vi.mock("~/db.server", () => ({
       },
     },
     subscriberEvent: {
-      findFirst: async ({ where }: { where: { type: string; payload: { equals: unknown } } }) => {
-        const orderId = where.payload.equals;
-        return (
-          db.events.find(
-            (e) => e.type === where.type && e.payload.orderId === orderId,
-          ) ?? null
+      findFirst: async ({
+        where,
+      }: {
+        where: {
+          type: string;
+          payload?: { path: string[]; equals: unknown };
+          AND?: { payload: { path: string[]; equals: unknown } };
+        };
+      }) => {
+        // Honor every payload-path condition present (the mismatch-guard
+        // query carries two: action AND orderId).
+        const conds = [where.payload, where.AND?.payload].filter(
+          (c): c is { path: string[]; equals: unknown } => Boolean(c),
         );
+        const hit = db.events.find(
+          (e) =>
+            e.type === where.type &&
+            conds.every((c) => e.payload[c.path[0]] === c.equals),
+        );
+        return hit ? { id: "evt_hit", createdAt: new Date() } : null;
       },
     },
-  },
-}));
+  };
+  return {
+    default: {
+      ...client,
+      $transaction: async (fn: (tx: typeof client) => Promise<unknown>) =>
+        fn(client),
+    },
+  };
+});
+
+const logEventImpl = async (input: {
+  shopId: string;
+  type: string;
+  payload?: Record<string, unknown>;
+}) => {
+  db.events.push({
+    shopId: input.shopId,
+    type: input.type,
+    payload: input.payload ?? {},
+  });
+};
 
 vi.mock("~/lib/events/log.server", () => ({
-  logEvent: async (input: { shopId: string; type: string; payload?: Record<string, unknown> }) => {
-    db.events.push({
-      shopId: input.shopId,
-      type: input.type,
-      payload: input.payload ?? {},
-    });
-  },
+  logEvent: async (input: { shopId: string; type: string; payload?: Record<string, unknown> }) =>
+    logEventImpl(input),
+  logEventOrThrow: async (input: { shopId: string; type: string; payload?: Record<string, unknown> }) =>
+    logEventImpl(input),
 }));
 
 vi.mock("~/lib/settings/settings.server", () => ({
@@ -147,9 +219,14 @@ vi.mock("~/lib/settings/settings.server", () => ({
 }));
 
 import {
+  getSurveyOrderStatus,
+  linkSurveyForContract,
+  maybeEmitAnswered,
   recordSurveyWrite,
+  runSurveyLinkSweep,
   surveyHoldoutForContract,
 } from "~/lib/survey/service.server";
+import type { SubscriptionContract, SurveyResponse } from "@prisma/client";
 
 const SHOP = "shop_1";
 const ORDER = "gid://shopify/Order/1001";
@@ -360,5 +437,194 @@ describe("recordSurveyWrite", () => {
     const row = [...db.surveys.values()][0];
     expect(row.contractId).toBeNull();
     expect(db.events.filter((e) => e.type === "survey.answered")).toHaveLength(0);
+  });
+});
+
+// ── v1.22.0 hardening ────────────────────────────────────────────────────────
+
+function seedContract(over: Partial<ContractRow> = {}): ContractRow {
+  const row: ContractRow = {
+    id: "c1",
+    shopId: SHOP,
+    originOrderId: ORDER,
+    customerId: "gid://shopify/Customer/9",
+    email: "a@b.co",
+    isDemo: false,
+    ownership: "OURS",
+    surveyHoldout: null,
+    ...over,
+  };
+  db.contracts.set(row.id, row);
+  return row;
+}
+
+function seedSurvey(over: Partial<SurveyRow> = {}): SurveyRow {
+  const row: SurveyRow = {
+    id: `sr_${db.nextId++}`,
+    shopId: SHOP,
+    orderId: ORDER,
+    contractId: null,
+    customerId: null,
+    source: "THANK_YOU",
+    locale: null,
+    questionSetVersion: 1,
+    answers: { plannedDuration: "permanent" },
+    shownAt: new Date(),
+    answeredAt: new Date(Date.now() - 2 * 3600_000),
+    completedAt: null,
+    linkedAt: null,
+    emittedAt: null,
+    ...over,
+  };
+  db.surveys.set(row.id, row);
+  return row;
+}
+
+describe("REGRESSION: linkSurveyForContract identity guard (cross-customer poisoning)", () => {
+  it("never links a row claimed by a different customer, and logs the guard once", async () => {
+    const contract = seedContract();
+    const row = seedSurvey({ customerId: "gid://shopify/Customer/666" });
+
+    await linkSurveyForContract(
+      row as unknown as SurveyResponse,
+      contract as unknown as SubscriptionContract,
+    );
+    expect(db.surveys.get(row.id)?.contractId).toBeNull();
+    expect(db.events.filter((e) => e.type === "survey.answered")).toHaveLength(0);
+
+    // Second attempt (the daily sweep) must not spam a second guard event.
+    await linkSurveyForContract(
+      row as unknown as SurveyResponse,
+      contract as unknown as SubscriptionContract,
+    );
+    const guards = db.events.filter(
+      (e) => e.payload.action === "survey_link_customer_mismatch",
+    );
+    expect(guards).toHaveLength(1);
+    expect(guards[0].payload.orderId).toBe(ORDER);
+  });
+
+  it("still links matching and guest (null-customerId) rows", async () => {
+    const contract = seedContract();
+    const row = seedSurvey({ customerId: contract.customerId });
+    await linkSurveyForContract(
+      row as unknown as SurveyResponse,
+      contract as unknown as SubscriptionContract,
+    );
+    expect(db.surveys.get(row.id)?.contractId).toBe("c1");
+  });
+});
+
+describe("REGRESSION: one-shot survey.answered emission (emittedAt claim)", () => {
+  it("racing emitters produce exactly one event; the claim survives on the row", async () => {
+    const contract = seedContract();
+    const row = seedSurvey({
+      contractId: "c1",
+      answers: {
+        plannedDuration: "permanent",
+        motive: "prevention",
+        expectedSpeed: "days",
+        routine: "full",
+      },
+    });
+    db.contracts.get("c1")!.surveyHoldout = false;
+
+    const results = await Promise.all([
+      maybeEmitAnswered(db.surveys.get(row.id) as unknown as SurveyResponse),
+      maybeEmitAnswered(db.surveys.get(row.id) as unknown as SurveyResponse),
+    ]);
+    expect(results.filter(Boolean)).toHaveLength(1);
+    expect(db.events.filter((e) => e.type === "survey.answered")).toHaveLength(1);
+    expect(db.surveys.get(row.id)?.emittedAt).not.toBeNull();
+    void contract;
+  });
+
+  it("heals a pre-upgrade row (event exists, emittedAt null) without re-emitting", async () => {
+    seedContract();
+    const row = seedSurvey({
+      contractId: "c1",
+      answers: {
+        plannedDuration: "permanent",
+        motive: "prevention",
+        expectedSpeed: "days",
+        routine: "full",
+      },
+    });
+    db.events.push({
+      shopId: SHOP,
+      type: "survey.answered",
+      payload: { orderId: ORDER },
+    });
+
+    const emitted = await maybeEmitAnswered(
+      db.surveys.get(row.id) as unknown as SurveyResponse,
+    );
+    expect(emitted).toBe(false);
+    expect(db.surveys.get(row.id)?.emittedAt).not.toBeNull();
+    expect(db.events.filter((e) => e.type === "survey.answered")).toHaveLength(1);
+  });
+});
+
+describe("REGRESSION: sweep partial-answer pass cannot be starved by emitted rows", () => {
+  it("only scans rows still owing their event and flushes stale partials", async () => {
+    seedContract();
+    // An already-emitted row (would previously occupy the take() window)…
+    seedSurvey({
+      orderId: "gid://shopify/Order/9001",
+      contractId: "c1",
+      emittedAt: new Date(),
+    });
+    // …and a stale linked partial still owing its event.
+    const owed = seedSurvey({
+      orderId: "gid://shopify/Order/9002",
+      contractId: "c1",
+      answers: { motive: "prevention" },
+    });
+
+    const stats = await runSurveyLinkSweep(SHOP, new Date());
+    expect(stats.emitted).toBe(1);
+    expect(db.surveys.get(owed.id)?.emittedAt).not.toBeNull();
+    const events = db.events.filter((e) => e.type === "survey.answered");
+    expect(events).toHaveLength(1);
+    expect(events[0].payload.orderId).toBe("gid://shopify/Order/9002");
+    expect(events[0].payload.survey_completed).toBe(false);
+  });
+});
+
+describe("REGRESSION: getSurveyOrderStatus hides another customer's answers", () => {
+  it("returns the empty shape to a provably different customer, the answers to the owner", async () => {
+    seedSurvey({
+      customerId: "gid://shopify/Customer/9",
+      completedAt: new Date(),
+    });
+
+    const foreign = await getSurveyOrderStatus(
+      SHOP,
+      ORDER,
+      "gid://shopify/Customer/666",
+    );
+    expect(foreign.answered).toEqual({});
+    expect(foreign.completed).toBe(false);
+
+    const owner = await getSurveyOrderStatus(
+      SHOP,
+      ORDER,
+      "gid://shopify/Customer/9",
+    );
+    expect(owner.answered).toEqual({ plannedDuration: "permanent" });
+    expect(owner.completed).toBe(true);
+  });
+
+  it("hides an owned row from an ANONYMOUS requester (guessed orderId, no customer claim)", async () => {
+    // A null-vs-null "not foreign" reading would let anyone with a guessed
+    // orderId and no customer claim read a stranger's answers.
+    seedSurvey({
+      customerId: "gid://shopify/Customer/9",
+      completedAt: new Date(),
+    });
+
+    const anonymous = await getSurveyOrderStatus(SHOP, ORDER, null);
+    expect(anonymous.answered).toEqual({});
+    expect(anonymous.completed).toBe(false);
   });
 });

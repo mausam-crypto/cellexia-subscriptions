@@ -140,6 +140,11 @@ function buildPage(
     /** "select" renders the theme's field as a <select name="id"> with one
         <option> per jar — the dropdown-picker theme shape. Default input. */
     fieldKind?: "input" | "select";
+    /** Renders the THEME's own <select name="selling_plan"> inside the form
+        (one option per plan + the "" one-time option, "" preselected) — the
+        OS 2.0 native purchase-options shape. The widget must ADOPT it, never
+        create a second named field beside it. Requires withForm. */
+    sellingPlanSelect?: boolean;
     /** v1.11.0, the SECOND live Sleepify shape: NO [name="id"] anywhere.
         The pills carry data-val-id (jar 2's value is padded with trailing
         whitespace, exactly like the live page) and the theme marks the
@@ -189,11 +194,27 @@ function buildPage(
           .join("") +
         "</select>"
       : `<input type="hidden" name="id" value="${mainValue}">`;
+  // The theme's own purchase-options control (OS 2.0 renders every selling
+  // plan group as a select or radios inside the product form): an option per
+  // plan of OUR group plus the "" one-time option the theme preselects.
+  const planSelect = options.sellingPlanSelect
+    ? '<select name="selling_plan">' +
+      '<option value="" selected>One-time purchase</option>' +
+      [
+        FIXTURE.planIds.weeks4,
+        FIXTURE.planIds.weeks6,
+        FIXTURE.planIds.weeks8,
+      ]
+        .map((id) => `<option value="${id}">Delivery plan ${id}</option>`)
+        .join("") +
+      "</select>"
+    : "";
   const idField = options.markerTheme
     ? ""
     : options.withForm
       ? '<form action="/cart/add" method="post">' +
         mainField +
+        planSelect +
         '<button type="submit">Add to cart</button>' +
         "</form>"
       : mainField;
@@ -631,6 +652,55 @@ describe("un-synced variant: a numeric id the island has no row for", () => {
         .disabled,
     ).toBe(false);
     expectClassicPrices(page, "jar3");
+  });
+
+  it("with the theme's own <select name=selling_plan>: parking empties the ADOPTED select too", () => {
+    // The OS 2.0 native purchase-options shape: the theme renders its own
+    // <select name="selling_plan"> inside the /cart/add form. Pre-fix,
+    // releaseForm() queried only input[data-cellexia-plan-input] — a <select>
+    // can never match an `input` type selector — so the plan id survived the
+    // hidden-widget write gate and the invisible widget kept a subscription
+    // in the theme's form (422 on an uncovered variant, or a silent
+    // subscription line).
+    const page = buildPage(CLASSIC_MARKUP, {
+      withForm: true,
+      sellingPlanSelect: true,
+    });
+    const form = page.document.querySelector("form") as ElementNode;
+    const select = form.querySelector(
+      'select[name="selling_plan"]',
+    ) as ElementNode;
+    expect(select).not.toBeNull();
+
+    // Adoption, not duplication: the theme's select is tagged and drives the
+    // cart; NO hidden input is created beside it (two named fields would let
+    // the cart read one while the widget writes the other).
+    expect(select.getAttribute("data-cellexia-plan-input")).toBe("adopted");
+    expect(form.querySelector('input[name="selling_plan"]')).toBeNull();
+    expect(select.value).not.toBe("");
+    expect(select.value).toBe(String(page.state()!.sellingPlanId));
+
+    themeSwitches(page, UNSYNCED, "CHF 199.00");
+    page.pollTick();
+
+    // Parked and released: the ADOPTED select is EMPTIED — the theme keeps
+    // its own control, but no selling_plan value survives the hide — and the
+    // design property is disabled, exactly like the own-input path above.
+    expect(page.widget.getAttribute("data-cellexia-unsynced")).toBe("true");
+    expect(select.value).toBe("");
+    expect(select.getAttribute("data-cellexia-plan-input")).toBe("adopted");
+    const designProp = form.querySelector("input[data-cellexia-design-prop]");
+    expect(designProp!.disabled).toBe(true);
+    expect(page.state()).toBeNull();
+
+    // Back on a synced variant: the SAME select is re-filled through the
+    // adopted tag — still no second field.
+    themeSwitches(page, JAR3, M.jar3.oneTime);
+    page.pollTick();
+    expect(page.state()).toMatchObject({ variantId: JAR3, mode: "subscription" });
+    expect(select.value).not.toBe("");
+    expect(select.value).toBe(String(page.state()!.sellingPlanId));
+    expect(form.querySelector('input[name="selling_plan"]')).toBeNull();
   });
 
   it("another product's foreign numeric id (never seen holding our ids) does NOT park the widget", () => {

@@ -1,7 +1,9 @@
+import { Prisma } from "@prisma/client";
 import prisma from "~/db.server";
 import { adminClientForShop } from "~/shopify.server";
 import { requireShop } from "~/lib/shop/install.server";
 import { getSetting, setSetting } from "~/lib/settings/settings.server";
+import { settingsSchemas } from "~/lib/settings/registry.server";
 import type { SettingsValue } from "~/lib/settings/registry.server";
 import type { AdminClient } from "~/lib/graphql/client.server";
 import {
@@ -157,17 +159,106 @@ export function launchFlagDiverged(
 
 // ── Checklist ────────────────────────────────────────────────────────────────
 
-/** Partial update of one launch-checklist boolean (read-modify-write). */
+/** The Setting row every launch writer targets (settings registry key). */
+const LAUNCH_SETTING_KEY = "launch";
+
+/**
+ * How many lost compare-and-swap races markChecklist retries before falling
+ * back to the plain validated write. Two concurrent writers (a preview action
+ * ticking its box and the go-live modal) is the realistic ceiling; exhausting
+ * this many attempts means the stored row's raw `mode` can never equal its
+ * parsed form — a junk value getLaunchState papers over with the default.
+ */
+const MARK_CHECKLIST_MAX_RETRIES = 3;
+
+/**
+ * Partial update of one launch-checklist boolean.
+ *
+ * INVARIANT: ticking a checklist box must never move `mode`. This used to be
+ * a plain read-modify-write (getLaunchState → spread → setSetting), so a
+ * goLive() committing between the read and the write was clobbered back to
+ * SETUP by the stale snapshot — after which goLive still pushed "live" into
+ * the cellexia.launch_status metafield: the storefront widget selling
+ * subscriptions while billing, dunning and notifications stay gated dark,
+ * exactly the diverged-flag direction the Preview & launch banner and the
+ * launch_flag self-check exist to catch. The race is reachable: the preview
+ * actions (which tick previewedStorefront/previewedPortal) and the go-live
+ * modal are independent fetchers the same admin can have in flight at once.
+ *
+ * The write is therefore enforced AT the database (the monotonic-ownership
+ * pattern in app/lib/contracts/sync.server.ts): a conditional update that
+ * only lands while the stored `mode` still equals the mode this snapshot was
+ * computed from. A lost race re-reads and re-applies the one field on the
+ * fresh value — the mode flip always wins, the checkbox never does.
+ */
 export async function markChecklist(
   shopId: string,
   field: LaunchChecklistField,
   value: boolean,
   updatedBy?: string,
 ): Promise<LaunchState> {
+  for (let attempt = 0; attempt < MARK_CHECKLIST_MAX_RETRIES; attempt++) {
+    const state = await getLaunchState(shopId);
+    if (state[field] === value) return state;
+    const next: LaunchState = { ...state, [field]: value };
+    // Same validation setSetting would run — the direct row writes below
+    // must never store a value getSetting's schema would reject as junk.
+    const validated = settingsSchemas[LAUNCH_SETTING_KEY].parse(next);
+
+    const row = await prisma.setting.findUnique({
+      where: { shopId_key: { shopId, key: LAUNCH_SETTING_KEY } },
+      select: { id: true },
+    });
+    if (!row) {
+      // Fresh install: no launch row yet. create(), not upsert — a writer
+      // that got there first surfaces as a unique violation, and the loop
+      // retries ON TOP OF its value instead of overwriting it.
+      try {
+        await prisma.setting.create({
+          data: {
+            shopId,
+            key: LAUNCH_SETTING_KEY,
+            value: validated as object,
+            updatedBy,
+          },
+        });
+        return next;
+      } catch (err) {
+        if (
+          err instanceof Prisma.PrismaClientKnownRequestError &&
+          err.code === "P2002"
+        ) {
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    const updated = await prisma.setting.updateMany({
+      where: {
+        shopId,
+        key: LAUNCH_SETTING_KEY,
+        // The compare-and-swap: never land on a row whose mode moved since
+        // the read. A path filter rather than whole-value equality, so a
+        // stored value with extra or missing optional fields (an older app
+        // version's shape) can still be written through.
+        value: { path: ["mode"], equals: state.mode },
+      },
+      data: { value: validated as object, updatedBy },
+    });
+    if (updated.count === 1) return next;
+    // Lost the race: a concurrent goLive/revertToSetup moved the mode
+    // between the read and this write. Re-read and re-apply the one field.
+  }
+
+  // Every attempt found a stored raw `mode` that cannot equal its parsed
+  // form: junk the schema fallback is masking. Heal it through the
+  // validating whole-object writer — here the full rewrite is the repair,
+  // not the bug (no concurrent flip can lose this many CAS rounds).
   const state = await getLaunchState(shopId);
   if (state[field] === value) return state;
   const next: LaunchState = { ...state, [field]: value };
-  await setSetting(shopId, "launch", next, updatedBy);
+  await setSetting(shopId, LAUNCH_SETTING_KEY, next, updatedBy);
   return next;
 }
 
@@ -521,6 +612,9 @@ export interface ProxyIdentityProbe {
  * Never throws, never blocks the page render: network failures (timeout, DNS,
  * TLS) are UNREACHABLE — a warning, not a failed row, because a hiccup
  * between the app host and the storefront proves nothing about ownership.
+ * A landing on the storefront /password page is UNREACHABLE too (see below):
+ * a password-protected store answers for every storefront path, ours
+ * included, so it proves nothing about who owns this one.
  */
 export async function probeProxyIdentity(
   shopId: string,
@@ -556,6 +650,25 @@ export async function probeProxyIdentity(
       });
     } finally {
       clearTimeout(timer);
+    }
+
+    // A password-protected storefront (the normal pre-launch state) 302s
+    // every store-domain path — app-proxy paths included — to /password,
+    // which answers 200 text/html and would otherwise read as a MISMATCH
+    // ("non-JSON response body"). That is not a real answer from the wrong
+    // app; it is no answer about the proxy at all, so it grades UNREACHABLE
+    // (inconclusive — the self-check confirms once and WARNs), the same
+    // policy every sibling probe pins for this exact hop (portal_endtoend in
+    // app/lib/debug/selfcheck.server.ts, storefront_markup in
+    // doctor.server.ts). MISMATCH stays reserved for a deterministic answer
+    // from something that is not this app.
+    if ((response.url ?? "").includes("/password")) {
+      return {
+        status: "UNREACHABLE",
+        url,
+        detail:
+          "redirected to the storefront password page — the store is password-protected, which proves nothing about proxy ownership; check again after removing the password (or verify in a browser after entering it)",
+      };
     }
 
     if (!response.ok) {

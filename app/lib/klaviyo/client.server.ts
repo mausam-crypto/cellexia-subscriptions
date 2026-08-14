@@ -122,6 +122,10 @@ function apiRevision(): string {
 export interface KlaviyoKeyProbeResult {
   ok: boolean;
   detail: string;
+  /** true = Klaviyo was unreachable (network/timeout) — the key itself is
+   * unproven either way, so callers should treat the result as inconclusive
+   * rather than as a bad key. */
+  transient?: boolean;
 }
 
 /**
@@ -148,6 +152,7 @@ export async function probeKlaviyoKey(
   } catch (err) {
     return {
       ok: false,
+      transient: true,
       detail: `Could not reach Klaviyo to test the key — try again (${
         err instanceof Error ? err.message : String(err)
       })`,
@@ -174,8 +179,14 @@ export async function probeKlaviyoKey(
       detail: "Key authenticates (Klaviyo rate-limited the test request).",
     };
   }
+  // Only a 401 proves the key bad (see the doc comment above). Anything else
+  // unexpected — a 5xx during a Klaviyo-side outage, a new status Klaviyo
+  // starts returning — is inconclusive about the KEY, not a proven failure;
+  // grading it as a hard FAIL would false-alarm the Debug tab's
+  // klaviyo_key_live self-check during a transient Klaviyo incident.
   return {
     ok: false,
+    transient: true,
     detail: `Unexpected Klaviyo response (${response.status}) — the key could not be verified.`,
   };
 }

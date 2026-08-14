@@ -4,6 +4,218 @@ All notable changes to Cellexia Subscriptions. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [SemVer](https://semver.org) as contracted in [docs/UPDATE.md](docs/UPDATE.md).
 
+## [1.22.0] — 2026-08-13
+
+**Debug tab: 9 new live self-checks (28 → 37), plus a 28-defect audit fix
+wave from a full adversarially-verified review of every subsystem.** Two
+additive migrations (0021, 0022 — `npm run setup` applies them); no new env
+vars. **`npm run deploy` IS required** (the buy-box extension's JS asset and
+core snippet changed).
+
+### Added
+
+- **`storefront_widget` (Launch & storefront)**: every 30 minutes the
+  self-check fetches a REAL plan product's page off the live theme and
+  verifies our widget markup is present and launch-gated exactly as the
+  app's mode demands. Catches what nothing else could: a theme publish or
+  editor change that silently dropped the app embed (LIVE + no markup =
+  FAIL "sells nothing"), a launch flag the THEME sees differently than the
+  API reports (LIVE + still gated = FAIL), and a widget visible before
+  go-live (SETUP + ungated = FAIL). Password pages / fetch failures grade
+  WARN — inconclusive is never an outage claim.
+- **`renewal_readiness` (Billing)**: ACTIVE OURS contracts with a NULL
+  `nextBillingDate` — the one shape the billing sweep (which selects BY
+  date) can never pick up: a paying subscriber silently never billed again.
+  FAIL when live, WARN in setup.
+- **`dunning_config` (Dunning & retries)**: cross-field coherence the
+  settings schema cannot see — retry/email/SMS ladder steps scheduled
+  on/after `cancelAfterFailedDays` are cut off by exhaustion and never
+  fire; payday alignment with no paydays. WARN naming the dead steps.
+- **`job_locks` (Jobs)**: JobLock leases further in the future than the
+  runner could ever have written (2× `LOCK_LEASE_MS`, imported — not
+  copied — from the runner). Such a lease can never be reclaimed, so the
+  job is stopped permanently and silently; `jobs_health` would only notice
+  3 cadences later (3 days for a daily job).
+- **`klaviyo_key_live` (Notifications)**: the configured Klaviyo key
+  live-probed against Klaviyo's API (the Settings "Test key" probe, now on
+  the 30-minute tick). A key revoked in Klaviyo's dashboard was previously
+  invisible until events started dying in the outbox 24h later.
+  `probeKlaviyoKey` gained a `transient` flag so an unreachable Klaviyo
+  grades WARN (inconclusive), never a false "bad key" FAIL.
+- **`klaviyo_flow_coverage` (Notifications)**: the machine-written
+  `klaviyoFlowSetup` coverage cache surfaced on the Debug tab — uncovered
+  or errored delivery metrics WARN with names; a cache older than 48h
+  WARNs that the daily refresh died. Reads the cache only; the daily sweep
+  keeps sole ownership of the Klaviyo API budget.
+- **`email_templates` (Notifications)**: every template rendered through
+  the REAL `renderEmail` pipeline with the merchant's stored overrides and
+  brand kit applied, on the preview sample data. A render throw is a
+  send-time failure (FAIL); an unresolved `{placeholder}` — a typo'd
+  variable in a merchant override, which tests can never pin — reaches the
+  customer as literal braces (WARN naming template + token).
+- **`stored_secrets` (Data integrity)**: the encrypted Klaviyo key / SMTP
+  password still decrypt. An APP_SIGNING_SECRET rotation silently degrades
+  delivery to env-var fallbacks today (logged, swallowed); now it is a
+  named FAIL with the re-enter-on-Settings remediation.
+- **`event_provenance` (Data integrity)**: contract-scoped events
+  (`contract.*`/`cycle.*`/`billing.*`/`dunning.*`) whose `contractId` went
+  NULL — evidence of a contract deleted outside the demo-reset path or a
+  demo reset that failed to take its events with it (the deletion
+  invariant). WARN with count.
+
+### Changed
+
+- **Debug page**: per-category health badge on every card, a warning
+  banner listing the WARN checks when the run is DEGRADED (previously only
+  BROKEN got a banner), slow probes (≥2s) show their wall-clock cost, and
+  the subtitle names the widened coverage.
+- `STOREFRONT_MARKERS` is exported from the Preview Doctor so the
+  self-check and the doctor can never drift on what proves our markup.
+- `LOCK_LEASE_MS` is exported from the jobs runner (threshold-mirroring
+  rule: the self-check imports the source instead of copying the number).
+
+### Fixed — billing & jobs
+
+- **Job lock leases and JobRun stamps anchored to WALL time, not tick
+  time** (runner): jobs run sequentially per tick, so a job acquired >5
+  real minutes into a long tick held a lease that expired before its first
+  heartbeat renewal, and its backdated `startedAt` made a rival invocation
+  treat the live run as crash residue — two sweeps then ran concurrently
+  (duplicate dunning emails, double ladder increments; the exact race the
+  lease exists to prevent). Job bodies keep receiving the logical tick
+  `now`. Mutation-verified regression test.
+- **Stale-sweep expiry no longer kills the resume window on overdue
+  contracts**: un-started residue rows (transport error before Shopify
+  confirmed the attempt) aged by `scheduledFor` — the contract's
+  nextBillingDate, arbitrarily far in the past on an overdue contract — so
+  ONE transient error EXPIREd the row on the sweep's first tick and the
+  cycle-history guard held the cycle forever (subscriber silently never
+  billed again). New `BillingAttempt.createdAt` (migration 0022); expiry
+  basis is now `startedAt ?? max(scheduledFor, createdAt)`.
+- **Billing sweep batch refetch re-applies ALL due conditions**: the
+  per-batch refetch filtered by id + ownership only, so a contract
+  cancelled, paused or given an in-flight attempt mid-sweep (launch-scale
+  sweeps run for minutes) could still be billed. The candidate scan and
+  the refetch now share one `dueWhere`, pinned by the ownership suite.
+- **Wedged job locks are now detectable** (see `job_locks` self-check).
+
+### Fixed — dunning & reminders
+
+- **A 3DS challenge on cycle N no longer hijacks an open dunning case from
+  cycle M**: the old case is superseded exactly like the failure path
+  (`dunning.case_superseded`), a fresh cycle-anchored case opens with a
+  fresh exhaust clock, and redelivered challenges are cycle-scoped.
+- **The "we switched to your backup card" notification names the card
+  actually charged** — the handler read stale in-memory card metadata from
+  before the switch; `dunning.backup_used` still records the pre-switch
+  instrument.
+- **A skip no longer suppresses the next cycle's upcoming-order reminder**:
+  dedupe re-keyed from `ordersCount + 1` (which collides across a skip) to
+  the shop-tz due-day of `nextBillingDate`, with a legacy-row match so the
+  upgrade neither double-sends nor stays suppressed.
+
+### Fixed — consolidation (merge)
+
+- **`mergeContracts` is retry-safe**: the source's `mergeGroupId` is
+  stamped after the Shopify draft commit and before the cancel, so a retry
+  after a failed source cancel completes the cancel instead of duplicating
+  the moved lines on the primary (double product, double charge). Sources
+  half-merged into a DIFFERENT primary are refused outright.
+- **Active DiscountGrants survive consolidation**: live grants re-point to
+  the primary (re-clamped against its post-merge lines; zero headroom is a
+  logged drop, never silent) — an accepted cancel-save/win-back promise no
+  longer evaporates when the daily job merges contracts.
+- **Auto-consolidation only merges contracts with the same delivery
+  address and payment method** (normalized fingerprint; null vs set =
+  different, fail-safe). Explicit admin merges are unchanged.
+
+### Fixed — notifications & Klaviyo
+
+- **The outbox can no longer swallow a customer email**: when the
+  content-less canonical twin row was already SENT, the router's
+  content-carrying enqueue was deduped into it and the email never went
+  out. The graft now targets any undelivered duplicate (PENDING or
+  FAILED); a SENT content-less survivor lets the content row proceed on
+  its own. Confirmation-verdict rows keep suppressing their twins (the
+  cellexia_send contract is untouched).
+- **EMAIL and SMS legs of one metric no longer dedupe against each
+  other**: the dunning email rung and `payment_failed_sms` share the
+  "Cellexia Payment Failed" metric and collapsed into one row — one
+  channel silently never fired. Dedupe is now per delivery leg.
+- **The confirmation bridge uses the same provenance rule as the flow
+  verdict, mirror fallback included**: a consolidation merge-cancel (or
+  externally-observed cancel) could send "your subscription is cancelled —
+  as requested" via the app-sent bridge although the flow path already
+  blocked it. Both paths now agree; fail-safe no-send on a mirror read
+  failure.
+
+### Fixed — portal, magic links & survey
+
+- **Magic-link confirm pages no longer auto-submit**: the 1200ms timer let
+  JS-executing email scanners (SafeLinks/Proofpoint) consume single-use
+  tokens and EXECUTE the verb (skip/pause/…) before the customer ever saw
+  the page. The state-changing POST now requires a real tap; GET never
+  consumes.
+- **Magic links respect setup mode**: contract-mutating verbs are refused
+  with the closed-portal copy while the store is dark (notably after an
+  emergency revert-to-setup) — and the token is NOT consumed at describe
+  time, so the same emailed link works again once live. LOGIN,
+  UPDATE_CARD, CONFIRM_3DS and PREVIEW keep working.
+- **`requestOtp` no longer leaks known-vs-unknown emails** through the
+  reported TTL when the merchant changed the OTP TTL setting — every path
+  now reports the configured value (content parity joins timing parity).
+- **The portal `addon` action honors `portal.allowAddProducts`** — the
+  merchant's OFF switch was bypassable by direct POST (the sibling
+  `add_line` gate was missing on this endpoint).
+- **Survey writes are bound to the token's customer** (endpoint + link
+  guard + status read; migration 0021 also adds the emission marker):
+  `orderId` is client-supplied and guessable, so any shopper could poison
+  another customer's survey answers — feeding the victim's churn-risk
+  features, predicted LTGP and the survey.answered Klaviyo event (which
+  emails the victim). Rows/contracts claimed by another customer reject
+  with `not_your_order`; sub-less tokens can merge but never create;
+  `linkSurveyForContract` re-enforces identity at the analytics gate; the
+  status read hides another customer's answers.
+- **`survey.answered` emission is race-free and the sweep can't starve**:
+  emission state moved to `SurveyResponse.emittedAt` (atomic claim, event
+  insert in the same transaction; pre-upgrade rows heal on first scan) —
+  previously two racing linkers could emit twice, and the sweep's
+  take(200) window filled with already-emitted rows so new partial answers
+  were never flushed once 200 answered surveys existed.
+
+### Fixed — launch, preview & ownership
+
+- **`probeProxyIdentity` classifies the storefront password page as
+  inconclusive (UNREACHABLE → WARN)** instead of MISMATCH ("another app
+  owns the path") — a password-protected store is the normal pre-launch
+  state and was producing false CRITICAL self-check emails.
+- **`markChecklist` can no longer clobber a concurrent go-live**: the
+  read-modify-write is now a mode-guarded compare-and-swap, so ticking a
+  checklist box can never revert `mode` and create a
+  "metafield live / setting SETUP" split.
+- **The demo-portal preview repairs a stuck demo contract**: a demo row
+  with UNKNOWN ownership or zero lines opened an empty portal; the preview
+  intent now routes through the demo module's repair/recreate paths — the
+  self-check's "self-repairs on the next preview click" is now true.
+- **`claimContracts` promotes UNKNOWN → OURS atomically**: the
+  unconditional per-row update could overwrite a concurrent sync's fresh
+  FOREIGN verdict; the write is now conditioned on `ownership: UNKNOWN`
+  and the audit event fires only for rows actually promoted.
+- **CHURN_SPIKE no longer counts consolidation merges as churn**
+  (`cancelReason MERGED` excluded, matching the analytics rule) — a bulk
+  merge day would have paged the merchant with a phantom spike.
+
+### Fixed — buy box extension
+
+- **`releaseForm()` releases an adopted `<select name="selling_plan">`**:
+  the hidden-widget write gate only released hidden inputs, so on themes
+  whose native selling-plan control is a `<select>`, a hidden/gated widget
+  left our plan id in the theme's form. Mutation-verified.
+- **A configured 12px corner radius reaches the storefront**: the Liquid
+  skipped emitting `--cx-radius` at 12 (a stale pre-v1.2.0 default; the
+  stylesheet default is 0px), so a published 12px design rendered square.
+  The skip constant is now pinned against the stylesheet's real default.
+
 ## [1.21.2] — 2026-08-13
 
 **Survey block invisible on the Thank You page (theme editor included) —

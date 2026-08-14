@@ -138,6 +138,9 @@ function agoLabel(iso: string): string {
   return `${hours}h ago`;
 }
 
+/** A live probe slower than this gets its wall-clock cost shown. */
+const SLOW_CHECK_MS = 2_000;
+
 function CheckRow({ check }: { check: SelfCheckResult }) {
   const badge = CHECK_BADGES[check.status];
   return (
@@ -148,6 +151,11 @@ function CheckRow({ check }: { check: SelfCheckResult }) {
       <BlockStack gap="050">
         <Text as="p" variant="bodyMd" fontWeight="medium">
           {check.label}
+          {check.ms >= SLOW_CHECK_MS ? (
+            <Text as="span" variant="bodySm" tone="subdued">
+              {`  (${(check.ms / 1000).toFixed(1)}s)`}
+            </Text>
+          ) : null}
         </Text>
         <Text as="p" variant="bodySm" tone="subdued">
           {check.detail}
@@ -160,6 +168,19 @@ function CheckRow({ check }: { check: SelfCheckResult }) {
       </BlockStack>
     </InlineStack>
   );
+}
+
+/** Worst status in a category, for its card-header badge. */
+function categoryTone(
+  checks: SelfCheckResult[],
+): { tone?: "success" | "critical" | "warning"; label: string } {
+  if (checks.some((c) => c.status === "FAIL")) {
+    return { tone: "critical", label: "Failing" };
+  }
+  if (checks.some((c) => c.status === "WARN")) {
+    return { tone: "warning", label: "Check" };
+  }
+  return { tone: "success", label: "Healthy" };
 }
 
 export default function DebugPage() {
@@ -190,12 +211,13 @@ export default function DebugPage() {
   }, [report]);
 
   const failing = (report?.checks ?? []).filter((c) => c.status === "FAIL");
+  const warning = (report?.checks ?? []).filter((c) => c.status === "WARN");
   const verdictBadge = report ? VERDICT_BADGES[report.verdict] : null;
 
   return (
     <Page
       title="Debug"
-      subtitle="Live self-checks of billing, retries, the customer portal, webhooks, jobs and configuration — probed on the deployed store, not assumed from local behavior."
+      subtitle="Live self-checks of billing, retries, the customer portal, the storefront buy box, webhooks, jobs, email delivery and configuration — probed on the deployed store, not assumed from local behavior."
       primaryAction={
         <Button
           variant="primary"
@@ -220,6 +242,21 @@ export default function DebugPage() {
           >
             <BlockStack gap="100">
               {failing.map((check) => (
+                <Text key={check.key} as="p" variant="bodySm">
+                  {`${check.label}: ${check.detail}`}
+                </Text>
+              ))}
+            </BlockStack>
+          </Banner>
+        ) : null}
+
+        {report && report.verdict === "DEGRADED" ? (
+          <Banner
+            tone="warning"
+            title={`${warning.length} check(s) need attention before go-live`}
+          >
+            <BlockStack gap="100">
+              {warning.map((check) => (
                 <Text key={check.key} as="p" variant="bodySm">
                   {`${check.label}: ${check.detail}`}
                 </Text>
@@ -260,20 +297,26 @@ export default function DebugPage() {
           </BlockStack>
         </Card>
 
-        {byCategory.map(({ category, checks }) => (
-          <Card key={category}>
-            <BlockStack gap="300">
-              <Text as="h2" variant="headingSm">
-                {category}
-              </Text>
+        {byCategory.map(({ category, checks }) => {
+          const tone = categoryTone(checks);
+          return (
+            <Card key={category}>
               <BlockStack gap="300">
-                {checks.map((check) => (
-                  <CheckRow key={check.key} check={check} />
-                ))}
+                <InlineStack gap="200" blockAlign="center">
+                  <Text as="h2" variant="headingSm">
+                    {category}
+                  </Text>
+                  <Badge tone={tone.tone}>{tone.label}</Badge>
+                </InlineStack>
+                <BlockStack gap="300">
+                  {checks.map((check) => (
+                    <CheckRow key={check.key} check={check} />
+                  ))}
+                </BlockStack>
               </BlockStack>
-            </BlockStack>
-          </Card>
-        ))}
+            </Card>
+          );
+        })}
       </BlockStack>
     </Page>
   );

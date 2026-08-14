@@ -16,11 +16,14 @@ import type { TemplateKey } from "./templates.server";
  * Rules:
  * - Fires ONLY for sender === "app" — an explicit merchant choice. "auto"
  *   keeps the historical owner (the flow), so upgrades change nothing.
- * - Fires only for moments a PERSON initiated (see the provenance gate):
- *   the copy says "as requested", so system-driven transitions — a
- *   consolidation merge-cancel, a stockout skip, a dunning cancel, the
- *   pause auto-resume — must never claim the customer asked for them.
- *   Those moments have their own messaging where messaging is due.
+ * - Fires only for moments a PERSON initiated (see the provenance gate —
+ *   the SAME rule, contract-mirror fallback included, that the Klaviyo
+ *   events-map applies when stamping cellexia_send): the copy says "as
+ *   requested", so system-driven transitions — a consolidation
+ *   merge-cancel (including its provenance-less webhook twin), a stockout
+ *   skip, a dunning cancel, the pause auto-resume — must never claim the
+ *   customer asked for them. Those moments have their own messaging where
+ *   messaging is due.
  * - The canonical state-change metric still fires independently (segments,
  *   analytics and any remaining flows are untouched); with sender "app" the
  *   router does not enqueue a second delivery metric, so there is no
@@ -76,8 +79,8 @@ const CLAIM_STATUS = "CLAIMED";
  *   is bookkeeping (the customer never left — mailing them "your
  *   subscription is cancelled" would be actively harmful), and DUNNING /
  *   SYSTEM cancels have their own messaging. A webhook-observed cancel
- *   without a cancelSource (Shopify-admin cancel) is a real cancellation
- *   and does send.
+ *   with no provenance ANYWHERE (payload or mirror) is treated as a real
+ *   cancellation and does send.
  *
  * Exported (v1.18.0): the Klaviyo events-map applies the SAME gate when
  * stamping `cellexia_send` on confirmation events, so the auto-created
@@ -86,6 +89,8 @@ const CLAIM_STATUS = "CLAIMED";
  * persisted cancel provenance as a fallback: the webhook status-diff twin
  * of a cancel carries NO reason/cancelSource in its payload, and without
  * the fallback a consolidation merge-cancel's twin would pass the gate.
+ * The events-map passes its already-loaded contract; the bridge resolves
+ * the same fallback via isPersonInitiatedWithMirror below.
  */
 export function isPersonInitiated(
   event: LogEventInput,
@@ -116,6 +121,45 @@ export function isPersonInitiated(
   return true;
 }
 
+/**
+ * The shared gate resolved the way callers WITHOUT a loaded contract need
+ * it: payload-only first, then — only for a contract.cancelled whose
+ * payload lacks complete provenance (the webhook status-diff twin) — the
+ * contract mirror's persisted cancelReason/cancelSource. The Klaviyo
+ * events-map already holds the contract and passes it to isPersonInitiated
+ * directly; the confirmation bridge resolves the SAME rule through this
+ * wrapper, so the two delivery paths agree about every moment. Without the
+ * mirror the bridge once mailed "your subscription is cancelled" for a
+ * consolidation merge-cancel's webhook twin: the SYSTEM service leg was
+ * gated before it could claim (so dedupe offered no protection) and the
+ * twin's empty payload passed the payload-only gate. Whichever stamp the
+ * webhook-vs-service race leaves on the mirror at read time — the
+ * service's MERGED/SYSTEM write, or the sync's first-observed EXTERNAL —
+ * is a non-person source and blocks.
+ *
+ * Throws propagate (a failed mirror read means NO verdict): the bridge's
+ * outer containment turns that into a fail-safe no-send, mirroring the
+ * events-map's "without a verdict, no auto-flow sends".
+ */
+export async function isPersonInitiatedWithMirror(
+  event: LogEventInput,
+): Promise<boolean> {
+  if (!isPersonInitiated(event)) return false;
+  if (event.type !== "contract.cancelled" || !event.contractId) return true;
+  const payload = event.payload ?? {};
+  if (
+    typeof payload.reason === "string" &&
+    typeof payload.cancelSource === "string"
+  ) {
+    return true; // the payload carried the full verdict — nothing to fall back to
+  }
+  const mirror = await prisma.subscriptionContract.findUnique({
+    where: { id: event.contractId },
+    select: { cancelReason: true, cancelSource: true },
+  });
+  return isPersonInitiated(event, mirror);
+}
+
 /** Scalars from the event payload become copy placeholders ({weeks}, …). */
 function scalarVars(
   payload: Record<string, unknown> | undefined,
@@ -139,7 +183,7 @@ export async function maybeSendConfirmationForEvent(
   try {
     const template = CONFIRMATION_TEMPLATE_BY_EVENT[event.type];
     if (!template || !event.contractId) return;
-    if (!isPersonInitiated(event)) return;
+    if (!(await isPersonInitiatedWithMirror(event))) return;
 
     // Lazy imports keep the events↔notifications module graph acyclic.
     const { getSetting } = await import("~/lib/settings/settings.server");

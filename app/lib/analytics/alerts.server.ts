@@ -573,6 +573,9 @@ async function checkChurnSpike(
   const todayStart = shopDayStartUtc(now, tz);
   const baselineStart = subDays(todayStart, 28);
 
+  // Consolidation merges are never churn (the queries.server.ts rollup rule)
+  // — a bulk merge day would otherwise page the merchant with a phantom
+  // churn spike.
   const [todayCancels, baselineCancels] = await Promise.all([
     prisma.subscriptionContract.count({
       where: {
@@ -580,6 +583,7 @@ async function checkChurnSpike(
         isDemo: false,
         ...OURS_ONLY,
         cancelledAt: { gte: todayStart, lte: now },
+        NOT: { cancelReason: "MERGED" },
       },
     }),
     prisma.subscriptionContract.count({
@@ -587,6 +591,7 @@ async function checkChurnSpike(
         shopId,
         isDemo: false, ...OURS_ONLY,
         cancelledAt: { gte: baselineStart, lt: todayStart },
+        NOT: { cancelReason: "MERGED" },
       },
     }),
   ]);

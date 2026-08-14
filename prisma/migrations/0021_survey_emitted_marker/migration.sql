@@ -1,0 +1,23 @@
+-- 0021_survey_emitted_marker (v1.22.0)
+-- One nullable column on "SurveyResponse".
+--
+-- ADDITIVE ONLY: nullable ADD COLUMN is metadata-only on PG 11+, so existing
+-- rows are untouched and the previous release runs unchanged against this
+-- schema (UPDATE.md §2.3 / §5.2).
+--
+-- "SurveyResponse"."emittedAt": when the one-shot survey.answered event for
+--   this row was emitted. Two defects rode on the old "does the event row
+--   exist" dedupe alone:
+--   (1) the daily survey_link_sweep's partial-answer pass had no SQL-visible
+--       marker, so its take(200) window filled with already-emitted rows and
+--       new partial answers starved permanently once 200 emitted rows
+--       existed;
+--   (2) the check-then-insert dedupe let two racing linkers (endpoint +
+--       webhook tail) emit the event twice.
+--   maybeEmitAnswered now claims emittedAt atomically (updateMany on
+--   emittedAt IS NULL) and rides the event insert in the same transaction;
+--   pre-upgrade rows (emittedAt NULL, event already logged) are healed by
+--   the retained event-existence check stamping the column without
+--   re-emitting.
+
+ALTER TABLE "SurveyResponse" ADD COLUMN "emittedAt" TIMESTAMP(3);
