@@ -38,6 +38,8 @@ import {
   type CancelReason,
   type SaveKind,
 } from "./config.server";
+import { pickGiftForContract } from "~/lib/gifts/picker.server";
+import { settingOverride } from "~/lib/experiments/index.server";
 
 /**
  * Cancel-flow engine: CancelSession lifecycle, reason-matched save offers,
@@ -104,6 +106,14 @@ export type SaveOffer =
       lineTitle: string;
       options: SwapOption[];
     }
+  | {
+      kind: "GIFT";
+      variantId: string;
+      title: string;
+      imageUrl: string | null;
+      retailCents: number;
+      currencyCode: string;
+    }
   | { kind: "EDUCATION" }
   | { kind: "SUPPORT" }
   | { kind: "FINAL_DISCOUNT"; percent: number; cycles: number };
@@ -124,6 +134,8 @@ export interface SaveConfirmation {
   frequency?: Frequency;
   /** SWAP */
   swappedTitle?: string;
+  /** GIFT */
+  giftTitle?: string;
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
@@ -641,7 +653,7 @@ export async function getSavesForReason(
         // discount recently never sees the card again until the cooldown
         // elapses — otherwise re-walking the flow every ~2 cycles farms a
         // permanent discount (the exact behavior the module exists to avoid).
-        if (await reasonOfferOnCooldown(shopId, contract.id, cancelFlow)) break;
+        if (await reasonOfferOnCooldown(shopId, contract, cancelFlow)) break;
         // Stacking cap: only offer what applyDiscountGrant will actually
         // grant on top of the plan's ongoing discount — never a percent the
         // cap would then quietly reduce.
@@ -688,6 +700,39 @@ export async function getSavesForReason(
         }
         break;
       }
+      case "GIFT": {
+        // A free product on the next delivery — COGS instead of face-value
+        // margin (OFFER_PLAYBOOK §2), picked per customer so it is always
+        // something they don't have. Gated like DISCOUNT: a per-CUSTOMER
+        // cooldown (re-walking the flow must not farm free products) and a
+        // Shopify hiccup skips the card, never blocks the flow.
+        if (!cancelFlow.giftSaveEnabled) break;
+        if (await giftSaveOnCooldown(shopId, contract, cancelFlow)) break;
+        try {
+          const admin = await adminClientForShop(shop.domain);
+          const pick = await pickGiftForContract({
+            shopId,
+            admin,
+            contract,
+          });
+          if (!pick || pick.exhausted) break; // a repeat is no save sweetener
+          offers.push({
+            kind: "GIFT",
+            variantId: pick.variantId,
+            title: pick.label,
+            imageUrl: pick.imageUrl,
+            retailCents: pick.retailCents,
+            currencyCode: contract.currencyCode,
+          });
+        } catch (err) {
+          console.error(
+            "[cancel] GIFT save pick failed, skipping card",
+            contract.id,
+            err,
+          );
+        }
+        break;
+      }
       case "EDUCATION": {
         offers.push({ kind: "EDUCATION" });
         break;
@@ -701,19 +746,61 @@ export async function getSavesForReason(
   return offers;
 }
 
-/** Has a SAVE_OFFER grant been created for the contract within the cooldown? */
+/**
+ * Contract ids sharing this customer's email. Cooldowns are per PERSON
+ * (v1.24.0): cancelling and re-subscribing on a fresh contract must not
+ * reset the anti-farming clocks — the per-contract versions did exactly
+ * that.
+ */
+async function contractIdsForCustomer(
+  shopId: string,
+  email: string,
+): Promise<string[]> {
+  const rows = await prisma.subscriptionContract.findMany({
+    where: { shopId, email, isDemo: false },
+    select: { id: true },
+  });
+  return rows.map((r) => r.id);
+}
+
+/** Has a SAVE_FLOW gift been granted to this CUSTOMER within the cooldown? */
+async function giftSaveOnCooldown(
+  shopId: string,
+  contract: { id: string; email: string },
+  cancelFlow: { giftSaveCooldownDays: number },
+): Promise<boolean> {
+  if (cancelFlow.giftSaveCooldownDays <= 0) return false;
+  const cutoff = new Date(
+    Date.now() - cancelFlow.giftSaveCooldownDays * 24 * 3600_000,
+  );
+  const ids = await contractIdsForCustomer(shopId, contract.email);
+  const prior = await prisma.giftGrant.findFirst({
+    where: {
+      contractId: { in: ids.length > 0 ? ids : [contract.id] },
+      source: "SAVE_FLOW",
+      createdAt: { gte: cutoff },
+    },
+    select: { id: true },
+  });
+  return prior != null;
+}
+
+/** Has a SAVE_OFFER grant been created for this CUSTOMER within the cooldown?
+ * Per person (v1.24.0), not per contract — cancelling and re-subscribing on a
+ * fresh contract must not reset the anti-farming clock. */
 async function reasonOfferOnCooldown(
   shopId: string,
-  contractLocalId: string,
+  contract: { id: string; email: string },
   cancelFlow: { reasonOfferCooldownDays: number },
 ): Promise<boolean> {
   if (cancelFlow.reasonOfferCooldownDays <= 0) return false;
   const cutoff = new Date(
     Date.now() - cancelFlow.reasonOfferCooldownDays * 24 * 3600_000,
   );
+  const ids = await contractIdsForCustomer(shopId, contract.email);
   const prior = await prisma.discountGrant.findFirst({
     where: {
-      contractId: contractLocalId,
+      contractId: { in: ids.length > 0 ? ids : [contract.id] },
       type: "SAVE_OFFER",
       createdAt: { gte: cutoff },
     },
@@ -777,6 +864,8 @@ function offerSummary(offer: SaveOffer): Record<string, unknown> {
       };
     case "PAUSE":
       return { kind: offer.kind, months: offer.months };
+    case "GIFT":
+      return { kind: offer.kind, variantId: offer.variantId, title: offer.title };
     default:
       return { kind: offer.kind };
   }
@@ -786,17 +875,35 @@ function offerSummary(offer: SaveOffer): Record<string, unknown> {
  * Append the final offer to the presented list and log
  * `cancel.final_offer_shown` (once per session).
  */
-export async function recordFinalOfferShown(sessionId: string): Promise<void> {
+export async function recordFinalOfferShown(
+  sessionId: string,
+): Promise<{ percent: number; cycles: number }> {
   const { session, contract } = await loadSessionContext(sessionId);
   const shown = savesShownArray(session);
-  if (shown.some((s) => s.kind === FINAL_DISCOUNT)) return;
+  // Already shown: return exactly what savesShown recorded, so a page
+  // refresh renders the same number the customer first saw (and the same
+  // number acceptFinalOffer's re-clamp will grant).
+  const prior = shown.find(
+    (s): s is Extract<SaveOffer, { kind: "FINAL_DISCOUNT" }> =>
+      s.kind === FINAL_DISCOUNT,
+  );
+  if (prior) return { percent: prior.percent, cycles: prior.cycles };
 
   const cancelFlow = await getSetting(contract.shopId, "cancelFlow");
-  // Stacking cap: present the percent that will actually be granted.
+  // Experiment overlay first (final_offer_depth — deterministic per
+  // customer, frozen at this exposure), then the stacking cap: present the
+  // percent that will actually be granted.
+  const finalPct = await settingOverride({
+    shopId: contract.shopId,
+    email: contract.email,
+    contractId: contract.id,
+    path: "cancelFlow.finalOfferPct",
+    current: cancelFlow.finalOfferPct,
+  });
   const clamp = await clampGrantPercentForContract(
     contract.shopId,
     contract.lines,
-    cancelFlow.finalOfferPct,
+    finalPct,
   );
   shown.push({
     kind: "FINAL_DISCOUNT",
@@ -824,6 +931,8 @@ export async function recordFinalOfferShown(sessionId: string): Promise<void> {
       cycles: cancelFlow.finalOfferCycles,
     },
   });
+
+  return { percent: clamp.percent, cycles: cancelFlow.finalOfferCycles };
 }
 
 /** Has the step-4 final offer already been presented in this session? */
@@ -914,6 +1023,7 @@ export async function acceptSave(
   let swappedTitle: string | undefined;
   let discountPercent: number | undefined;
   let discountCycles: number | undefined;
+  let giftTitle: string | undefined;
 
   try {
     // The contract can be cancelled outside this session (admin, Shopify-side
@@ -1002,7 +1112,7 @@ export async function acceptSave(
       const cancelFlow = await getSetting(shop.id, "cancelFlow");
       // Cooldown mirror of the getSavesForReason gate: a card the flow would
       // no longer show cannot be accepted from a stale/tampered form either.
-      if (await reasonOfferOnCooldown(shop.id, contract.id, cancelFlow)) {
+      if (await reasonOfferOnCooldown(shop.id, contract, cancelFlow)) {
         throw new Error(
           `Discount save unavailable for contract ${contract.id}: a SAVE_OFFER grant exists within reasonOfferCooldownDays`,
         );
@@ -1062,6 +1172,103 @@ export async function acceptSave(
         updated.lines.find((l) => l.id === lineId)?.title ?? line.title;
       break;
     }
+    case "GIFT": {
+      // The accepted product is exactly the one the card showed — savesShown
+      // is the record (the FREQUENCY value-gating pattern). Re-picking here
+      // could resolve a different product than the customer said yes to.
+      const shownGift = savesShownArray(session).find(
+        (s): s is Extract<SaveOffer, { kind: "GIFT" }> => s.kind === "GIFT",
+      );
+      if (!shownGift) {
+        throw new Error(
+          `GIFT save was never offered in cancel session ${session.id}`,
+        );
+      }
+      const cancelFlow = await getSetting(shop.id, "cancelFlow");
+      // Gate mirrors of the offer path — a card the flow would no longer
+      // show cannot be accepted from a stale/tampered form.
+      if (!cancelFlow.giftSaveEnabled) {
+        throw new Error(
+          `Gift save disabled for contract ${contract.id} (cancelFlow.giftSaveEnabled)`,
+        );
+      }
+      if (await giftSaveOnCooldown(shop.id, contract, cancelFlow)) {
+        throw new Error(
+          `Gift save unavailable for contract ${contract.id}: a SAVE_FLOW gift exists within giftSaveCooldownDays`,
+        );
+      }
+
+      // The grant rides the next chargeable cycle; a cycle read failure
+      // falls back to order space and the gift engine's re-anchoring repairs
+      // it pre-charge.
+      let cycleIndex = contract.ordersCount + 1;
+      if (contract.nextBillingDate) {
+        try {
+          const admin = await adminClientForShop(shop.domain);
+          const cycle = await getBillingCycleByDate(
+            admin,
+            contract.shopifyContractId,
+            contract.nextBillingDate,
+          );
+          if (cycle) cycleIndex = cycle.cycleIndex;
+        } catch (err) {
+          console.error(
+            "[cancel] gift save cycle read failed — ordersCount fallback",
+            contract.id,
+            err,
+          );
+        }
+      }
+
+      const priorOnCycle = await prisma.giftGrant.findFirst({
+        where: {
+          contractId: contract.id,
+          cycleIndex,
+          variantId: shownGift.variantId,
+        },
+        select: { id: true },
+      });
+      if (!priorOnCycle) {
+        // COGS stamp from the pool's merchant override; the analytics chain
+        // (grant → rule → variant override → 0) covers the rest.
+        const gifts = await getSetting(shop.id, "gifts");
+        const poolEntry = gifts.pool.find(
+          (p) => p.variantId === shownGift.variantId,
+        );
+        const grant = await prisma.giftGrant.create({
+          data: {
+            contractId: contract.id,
+            ruleId: null,
+            cycleIndex,
+            variantId: shownGift.variantId,
+            status: "SCHEDULED",
+            unitCostCents:
+              poolEntry && poolEntry.unitCostCents > 0
+                ? poolEntry.unitCostCents
+                : null,
+            source: "SAVE_FLOW",
+          },
+        });
+        await logEvent({
+          ...identity(contract),
+          type: "lifecycle.gift_scheduled",
+          source,
+          actor: "cancel_flow",
+          payload: {
+            grantId: grant.id,
+            ruleId: null,
+            ruleName: "Cancel-flow gift save",
+            trigger: "SAVE_FLOW",
+            cycleIndex,
+            variantId: shownGift.variantId,
+            variantTitle: shownGift.title,
+            sessionId: session.id,
+          },
+        });
+      }
+      giftTitle = shownGift.title;
+      break;
+    }
     case "EDUCATION":
     case "SUPPORT": {
       // Nothing to mutate on the contract — the customer keeps subscribing
@@ -1099,6 +1306,7 @@ export async function acceptSave(
           : {}),
         ...(params.months ? { months: params.months } : {}),
         ...(params.variantId ? { variantId: params.variantId } : {}),
+        ...(giftTitle ? { giftTitle } : {}),
       },
     });
   }
@@ -1108,6 +1316,7 @@ export async function acceptSave(
     percent: discountPercent,
     cycles: discountCycles,
     swappedTitle,
+    giftTitle,
   });
 }
 
@@ -1119,6 +1328,7 @@ function buildConfirmation(
     percent?: number;
     cycles?: number;
     swappedTitle?: string;
+    giftTitle?: string;
   } = {},
 ): SaveConfirmation {
   // Exact cadence for the confirmation page's localized phrase; `weeks`
@@ -1139,6 +1349,7 @@ function buildConfirmation(
     weeks: approxWeeks(frequency.unit, frequency.count),
     frequency,
     swappedTitle: extras.swappedTitle,
+    giftTitle: extras.giftTitle,
   };
 }
 
@@ -1180,9 +1391,18 @@ export async function eligibleForFinalOffer(
     Date.now() - cancelFlow.finalOfferCooldownDays * 24 * 3600_000,
   );
 
+  // Per PERSON (v1.24.0): the cooldown queries cover every contract on this
+  // customer's email — a cancel-and-resubscribe must not mint a fresh
+  // "genuinely once" final offer.
+  const customerIds = await contractIdsForCustomer(
+    contract.shopId,
+    contract.email,
+  );
+  const idScope = customerIds.length > 0 ? customerIds : [contractLocalId];
+
   const priorFinalSave = await prisma.cancelSession.findFirst({
     where: {
-      contractId: contractLocalId,
+      contractId: { in: idScope },
       saveAccepted: { in: [FINAL_DISCOUNT] },
       completedAt: { gte: cutoff },
     },
@@ -1192,7 +1412,7 @@ export async function eligibleForFinalOffer(
 
   const priorGrant = await prisma.discountGrant.findFirst({
     where: {
-      contractId: contractLocalId,
+      contractId: { in: idScope },
       type: "SAVE_OFFER_FINAL",
       createdAt: { gte: cutoff },
     },
@@ -1205,7 +1425,7 @@ export async function eligibleForFinalOffer(
   // exempted so refresh/accept still work after recordFinalOfferShown).
   const priorShown = await prisma.subscriberEvent.findFirst({
     where: {
-      contractId: contractLocalId,
+      contractId: { in: idScope },
       type: "cancel.final_offer_shown",
       createdAt: { gte: cutoff },
       ...(opts?.excludeSessionId
@@ -1235,12 +1455,21 @@ export async function acceptFinalOffer(
 ): Promise<SaveConfirmation> {
   const { session, contract, shop } = await loadSessionContext(sessionId);
   const cancelFlow = await getSetting(shop.id, "cancelFlow");
-  // Stacking cap: grant (and confirm) exactly what the cap allows on top of
-  // the plan's ongoing discount — the same clamp recordFinalOfferShown used.
+  // Same experiment overlay as recordFinalOfferShown (deterministic per
+  // customer, so show and accept always resolve the same depth), then the
+  // stacking cap: grant (and confirm) exactly what the cap allows on top of
+  // the plan's ongoing discount.
+  const finalPct = await settingOverride({
+    shopId: shop.id,
+    email: contract.email,
+    contractId: contract.id,
+    path: "cancelFlow.finalOfferPct",
+    current: cancelFlow.finalOfferPct,
+  });
   const clamp = await clampGrantPercentForContract(
     shop.id,
     contract.lines,
-    cancelFlow.finalOfferPct,
+    finalPct,
   );
 
   if (session.outcome === "SAVED" && session.saveAccepted === FINAL_DISCOUNT) {

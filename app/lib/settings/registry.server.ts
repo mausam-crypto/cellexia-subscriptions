@@ -19,6 +19,22 @@ import { z } from "zod";
 export const PRICE_CHANGE_NOTICE_DAYS_MIN = 7;
 export const PRICE_CHANGE_NOTICE_DAYS_MAX = 90;
 
+/**
+ * One Shopify tag value (tagging group). Shopify treats the comma as the tag
+ * separator on every surface that renders tags (admin, CSV export, REST), so
+ * a comma inside a single tag would silently split into two; 255 chars is
+ * Shopify's per-tag limit. Trimmed: tagsRemove matches byte-exact, and an
+ * invisible leading space would strand the applied tag unremovable.
+ */
+const tagValueSchema = z
+  .string()
+  .trim()
+  .min(1, "Tag cannot be empty")
+  .max(255, "Shopify tags are limited to 255 characters")
+  .refine((v) => !v.includes(","), {
+    message: "Shopify tags cannot contain commas",
+  });
+
 export const settingsSchemas = {
   /**
    * Launch state — the install-dark safety contract. Installing the app makes
@@ -276,6 +292,15 @@ export const settingsSchemas = {
       frequencySuggestDeltaWeeks: z.number().int().min(1).max(12).default(2),
       pauseSuggestMonths: z.number().int().min(1).max(6).default(2),
       sessionFreshMinutes: z.number().int().min(15).max(720).default(60),
+      // Free-product save (v1.24.0): a dynamically picked gift on the next
+      // cycle as a non-price save. Costs COGS instead of face-value margin,
+      // so it is the preferred sweetener for non-price cancel reasons
+      // (OFFER_PLAYBOOK §2). Requires a non-empty gifts.pool to render.
+      // Cooldown is per CUSTOMER (email), not per contract — cancelling and
+      // re-subscribing must not reset it. Field-level defaults keep
+      // previously stored values valid (additive change).
+      giftSaveEnabled: z.boolean().default(true),
+      giftSaveCooldownDays: z.number().int().min(0).max(720).default(180),
     })
     .default({
       enabled: true,
@@ -289,6 +314,8 @@ export const settingsSchemas = {
       frequencySuggestDeltaWeeks: 2,
       pauseSuggestMonths: 2,
       sessionFreshMinutes: 60,
+      giftSaveEnabled: true,
+      giftSaveCooldownDays: 180,
     }),
 
   /** Lifecycle & milestones. */
@@ -299,6 +326,25 @@ export const settingsSchemas = {
       anniversaryGiftDays: z.number().int().min(90).max(1000), // e.g. 365
       rewardsUnlockDay: z.number().int().min(30).max(365), // retention milestone dressed as a perk
       earlyCycleIncentivesEnabled: z.boolean(), // extra nudges through cycles 1–2
+      // Milestones AFTER milestoneGiftCycle (v1.24.0): the goal-gradient hook
+      // must never exhaust — once order 6 is reached there should always be a
+      // next rung (12, 18, ...). Consumed by the lifecycle engine (fires the
+      // milestone email + a dynamic gift at each rung) and the portal counter
+      // (portal/growth.server.ts shows "N boxes until your next reward").
+      // Field-level default keeps previously stored values valid.
+      milestoneLadder: z
+        .array(z.number().int().min(2).max(96))
+        .max(12)
+        .default([12, 18, 24])
+        .refine(
+          (arr) => arr.every((v, i) => i === 0 || v > arr[i - 1]),
+          { message: "Ladder rungs must be strictly increasing" },
+        ),
+      // Day-90 "rewards unlocked" carries a REAL reward (v1.24.0): a
+      // dynamically picked free product on the next cycle. Without it the
+      // email is copy with no economics behind it — the truth-in-emails rule
+      // (the rewards email only promises the product when a grant exists).
+      rewardsGiftEnabled: z.boolean().default(true),
     })
     .default({
       surpriseGiftOnCycle2: true,
@@ -306,7 +352,86 @@ export const settingsSchemas = {
       anniversaryGiftDays: 365,
       rewardsUnlockDay: 90,
       earlyCycleIncentivesEnabled: true,
+      milestoneLadder: [12, 18, 24],
+      rewardsGiftEnabled: true,
     }),
+
+  /**
+   * Dynamic gift pool + affinity ranking (v1.24.0). Consumed by the gift
+   * picker (app/lib/gifts/picker.server.ts), which resolves DYNAMIC GiftRule
+   * grants, cancel-flow gift saves, win-back perks and the day-90 reward.
+   * Structured values (pool rows, pairings) are edited from the Gifts page
+   * (app/routes/app.gifts.tsx), never from the generic Settings renderer —
+   * the record shapes don't fit its field types. Schema stays permissive on
+   * record KEYS (a product deleted later must not corrupt the stored value);
+   * live keys are validated at the editing surface, like emails.templates.
+   */
+  gifts: z
+    .object({
+      // Products eligible to be picked as gifts. variantTitle is a display
+      // cache; unitCostCents is the merchant's COGS override (0 = use
+      // Shopify's cost-per-item at pick time). Live price/image/product data
+      // is always fetched fresh from Shopify when picking or emailing.
+      pool: z
+        .array(
+          z.object({
+            variantId: z
+              .string()
+              .regex(/^gid:\/\/shopify\/ProductVariant\/\d+$/),
+            variantTitle: z.string().nullable().default(null),
+            unitCostCents: z.number().int().min(0).max(10_000_000).default(0),
+          }),
+        )
+        .max(50)
+        .default([]),
+      // Subscribed product GID → gift variant GIDs, best first ("whoever gets
+      // the serum most likely wants the night cream"). The strongest ranking
+      // signal — the merchant knows the catalog; co-purchase data can sharpen
+      // this once real order history exists.
+      pairings: z
+        .record(z.string(), z.array(z.string()).max(50))
+        .default({}),
+      // "question:option" (survey answer, e.g. "motive:prevention") → gift
+      // variant GIDs, best first. A tiebreaker after pairings; empty by
+      // default. Keys follow app/lib/survey/shared.ts option keys.
+      surveyPairings: z
+        .record(z.string(), z.array(z.string()).max(50))
+        .default({}),
+      // One box should feel generous, not bought — and two gifts in one
+      // parcel doubles the spend at the exact moment one would do.
+      maxGiftsPerCycle: z.number().int().min(1).max(3).default(1),
+    })
+    .default({
+      pool: [],
+      pairings: {},
+      surveyPairings: {},
+      maxGiftsPerCycle: 1,
+    }),
+
+  /**
+   * Experiment switches (v1.24.0). Experiment DEFINITIONS — arms, allocation,
+   * decision points, readout — live in code (app/lib/experiments/
+   * registry.server.ts); this key stores only which are enabled and when they
+   * started/stopped, edited from the Experiments page. Record keys stay
+   * permissive on purpose (a retired experiment must never corrupt the stored
+   * value — the emails.templates rule); live keys are validated at the
+   * editing surface. startedAt/stoppedAt are ISO stamps written on toggle —
+   * readouts window their outcome queries by them.
+   */
+  experiments: z
+    .object({
+      entries: z
+        .record(
+          z.string().regex(/^[a-z0-9_]+$/),
+          z.object({
+            enabled: z.boolean().default(false),
+            startedAt: z.string().nullable().default(null),
+            stoppedAt: z.string().nullable().default(null),
+          }),
+        )
+        .default({}),
+    })
+    .default({ entries: {} }),
 
   /** Win-back for cancelled subscribers, timed to predicted empty date. */
   winback: z
@@ -549,6 +674,44 @@ export const settingsSchemas = {
       concessionLadder: true,
       cadenceNudge: true,
       runoutPrompt: true,
+    }),
+
+  /**
+   * Shopify tagging (v1.23.0, ON by default) — mirrors subscription state
+   * onto Shopify tags so themes, Shopify Flow, search & discovery filters
+   * and third-party apps can key off it without talking to this app.
+   *
+   * - Customer tag: applied while the customer has ≥1 live (ACTIVE or
+   *   PAUSED) contract that is OURS and not demo; removed when their last
+   *   live contract ends (cancelled, expired or failed — dunning recovery
+   *   re-applies it). The applied value is recorded per customer
+   *   (CustomerTagState) so renames swap the old tag for the new one and a
+   *   removal can only ever take back a tag this app itself applied.
+   * - Order tags: the origin (checkout) order gets the first-order tag at
+   *   the proven-ours moment (the contract-create webhook tail); every
+   *   renewal order gets the repeat-order tag when its billing attempt
+   *   settles. Tags are applied going forward only — orders that predate
+   *   the feature (or a rename) keep whatever they have.
+   *
+   * All writes are suppressed while launch mode is SETUP (install-dark) and
+   * contained (a tag failure never breaks a webhook or a billing run).
+   * Disabling a toggle stops tag management; already-applied tags are
+   * deliberately left in place.
+   */
+  tagging: z
+    .object({
+      customerTagEnabled: z.boolean().default(true),
+      customerTag: tagValueSchema.default("Active Subscriber"),
+      orderTagsEnabled: z.boolean().default(true),
+      firstOrderTag: tagValueSchema.default("Subscription First Order"),
+      repeatOrderTag: tagValueSchema.default("Subscription Recurring Order"),
+    })
+    .default({
+      customerTagEnabled: true,
+      customerTag: "Active Subscriber",
+      orderTagsEnabled: true,
+      firstOrderTag: "Subscription First Order",
+      repeatOrderTag: "Subscription Recurring Order",
     }),
 
   /**

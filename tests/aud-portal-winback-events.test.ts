@@ -74,6 +74,20 @@ vi.mock("~/db.server", () => {
       update: vi.fn(async (): Promise<unknown> => ({})),
     },
     subscriberEvent: { findFirst: mocks.subscriberEventFindFirst },
+    giftRule: {
+      // v1.24.0 perk truth gate: the ORDER_INDEX=2 fallback rule must exist
+      // (with the dynamic pick mocked to null) for winback_perk to send.
+      findFirst: vi.fn(async (): Promise<unknown> => ({
+        id: "rule_2",
+        name: "Surprise",
+        variantId: "gid://shopify/ProductVariant/2",
+        variantTitle: "Mini serum",
+      })),
+    },
+    giftGrant: {
+      findFirst: vi.fn(async (): Promise<unknown> => null),
+      create: vi.fn(async (): Promise<unknown> => ({})),
+    },
     shop: {
       findUniqueOrThrow: vi.fn(async (): Promise<unknown> => ({
         id: "shop_1",
@@ -125,6 +139,24 @@ vi.mock("~/lib/notifications/index.server", () => ({
 }));
 vi.mock("~/lib/contracts/service.server", () => ({
   applyDiscountGrant: vi.fn(async (): Promise<unknown> => ({})),
+}));
+// v1.24.0 dynamic-gift modules: pick nothing from the pool (the fallback
+// giftRule mock above carries the perk), plain email lines, no experiment
+// overrides (settingOverride passes the current value through).
+vi.mock("~/lib/gifts/picker.server", () => ({
+  pickGiftForContract: vi.fn(async (): Promise<unknown> => null),
+}));
+vi.mock("~/lib/gifts/emailLines.server", () => ({
+  giftEmailLines: vi.fn(() => ({
+    gift_image_line: "",
+    gift_worth_line: "",
+    gift_date_line: "",
+  })),
+}));
+vi.mock("~/lib/experiments/index.server", () => ({
+  settingOverride: vi.fn(async (o: { current: unknown }) => o.current),
+  surpriseGiftArmFor: vi.fn(async (): Promise<string> => "gift"),
+  assignedArm: vi.fn(async (): Promise<string> => "control"),
 }));
 vi.mock("~/lib/graphql/index.server", () => ({
   contractActivate: vi.fn(async (): Promise<unknown> => ({})),

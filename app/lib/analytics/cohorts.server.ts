@@ -331,6 +331,7 @@ export async function computeCohortRows(
         contractId: true,
         variantId: true,
         addedAt: true,
+        unitCostCents: true,
         rule: { select: { unitCostCents: true } },
       },
     }),
@@ -534,8 +535,11 @@ export async function computeCohortRows(
   }
 
   // Gift COGS per grant, booked in the month the gift was attached (survives
-  // later line removal; never multiplied per billed cycle). Fallback when the
-  // rule is gone: the merchant's per-product COGS override for the variant.
+  // later line removal; never multiplied per billed cycle). Resolution chain
+  // (v1.24.0): the grant's OWN cost stamp first — dynamically picked gifts
+  // carry it, and the rule's cost describes the fallback variant, not the
+  // picked one — then the rule, then the merchant's per-product override for
+  // the variant (rule gone / rule-less grants), then 0.
   const overrideByVariant = new Map<string, number>();
   for (const [key, cents] of costCtx.overrides.byVariant) {
     overrideByVariant.set(key.split("|")[1] ?? key, cents);
@@ -544,7 +548,10 @@ export async function computeCohortRows(
     const cohortIdx = cohortIdxByContract.get(grant.contractId);
     if (cohortIdx == null || !grant.addedAt) continue;
     const cost =
-      grant.rule?.unitCostCents ?? overrideByVariant.get(grant.variantId) ?? 0;
+      grant.unitCostCents ??
+      grant.rule?.unitCostCents ??
+      overrideByVariant.get(grant.variantId) ??
+      0;
     if (cost === 0) continue;
     const offset = Math.max(0, ymIndex(ymKey(grant.addedAt, tz)) - cohortIdx);
     cellFor(cohortIdx, offset).cogsCents += cost;

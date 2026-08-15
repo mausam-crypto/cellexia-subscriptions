@@ -42,6 +42,7 @@ export default function App() {
         <Link to="/app/plans">Plans</Link>
         <Link to="/app/buy-box">Buy box designer</Link>
         <Link to="/app/gifts">Gifts</Link>
+        <Link to="/app/experiments">Experiments</Link>
         <Link to="/app/cancel-flow">Cancel flow</Link>
         <Link to="/app/bulk">Bulk ops</Link>
         <Link to="/app/import">Import</Link>

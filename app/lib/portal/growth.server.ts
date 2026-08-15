@@ -68,17 +68,24 @@ export async function memberSavingsCents(
 }
 
 /**
- * Deliveries remaining until the milestone gift — the goal-gradient hook.
- * Null when the milestone system is off (cycle <= 0) or already reached
- * (>=, matching the lifecycle engine's fire condition).
+ * Deliveries remaining until the NEXT milestone gift — the goal-gradient
+ * hook. Ladder-aware since v1.24.0: past the base milestone the countdown
+ * re-anchors to the next ladder rung (12, 18, ...), so the hook never
+ * exhausts while rungs remain. Null when the milestone system is off
+ * (cycle <= 0) or every rung is behind the subscriber (matching the
+ * lifecycle engine's fire condition on each rung).
  */
 export function milestoneRemaining(
   ordersCount: number,
   milestoneGiftCycle: number,
+  milestoneLadder: readonly number[] = [],
 ): number | null {
   if (milestoneGiftCycle <= 0) return null;
-  if (ordersCount >= milestoneGiftCycle) return null;
-  return milestoneGiftCycle - ordersCount;
+  const rungs = [...new Set([milestoneGiftCycle, ...milestoneLadder])].sort(
+    (a, b) => a - b,
+  );
+  const next = rungs.find((c) => c > ordersCount);
+  return next == null ? null : next - ordersCount;
 }
 
 /**

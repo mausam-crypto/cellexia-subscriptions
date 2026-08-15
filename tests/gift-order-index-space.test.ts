@@ -35,6 +35,7 @@ const mocks = vi.hoisted(() => ({
   giftRuleFindFirst: vi.fn(async (): Promise<unknown> => null),
   giftGrantFindMany: vi.fn(async (): Promise<unknown[]> => []),
   giftGrantFindFirst: vi.fn(async (): Promise<unknown> => null),
+  giftGrantCount: vi.fn(async (): Promise<number> => 0),
   giftGrantUpdate: vi.fn(async (): Promise<unknown> => ({})),
   giftGrantCreate: vi.fn(async (args: unknown): Promise<unknown> => args),
   subscriberEventFindFirst: vi.fn(async (): Promise<unknown> => null),
@@ -77,6 +78,7 @@ vi.mock("~/db.server", () => ({
     giftGrant: {
       findMany: mocks.giftGrantFindMany,
       findFirst: mocks.giftGrantFindFirst,
+      count: mocks.giftGrantCount,
       update: mocks.giftGrantUpdate,
       create: mocks.giftGrantCreate,
     },
@@ -96,7 +98,34 @@ vi.mock("~/lib/shop/install.server", () => ({
 }));
 vi.mock("~/lib/events/log.server", () => ({ logEvent: mocks.logEvent }));
 vi.mock("~/lib/settings/settings.server", () => ({
-  getSetting: vi.fn(async (): Promise<unknown> => ({})),
+  getSetting: vi.fn(async (_shopId: string, key: string): Promise<unknown> => {
+    if (key === "gifts") {
+      return { pool: [], pairings: {}, surveyPairings: {}, maxGiftsPerCycle: 1 };
+    }
+    if (key === "lifecycle") {
+      // Ladder rungs (12/18/24) sit far above the order numbers under test,
+      // so the ladder block stays quiet and rule matching is what's observed.
+      return {
+        milestoneGiftCycle: 6,
+        milestoneLadder: [12, 18, 24],
+        surpriseGiftOnCycle2: false,
+      };
+    }
+    return {};
+  }),
+}));
+// Dynamic-pick seam: null pick = FIXED rules keep granting rule.variantId
+// (the pre-0024 behavior these tests pin).
+vi.mock("~/lib/gifts/picker.server", () => ({
+  pickGiftForContract: vi.fn(async (): Promise<unknown> => null),
+}));
+// gift2 holdout experiment: "gift" arm keeps the ORDER_INDEX=2 rule granting.
+vi.mock("~/lib/experiments/index.server", () => ({
+  surpriseGiftArmFor: vi.fn(async (): Promise<string> => "gift"),
+  settingOverride: vi.fn(
+    async (o: { current: unknown }): Promise<unknown> => o.current,
+  ),
+  assignedArm: vi.fn(async (): Promise<string> => "control"),
 }));
 vi.mock("~/lib/notifications/index.server", () => ({
   sendNotification: vi.fn(async (): Promise<unknown> => ({ status: "SENT" })),
@@ -154,6 +183,8 @@ function orderIndexRule(orderIndex: number) {
     variantId: GIFT_VARIANT,
     variantTitle: "Free Serum",
     unitCostCents: 500,
+    selection: "FIXED",
+    repeatsAnnually: false,
     announceInAdvance: false,
     active: true,
     createdAt: new Date("2026-01-01T00:00:00Z"),

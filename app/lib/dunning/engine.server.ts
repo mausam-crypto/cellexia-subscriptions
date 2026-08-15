@@ -1819,6 +1819,12 @@ export async function runDunningSweep(
     if (kase.state !== "AWAITING_CUSTOMER" && kase.state !== "AWAITING_3DS") {
       continue;
     }
+    // A customer who chose "pause instead" (the ladder emails' pause link,
+    // v1.24.0) froze the whole dunning clock, not just retries and emails —
+    // exhausting a paused contract to FAILED would punish exactly the
+    // customer who took the soft landing we offered. The case parks; after
+    // resume the window continues from where it stood.
+    if (kase.contract.status === "PAUSED") continue;
     try {
       const settings = await dunningSettings(kase.contract.shopId);
       const daysOpen = Math.floor(

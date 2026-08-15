@@ -31,6 +31,7 @@ const mocks = vi.hoisted(() => ({
   giftRuleFindMany: vi.fn(async (): Promise<unknown[]> => []),
   giftGrantFindMany: vi.fn(async (): Promise<unknown[]> => []),
   giftGrantFindFirst: vi.fn(async (): Promise<unknown> => null),
+  giftGrantCount: vi.fn(async (): Promise<number> => 0),
   giftGrantUpdate: vi.fn(
     async (_args: { data: Record<string, unknown> }): Promise<unknown> => ({}),
   ),
@@ -67,6 +68,7 @@ vi.mock("~/db.server", () => ({
     giftGrant: {
       findMany: mocks.giftGrantFindMany,
       findFirst: mocks.giftGrantFindFirst,
+      count: mocks.giftGrantCount,
       update: mocks.giftGrantUpdate,
       create: mocks.giftGrantCreate,
     },
@@ -86,7 +88,33 @@ vi.mock("~/lib/shop/install.server", () => ({
 }));
 vi.mock("~/lib/events/log.server", () => ({ logEvent: mocks.logEvent }));
 vi.mock("~/lib/settings/settings.server", () => ({
-  getSetting: vi.fn(async (): Promise<unknown> => ({})),
+  getSetting: vi.fn(async (_shopId: string, key: string): Promise<unknown> => {
+    if (key === "gifts") {
+      return { pool: [], pairings: {}, surveyPairings: {}, maxGiftsPerCycle: 1 };
+    }
+    if (key === "lifecycle") {
+      return {
+        surpriseGiftOnCycle2: true,
+        milestoneGiftCycle: 6,
+        anniversaryGiftDays: 365,
+        rewardsUnlockDay: 90,
+        earlyCycleIncentivesEnabled: true,
+        milestoneLadder: [12, 18, 24],
+        rewardsGiftEnabled: true,
+      };
+    }
+    return {};
+  }),
+}));
+vi.mock("~/lib/gifts/picker.server", () => ({
+  pickGiftForContract: vi.fn(async (): Promise<unknown> => null),
+}));
+vi.mock("~/lib/experiments/index.server", () => ({
+  surpriseGiftArmFor: vi.fn(async (): Promise<string> => "gift"),
+  settingOverride: vi.fn(
+    async (o: { current: unknown }): Promise<unknown> => o.current,
+  ),
+  assignedArm: vi.fn(async (): Promise<string> => "control"),
 }));
 vi.mock("~/lib/notifications/index.server", () => ({
   sendNotification: vi.fn(async (): Promise<unknown> => ({ status: "SENT" })),

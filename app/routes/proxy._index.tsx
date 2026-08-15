@@ -584,6 +584,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         milestoneAway: milestoneRemaining(
           contract.ordersCount,
           lifecycle.milestoneGiftCycle,
+          lifecycle.milestoneLadder,
         ),
       });
     }

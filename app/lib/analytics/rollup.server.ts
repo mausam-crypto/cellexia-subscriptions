@@ -435,7 +435,11 @@ export async function runDailyRollup(
           { shippedAt: { not: null } },
         ],
       },
-      select: { variantId: true, rule: { select: { unitCostCents: true } } },
+      select: {
+        variantId: true,
+        unitCostCents: true,
+        rule: { select: { unitCostCents: true } },
+      },
     }),
     prisma.billingAttempt.count({
       where: {
@@ -722,15 +726,21 @@ export async function runDailyRollup(
     }
   }
 
-  // Gift COGS: the rule's cost, else the merchant's per-product override for
-  // the gifted variant (rule deleted / manual grant), else 0.
+  // Gift COGS: the grant's own cost stamp first (v1.24.0 — dynamic picks
+  // carry it; the rule's cost describes the fallback variant, not the picked
+  // one), else the rule's cost, else the merchant's per-product override for
+  // the gifted variant (rule deleted / rule-less grant), else 0.
   const overrideByVariant = new Map<string, number>();
   for (const [key, cents] of costCtx.overrides.byVariant) {
     overrideByVariant.set(key.split("|")[1] ?? key, cents);
   }
   const giftCogsCents = giftGrants.reduce(
     (sum, g) =>
-      sum + (g.rule?.unitCostCents ?? overrideByVariant.get(g.variantId) ?? 0),
+      sum +
+      (g.unitCostCents ??
+        g.rule?.unitCostCents ??
+        overrideByVariant.get(g.variantId) ??
+        0),
     0,
   );
 

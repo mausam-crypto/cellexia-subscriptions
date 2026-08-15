@@ -25,6 +25,9 @@ import {
   withBillingCycleEdit,
 } from "~/lib/graphql/index.server";
 import { OURS_ONLY, isBillableOwnership } from "~/lib/ownership/ownership.server";
+import { pickGiftForContract } from "~/lib/gifts/picker.server";
+import { giftEmailLines } from "~/lib/gifts/emailLines.server";
+import { surpriseGiftArmFor } from "~/lib/experiments/index.server";
 
 /**
  * Gift engine — turns GiftRules into GiftGrants and rides the earned gift
@@ -129,6 +132,44 @@ function estimateCycleDate(
  * SAVE_FLOW / WINBACK / MANUAL rules are never auto-matched here; those flows
  * create SCHEDULED grants directly and the engine attaches them.
  */
+/** Repeating anniversaries stop being checked after this many multiples. */
+const MAX_ANNIVERSARY_REPEATS = 30;
+
+/**
+ * Which anniversary multiple of `rule.daysSubscribed` (1st, 2nd, ...) falls
+ * inside this cycle's window (previous cycle date, cycle date]? Non-repeating
+ * rules only ever consider the first multiple (the pre-0024 behavior);
+ * repeating rules (repeatsAnnually) check every multiple, so a 365-day rule
+ * fires on year one, two, three... The k it returns doubles as the dedupe
+ * key: the k-th anniversary grant is the k-th grant this rule produced for
+ * the contract (see the rule loop's count guard).
+ */
+export function anniversaryIndexForCycle(
+  rule: GiftRule,
+  contract: ContractWithLines,
+  cycleDate: Date | null,
+  tz: string,
+): number | null {
+  if (rule.daysSubscribed == null || !contract.firstChargeAt || !cycleDate) {
+    return null;
+  }
+  // Window start = one billing interval before this cycle's date.
+  const freq = contractFrequency(contract);
+  const windowStart = addIntervalTz(cycleDate, freq.unit, freq.count, tz, -1);
+  const maxK = rule.repeatsAnnually ? MAX_ANNIVERSARY_REPEATS : 1;
+  for (let k = 1; k <= maxK; k += 1) {
+    const milestone = addDaysTz(
+      contract.firstChargeAt,
+      rule.daysSubscribed * k,
+      tz,
+    );
+    // Milestones are ordered, so past the window end every later k is too.
+    if (milestone.getTime() > cycleDate.getTime()) break;
+    if (milestone.getTime() > windowStart.getTime()) return k;
+  }
+  return null;
+}
+
 function ruleMatchesCycle(
   rule: GiftRule,
   contract: ContractWithLines,
@@ -140,17 +181,7 @@ function ruleMatchesCycle(
     return rule.orderIndex != null && rule.orderIndex === orderNumber;
   }
   if (rule.trigger === "DAYS_SUBSCRIBED") {
-    if (rule.daysSubscribed == null || !contract.firstChargeAt || !cycleDate) {
-      return false;
-    }
-    const milestone = addDaysTz(contract.firstChargeAt, rule.daysSubscribed, tz);
-    // Window start = one billing interval before this cycle's date.
-    const freq = contractFrequency(contract);
-    const windowStart = addIntervalTz(cycleDate, freq.unit, freq.count, tz, -1);
-    return (
-      milestone.getTime() > windowStart.getTime() &&
-      milestone.getTime() <= cycleDate.getTime()
-    );
+    return anniversaryIndexForCycle(rule, contract, cycleDate, tz) != null;
   }
   return false;
 }
@@ -218,6 +249,12 @@ async function attachGrantToCycle(
     grant.cycleIndex,
   );
 
+  // Variant lookup hoisted above the commit: best-effort and never throws, so
+  // it cannot fail the attach — and the marker event below needs the title.
+  const variant = await fetchVariant(admin, grant.variantId);
+  const title =
+    variant?.productTitle || grant.rule?.variantTitle || grant.rule?.name || "Gift";
+
   if (!alreadyCommitted) {
     await withBillingCycleEdit(
       admin,
@@ -232,6 +269,30 @@ async function attachGrantToCycle(
         });
       },
     );
+    // The idempotency marker goes down IMMEDIATELY after the commit — before
+    // the ADDED flip and the mirror write (v1.24.0; it used to be written
+    // last, so a crash anywhere in the bookkeeping left a committed edit
+    // with no marker and the retry committed a second free line). A swallowed
+    // marker-write failure is still safe: the ADDED flip below takes the
+    // grant out of SCHEDULED, so nothing retries the commit.
+    await logEvent({
+      shopId: shop.id,
+      contractId: contract.id,
+      customerId: contract.customerId,
+      email: contract.email,
+      type: "cycle.gift_added",
+      source: "SYSTEM",
+      actor: "gift_engine",
+      payload: {
+        grantId: grant.id,
+        ruleId: grant.ruleId,
+        ruleName: grant.rule?.name ?? null,
+        cycleIndex: grant.cycleIndex,
+        variantId: grant.variantId,
+        title,
+        unitCostCents: grant.unitCostCents ?? grant.rule?.unitCostCents ?? null,
+      },
+    });
   }
 
   const now = new Date();
@@ -243,9 +304,6 @@ async function attachGrantToCycle(
   // Mirror line for portal display / analytics. Reuse an existing gift mirror
   // for the same variant (a prior cycle's mirror not yet cleared) so the
   // portal never shows the same gift twice.
-  const variant = await fetchVariant(admin, grant.variantId);
-  const title =
-    variant?.productTitle || grant.rule?.variantTitle || grant.rule?.name || "Gift";
   const existingMirror = await prisma.contractLine.findFirst({
     where: { contractId: contract.id, isGift: true, variantId: grant.variantId },
   });
@@ -272,26 +330,6 @@ async function attachGrantToCycle(
     });
   }
 
-  if (!alreadyCommitted) {
-    await logEvent({
-      shopId: shop.id,
-      contractId: contract.id,
-      customerId: contract.customerId,
-      email: contract.email,
-      type: "cycle.gift_added",
-      source: "SYSTEM",
-      actor: "gift_engine",
-      payload: {
-        grantId: grant.id,
-        ruleId: grant.ruleId,
-        ruleName: grant.rule?.name ?? null,
-        cycleIndex: grant.cycleIndex,
-        variantId: grant.variantId,
-        title,
-        unitCostCents: grant.rule?.unitCostCents ?? null,
-      },
-    });
-  }
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -362,6 +400,16 @@ export async function ensureGiftsForUpcomingCycle(
     orderBy: { createdAt: "asc" },
   });
 
+  const giftsSettings = await getSetting(shop.id, "gifts");
+  const lifecycle = await getSetting(shop.id, "lifecycle");
+  // Ladder rungs past the base milestone are gift moments with no GiftRule
+  // row behind them — the engine grants them directly (dynamic pick). The
+  // base milestoneGiftCycle itself stays rule-driven (its rule carries the
+  // merchant's chosen variant + announce flag).
+  const ladderRungMatched =
+    lifecycle.milestoneLadder.includes(targetOrderNumber) &&
+    targetOrderNumber !== lifecycle.milestoneGiftCycle;
+
   // Pre-existing SCHEDULED grants for this cycle (win-back perks, manual
   // grants) are attached even when no rule matches, so check them up front.
   // The lte also surfaces grants stranded on an EARLIER index — producers in
@@ -393,7 +441,8 @@ export async function ensureGiftsForUpcomingCycle(
   if (
     rules.length === 0 &&
     scheduledGrants.length === 0 &&
-    strandedAddedGrants.length === 0
+    strandedAddedGrants.length === 0 &&
+    !ladderRungMatched
   ) {
     result.skipped = "no_rules";
     return result;
@@ -489,9 +538,11 @@ export async function ensureGiftsForUpcomingCycle(
       if (grant.status === "ADDED") {
         if (staleCycle && !staleCycle.skipped && staleCycle.status === "BILLED") {
           // The gift shipped with that order — only the flip went missing.
+          // Stamp shippedAt exactly like consumeCycleOnSuccess does: it is
+          // the durable ship fact analytics survive REMOVED flips by.
           await prisma.giftGrant.update({
             where: { id: grant.id },
-            data: { status: "SHIPPED" },
+            data: { status: "SHIPPED", shippedAt: new Date() },
           });
           continue;
         }
@@ -592,6 +643,116 @@ export async function ensureGiftsForUpcomingCycle(
     }
   }
 
+  // Grants already occupying this cycle, for the per-cycle cap: ADDED rows at
+  // exactly this index (healthy steady state, not in grantsToAttach) plus
+  // everything queued to attach. One box should feel generous, not bought —
+  // when a save/win-back/reward grant already rides this cycle, rule gifts
+  // stand down (gifts.maxGiftsPerCycle, default 1).
+  const addedOnThisCycle = pendingGrants.filter(
+    (g) => g.status === "ADDED" && g.cycleIndex === cycleIndex,
+  ).length;
+  const giftsOnThisCycle = () => addedOnThisCycle + grantsToAttach.length;
+
+  /**
+   * Create a grant + its lifecycle.gift_scheduled event and (optionally) the
+   * gift_announcement email, shared by the rule loop and the ladder block.
+   * The announcement's gift_title always names the ACTUAL granted variant —
+   * the truth-in-emails rule: never announce a product the grant won't ship.
+   */
+  const createGrant = async (input: {
+    ruleId: string | null;
+    ruleName: string;
+    trigger: string;
+    variantId: string;
+    variantTitle: string | null;
+    unitCostCents: number | null;
+    source: string;
+    announce: boolean;
+    /** Live enrichment for the announcement email; undefined = fetch when announcing. */
+    imageUrl?: string | null;
+    retailCents?: number | null;
+  }): Promise<void> => {
+    const created = await prisma.giftGrant.create({
+      data: {
+        contractId: contract.id,
+        ruleId: input.ruleId,
+        cycleIndex,
+        variantId: input.variantId,
+        status: "SCHEDULED",
+        unitCostCents: input.unitCostCents,
+        source: input.source,
+      },
+      include: { rule: true },
+    });
+    result.grantsCreated += 1;
+    grantsToAttach.push(created);
+
+    await logEvent({
+      shopId: shop.id,
+      contractId: contract.id,
+      customerId: contract.customerId,
+      email: contract.email,
+      type: "lifecycle.gift_scheduled",
+      source: "SYSTEM",
+      actor: "gift_engine",
+      payload: {
+        grantId: created.id,
+        ruleId: input.ruleId,
+        ruleName: input.ruleName,
+        trigger: input.trigger,
+        cycleIndex,
+        orderNumber: targetOrderNumber,
+        variantId: input.variantId,
+        variantTitle: input.variantTitle,
+        announceInAdvance: input.announce,
+      },
+    });
+
+    // "Stay subscribed and get X" teaser — deduped per cycle so re-runs
+    // never re-announce. The email shows the actual product: photo, shelf
+    // price and arrival date, composed as localized lines (the body's
+    // {gift_image_line}/{gift_worth_line}/{gift_date_line} slots).
+    if (input.announce) {
+      const sent = await hasSentForCycle(
+        contract.id,
+        "gift_announcement",
+        cycleIndex,
+      );
+      if (!sent) {
+        let imageUrl = input.imageUrl;
+        let retailCents = input.retailCents;
+        if (imageUrl === undefined || retailCents === undefined) {
+          const variant = await fetchVariant(admin, input.variantId);
+          imageUrl = imageUrl ?? variant?.imageUrl ?? null;
+          retailCents = retailCents ?? variant?.priceCents ?? null;
+        }
+        const giftTitle = input.variantTitle ?? input.ruleName;
+        await sendNotification({
+          shopId: shop.id,
+          contractId: contract.id,
+          template: "gift_announcement",
+          vars: {
+            cycleIndex,
+            gift_title: giftTitle,
+            rule_name: input.ruleName,
+            gift_variant_id: input.variantId,
+            ...(cycleDate ? { gift_cycle_date: cycleDate.toISOString() } : {}),
+            ...giftEmailLines({
+              locale: contract.locale,
+              title: giftTitle,
+              imageUrl,
+              retailCents,
+              currencyCode: contract.currencyCode,
+              arrivalDate: cycleDate,
+              tz,
+            }),
+          },
+        });
+        result.announced += 1;
+      }
+    }
+  };
+
   for (const rule of rules) {
     try {
       if (!ruleMatchesCycle(rule, contract, targetOrderNumber, cycleDate, tz)) {
@@ -599,30 +760,49 @@ export async function ensureGiftsForUpcomingCycle(
       }
       result.rulesMatched += 1;
 
-      // An anniversary fires ONCE per (contract, rule). The cycle window is
-      // (previous cycle date, cycle date] with the previous date computed by
-      // a calendar step back — and a MONTH step back from a clamped
-      // month-end (Feb 28 → Jan 28) reaches PAST the real previous cycle
-      // date (Jan 31), so a milestone in the overlap would match two
-      // consecutive cycles. The rule-scoped guard makes that impossible; a
-      // grant parked on a skipped cycle is re-anchored by the pending-grant
-      // machinery above, never re-created here.
+      // An anniversary fires ONCE per (contract, rule, multiple). The cycle
+      // window is (previous cycle date, cycle date] with the previous date
+      // computed by a calendar step back — and a MONTH step back from a
+      // clamped month-end (Feb 28 → Jan 28) reaches PAST the real previous
+      // cycle date (Jan 31), so a milestone in the overlap would match two
+      // consecutive cycles. The count guard makes that impossible: the k-th
+      // anniversary grant is the k-th grant this rule produced, so a repeat
+      // rule that already produced k grants owes nothing until multiple k+1
+      // (non-repeat rules have k=1 — the pre-0024 behavior). A grant parked
+      // on a skipped cycle is re-anchored by the pending-grant machinery
+      // above, never re-created here.
       if (rule.trigger === "DAYS_SUBSCRIBED") {
-        const priorForRule = await prisma.giftGrant.findFirst({
+        const k =
+          anniversaryIndexForCycle(rule, contract, cycleDate, tz) ?? 1;
+        const priorForRule = await prisma.giftGrant.count({
           where: { contractId: contract.id, ruleId: rule.id },
-          select: { id: true },
         });
-        if (priorForRule) continue;
+        if (priorForRule >= k) continue;
       }
 
-      // Unique-ish guard: one grant per (contract, cycle, variant) — any
-      // existing grant (whatever its status) means this gift was handled.
+      // ORDER_INDEX rules fire ONCE per (contract, rule), ever — the promise
+      // is about one specific order. Without this, a skip that shifts the
+      // cycle↔order mapping after a grant was pre-attached under the fresh-
+      // contract assumption lets the order-space rematch grant it a second
+      // time on the shifted cycle (double COGS, duplicate surprise). The
+      // re-anchor machinery moves the EXISTING row, so it is never blocked
+      // by this guard.
+      if (rule.trigger === "ORDER_INDEX") {
+        const priorForRule = await prisma.giftGrant.count({
+          where: { contractId: contract.id, ruleId: rule.id },
+        });
+        if (priorForRule >= 1) continue;
+      }
+
+      // Handled guard: one grant per (contract, cycle, variant) for FIXED
+      // rules — any existing grant (whatever its status) means this gift was
+      // handled. DYNAMIC rules vary the variant per customer, so their
+      // handled mark is (contract, cycle, rule) instead.
       const existing = await prisma.giftGrant.findFirst({
-        where: {
-          contractId: contract.id,
-          cycleIndex,
-          variantId: rule.variantId,
-        },
+        where:
+          rule.selection === "DYNAMIC"
+            ? { contractId: contract.id, cycleIndex, ruleId: rule.id }
+            : { contractId: contract.id, cycleIndex, variantId: rule.variantId },
         include: { rule: true },
       });
       if (existing) {
@@ -633,69 +813,182 @@ export async function ensureGiftsForUpcomingCycle(
         continue;
       }
 
-      const created = await prisma.giftGrant.create({
-        data: {
-          contractId: contract.id,
-          ruleId: rule.id,
-          cycleIndex,
-          variantId: rule.variantId,
-          status: "SCHEDULED",
-        },
-        include: { rule: true },
-      });
-      result.grantsCreated += 1;
-      grantsToAttach.push(created);
+      if (giftsOnThisCycle() >= giftsSettings.maxGiftsPerCycle) continue;
 
-      await logEvent({
-        shopId: shop.id,
-        contractId: contract.id,
-        customerId: contract.customerId,
-        email: contract.email,
-        type: "lifecycle.gift_scheduled",
-        source: "SYSTEM",
-        actor: "gift_engine",
-        payload: {
-          grantId: created.id,
-          ruleId: rule.id,
-          ruleName: rule.name,
-          trigger: rule.trigger,
-          cycleIndex,
-          orderNumber: targetOrderNumber,
-          variantId: rule.variantId,
-          variantTitle: rule.variantTitle,
-          announceInAdvance: rule.announceInAdvance,
-        },
-      });
-
-      // "Stay subscribed and get X" teaser — deduped per cycle so re-runs
-      // never re-announce. The Klaviyo flow owns the actual email.
-      if (rule.announceInAdvance) {
-        const sent = await hasSentForCycle(
-          contract.id,
-          "gift_announcement",
-          cycleIndex,
-        );
-        if (!sent) {
-          await sendNotification({
+      // gift2 holdout: the cycle-2 surprise is the app's standing experiment
+      // — a deterministic slice of customers gets no gift (and no teaser, the
+      // lifecycle engine checks the same arm), so months from now the cohort
+      // numbers can say what the gift actually earns. This is THE divergence
+      // point, so exposure is recorded here. Win-back perks and first-order
+      // gifts are different moments and stay outside the experiment.
+      if (rule.trigger === "ORDER_INDEX" && rule.orderIndex === 2) {
+        const arm = await surpriseGiftArmFor(contract);
+        if (arm === "no_gift") {
+          // Promise-keeping guard: a stop→re-enable of the experiment can
+          // leave a customer who was TEASED (arm resolved "gift" at order 1)
+          // resolving "no_gift" now. A sent teaser outranks the arm — the
+          // promise ships, and the contamination is logged so readouts can
+          // drop the unit instead of counting a teased customer as holdout.
+          const teased = await hasSentForCycle(
+            contract.id,
+            "gift_teaser",
+            targetOrderNumber,
+          );
+          if (!teased) continue;
+          await logEvent({
             shopId: shop.id,
             contractId: contract.id,
-            template: "gift_announcement",
-            vars: {
-              cycleIndex,
-              gift_title: rule.variantTitle ?? rule.name,
-              rule_name: rule.name,
-              ...(cycleDate ? { gift_cycle_date: cycleDate.toISOString() } : {}),
+            customerId: contract.customerId,
+            email: contract.email,
+            type: "experiment.contaminated",
+            source: "SYSTEM",
+            actor: "gift_engine",
+            payload: {
+              experimentKey: "gift2_holdout",
+              reason: "teaser_sent_before_no_gift_arm",
+              orderNumber: targetOrderNumber,
             },
           });
-          result.announced += 1;
         }
       }
+
+      // Resolve the variant this grant will carry. DYNAMIC rules pick the
+      // best product for THIS customer from gifts.pool (new to them, likely
+      // wanted); a null pick falls back to the rule's fixed variant, so a
+      // DYNAMIC rule can never grant less than a FIXED one.
+      let variantId = rule.variantId;
+      let variantTitle = rule.variantTitle;
+      let grantUnitCostCents: number | null = null;
+      let pickImageUrl: string | null | undefined;
+      let pickRetailCents: number | null | undefined;
+      if (rule.selection === "DYNAMIC") {
+        const pick = await pickGiftForContract({
+          shopId: shop.id,
+          admin,
+          contract,
+          excludeVariantIds: [
+            ...grantsToAttach.map((g) => g.variantId),
+            ...pendingGrants
+              .filter((g) => g.cycleIndex === cycleIndex)
+              .map((g) => g.variantId),
+          ],
+        });
+        if (pick) {
+          variantId = pick.variantId;
+          variantTitle = pick.label;
+          grantUnitCostCents = pick.unitCostCents;
+          pickImageUrl = pick.imageUrl;
+          pickRetailCents = pick.retailCents;
+        }
+      }
+
+      // The resolved variant may collide with a grant another producer
+      // created for this cycle under a different rule identity — keep the
+      // one-grant-per-(contract, cycle, variant) invariant. This runs for
+      // EVERY dynamic rule (a null pick falls back to rule.variantId, which
+      // the rule-scoped handled guard above cannot see), matching the ladder
+      // block's unconditional check.
+      if (rule.selection === "DYNAMIC" || variantId !== rule.variantId) {
+        const dupe = await prisma.giftGrant.findFirst({
+          where: { contractId: contract.id, cycleIndex, variantId },
+          include: { rule: true },
+        });
+        if (dupe) {
+          if (dupe.status === "SCHEDULED") {
+            const queued = grantsToAttach.some((g) => g.id === dupe.id);
+            if (!queued) grantsToAttach.push(dupe);
+          }
+          continue;
+        }
+      }
+
+      await createGrant({
+        ruleId: rule.id,
+        ruleName: rule.name,
+        trigger: rule.trigger,
+        variantId,
+        variantTitle,
+        unitCostCents: grantUnitCostCents,
+        source: "RULE",
+        announce: rule.announceInAdvance,
+        imageUrl: pickImageUrl,
+        retailCents: pickRetailCents,
+      });
     } catch (err) {
       result.errors += 1;
       console.error(
         "[gifts] rule evaluation failed",
         rule.id,
         contract.id,
+        err,
+      );
+    }
+  }
+
+  // ── 1b. Milestone-ladder rungs (no GiftRule row — dynamic grants) ──────────
+  // lifecycle.milestoneLadder keeps the goal-gradient alive past the base
+  // milestone: order 12, 18, 24... each gets a gift, always announced (a
+  // pre-announced reward is the whole point of a ladder). The variant is
+  // picked per customer; when the pool yields nothing the base milestone
+  // rule's variant is the fallback, and with neither the rung grants nothing
+  // — the milestone email then omits the gift promise (truth gate).
+  if (ladderRungMatched) {
+    try {
+      const priorLadderGrant = await prisma.giftGrant.findFirst({
+        where: { contractId: contract.id, cycleIndex, source: "LADDER" },
+        select: { id: true },
+      });
+      if (
+        !priorLadderGrant &&
+        giftsOnThisCycle() < giftsSettings.maxGiftsPerCycle
+      ) {
+        const pick = await pickGiftForContract({
+          shopId: shop.id,
+          admin,
+          contract,
+          excludeVariantIds: [
+            ...grantsToAttach.map((g) => g.variantId),
+            ...pendingGrants
+              .filter((g) => g.cycleIndex === cycleIndex)
+              .map((g) => g.variantId),
+          ],
+        });
+        const baseMilestoneRule = pick
+          ? null
+          : rules.find(
+              (r) =>
+                r.trigger === "ORDER_INDEX" &&
+                r.orderIndex === lifecycle.milestoneGiftCycle,
+            ) ?? null;
+        const variantId = pick?.variantId ?? baseMilestoneRule?.variantId;
+        if (variantId) {
+          const dupe = await prisma.giftGrant.findFirst({
+            where: { contractId: contract.id, cycleIndex, variantId },
+            select: { id: true },
+          });
+          if (!dupe) {
+            await createGrant({
+              ruleId: null,
+              ruleName: `Milestone ladder — order ${targetOrderNumber}`,
+              trigger: "MILESTONE_LADDER",
+              variantId,
+              variantTitle:
+                pick?.label ?? baseMilestoneRule?.variantTitle ?? null,
+              unitCostCents: pick?.unitCostCents ?? null,
+              source: "LADDER",
+              announce: true,
+              imageUrl: pick?.imageUrl,
+              retailCents: pick?.retailCents,
+            });
+          }
+        }
+      }
+    } catch (err) {
+      result.errors += 1;
+      console.error(
+        "[gifts] milestone-ladder grant failed",
+        contract.id,
+        targetOrderNumber,
         err,
       );
     }
@@ -738,10 +1031,15 @@ export async function clearShippedGiftMirrors(
 
   // A variant is still "live" when a SCHEDULED/ADDED grant references it —
   // its mirror belongs to the upcoming cycle and must survive the clear.
+  // Cycle-0 grants are excluded: the first-order gift is terminally ADDED on
+  // the synthetic origin-order index forever, and letting it protect its
+  // variant made any later engine grant of the same product an immortal
+  // phantom line in the portal.
   const liveGrants = await prisma.giftGrant.findMany({
     where: {
       contractId: contract.id,
       status: { in: ["SCHEDULED", "ADDED"] },
+      cycleIndex: { gte: 1 },
     },
     select: { variantId: true },
   });

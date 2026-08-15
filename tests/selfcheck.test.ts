@@ -76,6 +76,29 @@ const mocks = vi.hoisted(() => {
     })),
     jobLockFindMany: vi.fn(async (): Promise<unknown[]> => []),
     subscriberEventCount: vi.fn(async (): Promise<number> => 0),
+    // gift_promises fixture: a fully-aligned gift setup (cycle-2 + milestone
+    // rules, an anniversary rule, a stocked pool) so the healthy run stays
+    // healthy; tests that probe the check override these.
+    giftRuleFindMany: vi.fn(async (): Promise<unknown[]> => [
+      {
+        trigger: "ORDER_INDEX",
+        orderIndex: 2,
+        daysSubscribed: null,
+        selection: "FIXED",
+      },
+      {
+        trigger: "ORDER_INDEX",
+        orderIndex: 6,
+        daysSubscribed: null,
+        selection: "FIXED",
+      },
+      {
+        trigger: "DAYS_SUBSCRIBED",
+        orderIndex: null,
+        daysSubscribed: 365,
+        selection: "FIXED",
+      },
+    ]),
     setSetting: vi.fn(async (): Promise<void> => {}),
     raiseAlert: vi.fn(async (): Promise<boolean> => true),
     logEvent: vi.fn(async (): Promise<void> => {}),
@@ -156,6 +179,7 @@ vi.mock("~/db.server", () => ({
     },
     jobLock: { findMany: mocks.jobLockFindMany },
     subscriberEvent: { count: mocks.subscriberEventCount },
+    giftRule: { findMany: mocks.giftRuleFindMany },
   },
 }));
 
@@ -184,6 +208,32 @@ vi.mock("~/lib/settings/settings.server", () => ({
     if (key === "klaviyoFlowSetup") return mocks.flowSetupSetting.value;
     if (key === "klaviyo") return mocks.klaviyoSetting.value;
     if (key === "mailTransport") return mocks.mailTransportSetting.value;
+    if (key === "lifecycle") {
+      return {
+        surpriseGiftOnCycle2: true,
+        milestoneGiftCycle: 6,
+        anniversaryGiftDays: 365,
+        rewardsUnlockDay: 90,
+        earlyCycleIncentivesEnabled: true,
+        milestoneLadder: [12, 18, 24],
+        rewardsGiftEnabled: true,
+      };
+    }
+    if (key === "cancelFlow") return { giftSaveEnabled: true };
+    if (key === "gifts") {
+      return {
+        pool: [
+          {
+            variantId: "gid://shopify/ProductVariant/9",
+            variantTitle: "Travel serum",
+            unitCostCents: 240,
+          },
+        ],
+        pairings: {},
+        surveyPairings: {},
+        maxGiftsPerCycle: 1,
+      };
+    }
     return {};
   }),
   setSetting: mocks.setSetting,

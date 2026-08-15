@@ -1,12 +1,12 @@
 {
-  "introTitle": "Aiutaci a organizzare al meglio le tue consegne",
+  "introTitle": "Quattro domande veloci",
   "progress": "Domanda {{current}} di {{total}} — basta un tocco",
   "doneTitle": "Grazie!",
-  "doneBody": "Useremo le tue risposte per personalizzare consegne e consigli di bellezza.",
+  "doneBody": "Le tue risposte servono a personalizzare tutto per te.",
   "q": {
     "plannedDuration": {
-      "title": "Per aiutarci a pianificare — come pensi di usare questo prodotto?",
-      "trying": "Lo sto provando — deciderò dopo la prima consegna",
+      "title": "Come pensi di usare questo prodotto?",
+      "trying": "Lo sto provando — vedrò come va",
       "few_months": "Qualche mese — il tempo di valutare i risultati veri",
       "six_months_plus": "Sei mesi o più",
       "permanent": "Questo tipo di prodotto fa parte stabile della mia routine"

@@ -4,6 +4,167 @@ All notable changes to Cellexia Subscriptions. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [SemVer](https://semver.org) as contracted in [docs/UPDATE.md](docs/UPDATE.md).
 
+## [1.24.0] — 2026-08-14
+
+**Dynamic gifts, truthful gift emails, and the experiment kernel** — the
+gift system stops being one fixed product and starts choosing per customer:
+gift rules gain a **Dynamic** mode that picks the best gift from a new
+**gift pool** (Gifts page) — always a product the customer doesn't already
+have (their whole email's contract history counts, gifts included), ranked
+by merchant-defined **pairings** and, as a tiebreaker, the post-purchase
+survey's "what brings you here" answer. Deterministic, no RNG; when the
+pool holds nothing new it repeats the longest-ago gift and raises a deduped
+`GIFT_POOL_EXHAUSTED` alert; every dynamic rule keeps a fixed fallback
+variant, so a rolled-back release still grants a real product. The
+**milestone ladder** (`lifecycle.milestoneLadder`, default 12/18/24) keeps
+a next reward ahead of every subscriber forever — each rung ships an
+announced dynamic gift and re-anchors the portal countdown — and
+anniversary rules can now **repeat yearly**. The day-90 **rewards unlock
+carries a real gift** (`lifecycle.rewardsGiftEnabled`, ON). Gift emails
+are enriched — product **photo** (new `[image:Alt](url)` block in the email
+renderer), shelf price and arrival date — and a new **gift teaser** email
+("something extra is coming in your next box") fires after the first order.
+Every gift email now obeys one rule: **never promise what no grant will
+ship** — the teaser checks the cycle-2 rule exists, the win-back perk stage
+skips (logging `winback.perk_skipped`) when nothing is grantable, the
+milestone email drops its gift sentence when no gift rode along, and a new
+`gift_promises` self-check surfaces config drift. The cancel flow gains a
+**GIFT save** (free product instead of margin-costing discounts, for
+NOT_SEEING_RESULTS / TRYING_SOMETHING_ELSE / OTHER), all save cooldowns
+move from per-contract to **per-customer** (cancel-and-resubscribe no
+longer resets the anti-farming clocks), and dunning emails 2–3 offer a
+one-tap **"pause instead"** (pausing now freezes the whole dunning clock,
+exhaustion included). Finally, the **experiment kernel**
+(`ExperimentAssignment` table, Experiments admin page): deterministic
+customer-email bucketing, arms frozen at first exposure, definitions in
+code — shipping with the **cycle-2 gift holdout ON by default** (12.5% of
+customers get no surprise gift and no teaser, the comparison group that
+must exist from subscriber #1 or never), plus two off-by-default depth
+tests (final offer 25 vs 20, win-back 20 vs 15) that overlay settings at
+their decision points. One additive migration (0024, `npm run setup`
+applies: GiftRule.selection/repeatsAnnually, GiftGrant.unitCostCents/source,
+ExperimentAssignment). **No new env vars, no scope changes, no webhook or
+extension changes — `npm run deploy` NOT required.** All 22 locales
+updated; existing Klaviyo flows keep working untouched — one more click of
+the guided setup adds just the new Gift Teaser flow.
+
+> Update notes: `npm run setup` (applies migration 0024). Then: (1) open
+> **Gifts** and stock the **gift pool** (your normal products work — the
+> picker never gives a customer something they already get) and set the
+> pairings; (2) open **Klaviyo setup** and click once — it creates only the
+> new Gift Teaser flow; (3) review **Experiments** — the cycle-2 gift
+> holdout is on by default and should stay on from your first subscriber;
+> (4) optionally flip existing gift rules to Dynamic on the Gifts page.
+> The Debug page's new `gift_promises` check tells you if any email
+> promises a gift nothing backs.
+
+### Added
+
+- `gifts` settings group (pool, pairings, surveyPairings, maxGiftsPerCycle)
+  + Gifts-page pool/pairings editors; `app/lib/gifts/picker.server.ts`
+  (deterministic per-customer pick, exhausted fallback, contained failures).
+- `GiftRule.selection` (FIXED/DYNAMIC) + `repeatsAnnually`;
+  `GiftGrant.unitCostCents` (per-grant COGS stamp for dynamic picks) +
+  `source` (RULE/LADDER/FIRST_ORDER/SAVE_FLOW/WINBACK/REWARDS/MANUAL) —
+  gift spend is now splittable by origin.
+- `lifecycle.milestoneLadder` + `lifecycle.rewardsGiftEnabled`; ladder
+  rungs granted by the gift engine (source LADDER, announced); portal
+  `milestoneRemaining` counts to the NEXT rung.
+- `gift_teaser` template + "Cellexia Gift Teaser" metric + guided-flow
+  entry; `[image:Alt](url)` markdown-lite block; localized gift line vars
+  (`gift_image_line`/`gift_worth_line`/`gift_date_line`/`gift_line`)
+  composed by `app/lib/gifts/emailLines.server.ts`.
+- Cancel-flow `GIFT` save kind (`cancelFlow.giftSaveEnabled`,
+  `cancelFlow.giftSaveCooldownDays`), per-customer cooldowns, dunning
+  "pause instead" copy + PAUSED contracts exempt from exhaustion.
+- Experiment kernel (`app/lib/experiments/index.server.ts`), the
+  `experiments` settings key, `ExperimentAssignment` table, the
+  Experiments admin page, and `settingOverride()` wired at the final-offer
+  and win-back discount decision points.
+- Self-check `gift_promises`; picker/ladder/experiment test suites.
+- Localized CTA buttons: every email's action button now renders in the
+  customer's language with an intent-matched label (`email.cta.manage` /
+  `update_card` / `confirm_payment` / `reactivate`, all 22 locales;
+  `NotificationTemplate.ctaLabelKey`), and the win-back perk/discount
+  bodies gained a proper `{cta}` slot — the button renders in place
+  instead of being appended after the sign-off in English.
+
+## [1.23.0] — 2026-08-14
+
+**Shopify tags: subscribers and subscription orders** — a new **Settings →
+Shopify tags** card (`tagging` group, everything ON by default) mirrors
+subscription state onto Shopify tags so themes, Shopify Flow, segments and
+other apps can key off it. Customers carry **"Active Subscriber"** (name
+editable) while they hold ≥1 live — ACTIVE or PAUSED — contract that is
+ours and not demo, and lose it automatically when their last one ends
+(cancelled, expired or payment-failed; dunning recovery re-applies it).
+Orders are tagged **"Subscription First Order"** (the checkout order, at
+the proven-ours contract-create moment — never from the raced, ownership-
+blind ORDERS_CREATE) and **"Subscription Recurring Order"** (every renewal,
+in the settlement tail both claim winners share, so a lost success webhook
+cannot strand the tag). One additive migration (0023 `CustomerTagState`,
+`npm run setup` applies it): the per-customer ledger of the tag we last
+applied — reconciles are free when nothing changed, a rename swaps the old
+byte-exact tag for the new one, and a removal can only ever take back a tag
+this app itself applied (hand-typed merchant tags are never touched; the
+removal keeps working even after a contract is reclassified away from
+ours, and racing webhook echoes serialize on a per-customer advisory
+lock). The customer tag self-heals from live-set membership on every
+contract sync (the daily `full_sync_reconcile` re-converges everyone
+within 24h); saving the settings card kicks off a background reconcile of
+the whole base (summary in the Audit log). Install-dark honored: nothing
+is tagged while launch mode is SETUP — after go-live, save the card once
+to tag the existing base (or let the daily pass do it). All writes are
+contained (a tag failure never breaks a webhook, a billing settlement or a
+cancel), skip GDPR-redacted identities on both paths, and are forward-only
+for orders (historical orders are left alone; a contract that mirrored
+with unknown ownership gets its first-order tag healed by the sync that
+proves it ours). Disabling a toggle stops tag management and deliberately
+leaves applied tags in place. **No new env vars, no scope changes**
+(`write_customers`/`write_orders` were already granted), **no webhook or
+theme changes — `npm run deploy` NOT required.**
+
+> Update notes: `npm run setup` (applies migration 0023). Tags appear on
+> renewals/new subscriptions immediately; open **Settings → Shopify tags**
+> and hit Save once to tag the existing subscriber base without waiting for
+> the nightly reconcile. Rename a tag on the same card any time — current
+> subscribers are swapped on save.
+
+### Added
+
+- `tagging` settings group: `customerTagEnabled` + `customerTag`,
+  `orderTagsEnabled` + `firstOrderTag`/`repeatOrderTag`; tag values are
+  trimmed, non-empty, comma-free (Shopify treats commas as separators).
+- `app/lib/tagging/tags.server.ts`: membership recompute
+  (`maybeSyncSubscriberTag`), order tagging (`maybeTagSubscriptionOrder`,
+  idempotent across settlement redrives via a `taggedOrderId`-keyed event
+  guard), and the settings-save sweep (`reconcileAllSubscriberTags`,
+  capped, one `admin.action` summary event).
+- `app/lib/graphql/tags.server.ts`: generic `tagsAdd`/`tagsRemove` helpers
+  for any taggable Admin node (Customer and Order share the mutations).
+- Audit trail: every applied change logs `contract.updated` with action
+  `subscriber_tag_synced` / `order_tagged` (source SYSTEM, contract-linked
+  — the `event_provenance` self-check stays clean); GDPR-redacted
+  identities and uninstalled shops are never written to.
+
+## [1.22.1] — 2026-08-14
+
+**Survey copy: customer-focused, delivery-free** — the survey no longer
+talks about the brand or the subscription. The intro ("Help us get your
+deliveries right") is now "Four quick questions", the planned-duration
+question opens directly ("How do you see yourself using this?" — the "So we
+can plan ahead" framing is gone), the trial option drops its delivery
+reference ("I'll see how it goes"), and the completion note says answers
+tailor things to the customer — across all 9 locales. Wording polish only:
+question/option KEYS and their meanings are unchanged, so the measurement
+instrument stays version 1 and answer analytics remain continuous. **No
+migration**, no new env vars, no scope, webhook or theme changes.
+**`npm run deploy` required** (extension locale files changed).
+
+> Update notes: `npx prisma migrate deploy` is a no-op. Run `npm run
+> deploy` to push the new copy, then hard-refresh the checkout editor if it
+> still previews the old strings.
+
 ## [1.22.0] — 2026-08-13
 
 **Debug tab: 9 new live self-checks (28 → 37), plus a 28-defect audit fix

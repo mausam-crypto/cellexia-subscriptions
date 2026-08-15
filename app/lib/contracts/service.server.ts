@@ -1407,6 +1407,24 @@ export async function cancelContract(
 
   const updated = await reloadContract(contract.id);
 
+  // Subscriber-tag recompute (tagging setting group): the cancel webhook echo
+  // reaches the same recompute through syncContractFromShopify within
+  // seconds, but "remove the tag when they cancel" is the feature's headline
+  // promise — apply it in the same request. Contained: tagging never breaks
+  // a cancel.
+  try {
+    const { maybeSyncSubscriberTag } = await import("~/lib/tagging/tags.server");
+    await maybeSyncSubscriberTag(shop.id, contract.customerId, {
+      contractId: contract.id,
+    });
+  } catch (err) {
+    console.error(
+      "[contracts] subscriber tag recompute failed after cancel",
+      contract.id,
+      err,
+    );
+  }
+
   if (options?.scheduleWinback !== false) {
     try {
       const winback = (await import("~/lib/winback/engine.server")) as {

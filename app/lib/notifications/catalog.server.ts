@@ -374,6 +374,17 @@ export const EMAIL_CATALOG: Record<TemplateKey, Omit<EmailCatalogEntry, "templat
     disableable: true,
     group: "lifecycle",
   },
+  gift_teaser: {
+    title: "Gift teaser",
+    trigger:
+      "The first order billed and the cycle-2 surprise gift is coming — teases it without spoiling what it is.",
+    sentBy: "billing-success hook, once per contract",
+    timing: null,
+    links: PORTAL_ONLY,
+    customizable: true,
+    disableable: true,
+    group: "lifecycle",
+  },
   milestone_gift: {
     title: "Milestone reached",
     trigger: "The customer reached the configured milestone cycle.",

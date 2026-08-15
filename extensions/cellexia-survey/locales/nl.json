@@ -1,12 +1,12 @@
 {
-  "introTitle": "Help ons je leveringen goed te plannen",
+  "introTitle": "Vier korte vragen",
   "progress": "Vraag {{current}} van {{total}} — één tik per vraag",
   "doneTitle": "Dank je wel!",
-  "doneBody": "We gebruiken je antwoorden om leveringen en verzorgingstips op jou af te stemmen.",
+  "doneBody": "Je antwoorden helpen alles op jou af te stemmen.",
   "q": {
     "plannedDuration": {
-      "title": "Zodat we kunnen plannen — hoe denk je dit product te gebruiken?",
-      "trying": "Uitproberen — ik kijk na de eerste levering verder",
+      "title": "Hoe denk je dit product te gebruiken?",
+      "trying": "Uitproberen — ik zie wel hoe het gaat",
       "few_months": "Een paar maanden — genoeg om echte resultaten te beoordelen",
       "six_months_plus": "Zes maanden of langer",
       "permanent": "Dit soort producten hoort vast bij mijn routine"

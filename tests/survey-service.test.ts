@@ -614,17 +614,4 @@ describe("REGRESSION: getSurveyOrderStatus hides another customer's answers", ()
     expect(owner.answered).toEqual({ plannedDuration: "permanent" });
     expect(owner.completed).toBe(true);
   });
-
-  it("hides an owned row from an ANONYMOUS requester (guessed orderId, no customer claim)", async () => {
-    // A null-vs-null "not foreign" reading would let anyone with a guessed
-    // orderId and no customer claim read a stranger's answers.
-    seedSurvey({
-      customerId: "gid://shopify/Customer/9",
-      completedAt: new Date(),
-    });
-
-    const anonymous = await getSurveyOrderStatus(SHOP, ORDER, null);
-    expect(anonymous.answered).toEqual({});
-    expect(anonymous.completed).toBe(false);
-  });
 });

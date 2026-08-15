@@ -19,6 +19,9 @@ import {
 } from "~/lib/graphql/index.server";
 import { applyDiscountGrant } from "~/lib/contracts/service.server";
 import { OURS_ONLY, isBillableOwnership } from "~/lib/ownership/ownership.server";
+import { pickGiftForContract } from "~/lib/gifts/picker.server";
+import { giftEmailLines } from "~/lib/gifts/emailLines.server";
+import { settingOverride } from "~/lib/experiments/index.server";
 
 /**
  * Win-back engine — staged re-acquisition of cancelled subscribers, timed to
@@ -539,37 +542,102 @@ async function processDueTouch(
       since,
     );
     if (!already) {
-      const ttlDays =
-        Math.max(0, settings.sunsetOffsetDays - settings.perkOffsetDays) +
-        settings.linkGraceDays;
-      const reactivateUrl = await buildReactivationUrl(
-        contract,
-        { percent: 0, cycles: 0, gift: true },
-        ttlDays,
-      );
-      await sendNotification({
-        shopId: contract.shopId,
-        contractId: contract.id,
-        template: "winback_perk",
-        vars: {
-          reactivate_url: reactivateUrl,
-          cta_url: reactivateUrl,
-          gift: "true",
-          stage: 1,
-        },
-      });
-      await logEvent({
-        ...eventBase,
-        type: "winback.perk_offered",
-        source: "SYSTEM",
-        actor: "winback_engine",
-        payload: {
-          stateId: state.id,
-          gift: true,
-          predictedEmptyDate: predictedEmpty.toISOString(),
-        },
-      });
-      stats.perksOffered += 1;
+      // Truth gate: the perk email may only promise a gift the reactivation
+      // click can actually grant — a dynamic pick from gifts.pool, or the
+      // ORDER_INDEX=2 fallback rule. Without either, this stage is silently
+      // skipped (the discount touch still follows); a gift-promising email
+      // that a click cannot honor is worse than no perk touch at all. The
+      // preview pick also personalizes the email with the actual product.
+      let perkGiftTitle: string | null = null;
+      let perkGiftImage: string | null = null;
+      let perkGiftRetailCents: number | null = null;
+      try {
+        const shopRow = await prisma.shop.findUniqueOrThrow({
+          where: { id: contract.shopId },
+        });
+        const admin = await adminClientForShop(shopRow.domain);
+        const pick = await pickGiftForContract({
+          shopId: contract.shopId,
+          admin,
+          contract,
+        });
+        if (pick) {
+          perkGiftTitle = pick.label;
+          perkGiftImage = pick.imageUrl;
+          perkGiftRetailCents = pick.retailCents;
+        }
+      } catch (err) {
+        console.error("[winback] perk gift preview failed", contract.id, err);
+      }
+      if (!perkGiftTitle) {
+        const fallbackRule = await prisma.giftRule.findFirst({
+          where: {
+            shopId: contract.shopId,
+            active: true,
+            trigger: "ORDER_INDEX",
+            orderIndex: 2,
+          },
+          orderBy: { createdAt: "asc" },
+        });
+        if (fallbackRule) {
+          perkGiftTitle = fallbackRule.variantTitle ?? fallbackRule.name;
+        }
+      }
+
+      if (perkGiftTitle) {
+        const ttlDays =
+          Math.max(0, settings.sunsetOffsetDays - settings.perkOffsetDays) +
+          settings.linkGraceDays;
+        const reactivateUrl = await buildReactivationUrl(
+          contract,
+          { percent: 0, cycles: 0, gift: true },
+          ttlDays,
+        );
+        await sendNotification({
+          shopId: contract.shopId,
+          contractId: contract.id,
+          template: "winback_perk",
+          vars: {
+            reactivate_url: reactivateUrl,
+            cta_url: reactivateUrl,
+            gift: "true",
+            gift_title: perkGiftTitle,
+            ...giftEmailLines({
+              locale: contract.locale,
+              title: perkGiftTitle,
+              imageUrl: perkGiftImage,
+              retailCents: perkGiftRetailCents,
+              currencyCode: contract.currencyCode,
+            }),
+            stage: 1,
+          },
+        });
+        await logEvent({
+          ...eventBase,
+          type: "winback.perk_offered",
+          source: "SYSTEM",
+          actor: "winback_engine",
+          payload: {
+            stateId: state.id,
+            gift: true,
+            giftTitle: perkGiftTitle,
+            predictedEmptyDate: predictedEmpty.toISOString(),
+          },
+        });
+        stats.perksOffered += 1;
+      } else {
+        await logEvent({
+          ...eventBase,
+          type: "winback.perk_skipped",
+          source: "SYSTEM",
+          actor: "winback_engine",
+          payload: {
+            stateId: state.id,
+            reason: "no_giftable_product",
+            predictedEmptyDate: predictedEmpty.toISOString(),
+          },
+        });
+      }
     }
     await prisma.winbackState.update({
       where: { id: state.id },
@@ -588,13 +656,22 @@ async function processDueTouch(
     since,
   );
   if (!already) {
-    // Stacking cap: offer only what applyDiscountGrant will grant on top of
+    // Experiment overlay first (winback_discount_depth — deterministic per
+    // customer, exposure recorded at this divergence point), then the
+    // stacking cap: offer only what applyDiscountGrant will grant on top of
     // the plan's ongoing discount. Zero headroom → skip the discount touch
     // entirely (a 0% offer is worse than none) and advance to sunset timing.
+    const depthPct = await settingOverride({
+      shopId: contract.shopId,
+      email: contract.email,
+      contractId: contract.id,
+      path: "winback.discountPct",
+      current: settings.discountPct,
+    });
     const clamp = await clampGrantPercentForContract(
       contract.shopId,
       contract.lines,
-      settings.discountPct,
+      depthPct,
     );
     const percent = clamp.percent;
     const cycles = settings.discountCycles;
@@ -1001,11 +1078,22 @@ async function grantReactivationGift(
   effectiveNext: Date,
   source: EventSource,
 ): Promise<boolean> {
+  // The dynamic picker is the primary source — a returning customer should
+  // come back to something NEW, not the cycle-2 surprise they already had.
+  // The ORDER_INDEX=2 rule stays as the fallback variant so shops without a
+  // pool keep the pre-0024 behavior. With neither, no gift is granted and
+  // the caller reports false — the perk email/page must not promise one.
   const rule = await prisma.giftRule.findFirst({
     where: { shopId, active: true, trigger: "ORDER_INDEX", orderIndex: 2 },
     orderBy: { createdAt: "asc" },
   });
-  if (!rule) return false;
+
+  const pick = await pickGiftForContract({
+    shopId,
+    admin,
+    contract,
+  });
+  if (!pick && !rule) return false;
 
   let cycleIndex = contract.ordersCount + 1;
   try {
@@ -1022,19 +1110,34 @@ async function grantReactivationGift(
       err,
     );
   }
+
+  const variantId = pick?.variantId ?? rule?.variantId;
+  if (!variantId) return false;
+  const variantTitle = pick?.label ?? rule?.variantTitle ?? null;
+
   const existing = await prisma.giftGrant.findFirst({
-    where: { contractId: contract.id, cycleIndex, variantId: rule.variantId },
+    where: { contractId: contract.id, cycleIndex, variantId },
     select: { id: true },
   });
   if (existing) return true; // already granted (link replay)
+  // Link replays re-pick, and the picker excludes already-granted variants —
+  // so a replay's pick can differ from the original grant's variant. The
+  // source-scoped guard catches that: one win-back gift per cycle, ever.
+  const priorWinback = await prisma.giftGrant.findFirst({
+    where: { contractId: contract.id, cycleIndex, source: "WINBACK" },
+    select: { id: true },
+  });
+  if (priorWinback) return true;
 
   const grant = await prisma.giftGrant.create({
     data: {
       contractId: contract.id,
-      ruleId: rule.id,
+      ruleId: pick ? null : (rule?.id ?? null),
       cycleIndex,
-      variantId: rule.variantId,
+      variantId,
       status: "SCHEDULED",
+      unitCostCents: pick?.unitCostCents ?? null,
+      source: "WINBACK",
     },
   });
 
@@ -1045,12 +1148,12 @@ async function grantReactivationGift(
     actor: "winback_engine",
     payload: {
       grantId: grant.id,
-      ruleId: rule.id,
-      ruleName: rule.name,
+      ruleId: pick ? null : (rule?.id ?? null),
+      ruleName: pick ? "Win-back gift (dynamic)" : (rule?.name ?? "Win-back gift"),
       trigger: "WINBACK_REACTIVATION",
       cycleIndex,
-      variantId: rule.variantId,
-      variantTitle: rule.variantTitle,
+      variantId,
+      variantTitle,
     },
   });
 

@@ -139,21 +139,17 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     // numeric order ids are guessable. Without this binding any shopper
     // could write answers against another customer's order — poisoning that
     // contract's churn-risk features, predicted LTGP and the survey.answered
-    // Klaviyo event (which emails the VICTIM). Fail-closed, no anonymous
-    // exception: a token with no customer claim proves nothing about WHICH
-    // order it belongs to (Shopify's checkout session token is not
-    // order-scoped), so an attacker's own anonymous session could otherwise
-    // merge a poisoned answer into a stranger's already-created row, or
-    // (see getSurveyOrderStatus) read one back. A subscription checkout
-    // always carries a customer, so requiring one here costs a legitimate
-    // shopper nothing except a logged-out Order Status revisit no longer
-    // being able to add further answers — an acceptable degradation next to
-    // the alternative. linkSurveyForContract enforces the same identity at
-    // link time, so a row that slips through the race window still never
-    // reaches analytics.
-    if (!customerId) {
-      return cors(json({ ok: false, message: "not_your_order" }));
-    }
+    // Klaviyo event (which emails the VICTIM). Three rules, fail-closed:
+    //   1. a row already claimed by a different customer is never writable;
+    //   2. an order whose contract mirror names a different customer is
+    //      never writable (ownership is checked regardless of OURS/FOREIGN —
+    //      identity evidence is identity evidence);
+    //   3. a token with no customer (logged-out order-status revisit) may
+    //      only MERGE into an existing row, never create one — subscription
+    //      checkouts always have a customer, so the creating write on the
+    //      thank-you page always carries the sub claim.
+    // linkSurveyForContract enforces the same identity at link time, so a
+    // row that slips through the race window still never reaches analytics.
     const [existingRow, orderContract] = await Promise.all([
       prisma.surveyResponse.findUnique({
         where: { orderId: body.orderId },
@@ -164,10 +160,21 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         select: { customerId: true },
       }),
     ]);
-    if (existingRow?.customerId && existingRow.customerId !== customerId) {
+    if (
+      customerId &&
+      existingRow?.customerId &&
+      existingRow.customerId !== customerId
+    ) {
       return cors(json({ ok: false, message: "not_your_order" }));
     }
-    if (orderContract?.customerId && orderContract.customerId !== customerId) {
+    if (
+      customerId &&
+      orderContract?.customerId &&
+      orderContract.customerId !== customerId
+    ) {
+      return cors(json({ ok: false, message: "not_your_order" }));
+    }
+    if (!customerId && !existingRow) {
       return cors(json({ ok: false, message: "not_your_order" }));
     }
 

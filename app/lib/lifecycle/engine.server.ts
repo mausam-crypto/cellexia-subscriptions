@@ -1,11 +1,28 @@
-import type { SubscriptionContract } from "@prisma/client";
+import type { Shop, SubscriptionContract } from "@prisma/client";
 import prisma from "~/db.server";
 import { getPrimaryShop } from "~/lib/shop/install.server";
 import { logEvent } from "~/lib/events/log.server";
 import { getSetting } from "~/lib/settings/settings.server";
 import { addDaysTz } from "~/lib/dates.server";
 import { sendNotification } from "~/lib/notifications/index.server";
+import type { AdminClient } from "~/lib/graphql/client.server";
 import { OURS_ONLY, isBillableOwnership } from "~/lib/ownership/ownership.server";
+import { giftEmailLines } from "~/lib/gifts/emailLines.server";
+import { t } from "~/lib/i18n/i18n.server";
+
+// Shopify-touching dependencies stay LAZY: this module is imported by the
+// billing-success webhook path, and tests exercise it without a Shopify
+// session — the admin client, cycle reads and the picker are only pulled in
+// by the code paths that actually need them (grantRewardsGift, teaser gate).
+const shopifyDeps = async () => {
+  const [{ adminClientForShop }, { getBillingCycleByDate }, { pickGiftForContract }] =
+    await Promise.all([
+      import("~/shopify.server"),
+      import("~/lib/graphql/billingCycles.server"),
+      import("~/lib/gifts/picker.server"),
+    ]);
+  return { adminClientForShop, getBillingCycleByDate, pickGiftForContract };
+};
 
 /**
  * Lifecycle engine — milestones, early-cycle incentives and the day-N rewards
@@ -64,6 +81,23 @@ async function resolveContract(
   return prisma.subscriptionContract.findUnique({ where: { id } });
 }
 
+/**
+ * The full milestone sequence: the base milestoneGiftCycle plus every ladder
+ * rung after it, ascending and deduped. The goal-gradient hook must never
+ * exhaust — there is always a next rung (portal/growth.server.ts shows the
+ * countdown to it).
+ */
+export function milestoneCycles(lifecycle: {
+  milestoneGiftCycle: number;
+  milestoneLadder: number[];
+}): number[] {
+  const all = new Set<number>([
+    lifecycle.milestoneGiftCycle,
+    ...lifecycle.milestoneLadder,
+  ]);
+  return [...all].sort((a, b) => a - b);
+}
+
 // ── Successful-cycle hook ────────────────────────────────────────────────────
 
 export interface SuccessfulCycleResult {
@@ -100,14 +134,47 @@ export async function onSuccessfulCycle(
       email: contract.email,
     } as const;
 
-    // ── Milestone (e.g. order 6) ────────────────────────────────────────────
-    if (newOrdersCount === lifecycle.milestoneGiftCycle) {
+    // ── Milestone (base cycle, e.g. order 6, plus every ladder rung) ────────
+    if (milestoneCycles(lifecycle).includes(newOrdersCount)) {
       const already = await hasOrderCountEvent(
         contract.id,
         "lifecycle.milestone_reached",
         newOrdersCount,
       );
       if (!already) {
+        // Truth gate for the email copy: the gift sentence only renders when
+        // a gift actually rode along (the base cycle's ORDER_INDEX rule or a
+        // ladder grant — both created pre-charge by the gift engine). A
+        // milestone with no grant still gets its celebration email, just
+        // without promising a product that never shipped. Scoping: cycle 0
+        // excluded (the first-order gift is terminally ADDED there forever)
+        // and both legs are recency-bounded — the SHIPPED leg is the normal
+        // match (the settlement flip ran moments ago), the recent-ADDED leg
+        // is the missed-flip safety net.
+        const shippedSince = new Date(Date.now() - 3 * 86_400_000);
+        const milestoneGift = await prisma.giftGrant.findFirst({
+          where: {
+            contractId: contract.id,
+            cycleIndex: { gte: 1 },
+            OR: [
+              { status: "SHIPPED", shippedAt: { gte: shippedSince } },
+              { status: "ADDED", addedAt: { gte: shippedSince } },
+            ],
+          },
+          orderBy: { createdAt: "desc" },
+          include: { rule: true },
+        });
+        // The rule's title describes its FALLBACK variant — trust it only
+        // when the grant actually carries that variant. A dynamically picked
+        // grant gets the truthful generic sentence instead of naming a
+        // product that isn't in the box.
+        const giftTitle =
+          milestoneGift &&
+          milestoneGift.variantId === milestoneGift.rule?.variantId
+            ? (milestoneGift.rule?.variantTitle ??
+              milestoneGift.rule?.name ??
+              null)
+            : null;
         await logEvent({
           ...eventBase,
           type: "lifecycle.milestone_reached",
@@ -115,18 +182,36 @@ export async function onSuccessfulCycle(
           actor: "lifecycle_engine",
           payload: {
             ordersCount: newOrdersCount,
-            milestoneCycle: lifecycle.milestoneGiftCycle,
-            // The gift itself ships via the ORDER_INDEX GiftRule for this cycle.
+            milestoneCycle: newOrdersCount,
+            nextMilestoneCycle:
+              milestoneCycles(lifecycle).find((c) => c > newOrdersCount) ??
+              null,
+            // The gift itself ships via the ORDER_INDEX GiftRule (base) or
+            // the engine's ladder grant for this cycle.
             giftVia: "gift_rule_order_index",
+            giftGranted: milestoneGift != null,
           },
         });
+        // {gift_line} is the body's whole gift sentence — localized here,
+        // empty when nothing shipped, so the email can never promise a
+        // product the box doesn't carry.
+        const giftLine = milestoneGift
+          ? giftTitle
+            ? t(contract.locale, "email.milestone_gift.gift_line", {
+                gift_title: giftTitle,
+              })
+            : t(contract.locale, "email.milestone_gift.gift_line_generic")
+          : "";
         await sendNotification({
           shopId: contract.shopId,
           contractId: contract.id,
           template: "milestone_gift",
           vars: {
             cycleIndex: newOrdersCount,
-            milestone_cycle: lifecycle.milestoneGiftCycle,
+            milestone_cycle: newOrdersCount,
+            gift_line: giftLine,
+            ...(giftTitle ? { gift_title: giftTitle } : {}),
+            ...(milestoneGift ? { gift_granted: "true" } : {}),
           },
         });
         result.milestoneReached = true;
@@ -145,8 +230,35 @@ export async function onSuccessfulCycle(
       );
       if (!already) {
         const nextCycleIndex = newOrdersCount + 1;
-        const surpriseGiftComing =
+        // The teaser truth gate: "a surprise is coming in your next box" may
+        // only be said when the cycle-2 surprise will actually happen — the
+        // setting is on AND an active ORDER_INDEX=2 rule exists to produce
+        // the grant (the setting alone ships nothing; see
+        // suggestSurpriseGiftRule). Holdout-arm customers (gift2 experiment)
+        // get no grant, so they get no teaser either.
+        let surpriseGiftComing =
           lifecycle.surpriseGiftOnCycle2 && nextCycleIndex === 2;
+        if (surpriseGiftComing) {
+          const cycle2Rule = await prisma.giftRule.findFirst({
+            where: {
+              shopId: contract.shopId,
+              active: true,
+              trigger: "ORDER_INDEX",
+              orderIndex: 2,
+            },
+            select: { id: true },
+          });
+          surpriseGiftComing = cycle2Rule != null;
+        }
+        if (surpriseGiftComing) {
+          const { surpriseGiftArmFor } = await import(
+            "~/lib/experiments/index.server"
+          );
+          const arm = await surpriseGiftArmFor(contract);
+          surpriseGiftComing = arm !== "no_gift";
+        }
+        const nextMilestone =
+          milestoneCycles(lifecycle).find((c) => c > newOrdersCount) ?? null;
         await logEvent({
           ...eventBase,
           type: "lifecycle.incentive_announced",
@@ -158,13 +270,34 @@ export async function onSuccessfulCycle(
             nextCycleIndex,
             surpriseGiftComing,
             milestoneCycle: lifecycle.milestoneGiftCycle,
-            cyclesUntilMilestone: Math.max(
-              0,
-              lifecycle.milestoneGiftCycle - newOrdersCount,
-            ),
+            cyclesUntilMilestone:
+              nextMilestone == null
+                ? 0
+                : Math.max(0, nextMilestone - newOrdersCount),
             rewardsUnlockDay: lifecycle.rewardsUnlockDay,
           },
         });
+        // The teaser email itself (v1.24.0) — before this template existed
+        // the anticipation mechanic silently reached no one (the canonical
+        // event has no default flow). Deduped per teased cycle.
+        if (surpriseGiftComing) {
+          const { hasSentForCycle } = await import(
+            "~/lib/notifications/index.server"
+          );
+          const teased = await hasSentForCycle(
+            contract.id,
+            "gift_teaser",
+            nextCycleIndex,
+          );
+          if (!teased) {
+            await sendNotification({
+              shopId: contract.shopId,
+              contractId: contract.id,
+              template: "gift_teaser",
+              vars: { cycleIndex: nextCycleIndex },
+            });
+          }
+        }
         result.incentiveAnnounced = true;
       }
     }
@@ -225,8 +358,128 @@ async function rewardsLookbackDays(now: Date): Promise<number> {
 export interface RewardsUnlockStats {
   scanned: number;
   unlocked: number;
+  /** Rewards gifts granted alongside the unlock (rewardsGiftEnabled). */
+  giftsGranted: number;
   errors: number;
   skipped?: string;
+}
+
+interface RewardsGiftInfo {
+  /** Null on the crash-recovery reuse path (grant exists, pick data gone) —
+   * the email then celebrates without naming the product. */
+  title: string | null;
+  imageUrl: string | null;
+  retailCents: number | null;
+  cycleIndex: number;
+}
+
+/**
+ * The REAL reward behind "rewards unlocked" (v1.24.0): a dynamically picked
+ * free product on the customer's next cycle. Idempotent by the source-scoped
+ * grant (one REWARDS grant per contract, ever — the unlock itself fires
+ * once); a crash between grant and event re-enters here and reuses the
+ * existing grant. Returns null — and the caller's email then omits the
+ * product promise — when the pool yields nothing, the cycle is already
+ * gifted (gifts.maxGiftsPerCycle), or Shopify can't be read. Never throws.
+ */
+async function grantRewardsGift(
+  shop: Shop,
+  admin: AdminClient,
+  contract: SubscriptionContract,
+): Promise<RewardsGiftInfo | null> {
+  try {
+    const prior = await prisma.giftGrant.findFirst({
+      where: { contractId: contract.id, source: "REWARDS" },
+    });
+    if (prior) {
+      return {
+        title: null,
+        imageUrl: null,
+        retailCents: null,
+        cycleIndex: prior.cycleIndex,
+      };
+    }
+
+    const { getBillingCycleByDate, pickGiftForContract } = await shopifyDeps();
+
+    let cycleIndex = contract.ordersCount + 1;
+    if (contract.nextBillingDate) {
+      try {
+        const cycle = await getBillingCycleByDate(
+          admin,
+          contract.shopifyContractId,
+          contract.nextBillingDate,
+        );
+        if (cycle) cycleIndex = cycle.cycleIndex;
+      } catch (err) {
+        console.error(
+          "[lifecycle] rewards cycle read failed — ordersCount fallback",
+          contract.id,
+          err,
+        );
+      }
+    }
+
+    const gifts = await getSetting(shop.id, "gifts");
+    const onCycle = await prisma.giftGrant.findMany({
+      where: {
+        contractId: contract.id,
+        cycleIndex,
+        status: { in: ["SCHEDULED", "ADDED"] },
+      },
+      select: { variantId: true },
+    });
+    if (onCycle.length >= gifts.maxGiftsPerCycle) return null;
+
+    const pick = await pickGiftForContract({
+      shopId: shop.id,
+      admin,
+      contract,
+      excludeVariantIds: onCycle.map((g) => g.variantId),
+    });
+    if (!pick) return null;
+
+    const grant = await prisma.giftGrant.create({
+      data: {
+        contractId: contract.id,
+        ruleId: null,
+        cycleIndex,
+        variantId: pick.variantId,
+        status: "SCHEDULED",
+        unitCostCents: pick.unitCostCents,
+        source: "REWARDS",
+      },
+    });
+    await logEvent({
+      shopId: shop.id,
+      contractId: contract.id,
+      customerId: contract.customerId,
+      email: contract.email,
+      type: "lifecycle.gift_scheduled",
+      source: "SYSTEM",
+      actor: "lifecycle_engine",
+      payload: {
+        grantId: grant.id,
+        ruleId: null,
+        ruleName: "Rewards unlock gift",
+        trigger: "REWARDS_UNLOCK",
+        cycleIndex,
+        variantId: pick.variantId,
+        variantTitle: pick.label,
+        announceInAdvance: true,
+      },
+    });
+
+    return {
+      title: pick.label,
+      imageUrl: pick.imageUrl,
+      retailCents: pick.retailCents,
+      cycleIndex,
+    };
+  } catch (err) {
+    console.error("[lifecycle] rewards gift grant failed", contract.id, err);
+    return null;
+  }
 }
 
 /**
@@ -237,7 +490,12 @@ export interface RewardsUnlockStats {
  * keys off the event.
  */
 export async function runRewardsUnlock(now: Date): Promise<RewardsUnlockStats> {
-  const stats: RewardsUnlockStats = { scanned: 0, unlocked: 0, errors: 0 };
+  const stats: RewardsUnlockStats = {
+    scanned: 0,
+    unlocked: 0,
+    giftsGranted: 0,
+    errors: 0,
+  };
 
   const shop = await getPrimaryShop();
   if (!shop) {
@@ -246,6 +504,19 @@ export async function runRewardsUnlock(now: Date): Promise<RewardsUnlockStats> {
   }
   const tz = shop.ianaTimezone;
   const lifecycle = await getSetting(shop.id, "lifecycle");
+
+  // One admin client for the whole sweep — only needed when the unlock
+  // carries a real gift. A client failure downgrades the sweep to
+  // email-without-product, never blocks it.
+  let admin: AdminClient | null = null;
+  if (lifecycle.rewardsGiftEnabled) {
+    try {
+      const { adminClientForShop } = await shopifyDeps();
+      admin = await adminClientForShop(shop.domain);
+    } catch (err) {
+      console.error("[lifecycle] admin client for rewards gifts failed", err);
+    }
+  }
 
   // unlockAt = firstChargeAt + rewardsUnlockDay ∈ (now − lookback, now]
   //   ⇔ firstChargeAt ∈ (now − rewardsUnlockDay − lookback, now − rewardsUnlockDay]
@@ -272,6 +543,15 @@ export async function runRewardsUnlock(now: Date): Promise<RewardsUnlockStats> {
         ? addDaysTz(contract.firstChargeAt, lifecycle.rewardsUnlockDay, tz)
         : now;
 
+      // Grant the real reward BEFORE the event/email so both only ever
+      // describe a grant that exists — the unlock email's product sentence
+      // renders solely off these vars (truth gate).
+      let rewardGift: RewardsGiftInfo | null = null;
+      if (admin && lifecycle.rewardsGiftEnabled) {
+        rewardGift = await grantRewardsGift(shop, admin, contract);
+        if (rewardGift) stats.giftsGranted += 1;
+      }
+
       await logEvent({
         shopId: shop.id,
         contractId: contract.id,
@@ -285,13 +565,37 @@ export async function runRewardsUnlock(now: Date): Promise<RewardsUnlockStats> {
           unlockedAt: unlockAt.toISOString(),
           firstChargeAt: contract.firstChargeAt?.toISOString() ?? null,
           ordersCount: contract.ordersCount,
+          giftGranted: rewardGift != null,
+          giftTitle: rewardGift?.title ?? null,
         },
       });
+      // {gift_line}/{gift_image_line} are the body's gift slots — localized
+      // sentences when a reward grant exists, empty otherwise (truth gate).
+      const giftLine = rewardGift?.title
+        ? t(contract.locale, "email.rewards_unlocked.gift_line", {
+            gift_title: rewardGift.title,
+          })
+        : "";
+      const giftImageLine =
+        rewardGift?.title && rewardGift.imageUrl
+          ? giftEmailLines({
+              locale: contract.locale,
+              title: rewardGift.title,
+              imageUrl: rewardGift.imageUrl,
+            }).gift_image_line
+          : "";
       await sendNotification({
         shopId: shop.id,
         contractId: contract.id,
         template: "rewards_unlocked",
-        vars: { rewards_unlock_day: lifecycle.rewardsUnlockDay },
+        vars: {
+          rewards_unlock_day: lifecycle.rewardsUnlockDay,
+          gift_line: giftLine,
+          gift_image_line: giftImageLine,
+          ...(rewardGift?.title
+            ? { gift_title: rewardGift.title, gift_granted: "true" }
+            : {}),
+        },
       });
       stats.unlocked += 1;
     } catch (err) {

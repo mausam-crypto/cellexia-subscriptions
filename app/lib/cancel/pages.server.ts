@@ -376,6 +376,24 @@ ${postForm(
         options,
       );
     }
+    case "GIFT":
+      return card(
+        t(locale, "cancel.saves.gift.title"),
+        t(locale, "cancel.saves.gift.desc", {
+          giftTitle: offer.title,
+          retailPrice: formatMoney(offer.retailCents, offer.currencyCode, locale),
+        }),
+        `${
+          offer.imageUrl
+            ? `<img src="${esc(offer.imageUrl)}" alt="${esc(offer.title)}" style="display:block;max-width:160px;max-height:160px;border-radius:8px;margin:0 auto 12px" />`
+            : ""
+        }${postForm(
+          savesAction,
+          { intent: "accept_save", kind: "GIFT", _csrf: csrf },
+          t(locale, "cancel.saves.gift.cta"),
+          true,
+        )}`,
+      );
     case "EDUCATION":
       return card(
         t(locale, "cancel.saves.education.title"),

@@ -76,6 +76,16 @@ You do not need to build any flow by hand anymore. Open the app's
    Klaviyo on every visit — and daily by the alert scan, which raises
    `KLAVIYO_FLOW_COVERAGE` if a flow is ever deleted or paused.
 
+**Templates added by app updates join the same way.** When an update ships a
+new customer email — v1.24.0 added the gift teaser (metric
+`Cellexia Gift Teaser`) — the checklist simply shows one more missing flow on
+your next visit, and **Create my flows** creates just that one. Flows that
+already exist are never touched. The v1.24.0 *enrichment* of the existing
+gift emails (announcement, milestone, rewards unlocked, win-back perk — now
+carrying the actual product's photo, retail value and arrival date where the
+data exists) needs **no Klaviyo work at all**: your flows render the
+ready-made `content_html`, so the richer content flows through on its own.
+
 **The `cellexia_send` filter.** Every event the app emits carries this
 string property. The notifications router stamps `"true"` (it already
 applied every gate: launch mode, ownership, demo, channel toggles, the
@@ -184,6 +194,7 @@ properties; treat the rest as bonus context.
 | `Cellexia Payment Method Updated` | Card updated | snapshot |
 | `Cellexia Stockout Skip` | Cycle skipped due to stockout | snapshot |
 | `Cellexia Stockout Substitute` | Item substituted due to stockout | snapshot |
+| `Cellexia Gift Teaser` | After the first order's billing success, only when the cycle-2 surprise gift will actually happen — surprise setting on, an active order-2 gift rule, and the customer not in the gift2 holdout (v1.24.0) | snapshot, `cycleIndex` |
 
 Deduplication: identical metric + profile + contract enqueued twice within
 2 minutes collapses to one Klaviyo event, so the automatic state-change path
@@ -366,6 +377,13 @@ never suppressed, and ON for marketing-style touches (win-back, onboarding).
 - **Content:** "Stay subscribed — your next order includes a free X" using the
   event's gift/incentive properties. Filter `event.orders_count < 2` if you
   want to restrict strictly to the first two cycles.
+- Since v1.24.0 the tease itself is also a first-class app email: the
+  `Cellexia Gift Teaser` flow (auto-created by §0) delivers the app-rendered
+  "a surprise is coming" email after order 1, truth-gated — it only fires
+  when the cycle-2 surprise will actually happen (rule active, customer not
+  in the gift2 holdout). If you build a custom journey on
+  `Cellexia Incentive Announced` instead, branch on
+  `event.surpriseGiftComing` — it carries the same truth-gated verdict.
 
 ### 3.7 Milestones + Rewards Unlocked (day 90)
 
@@ -375,6 +393,14 @@ never suppressed, and ON for marketing-style touches (win-back, onboarding).
 - **Timing:** immediately.
 - **Content:** celebrate tenure ("90 days of consistency — skin loves
   routine"), present the unlocked perk, CTA to `{{ event.portal_url }}`.
+- Since v1.24.0 `Cellexia Milestone Reached` fires at **every** ladder rung
+  (base milestone, then `lifecycle.milestoneLadder` — 12, 18, 24 by default);
+  the payload carries `milestoneCycle` and `nextMilestoneCycle`, and
+  `giftGranted` says whether a gift actually rode along (the app's own email
+  only mentions a gift when it did — mirror that honesty in a custom flow).
+  `Cellexia Rewards Unlocked` now unlocks a real free product on the next
+  cycle (setting `lifecycle.rewardsGiftEnabled`): `giftGranted`/`giftTitle`
+  name it in the payload, and the app-rendered `content_html` already does.
 
 ### 3.8 Win-back series (cancelled subscribers)
 
@@ -384,7 +410,13 @@ owns the content:
 
 - **Trigger `Cellexia Winback Soft Touch`:** helpful, no offer. "How's your
   skin doing without it?" + routine tips. Buttons: `{{ event.portal_url }}`.
-- **Trigger `Cellexia Winback Perk`:** free-gift offer to restart.
+- **Trigger `Cellexia Winback Perk`:** free-gift offer to restart. Since
+  v1.24.0 this metric only fires when a gift is actually grantable (a dynamic
+  pick from the gift pool, or the order-2 rule as fallback) — otherwise the
+  app skips the stage silently (logging `winback.perk_skipped`) and the
+  discount touch still follows, so the flow can never promise a gift the
+  reactivation click cannot honor. The event names the actual product
+  (`giftTitle`), and the app-rendered content carries its photo and value.
 - **Trigger `Cellexia Winback Discount`:** capped discount (percent in event
   properties), clearly framed as final.
 - **Exit condition on all three:** `Cellexia Winback Reactivated` or

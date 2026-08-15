@@ -20,7 +20,7 @@ Subscriptions) unless a shell command is shown.
    90-day MRR trend, the 12-week new-vs-churned chart, the forecast teaser
    (with its accuracy grade chip) and the top open failed payments.
 2. **Debug** — the self-check verdict chip should read **Healthy**. The same
-   37 checks re-run automatically every 30 minutes (`selfcheck_run`, also in
+   38 checks re-run automatically every 30 minutes (`selfcheck_run`, also in
    setup mode); a **Broken** verdict raises one CRITICAL `SELF_CHECK_FAILED`
    alert (emailed to Settings → alerts → `emailTo`) and every failing row on
    the page carries a named fix. The alert auto-resolves when a later run
@@ -29,7 +29,10 @@ Subscriptions) unless a shell command is shown.
    Klaviyo key against Klaviyo, every email template with your overrides
    applied, renewal readiness, ladder coherence, job locks, stored-secret
    decryption, flow coverage and event provenance — the shapes that only
-   break on the deployed store.
+   break on the deployed store. v1.24.0 adds `gift_promises`, which WARNs
+   when your lifecycle/cancel settings promise gifts that no active rule or
+   stocked pool backs (see §21) — the engines suppress such sends silently,
+   so this check is where a promise-to-no-one becomes visible.
 3. **Alerts** — unresolved alerts (`BILLING_RUN_FAILED`, `WEBHOOK_FAILURES`,
    `ORIGIN_BACKFILL_FAILURES`, `STUCK_CONTRACTS`, `FAILURE_SPIKE`,
    `CHURN_SPIKE`, `FAST_SHIPPING_SKIPS`, `STOCKOUT_RENEWALS`,
@@ -39,6 +42,8 @@ Subscriptions) unless a shell command is shown.
    alerts → `emailTo`. `FOREIGN_CONTRACTS` (severity WARNING, raised while any
    contract on the store belongs to another subscription app or is still
    unattributed) is informational — see §18; it is not an incident.
+   `GIFT_POOL_EXHAUSTED` (severity INFO, v1.24.0) means a gift pick had to
+   repeat a previous gift — add pool products, see §21; also not an incident.
 4. **Dunning** — open cases, sorted by next retry. Sanity-check the queue size
    against yesterday (see §5).
 5. **Audit** — skim the event stream for anything unusual (bursts of
@@ -122,6 +127,14 @@ Meaning: `STUCK_CONTRACTS` alert — contracts past `nextBillingDate` by more th
   page" instead of re-opening a paid case.
 - Never retry a **HARD** decline manually (stolen/invalid card) — the engine
   won't either; the customer must update the card.
+- **Pausing is the off-ramp, and it freezes the whole dunning clock**
+  (v1.24.0): the second and third ladder emails carry a one-tap "pause
+  instead" link (the same signed pause link the bundle always had), and the
+  sweep skips PAUSED contracts in *both* the retry and the exhaustion phase —
+  a customer who took the soft landing is never retried and never flipped to
+  FAILED while paused. The case simply parks; on resume the window continues
+  from where it stood. Expect a few long-open cases on paused contracts in
+  the queue — that is the feature, not a stuck case.
 
 ## 6. Issuing refunds
 
@@ -249,11 +262,11 @@ scheduler liveness (last job tick); it returns non-200 when a subsystem is down.
 
 The admin **Debug** page is the wide companion to this endpoint: where
 `/api/health` answers "is the process alive" for an external monitor, the
-Debug self-check probes 28 feature-level facts on the live store (billing
+Debug self-check probes 38 feature-level facts on the live store (billing
 pipeline shapes, dunning cases, the portal fetched through the real app
 proxy, webhook delivery evidence, granted API scopes, secrets, Klaviyo
-outbox, settings integrity) every 30 minutes and emails on a broken verdict
-via the `SELF_CHECK_FAILED` alert. Use `/api/health` for paging, the Debug
+outbox, settings integrity, gift-promise configuration) every 30 minutes and
+emails on a broken verdict via the `SELF_CHECK_FAILED` alert. Use `/api/health` for paging, the Debug
 page for diagnosis.
 
 UptimeRobot setup: **Add monitor** → type *HTTP(s)* → URL
@@ -1041,3 +1054,104 @@ previewed** checklist item: **Open anyway** and the fail-open path open the
 tab but leave the item unticked (the audit event carries
 `checklistPreviewedStorefront: false`) — preview again once the diagnosis
 passes to tick it.
+
+## 21. Runbook — the gift pool, pairings and gift settings
+
+<a name="21-runbook--gift-pool"></a>
+
+Since v1.24.0 the **Gifts** page holds two things: the gift *rules* (as
+before) and the **gift pool & pairings** cards that power dynamic selection —
+the picker that resolves *which* product a gift carries, per customer, at
+grant time (why:
+[OFFER_PLAYBOOK.md §2](./OFFER_PLAYBOOK.md#2-gift-instead-of-discount--the-cogs-vs-perceived-value-math)).
+
+**Setting up the pool.** Gifts page → gift pool card: add every product you
+are willing to give away (aim for most of the catalog — the pool is what
+keeps long-tenure subscribers discovering something new), and enter each
+one's real **COGS** on its row (0 means "use Shopify's cost-per-item at pick
+time"). Keep per-product costs on **Plans → Costs & margins** set as well —
+that is the analytics fallback for grants without a rule. Deleted variants
+and retired products drop out of the pool silently; nothing to clean up.
+
+**Pairings.** The same card maps each *subscribed* product to a ranked list
+of gifts ("serum subscribers most likely want the night cream") — the
+strongest ranking signal, ahead of survey answers and pool order. The
+survey-pairings card does the same per survey answer (e.g.
+`motive:prevention`). Both are optional; an empty map just means the pool
+order decides.
+
+**Making a rule dynamic.** Edit a gift rule → **Gift selection** → "Dynamic —
+pick the best product per customer". The rule's own product becomes the
+fallback: it is granted whenever the picker comes up empty (empty pool,
+Shopify read failure, nothing giftable), so a dynamic rule never grants less
+than a fixed one. Keep a real product on the rule for exactly that reason.
+
+**The milestone ladder and the day-90 reward.** Settings → Lifecycle:
+`milestoneLadder` (default `12, 18, 24`) fires the milestone email plus a
+dynamically picked, announced gift at every rung after the base milestone —
+the portal counts down to the *next* rung, so the countdown never runs out;
+rungs must be strictly increasing. `rewardsGiftEnabled` (on by default) makes
+the day-90 "rewards unlocked" email carry a real free product on the next
+cycle; switched off, the email still sends but no longer promises a product
+(the copy's gift sentence only renders when a grant exists). Anniversary
+rules have a **Repeats annually** toggle — on, the rule fires at every
+multiple of its days-subscribed value instead of once.
+
+**The `GIFT_POOL_EXHAUSTED` alert** (INFO) means a pick had to repeat a
+previously gifted product because the pool held nothing new for at least one
+customer. Nothing is broken — a repeat was shipped rather than a promise
+broken — but the fix is to add more products to the pool.
+
+**"Winback perk skipped" in the audit log** (`winback.perk_skipped`): the
+win-back perk email promises a free gift on reactivation, so since v1.24.0 it
+only sends when a gift is actually grantable — a dynamic pick from the pool,
+or the order-2 surprise rule as fallback. With neither, the stage skips
+silently (the discount touch still follows on schedule) and logs this event.
+Seeing it regularly means the pool is empty and no order-2 rule exists:
+stock the pool.
+
+**The `gift_promises` self-check** (Debug page) is the standing watchdog for
+all of the above: it WARNs when the cycle-2 surprise is on with no
+`ORDER_INDEX=2` rule, when no rule backs the milestone email's gift, when no
+anniversary rule exists, or when the pool is empty while dynamic rules, the
+day-90 reward, the gift save or the ladder depend on it.
+
+## 22. Runbook — experiments
+
+<a name="22-runbook--experiments"></a>
+
+The **Experiments** page (v1.24.0) lists the app's built-in experiments:
+`gift2_holdout` (cycle-2 surprise gift, **on by default**), `final_offer_depth`
+and `winback_discount_depth` (both off). Definitions — arms, allocation,
+decision points — live in code; the page only starts/stops them and shows the
+readout. Full rationale:
+[OFFER_PLAYBOOK.md §8](./OFFER_PLAYBOOK.md#experiments).
+
+**How assignment works** (what to tell yourself when a customer asks): the arm
+is a deterministic hash of the experiment and the customer's email — the same
+customer always lands in the same arm, on every contract they ever hold, and
+the arm is frozen the first time treatment actually diverges (an
+`ExperimentAssignment` row; `experiment.exposed` on the audit page). Enabling
+or stopping an experiment never reshuffles anyone already exposed. Stopped or
+disabled experiments resolve everyone to the control arm.
+
+**Reading the page.** Each experiment shows a per-arm scoreboard (exposed,
+still subscribed, cancelled, reached order 3, average lifetime revenue) and a
+sample-size grade: **too early** (under 30 exposures in the smallest arm —
+noise, full stop), **direction only** (under 200), **usable**. The scoreboard
+is the quick look; the honest final judgment is cohort LTGP on the Analytics
+tab, exactly as for every other lever. Do not ship a decision on a
+*too early* or *direction only* grade.
+
+**Do not stop `gift2_holdout`.** Its 12.5% no-gift arm is the only control
+group the cycle-2 gift will ever have — it must run from subscriber #1,
+because a holdout added later has no untreated customers left to compare
+against. Stopping it (everyone gets the gift again) is safe for customers but
+spends the measurement; only do it once the readout has answered the question.
+
+**Starting a depth experiment.** Toggle it on; the start timestamp is
+recorded and the readout windows on it. The settings value
+(`cancelFlow.finalOfferPct` / `winback.discountPct`) stays your control arm —
+the experiment overlays the test value at the decision point only, and the
+discount stacking cap still applies afterwards. Change the underlying setting
+mid-experiment and you have changed the control arm mid-flight: don't.

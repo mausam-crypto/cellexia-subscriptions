@@ -69,7 +69,40 @@ vi.mock("~/lib/shop/install.server", () => ({
 }));
 vi.mock("~/lib/events/log.server", () => ({ logEvent: mocks.logEvent }));
 vi.mock("~/lib/settings/settings.server", () => ({
-  getSetting: vi.fn(async (): Promise<unknown> => ({})),
+  getSetting: vi.fn(
+    async (_shopId: string, key: string): Promise<unknown> => {
+      // v1.24.0: the engine reads these two keys right after loading rules.
+      if (key === "gifts") {
+        return { pool: [], pairings: {}, surveyPairings: {}, maxGiftsPerCycle: 1 };
+      }
+      if (key === "lifecycle") {
+        return {
+          surpriseGiftOnCycle2: true,
+          milestoneGiftCycle: 6,
+          anniversaryGiftDays: 365,
+          rewardsUnlockDay: 90,
+          earlyCycleIncentivesEnabled: true,
+          // Ladder rungs stay clear of targetOrderNumber (5) so the
+          // dynamic-ladder branch never fires in these tests.
+          milestoneLadder: [12, 18, 24],
+          rewardsGiftEnabled: true,
+        };
+      }
+      return {};
+    },
+  ),
+}));
+// v1.24.0 dynamic-gift deps: null pick = fall back to the rule's fixed
+// variant (the pre-1.24 behavior these tests pin).
+vi.mock("~/lib/gifts/picker.server", () => ({
+  pickGiftForContract: vi.fn(async (): Promise<unknown> => null),
+}));
+vi.mock("~/lib/experiments/index.server", () => ({
+  surpriseGiftArmFor: vi.fn(async (): Promise<string> => "gift"),
+  settingOverride: vi.fn(
+    async (o: { current: unknown }): Promise<unknown> => o.current,
+  ),
+  assignedArm: vi.fn(async (): Promise<string> => "control"),
 }));
 vi.mock("~/lib/notifications/index.server", () => ({
   hasSentForCycle: vi.fn(async (): Promise<boolean> => false),

@@ -33,7 +33,9 @@ import { z } from "zod";
 import prisma from "~/db.server";
 import { authenticate } from "~/shopify.server";
 import { getPrimaryShop } from "~/lib/shop/install.server";
-import { getSetting } from "~/lib/settings/settings.server";
+import { getSetting, setSetting } from "~/lib/settings/settings.server";
+import { settingsSchemas, type SettingsValue } from "~/lib/settings/registry.server";
+import { SURVEY_QUESTIONS } from "~/lib/survey/shared";
 import { logEvent } from "~/lib/events/log.server";
 import { centsFromDecimalString, formatMoney } from "~/lib/money";
 import { searchProducts } from "~/lib/graphql/index.server";
@@ -60,6 +62,8 @@ interface RuleView {
   unitCostCents: number;
   announceInAdvance: boolean;
   active: boolean;
+  selection: string;
+  repeatsAnnually: boolean;
 }
 
 interface GrantView {
@@ -131,6 +135,10 @@ const ruleSchema = z
       .max(10_000_000, "COGS looks too large"),
     announceInAdvance: z.boolean(),
     active: z.boolean(),
+    // DYNAMIC rules pick the gift per customer from the pool; variantId
+    // stays required as the fallback (and the whole story for FIXED).
+    selection: z.enum(["FIXED", "DYNAMIC"]),
+    repeatsAnnually: z.boolean(),
   })
   .superRefine((value, ctx) => {
     if (value.trigger === "ORDER_INDEX" && value.orderIndex == null) {
@@ -171,7 +179,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     throw new Response("App is not installed on any shop", { status: 503 });
   }
 
-  const [rules, grants, lifecycle] = await Promise.all([
+  const [rules, grants, lifecycle, gifts] = await Promise.all([
     prisma.giftRule.findMany({
       where: { shopId: shop.id },
       orderBy: { createdAt: "asc" },
@@ -186,6 +194,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       },
     }),
     getSetting(shop.id, "lifecycle"),
+    getSetting(shop.id, "gifts"),
   ]);
 
   const ruleViews: RuleView[] = rules.map((rule) => ({
@@ -199,6 +208,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     unitCostCents: rule.unitCostCents,
     announceInAdvance: rule.announceInAdvance,
     active: rule.active,
+    selection: rule.selection,
+    repeatsAnnually: rule.repeatsAnnually,
   }));
 
   const grantViews: GrantView[] = grants.map((grant) => ({
@@ -218,7 +229,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       surpriseGiftOnCycle2: lifecycle.surpriseGiftOnCycle2,
       milestoneGiftCycle: lifecycle.milestoneGiftCycle,
       anniversaryGiftDays: lifecycle.anniversaryGiftDays,
+      milestoneLadder: lifecycle.milestoneLadder,
     },
+    gifts,
   });
 };
 
@@ -278,6 +291,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       unitCostCents: Number.isNaN(unitCostCents) ? -1 : unitCostCents,
       announceInAdvance: formData.get("announceInAdvance") === "true",
       active: formData.get("active") === "true",
+      selection:
+        String(formData.get("selection") ?? "FIXED") === "DYNAMIC"
+          ? "DYNAMIC"
+          : "FIXED",
+      repeatsAnnually: formData.get("repeatsAnnually") === "true",
     };
     const parsed = ruleSchema.safeParse(candidate);
     if (!parsed.success) {
@@ -309,6 +327,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       unitCostCents: values.unitCostCents,
       announceInAdvance: values.announceInAdvance,
       active: values.active,
+      selection: values.selection,
+      // Anniversary repeats only make sense on DAYS_SUBSCRIBED rules.
+      repeatsAnnually:
+        values.trigger === "DAYS_SUBSCRIBED" ? values.repeatsAnnually : false,
     };
 
     let saved;
@@ -411,6 +433,50 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       ok: true,
       toast: "Gift rule deleted — past grants are kept for the audit trail",
     });
+  }
+
+  if (intent === "save-gifts-config") {
+    // The pool/pairings editors post the whole gifts settings object as one
+    // JSON payload; the registry schema is the validator (GID shapes, cost
+    // bounds, record keys), so a malformed post can never corrupt the
+    // stored value.
+    let candidate: unknown;
+    try {
+      candidate = JSON.parse(String(formData.get("config") ?? ""));
+    } catch {
+      return json<ActionData>(
+        { intent, ok: false, toast: "Invalid gift configuration payload" },
+        { status: 422 },
+      );
+    }
+    const parsed = settingsSchemas.gifts.safeParse(candidate);
+    if (!parsed.success) {
+      return json<ActionData>(
+        {
+          intent,
+          ok: false,
+          toast: `Gift configuration rejected: ${parsed.error.issues[0]?.message ?? "invalid"}`,
+        },
+        { status: 422 },
+      );
+    }
+    const previous = await getSetting(shop.id, "gifts");
+    await setSetting(shop.id, "gifts", parsed.data, actor);
+    await logEvent({
+      shopId: shop.id,
+      type: "admin.action",
+      source: "ADMIN",
+      actor,
+      payload: {
+        action: "gifts_config_updated",
+        poolSize: parsed.data.pool.length,
+        pairingProducts: Object.keys(parsed.data.pairings).length,
+        surveyPairingKeys: Object.keys(parsed.data.surveyPairings).length,
+        maxGiftsPerCycle: parsed.data.maxGiftsPerCycle,
+        previousPoolSize: previous.pool.length,
+      },
+    });
+    return json<ActionData>({ intent, ok: true, toast: "Gift pool saved" });
   }
 
   return json<ActionData>(
@@ -587,6 +653,10 @@ function RuleFormModal({
   );
   const [announce, setAnnounce] = useState(rule?.announceInAdvance ?? false);
   const [active, setActive] = useState(rule?.active ?? true);
+  const [selection, setSelection] = useState<string>(rule?.selection ?? "FIXED");
+  const [repeatsAnnually, setRepeatsAnnually] = useState(
+    rule?.repeatsAnnually ?? false,
+  );
 
   const handleSave = () => {
     const fd = new FormData();
@@ -604,6 +674,8 @@ function RuleFormModal({
     fd.set("unitCost", unitCost);
     fd.set("announceInAdvance", String(announce));
     fd.set("active", String(active));
+    fd.set("selection", selection);
+    fd.set("repeatsAnnually", String(repeatsAnnually));
     onSave(fd);
   };
 
@@ -662,6 +734,27 @@ function RuleFormModal({
               helpText="e.g. 365 for a one-year anniversary gift."
             />
           ) : null}
+          {trigger === "DAYS_SUBSCRIBED" ? (
+            <Checkbox
+              label="Repeat every anniversary"
+              checked={repeatsAnnually}
+              onChange={setRepeatsAnnually}
+              helpText="Fires at every multiple (365, 730, 1095…) instead of once — long-tenure subscribers always have a next anniversary."
+            />
+          ) : null}
+          <Select
+            label="Gift selection"
+            options={[
+              { label: "Fixed — always this product", value: "FIXED" },
+              {
+                label: "Dynamic — pick the best product per customer",
+                value: "DYNAMIC",
+              },
+            ]}
+            value={selection}
+            onChange={setSelection}
+            helpText="Dynamic picks from the gift pool below: always something the customer doesn't already have, ranked by your pairings. The product picked here becomes the fallback."
+          />
           <GiftVariantPicker
             currencyCode={currencyCode}
             selectedId={variantId}
@@ -701,6 +794,354 @@ function RuleFormModal({
   );
 }
 
+// ── Gift pool & pairings ─────────────────────────────────────────────────────
+
+type GiftsConfig = SettingsValue<"gifts">;
+
+/**
+ * Ordered multi-pick over the pool: click an unselected gift to append it
+ * (rank = click order, shown as a number), click a selected one to remove
+ * it. Deliberately tiny — the pool is ~10 products.
+ */
+function RankedGiftPicker({
+  pool,
+  selected,
+  onChange,
+}: {
+  pool: GiftsConfig["pool"];
+  selected: string[];
+  onChange: (next: string[]) => void;
+}) {
+  return (
+    <InlineStack gap="150" wrap>
+      {pool.map((entry) => {
+        const rank = selected.indexOf(entry.variantId);
+        const label = entry.variantTitle ?? entry.variantId;
+        return (
+          <Button
+            key={entry.variantId}
+            size="slim"
+            pressed={rank >= 0}
+            onClick={() =>
+              onChange(
+                rank >= 0
+                  ? selected.filter((v) => v !== entry.variantId)
+                  : [...selected, entry.variantId],
+              )
+            }
+          >
+            {rank >= 0 ? `${rank + 1}. ${label}` : label}
+          </Button>
+        );
+      })}
+    </InlineStack>
+  );
+}
+
+function GiftPoolCard({
+  gifts,
+  currencyCode,
+  saving,
+  onSave,
+}: {
+  gifts: GiftsConfig;
+  currencyCode: string;
+  saving: boolean;
+  onSave: (next: GiftsConfig) => void;
+}) {
+  const [pool, setPool] = useState<GiftsConfig["pool"]>(gifts.pool);
+  const [pairings, setPairings] = useState<Record<string, string[]>>(
+    Object.fromEntries(
+      Object.entries(gifts.pairings).map(([k, v]) => [k, [...v]]),
+    ),
+  );
+  const [surveyPairings, setSurveyPairings] = useState<Record<string, string[]>>(
+    Object.fromEntries(
+      Object.entries(gifts.surveyPairings).map(([k, v]) => [k, [...v]]),
+    ),
+  );
+  const [pairingProducts, setPairingProducts] = useState<
+    Array<{ id: string; title: string }>
+  >(
+    Object.keys(gifts.pairings).map((id) => ({ id, title: id })),
+  );
+  const [costDrafts, setCostDrafts] = useState<Record<string, string>>(
+    Object.fromEntries(
+      gifts.pool.map((p) => [
+        p.variantId,
+        p.unitCostCents > 0 ? (p.unitCostCents / 100).toFixed(2) : "",
+      ]),
+    ),
+  );
+
+  const addPoolEntry = (variantId: string, label: string) => {
+    if (pool.some((p) => p.variantId === variantId)) return;
+    setPool([...pool, { variantId, variantTitle: label, unitCostCents: 0 }]);
+  };
+  const removePoolEntry = (variantId: string) => {
+    setPool(pool.filter((p) => p.variantId !== variantId));
+    setPairings(
+      Object.fromEntries(
+        Object.entries(pairings).map(([k, v]) => [
+          k,
+          v.filter((x) => x !== variantId),
+        ]),
+      ),
+    );
+    setSurveyPairings(
+      Object.fromEntries(
+        Object.entries(surveyPairings).map(([k, v]) => [
+          k,
+          v.filter((x) => x !== variantId),
+        ]),
+      ),
+    );
+  };
+
+  const handleSave = () => {
+    const nextPool = pool.map((p) => {
+      const draft = (costDrafts[p.variantId] ?? "").trim();
+      const cents = draft === "" ? 0 : centsFromDecimalString(draft);
+      return {
+        ...p,
+        unitCostCents: Number.isNaN(cents) || cents < 0 ? 0 : cents,
+      };
+    });
+    const clean = (rec: Record<string, string[]>): Record<string, string[]> =>
+      Object.fromEntries(
+        Object.entries(rec).filter(([, v]) => v.length > 0),
+      );
+    onSave({
+      pool: nextPool,
+      pairings: clean(pairings),
+      surveyPairings: clean(surveyPairings),
+      maxGiftsPerCycle: gifts.maxGiftsPerCycle,
+    });
+  };
+
+  const motiveQuestion = SURVEY_QUESTIONS.find((q) => q.key === "motive");
+
+  return (
+    <Card>
+      <BlockStack gap="400">
+        <BlockStack gap="100">
+          <Text as="h2" variant="headingMd">
+            Gift pool — dynamic picking
+          </Text>
+          <Text as="p" tone="subdued" variant="bodySm">
+            Products the picker may give as gifts. Dynamic rules, the
+            cancel-flow gift save, the win-back perk, milestone-ladder rungs
+            and the day-90 reward all choose from this pool — always a product
+            the customer doesn't already have. Cost left at 0 uses Shopify's
+            cost per item.
+          </Text>
+        </BlockStack>
+        <Divider />
+        {pool.length === 0 ? (
+          <Text as="p" tone="subdued">
+            The pool is empty — dynamic picks fall back to each rule's fixed
+            product, and pool-dependent gifts (cancel save, day-90 reward,
+            ladder) quietly stand down.
+          </Text>
+        ) : (
+          <BlockStack gap="200">
+            {pool.map((entry) => (
+              <InlineStack key={entry.variantId} gap="300" blockAlign="center" wrap>
+                <Box minWidth="240px">
+                  <Text as="span" fontWeight="medium">
+                    {entry.variantTitle ?? entry.variantId}
+                  </Text>
+                </Box>
+                <Box maxWidth="160px">
+                  <TextField
+                    label="COGS"
+                    labelHidden
+                    autoComplete="off"
+                    type="number"
+                    min={0}
+                    step={0.01}
+                    prefix={currencyCode}
+                    placeholder="Shopify cost"
+                    value={costDrafts[entry.variantId] ?? ""}
+                    onChange={(v) =>
+                      setCostDrafts({ ...costDrafts, [entry.variantId]: v })
+                    }
+                  />
+                </Box>
+                <Button
+                  size="slim"
+                  tone="critical"
+                  variant="tertiary"
+                  onClick={() => removePoolEntry(entry.variantId)}
+                >
+                  Remove
+                </Button>
+              </InlineStack>
+            ))}
+          </BlockStack>
+        )}
+        <GiftVariantPicker
+          currencyCode={currencyCode}
+          selectedId={null}
+          selectedLabel={null}
+          onSelect={addPoolEntry}
+          onClear={() => {}}
+        />
+        <Divider />
+        <BlockStack gap="200">
+          <BlockStack gap="100">
+            <Text as="h3" variant="headingSm">
+              Pairings — what goes best with what they already get
+            </Text>
+            <Text as="p" tone="subdued" variant="bodySm">
+              For a subscribed product, rank the gifts that pair with it (1 =
+              best). The strongest ranking signal the picker has.
+            </Text>
+          </BlockStack>
+          {pairingProducts.map((product) => (
+            <BlockStack gap="100" key={product.id}>
+              <InlineStack gap="200" blockAlign="center">
+                <Text as="span" fontWeight="medium">
+                  {product.title === product.id
+                    ? `Product ${product.id.split("/").pop()}`
+                    : product.title}
+                </Text>
+                <Button
+                  size="micro"
+                  tone="critical"
+                  variant="tertiary"
+                  onClick={() => {
+                    setPairingProducts(
+                      pairingProducts.filter((x) => x.id !== product.id),
+                    );
+                    const next = { ...pairings };
+                    delete next[product.id];
+                    setPairings(next);
+                  }}
+                >
+                  Remove
+                </Button>
+              </InlineStack>
+              <RankedGiftPicker
+                pool={pool}
+                selected={pairings[product.id] ?? []}
+                onChange={(next) =>
+                  setPairings({ ...pairings, [product.id]: next })
+                }
+              />
+            </BlockStack>
+          ))}
+          <PairingProductAdder
+            existing={pairingProducts.map((x) => x.id)}
+            onAdd={(id, title) => {
+              setPairingProducts([...pairingProducts, { id, title }]);
+              if (!pairings[id]) setPairings({ ...pairings, [id]: [] });
+            }}
+          />
+        </BlockStack>
+        <Divider />
+        {motiveQuestion ? (
+          <BlockStack gap="200">
+            <BlockStack gap="100">
+              <Text as="h3" variant="headingSm">
+                Survey tiebreaker — match gifts to what customers came for
+              </Text>
+              <Text as="p" tone="subdued" variant="bodySm">
+                When pairings tie, the post-purchase survey's "what brings you
+                here" answer breaks it. Optional.
+              </Text>
+            </BlockStack>
+            {motiveQuestion.options.map((option) => (
+              <BlockStack gap="100" key={option}>
+                <Text as="span" fontWeight="medium">
+                  {option.replaceAll("_", " ")}
+                </Text>
+                <RankedGiftPicker
+                  pool={pool}
+                  selected={surveyPairings[`motive:${option}`] ?? []}
+                  onChange={(next) =>
+                    setSurveyPairings({
+                      ...surveyPairings,
+                      [`motive:${option}`]: next,
+                    })
+                  }
+                />
+              </BlockStack>
+            ))}
+          </BlockStack>
+        ) : null}
+        <InlineStack align="end">
+          <Button variant="primary" loading={saving} onClick={handleSave}>
+            Save gift pool
+          </Button>
+        </InlineStack>
+      </BlockStack>
+    </Card>
+  );
+}
+
+/** Product (not variant) search for pairing keys. */
+function PairingProductAdder({
+  existing,
+  onAdd,
+}: {
+  existing: string[];
+  onAdd: (productId: string, title: string) => void;
+}) {
+  const fetcher = useFetcher<ActionData>();
+  const [query, setQuery] = useState("");
+
+  useEffect(() => {
+    const q = query.trim();
+    if (q.length < 2) return;
+    const handle = setTimeout(() => {
+      fetcher.submit(
+        { intent: "search-products", query: q },
+        { method: "post" },
+      );
+    }, 350);
+    return () => clearTimeout(handle);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query]);
+
+  const results = (fetcher.data?.searchResults ?? []).filter(
+    (product) => !existing.includes(product.id),
+  );
+
+  return (
+    <BlockStack gap="200">
+      <TextField
+        label="Add a subscribed product"
+        autoComplete="off"
+        value={query}
+        onChange={setQuery}
+        placeholder="Search your products…"
+        loading={fetcher.state !== "idle"}
+      />
+      {results.length > 0 && query.trim().length >= 2 ? (
+        <Box borderColor="border" borderWidth="025" borderRadius="200" padding="150">
+          <BlockStack gap="100">
+            {results.map((product) => (
+              <Button
+                key={product.id}
+                variant="tertiary"
+                textAlign="left"
+                fullWidth
+                onClick={() => {
+                  onAdd(product.id, product.title);
+                  setQuery("");
+                }}
+              >
+                {product.title}
+              </Button>
+            ))}
+          </BlockStack>
+        </Box>
+      ) : null}
+    </BlockStack>
+  );
+}
+
 // ── Page ─────────────────────────────────────────────────────────────────────
 
 function grantBadgeTone(
@@ -721,7 +1162,7 @@ function grantBadgeTone(
 }
 
 export default function GiftsPage() {
-  const { currencyCode, rules, grants, lifecycle } =
+  const { currencyCode, rules, grants, lifecycle, gifts } =
     useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const shopify = useAppBridge();
@@ -821,7 +1262,9 @@ export default function GiftsPage() {
       {rule.name}
     </Text>,
     triggerHuman(rule),
-    rule.variantTitle ?? rule.variantId,
+    rule.selection === "DYNAMIC"
+      ? `Dynamic (fallback: ${rule.variantTitle ?? rule.variantId})`
+      : (rule.variantTitle ?? rule.variantId),
     formatMoney(rule.unitCostCents, currencyCode),
     rule.announceInAdvance ? "Announced" : "Surprise",
     <Checkbox
@@ -988,6 +1431,22 @@ export default function GiftsPage() {
                 )}
               </BlockStack>
             </Card>
+
+            <GiftPoolCard
+              key={JSON.stringify(gifts)}
+              gifts={gifts}
+              currencyCode={currencyCode}
+              saving={busy && navIntent === "save-gifts-config"}
+              onSave={(next) =>
+                submit(
+                  {
+                    intent: "save-gifts-config",
+                    config: JSON.stringify(next),
+                  },
+                  { method: "post" },
+                )
+              }
+            />
           </BlockStack>
         </Layout.Section>
       </Layout>

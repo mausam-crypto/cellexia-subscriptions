@@ -97,6 +97,8 @@ interface CancelFlowValues {
   frequencySuggestDeltaWeeks: number;
   pauseSuggestMonths: number;
   sessionFreshMinutes: number;
+  giftSaveEnabled: boolean;
+  giftSaveCooldownDays: number;
 }
 
 interface ActionData {
@@ -310,7 +312,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       const raw = String(formData.get(name) ?? "").trim();
       return raw === "" ? Number.NaN : Number(raw);
     };
+    // Spread the stored value first: fields this form doesn't render (and
+    // any future additions) must carry through the wholesale setSetting
+    // write instead of being silently reset to their zod defaults.
+    const previous = await getSetting(shop.id, "cancelFlow");
     const candidate = {
+      ...previous,
       enabled: formData.get("enabled") === "true",
       finalOfferPct: intField("finalOfferPct"),
       finalOfferCycles: intField("finalOfferCycles"),
@@ -322,6 +329,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       frequencySuggestDeltaWeeks: intField("frequencySuggestDeltaWeeks"),
       pauseSuggestMonths: intField("pauseSuggestMonths"),
       sessionFreshMinutes: intField("sessionFreshMinutes"),
+      giftSaveEnabled: formData.get("giftSaveEnabled") === "true",
+      giftSaveCooldownDays: intField("giftSaveCooldownDays"),
     };
     const parsed = settingsSchemas.cancelFlow.safeParse(candidate);
     if (!parsed.success) {
@@ -466,6 +475,12 @@ export default function CancelFlowPage() {
   const [sessionFresh, setSessionFresh] = useState(
     String(initial.sessionFreshMinutes),
   );
+  const [giftSaveEnabled, setGiftSaveEnabled] = useState(
+    initial.giftSaveEnabled,
+  );
+  const [giftSaveCooldown, setGiftSaveCooldown] = useState(
+    String(initial.giftSaveCooldownDays),
+  );
 
   useEffect(() => {
     if (!actionData) return;
@@ -498,6 +513,8 @@ export default function CancelFlowPage() {
         frequencySuggestDeltaWeeks: freqDelta,
         pauseSuggestMonths: pauseMonths,
         sessionFreshMinutes: sessionFresh,
+        giftSaveEnabled: String(giftSaveEnabled),
+        giftSaveCooldownDays: giftSaveCooldown,
       },
       { method: "post" },
     );
@@ -630,6 +647,31 @@ export default function CancelFlowPage() {
                       onChange={setReasonCooldown}
                       error={errors.reasonOfferCooldownDays}
                       helpText="The step-3 discount can only be taken once per this many days — re-walking the flow every couple of cycles must not farm a permanent discount. 0 disables the cooldown."
+                    />
+                  </Box>
+                </InlineStack>
+                <Divider />
+                <Text as="h3" variant="headingSm">
+                  Gift save
+                </Text>
+                <InlineStack gap="400" wrap blockAlign="start">
+                  <Checkbox
+                    label="Offer a free product as a save"
+                    checked={giftSaveEnabled}
+                    onChange={setGiftSaveEnabled}
+                    helpText="A dynamically picked product from the gift pool (Gifts page) — costs COGS instead of face-value margin, for non-price cancel reasons."
+                  />
+                  <Box minWidth="200px">
+                    <TextField
+                      label="Gift-save cooldown (days)"
+                      autoComplete="off"
+                      type="number"
+                      min={0}
+                      max={720}
+                      value={giftSaveCooldown}
+                      onChange={setGiftSaveCooldown}
+                      error={errors.giftSaveCooldownDays}
+                      helpText="Per customer, across all their contracts — cancelling and re-subscribing must not farm free products."
                     />
                   </Box>
                 </InlineStack>

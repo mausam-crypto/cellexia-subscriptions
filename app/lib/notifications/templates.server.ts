@@ -33,6 +33,13 @@ export interface NotificationTemplate {
   i18nKey: string;
   /** Critical mail is also sent via direct SMTP (and OTP is SMTP-only). */
   critical: boolean;
+  /**
+   * i18n key for the default CTA button label (v1.24.0). Falls back to
+   * email.cta.manage — the button must read in the CUSTOMER's language, so
+   * callers stopped needing to pass cta_label at all. A caller-provided
+   * vars.cta_label still wins.
+   */
+  ctaLabelKey?: string;
 }
 
 export const TEMPLATES = {
@@ -131,18 +138,21 @@ export const TEMPLATES = {
     klaviyoMetric: "Cellexia Payment Failed",
     i18nKey: "email.payment_failed_1",
     critical: false,
+    ctaLabelKey: "email.cta.update_card",
   },
   payment_failed_2: {
     channel: "EMAIL",
     klaviyoMetric: "Cellexia Payment Failed",
     i18nKey: "email.payment_failed_2",
     critical: false,
+    ctaLabelKey: "email.cta.update_card",
   },
   payment_failed_3: {
     channel: "EMAIL",
     klaviyoMetric: "Cellexia Payment Failed",
     i18nKey: "email.payment_failed_3",
     critical: false,
+    ctaLabelKey: "email.cta.update_card",
   },
   payment_failed_sms: {
     channel: "SMS",
@@ -155,17 +165,25 @@ export const TEMPLATES = {
     klaviyoMetric: "Cellexia Card Expiring",
     i18nKey: "email.card_expiring",
     critical: false,
+    ctaLabelKey: "email.cta.update_card",
   },
   threeds_action: {
     channel: "EMAIL",
     klaviyoMetric: "Cellexia 3DS Action Required",
     i18nKey: "email.threeds_action",
     critical: true,
+    ctaLabelKey: "email.cta.confirm_payment",
   },
   gift_announcement: {
     channel: "EMAIL",
     klaviyoMetric: "Cellexia Gift Scheduled",
     i18nKey: "email.gift_announcement",
+    critical: false,
+  },
+  gift_teaser: {
+    channel: "EMAIL",
+    klaviyoMetric: "Cellexia Gift Teaser",
+    i18nKey: "email.gift_teaser",
     critical: false,
   },
   milestone_gift: {
@@ -185,18 +203,21 @@ export const TEMPLATES = {
     klaviyoMetric: "Cellexia Winback Soft Touch",
     i18nKey: "email.winback_soft",
     critical: false,
+    ctaLabelKey: "email.cta.reactivate",
   },
   winback_perk: {
     channel: "EMAIL",
     klaviyoMetric: "Cellexia Winback Perk",
     i18nKey: "email.winback_perk",
     critical: false,
+    ctaLabelKey: "email.cta.reactivate",
   },
   winback_discount: {
     channel: "EMAIL",
     klaviyoMetric: "Cellexia Winback Discount",
     i18nKey: "email.winback_discount",
     critical: false,
+    ctaLabelKey: "email.cta.reactivate",
   },
   price_change_notice: {
     channel: "EMAIL",
@@ -338,10 +359,20 @@ export function renderEmail(
   }
 
   const ctaUrl = typeof vars.cta_url === "string" ? vars.cta_url : undefined;
+  // Button label: caller override → the template's localized intent label
+  // (update my card / confirm my payment / restart my subscription) → the
+  // localized generic manage label → English as the very last resort.
+  // Widen: the `as const` union only carries ctaLabelKey on entries that set
+  // it; the interface says it is optional everywhere.
+  const ctaLabelKey =
+    (def as NotificationTemplate).ctaLabelKey ?? "email.cta.manage";
+  const localizedCta = t(locale, ctaLabelKey);
   const ctaLabel =
     typeof vars.cta_label === "string" && vars.cta_label
       ? vars.cta_label
-      : "Manage subscription";
+      : localizedCta !== ctaLabelKey
+        ? localizedCta
+        : "Manage subscription";
 
   const body = formatEmailBody(bodyText, { design, ctaUrl, ctaLabel });
 

@@ -61,6 +61,23 @@ prefer the gift. Configure on the **Gifts** page (`GiftRule`: trigger by order
 index, days subscribed, save flow or win-back; `unitCostCents` feeds the LTGP
 math so analytics stay honest).
 
+**The dynamic pool (v1.24.0) — never gift what they already have.** A fixed
+gift variant eventually lands on a product the customer already receives, and
+a duplicate reads as zero generosity at full COGS (worse: it pays them to skip
+the next box). Set a gift rule's selection to **Dynamic** and the app picks
+the gift per customer at grant time from the **gift pool** (Gifts page):
+always a product on *none* of their contracts and a variant they were never
+gifted before — identity is the customer, across all their contracts — ranked
+by your pairings map ("whoever gets the serum most likely wants the night
+cream"), then their survey answers (motive), then pool order. The pick is
+deterministic (no randomness — same customer, same pick, auditable months
+later). When the pool holds nothing new for a long-tenure customer the app
+repeats the gift given longest ago and tells you via the `GIFT_POOL_EXHAUSTED`
+alert — the fix is more pool products, and a repeat still beats a broken
+promise. Give each pool product its real COGS on the Gifts page (stamped onto
+every grant) and keep a fixed fallback variant on the rule — the picker
+degrades to it, never to nothing.
+
 ## 3. Per-SKU cadence = the real empty date
 
 Arbitrary monthly billing is the silent churn machine: ship faster than the
@@ -118,14 +135,24 @@ default schedule (settings key `lifecycle`, rules on the Gifts page):
 
 | Moment | Lever | Why |
 |---|---|---|
-| Cycle 2 | **Unannounced** surprise gift in the box | Reciprocity exactly at the highest-risk charge; unannounced so it can't be gamed and reads as generosity, not payment |
+| After order 1 | **Gift teaser** email — "a surprise is coming in your next box", never what it is (v1.24.0) | Anticipation exactly at the highest-churn charge, without spoiling the surprise; truth-gated — it only sends when the surprise will actually happen |
+| Cycle 2 | **Unannounced** surprise gift in the box | Reciprocity exactly at the highest-risk charge; unannounced so it can't be gamed and reads as generosity, not payment. A standing 12.5% holdout (`gift2_holdout`, §8) is what will eventually prove the survival delta against gift COGS |
 | Cycles 1–2 | Early-cycle education nudges (usage, results timeline) | "Not seeing results" is a knowledge problem before it's a product problem |
 | Cycle 6 | Milestone gift — **announced in advance** ("your 6th box comes with X") | A pre-announced reward creates a forward-looking reason to survive cycles 4–5 |
-| Day 90 | "Rewards unlocked" perk | A retention milestone dressed as a perk |
-| Day 365 | Anniversary gift | Celebrates the habit; feeds referral/word of mouth |
+| Orders 12, 18, 24 | **Milestone ladder** (v1.24.0, `lifecycle.milestoneLadder`) — a dynamically picked gift at every rung, announced | The goal-gradient must never exhaust: past order 6 there is always a *next* rung, and the portal counts down to it |
+| Day 90 | "Rewards unlocked" — now carrying a **real** free product on the next cycle (v1.24.0, `lifecycle.rewardsGiftEnabled`) | A retention milestone dressed as a perk — and since the perk is a dynamically picked product, the email names something concrete instead of vibes |
+| Day 365 | Anniversary gift — repeating every year (v1.24.0, `repeatsAnnually` on the rule) | Celebrates the habit; feeds referral/word of mouth — and year 2 deserves it as much as year 1 |
 
 Principle: **spend the retention budget early and in COGS, not late and in
 percent** (§2).
+
+Every gift moment above picks its product per customer (§2's dynamic pool) and
+every gift email is **truth-gated** (v1.24.0): the teaser only sends when the
+cycle-2 grant will really happen, the milestone email only mentions a gift
+when a grant actually rode along, and the rewards email only names a product
+when one was granted. The `gift_promises` self-check (Debug page) warns when a
+setting promises what no active rule or stocked pool backs — a promise
+silently suppressed for everyone should surface somewhere.
 
 ## 6. Save-offer ladder — ethics and the FTC click-to-cancel rule
 
@@ -140,7 +167,15 @@ to solve the customer's actual problem, not to trap them:
   own 90-day cooldown (`cancelFlow.reasonOfferCooldownDays`, v1.5.0) so the
   step-3 save can't be farmed by re-walking the flow each time a grant
   exhausts.
-- Not seeing results → education + routine check, optional gift.
+- Not seeing results → education + routine check, then a **free different
+  product** (the GIFT save, v1.24.0).
+- Trying something else → the GIFT save leads: "trying something else" *is* a
+  variety request, and a free different product answers it exactly — at COGS,
+  not face-value margin (§2). The save is dynamically picked (always something
+  they don't have), shown with its photo and retail value, granted on the next
+  cycle, and gated by its own per-customer cooldown
+  (`cancelFlow.giftSaveCooldownDays`, default 180 days) so re-walking the flow
+  can't farm free products. It also backs "Other" (after the pause offer).
 - The **final offer** (25% × 2 cycles) is strictly **opt-in** (v1.5.0): it
   renders only when the customer taps "See my final offer" on the saves or
   confirm page — it is never auto-inserted into the decline path — and it is
@@ -148,6 +183,10 @@ to solve the customer's actual problem, not to trap them:
   just the current session. A repeatable or auto-pushed final offer trains
   cancel-threat behaviour and turns your best retention tool into a coupon
   dispenser.
+- All the anti-farming clocks — the reason-offer cooldown, the final-offer
+  cooldown and the gift-save cooldown — are enforced **per customer** across
+  every contract on their email (v1.24.0), so cancel-and-resubscribe on a
+  fresh contract no longer resets them.
 
 Every behavior knob of the flow is a **setting**, not code: offer depths and
 cooldowns, how many saves are shown (`cancelFlow.maxSavesShown`), the
@@ -201,9 +240,38 @@ percentage-of-price estimate (flagged); fees and per-parcel costs from
 the page tells you when they are partly estimated. Judge *every* lever in this
 document on cohort LTGP at months 3/6/12, never on one cycle's revenue.
 
-## 8. A/B ideas backlog
+## 8. Experiments — the built-in ones, and the ideas backlog
+
+<a name="experiments"></a>
+
+Since v1.24.0 the app runs real experiments (admin → **Experiments**):
+deterministic customer-level arms — the same customer always lands in the same
+arm, frozen the moment their treatment actually diverges, so a later
+allocation change never reshuffles anyone — with a per-arm scoreboard and an
+honest sample-size grade per experiment. Three are built in:
+
+- **Cycle-2 surprise gift** (`gift2_holdout`, **on by default**): a standing
+  12.5% no-gift arm — those customers get neither the cycle-2 grant nor the
+  teaser — so the cycle-2→3 survival delta can be measured against gift COGS
+  months from now. It must exist from subscriber #1: a holdout can never be
+  added after the fact, because every early subscriber would already have been
+  treated. **Leave it on**; stopping it spends your only control group.
+- **Final-offer depth** (`final_offer_depth`, off by default): 25% vs 20% —
+  does the shallower offer save nearly as many cancels at a fifth less margin
+  per save? The settings value stays your control; the experiment overlays the
+  test arm at the decision point.
+- **Win-back discount depth** (`winback_discount_depth`, off by default): 20%
+  vs 15%, same mechanics — returning customers may respond to the invitation
+  more than the number.
 
 Run one at a time; judge on take-rate × cycle-3 survival × LTGP, not clicks.
+The scoreboard is direction; **cohort LTGP (§7) is the verdict**; and the
+grade chip (*too early* / *direction only* / *usable*) says when the sample is
+big enough to mean anything — a single store takes months to reach *usable*,
+and that is the honest answer, not a bug.
+
+Still backlog (no experiment wiring yet — test by changing one setting for a
+full traffic cycle, §9 methodology):
 
 1. **Buy-box preselect on/off** (`preselectSubscription`) — preselect lifts take
    rate; verify it doesn't lift early involuntary churn (accidental subs).
@@ -213,13 +281,12 @@ Run one at a time; judge on take-rate × cycle-3 survival × LTGP, not clicks.
    on low-priced SKUs percent reads bigger; on bundles absolute £ reads bigger.
 4. **Gift vs extra % on first order** (`firstOrderGiftVariantId` vs deeper
    first-order discount) — the §2 math predicts gift wins on LTGP; prove it.
-5. **Cycle-2 surprise gift on/off** by cohort — measure the cycle-2→3 survival
-   delta against gift COGS.
-6. **Final-offer depth** 20% vs 25% vs a gift-based final offer.
-7. **Win-back discount stage timing** (offset from predicted empty date ±1 week).
-8. **Reassurance copy** on/off ("Skip, pause or cancel anytime") — it usually
+5. **A gift-based final offer** (vs the discount depths the built-in
+   experiment already covers).
+6. **Win-back discount stage timing** (offset from predicted empty date ±1 week).
+7. **Reassurance copy** on/off ("Skip, pause or cancel anytime") — it usually
    *raises* take rate; confirm it doesn't raise early cancels.
-9. **Channel quality, not just channel cost** (needs cohort age): every
+8. **Channel quality, not just channel cost** (needs cohort age): every
    subscriber since v1.5.0 carries sanitized acquisition data — source, UTM,
    geo, device, first-order shape
    ([DATA_FOUNDATION.md](./DATA_FOUNDATION.md)). Once cohorts mature, judge
@@ -413,7 +480,8 @@ cohort LTGP.
 
 Fifteen minutes, once a week, same order every time. Everything below is on
 the **Analytics** page (mechanics of each number:
-[OPERATIONS.md §19](./OPERATIONS.md#19-analytics)).
+[OPERATIONS.md §19](./OPERATIONS.md#19-analytics)), plus one stop on the
+**Experiments** page at the end.
 
 **0. Preconditions — make the numbers real first.**
 
@@ -474,6 +542,13 @@ week's per-model error is recorded and Auto weighs recent recorded weeks,
 so its pick keeps getting better calibrated to your store on its own; the
 backtest table shows why Auto picked what it picked. Overriding it manually
 throws that accumulated evidence away.
+
+**6. Experiments** (Experiments page, v1.24.0) — read each experiment's
+**grade chip first**, exactly like the forecast's: *too early* and *direction
+only* mean exactly that, and only a *usable* grade plus a cohort-LTGP
+confirmation (§7) justifies shipping a change. Do not stop `gift2_holdout`
+because one week's scoreboard looks lopsided — the holdout *is* the
+measurement (§8), and small-arm noise is the expected state for months.
 
 Judge levers on **cohort LTGP at M3/M6/M12** (§7) — the weekly funnel numbers
 are the steering wheel, not the destination.

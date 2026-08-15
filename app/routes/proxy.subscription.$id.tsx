@@ -803,6 +803,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const milestoneAway = milestoneRemaining(
     contract.ordersCount,
     lifecycle.milestoneGiftCycle,
+    lifecycle.milestoneLadder,
   );
   const skipConsequenceDate =
     isActive && contract.nextBillingDate

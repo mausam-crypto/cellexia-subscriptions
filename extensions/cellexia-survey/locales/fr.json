@@ -1,12 +1,12 @@
 {
-  "introTitle": "Aidez-nous à bien préparer vos livraisons",
+  "introTitle": "Quatre questions rapides",
   "progress": "Question {{current}} sur {{total}} — une seule pression",
   "doneTitle": "Merci !",
-  "doneBody": "Nous adapterons vos livraisons et nos conseils beauté à vos réponses.",
+  "doneBody": "Vos réponses servent à tout personnaliser pour vous.",
   "q": {
     "plannedDuration": {
-      "title": "Pour mieux planifier — comment envisagez-vous d'utiliser ce produit ?",
-      "trying": "Je l'essaie — je verrai après la première livraison",
+      "title": "Comment envisagez-vous d'utiliser ce produit ?",
+      "trying": "Je l'essaie — je verrai bien comment ça se passe",
       "few_months": "Quelques mois — le temps de juger les vrais résultats",
       "six_months_plus": "Six mois ou plus",
       "permanent": "Ce type de produit fait partie intégrante de ma routine"

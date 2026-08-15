@@ -103,12 +103,33 @@ const SAMPLE_BY_TEMPLATE: Partial<Record<TemplateKey, TemplateVars>> = {
     cta_url: "https://example.com/confirm-payment",
     cta_label: "Confirm payment",
   },
-  gift_announcement: { gift_title: "Cellexia Travel Set", rule_name: "Loyalty gift" },
-  milestone_gift: { milestone_cycle: 6 },
-  rewards_unlocked: { rewards_unlock_day: 90 },
+  gift_announcement: {
+    gift_title: "Cellexia Travel Set",
+    rule_name: "Loyalty gift",
+    gift_image_line: "[image:Cellexia Travel Set](https://example.com/travel-set.jpg)",
+    gift_worth_line: "A €39 product — yours free.",
+    gift_date_line: "It arrives with your delivery on 12 September 2026.",
+  },
+  gift_teaser: {},
+  milestone_gift: {
+    milestone_cycle: 6,
+    gift_line: "To say thank you, this delivery includes a free Cellexia Night Cream — on us.",
+  },
+  rewards_unlocked: {
+    rewards_unlock_day: 90,
+    gift_line: "To celebrate, a free Cellexia Renewal Serum rides along in your next delivery.",
+    gift_image_line: "[image:Cellexia Renewal Serum](https://example.com/serum.jpg)",
+  },
   winback_soft: { predicted_empty_date: "2026-09-20" },
-  winback_perk: { gift: "true" },
-  winback_discount: { discount_pct: 20, discount_cycles: 2 },
+  winback_perk: {
+    cta_url: "https://example.com/restart",
+    gift: "true",
+    gift_title: "Cellexia Night Cream",
+    gift_image_line: "[image:Cellexia Night Cream](https://example.com/night-cream.jpg)",
+    gift_worth_line: "A €42 product — yours free.",
+  },
+  winback_discount: {
+    cta_url: "https://example.com/restart", discount_pct: 20, discount_cycles: 2 },
   price_change_notice: {
     product_title: "Cellexia Renewal Serum",
     old_price: "CHF 64.00",

@@ -1910,6 +1910,80 @@ const CHECKS: CheckDef[] = [
       return { status: "PASS", detail: "No open alerts." };
     },
   },
+  {
+    key: "gift_promises",
+    label: "Gift emails backed by real gifts",
+    category: "Notifications",
+    remediation:
+      "Open the Gifts page and align each promise with a rule (or the gift pool): every email that mentions a gift must have machinery behind it.",
+    run: async (ctx) => {
+      // The v1.24.0 truth rule: an email may only promise what a grant will
+      // ship. The engines gate their sends at runtime; this check surfaces
+      // the CONFIGURATION drift behind those silent gates, so a promise
+      // quietly suppressed for everyone shows up here instead of nowhere.
+      const [lifecycle, cancelFlow, gifts] = await Promise.all([
+        getSetting(ctx.shop.id, "lifecycle"),
+        getSetting(ctx.shop.id, "cancelFlow"),
+        getSetting(ctx.shop.id, "gifts"),
+      ]);
+      const rules = await prisma.giftRule.findMany({
+        where: { shopId: ctx.shop.id, active: true },
+        select: {
+          trigger: true,
+          orderIndex: true,
+          daysSubscribed: true,
+          selection: true,
+        },
+      });
+      const hasOrderRule = (index: number): boolean =>
+        rules.some((r) => r.trigger === "ORDER_INDEX" && r.orderIndex === index);
+      const hasAnniversaryRule = rules.some(
+        (r) => r.trigger === "DAYS_SUBSCRIBED",
+      );
+      const poolEmpty = gifts.pool.length === 0;
+
+      const warnings: string[] = [];
+      if (lifecycle.surpriseGiftOnCycle2 && !hasOrderRule(2)) {
+        warnings.push(
+          "the cycle-2 surprise is on but no ORDER_INDEX=2 rule exists (no gift ships, no teaser sends)",
+        );
+      }
+      if (!hasOrderRule(lifecycle.milestoneGiftCycle)) {
+        warnings.push(
+          `no ORDER_INDEX=${lifecycle.milestoneGiftCycle} rule backs the milestone email's gift (it will send without its gift sentence)`,
+        );
+      }
+      if (!hasAnniversaryRule) {
+        warnings.push(
+          "no DAYS_SUBSCRIBED rule exists — anniversary gifts never ship",
+        );
+      }
+      if (poolEmpty) {
+        const needers: string[] = [];
+        if (rules.some((r) => r.selection === "DYNAMIC")) {
+          needers.push("dynamic gift rules");
+        }
+        if (lifecycle.rewardsGiftEnabled) needers.push("the day-90 reward");
+        if (cancelFlow.giftSaveEnabled) needers.push("the cancel-flow gift save");
+        if (lifecycle.milestoneLadder.length > 0) {
+          needers.push("milestone-ladder gifts");
+        }
+        if (needers.length > 0) {
+          warnings.push(
+            `the gift pool is empty but ${needers.join(", ")} depend(s) on it (each falls back or quietly skips)`,
+          );
+        }
+      }
+      if (warnings.length > 0) {
+        return { status: "WARN", detail: `${warnings.join("; ")}.` };
+      }
+      return {
+        status: "PASS",
+        detail:
+          "Every configured gift promise has an active rule or a stocked pool behind it.",
+      };
+    },
+  },
 ];
 
 /** Stable copy for tests and the Debug page's "what is covered" rendering. */

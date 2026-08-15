@@ -1,12 +1,12 @@
 {
-  "introTitle": "Help us get your deliveries right",
+  "introTitle": "Four quick questions",
   "progress": "Question {{current}} of {{total}} — one tap each",
   "doneTitle": "Thank you!",
-  "doneBody": "We'll use this to tailor your deliveries and skincare tips to you.",
+  "doneBody": "Your answers help tailor everything to you.",
   "q": {
     "plannedDuration": {
-      "title": "So we can plan ahead — how do you see yourself using this?",
-      "trying": "Trying it out — I'll see how the first delivery goes",
+      "title": "How do you see yourself using this?",
+      "trying": "Trying it out — I'll see how it goes",
       "few_months": "A few months — enough to judge real results",
       "six_months_plus": "Six months or more",
       "permanent": "This kind of product is a permanent part of my routine"

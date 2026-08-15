@@ -640,6 +640,29 @@ model SubscriberEvent {
   @@index([email])
 }
 
+// Subscriber-tag ledger (migration 0023, v1.23.0): the tag this app last
+// applied to a Shopify customer via the `tagging` setting group. A row exists
+// only for customers the tagger has actually written to Shopify for — it is
+// what makes the reconcile passes cheap (no Shopify round trip when the
+// recorded state already matches the desired one), what a rename needs to
+// remove the OLD tag value, and the proof that a removal is taking back OUR
+// tag rather than one the merchant typed by hand (no row + no live contract
+// = never touch the customer). Written only AFTER the Shopify mutation
+// succeeded, so a failed write self-heals on the next reconcile.
+model CustomerTagState {
+  id         String   @id @default(cuid())
+  shopId     String
+  customerId String // gid://shopify/Customer/...
+  // Whether the subscriber tag is currently applied (as far as this app knows).
+  tagged     Boolean
+  // The exact tag value last applied — tagsRemove needs the byte-exact string.
+  tagValue   String
+  updatedAt  DateTime @updatedAt
+  createdAt  DateTime @default(now())
+
+  @@unique([shopId, customerId])
+}
+
 // ── Magic links, OTP, portal sessions ─────────────────────────────────────────
 
 model MagicLinkToken {
@@ -697,9 +720,18 @@ model GiftRule {
   trigger           String // ORDER_INDEX | DAYS_SUBSCRIBED | SAVE_FLOW | WINBACK | MANUAL
   orderIndex        Int? // e.g. 1 (first renewal surprise), 2, 6
   daysSubscribed    Int? // e.g. 365 for 1-year milestone
-  variantId         String // the gift variant (zero-priced line)
+  variantId         String // the gift variant (zero-priced line); for DYNAMIC rules, the FALLBACK variant
   variantTitle      String?
   unitCostCents     Int      @default(0) // COGS — feeds LTGP math
+  // FIXED | DYNAMIC (migration 0024). DYNAMIC rules resolve the variant per
+  // contract at grant time via the gift picker (gifts.pool setting); variantId
+  // stays NOT NULL as the picker's fallback so a rolled-back release — which
+  // ignores this column — still grants a real product, never a null.
+  selection         String   @default("FIXED")
+  // DAYS_SUBSCRIBED rules only (migration 0024): fire at every anniversary
+  // multiple of daysSubscribed (365, 730, ...) instead of once. Older code
+  // ignores it and keeps the fire-once behavior — additive-safe.
+  repeatsAnnually   Boolean  @default(false)
   announceInAdvance Boolean  @default(false) // "stay subscribed and get X" emails
   active            Boolean  @default(true)
   createdAt         DateTime @default(now())
@@ -732,6 +764,15 @@ model GiftGrant {
   // Null on grants that shipped before 0016 (status alone said SHIPPED but
   // not when, and lost it on REMOVED).
   shippedAt  DateTime?
+  // COGS stamped at grant time for dynamically picked gifts (migration 0024),
+  // where the rule's unitCostCents describes the fallback variant, not the
+  // picked one. Analytics read grant.unitCostCents → rule.unitCostCents →
+  // per-variant cost override → 0. Null on FIXED-rule and pre-0024 grants.
+  unitCostCents Int?
+  // Producer label (migration 0024): RULE | LADDER | FIRST_ORDER | SAVE_FLOW
+  // | WINBACK | REWARDS | MANUAL. Lets analytics split gift spend by origin;
+  // null on pre-0024 grants (origin recoverable from ruleId/cycle 0 only).
+  source     String?
   createdAt  DateTime        @default(now())
 
   contract SubscriptionContract @relation(fields: [contractId], references: [id], onDelete: Cascade)
@@ -1130,4 +1171,34 @@ model SurveyResponse {
 
   @@index([shopId, answeredAt])
   @@index([contractId])
+}
+
+// ── Experiments ───────────────────────────────────────────────────────────────
+
+// One row per (shop, experiment, customer): the frozen record that this
+// customer was EXPOSED to an experiment decision and which arm they were in
+// when it happened (migration 0024). The arm itself is a pure sha256 hash of
+// (experimentKey, unit) — deterministic and recomputable, like the survey
+// holdout — so this table is not the assignment authority; it is the exposure
+// ledger that freezes the arm AT DECISION TIME, so a later allocation change
+// can never silently reshuffle customers whose treatment already diverged.
+// Readouts resolve arms → contract sets exclusively through these rows.
+//
+// unit is the lowercased customer email: offers and gifts are per-person
+// decisions (a customer with two contracts must never be their own control),
+// and cooldowns learned the same lesson. contractId is the contract that
+// triggered first exposure — a convenience pointer for readouts, deliberately
+// no FK (mirrors CustomerTagState): the row must survive contract deletion.
+model ExperimentAssignment {
+  id             String    @id @default(cuid())
+  shopId         String
+  experimentKey  String
+  unit           String // lowercased customer email
+  arm            String
+  contractId     String?
+  firstExposedAt DateTime  @default(now())
+  createdAt      DateTime  @default(now())
+
+  @@unique([shopId, experimentKey, unit])
+  @@index([shopId, experimentKey, arm])
 }

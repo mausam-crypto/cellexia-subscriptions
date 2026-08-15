@@ -70,10 +70,14 @@ const mocks = vi.hoisted(() => ({
     if (key === "lifecycle") {
       return {
         milestoneGiftCycle: 6,
+        milestoneLadder: [12, 18, 24],
         earlyCycleIncentivesEnabled: true,
         surpriseGiftOnCycle2: true,
         rewardsUnlockDay: 30,
       };
+    }
+    if (key === "gifts") {
+      return { pool: [], pairings: {}, surveyPairings: {}, maxGiftsPerCycle: 1 };
     }
     if (key === "winback") return { enabled: true, softTouchOffsetDays: 7 };
     return {};
@@ -526,6 +530,7 @@ const OWNERSHIP_FILTERED_QUERIES: Array<[string, string]> = [
   ["app/lib/launch/launch.server.ts", "go-live overdue stagger"],
   ["app/routes/api.sms.inbound.tsx", "inbound SMS keyword lookup"],
   ["app/routes/app.subscribers.$id.tsx", "admin support cockpit"],
+  ["app/lib/tagging/tags.server.ts", "subscriber/order Shopify tagging"],
 ];
 
 describe("ownership filters are present in every gating query", () => {
@@ -830,6 +835,8 @@ describe("migration 0003 backfills fail-SAFE and stays additive", () => {
       "0020_survey_predicted_ltgp",
       "0021_survey_emitted_marker",
       "0022_billing_attempt_created_at",
+      "0023_customer_tag_state",
+      "0024_dynamic_gifts_experiments",
     ]);
   });
 });
@@ -1609,6 +1616,94 @@ describe("migration 0022 (billing attempt createdAt) stays additive and leaves o
     expect(sql).not.toMatch(/ownership/i);
     // SET DEFAULT (altering an EXISTING column's default) stays banned; the
     // new column's own inline DEFAULT above is not that.
+    expect(sql).not.toMatch(/ALTER\s+COLUMN[^;]*SET DEFAULT/i);
+  });
+});
+
+describe("migration 0023 (customer tag state) stays additive and leaves ownership alone", () => {
+  const sql = read("prisma/migrations/0023_customer_tag_state/migration.sql")
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("is additive only — no destructive verb anywhere in it", () => {
+    for (const verb of [
+      /\bDROP\b/i,
+      /\bTRUNCATE\b/i,
+      /\bDELETE\s+FROM\b/i,
+      /\bUPDATE\s+"/i,
+      /\bRENAME\b/i,
+      /\bALTER\s+TYPE\b/i,
+      /\bALTER\s+COLUMN\s+"\w+"\s+TYPE\b/i,
+    ]) {
+      expect(sql, String(verb)).not.toMatch(verb);
+    }
+  });
+
+  it("creates exactly one brand-new table (invisible to the previous release) and no ALTERs", () => {
+    const creates = sql.match(/CREATE TABLE [^;]+;/g) ?? [];
+    expect(creates).toHaveLength(1);
+    expect(creates[0]).toContain('CREATE TABLE "CustomerTagState"');
+    expect(sql).not.toMatch(/\bALTER\s+TABLE\b/i);
+  });
+
+  it("never touches the ownership column", () => {
+    expect(sql).not.toMatch(/ownership/i);
+  });
+});
+
+describe("migration 0024 (dynamic gifts + experiments) stays additive and leaves ownership alone", () => {
+  const sql = read(
+    "prisma/migrations/0024_dynamic_gifts_experiments/migration.sql",
+  )
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("is additive only — no destructive verb anywhere in it", () => {
+    for (const verb of [
+      /\bDROP\b/i,
+      /\bTRUNCATE\b/i,
+      /\bDELETE\s+FROM\b/i,
+      /\bUPDATE\s+"/i,
+      /\bRENAME\b/i,
+      /\bALTER\s+TYPE\b/i,
+      /\bALTER\s+COLUMN\s+"\w+"\s+TYPE\b/i,
+    ]) {
+      expect(sql, String(verb)).not.toMatch(verb);
+    }
+  });
+
+  it("adds exactly the four gift columns — defaults/null ARE the pre-0024 behavior", () => {
+    // FIXED selection and fire-once (repeatsAnnually false) are exactly what
+    // every pre-upgrade rule did, so v1.23 code runs unchanged against this
+    // schema; the two GiftGrant columns are nullable on purpose (null = cost
+    // not captured / legacy producer), never a fabricated fact stamped onto
+    // existing grants.
+    const adds = sql.match(/ADD COLUMN [^,;]+/g) ?? [];
+    expect(adds).toHaveLength(4);
+    expect(sql).toMatch(
+      /ALTER TABLE "GiftRule" ADD COLUMN "selection" TEXT NOT NULL DEFAULT 'FIXED';/,
+    );
+    expect(sql).toMatch(
+      /ALTER TABLE "GiftRule" ADD COLUMN "repeatsAnnually" BOOLEAN NOT NULL DEFAULT false;/,
+    );
+    expect(sql).toMatch(
+      /ALTER TABLE "GiftGrant" ADD COLUMN "unitCostCents" INTEGER;/,
+    );
+    expect(sql).toMatch(/ALTER TABLE "GiftGrant" ADD COLUMN "source" TEXT;/);
+  });
+
+  it("creates exactly one brand-new table (invisible to the previous release)", () => {
+    const creates = sql.match(/CREATE TABLE [^;]+;/g) ?? [];
+    expect(creates).toHaveLength(1);
+    expect(creates[0]).toContain('CREATE TABLE "ExperimentAssignment"');
+  });
+
+  it("never touches the ownership column or any existing default", () => {
+    expect(sql).not.toMatch(/ownership/i);
+    // SET DEFAULT (altering an EXISTING column's default) stays banned; the
+    // new columns' own inline DEFAULTs above are not that.
     expect(sql).not.toMatch(/ALTER\s+COLUMN[^;]*SET DEFAULT/i);
   });
 });

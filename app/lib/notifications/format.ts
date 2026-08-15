@@ -22,6 +22,8 @@
  *                                      as bare {skip_url} lines; those now
  *                                      become real links instead of text)
  *   [button:Label](url) → a brand-colored button on its own line
+ *   [image:Alt](url)    → a centered product image on its own line (v1.24.0;
+ *                         unsafe/unresolved URLs stay visible plain text)
  *   {cta}               → the template's default action button (built from
  *                         vars.cta_url / cta_label — same contract as v1.16)
  *   # Heading / ## Sub  → headings (line-start)
@@ -302,10 +304,18 @@ type Block =
   | { kind: "quote"; lines: string[] }
   | { kind: "divider" }
   | { kind: "button"; label: string; href: string }
+  | { kind: "image"; alt: string; href: string }
   | { kind: "cta" };
 
 const BUTTON_LINE = new RegExp(
   String.raw`^\[button:\s*([^\]]+)\]\(` + LINK_DEST + String.raw`\)$`,
+);
+
+// [image:Alt text](https://url) on its own line → a centered product image
+// (v1.24.0, for gift emails). Same safety posture as buttons: an unsafe or
+// unresolved URL renders the source text, never a broken <img>.
+const IMAGE_LINE = new RegExp(
+  String.raw`^\[image:\s*([^\]]*)\]\(` + LINK_DEST + String.raw`\)$`,
 );
 
 function parseBlocks(raw: string): Block[] {
@@ -347,6 +357,16 @@ function parseBlocks(raw: string): Block[] {
         blocks.push({ kind: "button", label: button[1].trim(), href: button[2] });
       } else {
         // Unresolved placeholder or unsafe URL — show the source, unlinked.
+        blocks.push({ kind: "paragraph", lines: [trimmed] });
+      }
+      continue;
+    }
+    const image = trimmed.match(IMAGE_LINE);
+    if (image) {
+      flush();
+      if (isSafeHref(image[2])) {
+        blocks.push({ kind: "image", alt: image[1].trim(), href: image[2] });
+      } else {
         blocks.push({ kind: "paragraph", lines: [trimmed] });
       }
       continue;
@@ -471,6 +491,14 @@ export function formatEmailBody(
       case "button":
         htmlParts.push(buttonHtml(block.label, block.href, design));
         textParts.push(`${block.label}: ${block.href}`);
+        break;
+      case "image":
+        htmlParts.push(
+          `<p style="margin:0 0 16px;text-align:center;"><img src="${escapeHtml(block.href)}" alt="${escapeHtml(block.alt)}" style="max-width:100%;max-height:280px;border-radius:8px;" /></p>`,
+        );
+        // The text twin carries the alt only — a raw CDN URL is noise in a
+        // plain-text email; an image with no alt simply disappears there.
+        if (block.alt) textParts.push(block.alt);
         break;
       case "cta":
         if (ctaUrl) {

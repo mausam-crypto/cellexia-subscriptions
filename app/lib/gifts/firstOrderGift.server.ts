@@ -211,6 +211,7 @@ export async function ensureFirstOrderGift(
       cycleIndex: FIRST_ORDER_GIFT_CYCLE_INDEX,
       variantId,
       status: "SCHEDULED",
+      source: "FIRST_ORDER",
     },
   });
 

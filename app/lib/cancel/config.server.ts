@@ -43,12 +43,13 @@
 
 import { PORTAL_PROXY_BASE } from "~/lib/portal/proxy-path";
 
-/** The 7 save mechanics the flow can offer. */
+/** The 8 save mechanics the flow can offer. */
 export const SAVE_KINDS = [
   "SKIP",
   "FREQUENCY",
   "PAUSE",
   "DISCOUNT",
+  "GIFT",
   "SWAP",
   "EDUCATION",
   "SUPPORT",
@@ -96,12 +97,18 @@ export const REASONS: CancelReasonConfig[] = [
   {
     key: "NOT_SEEING_RESULTS",
     i18nKey: "cancel.reason.not_seeing_results",
-    savesOrder: ["EDUCATION", "SWAP"],
+    // Education first (a knowledge problem before a product problem), then a
+    // free product — COGS instead of face-value margin, and it introduces a
+    // second product (OFFER_PLAYBOOK §2). SWAP survives as the fallback when
+    // the gift card is unavailable (pool empty / cooldown).
+    savesOrder: ["EDUCATION", "GIFT", "SWAP"],
   },
   {
     key: "TRYING_SOMETHING_ELSE",
     i18nKey: "cancel.reason.trying_something_else",
-    savesOrder: ["PAUSE", "SWAP"],
+    // "Trying something else" IS a variety request — a free different
+    // product answers it exactly, and costs COGS, not margin.
+    savesOrder: ["GIFT", "PAUSE", "SWAP"],
   },
   {
     key: "SHIPPING_ISSUES",
@@ -111,7 +118,10 @@ export const REASONS: CancelReasonConfig[] = [
   {
     key: "OTHER",
     i18nKey: "cancel.reason.other",
-    savesOrder: ["PAUSE"],
+    // PAUSE first, deliberately (unqualified discounts train customers to
+    // threaten cancellation for money off — see the module JSDoc). A gift is
+    // the one sweetener that doesn't reprice the product, so it may follow.
+    savesOrder: ["PAUSE", "GIFT"],
   },
 ];
 
@@ -135,10 +145,15 @@ export function mergeSavesShown<T extends { kind: string }>(
 ): { merged: T[]; changed: boolean } {
   const preserved = existing.filter((s) => s.kind === FINAL_DISCOUNT);
   const existingNonFinal = existing.filter((s) => s.kind !== FINAL_DISCOUNT);
+  // Change detection compares full payloads, not just the kind sequence
+  // (v1.24.0): a re-rendered card of the SAME kind can carry a different
+  // offer — the dynamic GIFT pick being the sharp case — and savesShown is
+  // what the accept path executes, so a stale payload would grant something
+  // other than what the customer saw. Offers are built in deterministic key
+  // order by getSavesForReason, so stringify equality is reliable.
   const changed =
     existingNonFinal.length === 0 ||
-    existingNonFinal.map((s) => s.kind).join(",") !==
-      saves.map((s) => s.kind).join(",");
+    JSON.stringify(existingNonFinal) !== JSON.stringify(saves);
   return { merged: [...saves, ...preserved], changed };
 }
 

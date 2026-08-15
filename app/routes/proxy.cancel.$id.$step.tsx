@@ -261,22 +261,17 @@ async function loadFinal(ctx: CancelRouteContext, hasError: boolean) {
     return redirect(toPath(ctx, "confirm"));
   }
 
-  await recordFinalOfferShown(session.id);
-  const cancelFlow = await getSetting(shop.id, "cancelFlow");
-  // Discount stacking cap: show the percent acceptFinalOffer will actually
-  // grant (plan ongoing discount + grant <= maxTotalDiscountPct).
-  const clamp = await clampGrantPercentForContract(
-    shop.id,
-    contract.lines,
-    cancelFlow.finalOfferPct,
-  );
+  // The engine resolves the presented depth (experiment overlay + stacking
+  // clamp) and records it into savesShown — render EXACTLY what it recorded,
+  // so shown, refreshed and granted percents can never diverge.
+  const shownOffer = await recordFinalOfferShown(session.id);
 
   return renderCancelPage(ctx, pageFinal({
     locale,
     csrf: ctx.portalSession.csrfToken,
     contractId: contract.id,
-    percent: clamp.percent,
-    cycles: cancelFlow.finalOfferCycles,
+    percent: shownOffer.percent,
+    cycles: shownOffer.cycles,
     copyVariant: copyVariantFor(contract.id),
     showError: hasError,
     previewToken: ctx.portalSession.previewToken,
@@ -388,6 +383,22 @@ async function loadSaved(ctx: CancelRouteContext) {
       const swapped = contract.lines.find((l) => l.addedVia === "SWAP");
       messageKey = "cancel.saved.swap";
       messageVars = { title: swapped?.title ?? contract.lines[0]?.title ?? "" };
+      break;
+    }
+    case "GIFT": {
+      // The granted variant title lives on the newest SAVE_FLOW grant's
+      // scheduling event payload; the session's savesShown offer is the
+      // simpler read and always present (accept requires it).
+      const shownGift = (
+        Array.isArray(saved.savesShown) ? saved.savesShown : []
+      ).find(
+        (s): s is { kind: string; title: string } =>
+          typeof s === "object" &&
+          s != null &&
+          (s as { kind?: unknown }).kind === "GIFT",
+      );
+      messageKey = "cancel.saved.gift";
+      messageVars = { giftTitle: shownGift?.title ?? "" };
       break;
     }
     case "EDUCATION":

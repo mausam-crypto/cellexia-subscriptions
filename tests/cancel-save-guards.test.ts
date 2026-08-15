@@ -81,7 +81,9 @@ describe("acceptSave guardrails (source contract)", () => {
   });
 
   it("re-checks the reason-offer cooldown at accept time (not only at show time)", () => {
-    expect(engineSource).toContain("reasonOfferOnCooldown(shop.id, contract.id");
+    expect(engineSource).toContain(
+      "reasonOfferOnCooldown(shop.id, contract, cancelFlow)",
+    );
     expect(engineSource).toContain(
       "a SAVE_OFFER grant exists within reasonOfferCooldownDays",
     );
@@ -89,7 +91,7 @@ describe("acceptSave guardrails (source contract)", () => {
 
   it("skips the DISCOUNT card while a SAVE_OFFER grant is inside the cooldown", () => {
     expect(engineSource).toContain(
-      "await reasonOfferOnCooldown(shopId, contract.id, cancelFlow)",
+      "await reasonOfferOnCooldown(shopId, contract, cancelFlow)",
     );
   });
 

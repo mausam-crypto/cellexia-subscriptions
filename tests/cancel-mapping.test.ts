@@ -93,9 +93,10 @@ describe("discount gating", () => {
     }
   });
 
-  it("unqualified reasons (OTHER) map only to PAUSE — no discount training", () => {
+  it("unqualified reasons (OTHER) map to PAUSE then GIFT — no discount training", () => {
     const other = REASONS.find((r) => r.key === "OTHER")!;
-    expect(other.savesOrder).toEqual(["PAUSE"]);
+    expect(other.savesOrder).toEqual(["PAUSE", "GIFT"]);
+    expect(other.savesOrder).not.toContain("DISCOUNT" satisfies SaveKind);
   });
 });
 

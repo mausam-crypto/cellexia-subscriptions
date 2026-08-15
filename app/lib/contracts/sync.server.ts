@@ -932,6 +932,62 @@ export async function syncContractFromShopify(
     },
   });
 
+  // Subscriber-tag recompute (tagging setting group, v1.23.0): every path
+  // that can change whether this customer still holds a live owned contract
+  // converges on this sync — webhook transitions, app-internal writers via
+  // their webhook echo, install backfills and the daily full_sync_reconcile
+  // (which therefore re-converges every customer's tag daily). Membership is
+  // recomputed from the mirror, never diffed from this sync's transition, so
+  // an echo landing on an already-updated row still corrects the tag. Cheap
+  // when nothing changed (CustomerTagState short-circuit). Contained +
+  // lazily imported: tagging must never fail — or weigh down the module
+  // graph of — a mirror sync.
+  try {
+    const { maybeSyncSubscriberTag } = await import("~/lib/tagging/tags.server");
+    await maybeSyncSubscriberTag(shop.id, contractRow.customerId, {
+      contractId: contractRow.id,
+    });
+  } catch (err) {
+    console.error(
+      "[contracts] sync: subscriber tag recompute failed",
+      shopifyContractGid,
+      err,
+    );
+  }
+
+  // First-order tag heal: a contract that mirrored UNKNOWN (own-plan
+  // evidence unreadable at the create moment) is skipped by the create-tail
+  // tagging, and that tail never runs again — so when THIS sync is the one
+  // that proves the contract ours, the origin order gets its missed tag
+  // here. Existing rows only (a fresh billable CREATE is the create tail's
+  // job; a backfill CREATE is deliberately untagged — forward-only), and
+  // the taggedOrderId event guard keeps a repeat attempt a no-op.
+  try {
+    if (
+      existingRow &&
+      contractRow.originOrderId &&
+      !isBillableOwnership(existingRow.ownership) &&
+      isBillableOwnership(persistedOwnership)
+    ) {
+      const { maybeTagSubscriptionOrder } = await import(
+        "~/lib/tagging/tags.server"
+      );
+      await maybeTagSubscriptionOrder(
+        shop.id,
+        contractRow,
+        contractRow.originOrderId,
+        "first",
+        { orderName: contractRow.originOrderName },
+      );
+    }
+  } catch (err) {
+    console.error(
+      "[contracts] sync: first-order tag heal failed",
+      shopifyContractGid,
+      err,
+    );
+  }
+
   return reloadContract(contractRow.id);
 }
 

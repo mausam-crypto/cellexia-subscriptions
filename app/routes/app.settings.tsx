@@ -489,6 +489,47 @@ const SECTION_DEFS: SectionDef[] = [
     ],
   },
   {
+    key: "tagging",
+    title: "Shopify tags",
+    description:
+      "Mirror subscription state onto Shopify tags — the hook for theme logic, Shopify Flow, segments and other apps. Saving this card starts a background re-apply of the customer tag across the whole subscriber base (a summary lands in the Audit log), so a rename or a late enable doesn't wait for the nightly pass.",
+    fields: [
+      {
+        path: "customerTagEnabled",
+        label: "Tag subscribers",
+        helpText:
+          "Tag the customer while they have a live subscription; the tag is removed automatically when their last subscription ends (cancelled, expired or payment-failed). Turning this off stops tag management — tags already applied stay.",
+        type: "toggle",
+      },
+      {
+        path: "customerTag",
+        label: "Subscriber tag",
+        helpText:
+          "Renaming swaps the tag on current subscribers when you save. No commas — Shopify treats them as tag separators.",
+        type: "text",
+      },
+      {
+        path: "orderTagsEnabled",
+        label: "Tag subscription orders",
+        helpText:
+          "Tag each subscription order as it is created — the checkout order and every renewal. Applied going forward only; past orders keep whatever they have.",
+        type: "toggle",
+      },
+      {
+        path: "firstOrderTag",
+        label: "First-order tag",
+        helpText: "Applied to the checkout order that started the subscription.",
+        type: "text",
+      },
+      {
+        path: "repeatOrderTag",
+        label: "Repeat-order tag",
+        helpText: "Applied to every renewal order billed by the app.",
+        type: "text",
+      },
+    ],
+  },
+  {
     key: "lifecycle",
     title: "Lifecycle & milestones",
     description:
@@ -532,6 +573,20 @@ const SECTION_DEFS: SectionDef[] = [
         label: "Early-cycle incentives",
         helpText:
           "Extra nudges through cycles 1–2, where most voluntary churn happens.",
+        type: "toggle",
+      },
+      {
+        path: "milestoneLadder",
+        label: "Milestone ladder (order numbers)",
+        helpText:
+          "Milestones AFTER the base milestone, e.g. 12, 18, 24 — the goal-gradient hook never exhausts. Each rung ships a dynamically picked gift from the pool (Gifts page) and is announced in advance.",
+        type: "intList",
+      },
+      {
+        path: "rewardsGiftEnabled",
+        label: "Real gift with the rewards unlock",
+        helpText:
+          "Puts a dynamically picked free product behind the day-90 'rewards unlocked' email — without it the email is copy with nothing behind it.",
         type: "toggle",
       },
     ],
@@ -1190,6 +1245,29 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       } catch (error) {
         console.warn("[settings] analytics recompute after save failed", error);
       }
+    }
+
+    // Saving the tagging card reconciles the subscriber tag across the whole
+    // base (everyone with a live owned contract + everyone the ledger says is
+    // tagged) so a toggle-on, a rename or a post-go-live enable takes effect
+    // now instead of at the next daily full_sync_reconcile. DELIBERATELY not
+    // awaited (the sendConfirmations pattern): the sweep is a sequential
+    // Shopify write per changed customer and could hold this POST for
+    // minutes on a large base — the save must return immediately. The sweep
+    // contains every failure internally, logs one admin.action
+    // (subscriber_tags_reconciled) summary event when it finishes, and the
+    // per-sync recompute + daily reconcile converge anyone it missed.
+    if (key === "tagging") {
+      import("~/lib/tagging/tags.server")
+        .then(({ reconcileAllSubscriberTags }) =>
+          reconcileAllSubscriberTags(shop.id, actor),
+        )
+        .catch((error) => {
+          console.warn(
+            "[settings] subscriber tag reconcile after save failed",
+            error,
+          );
+        });
     }
 
     return json<ActionData>({

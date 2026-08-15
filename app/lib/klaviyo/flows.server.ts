@@ -110,6 +110,8 @@ const WHY_BY_METRIC: Record<string, string> = {
     "Transparency when billing switched to the backup card — surprises erode trust.",
   "Cellexia Gift Scheduled":
     "Announced gifts create anticipation for the next delivery instead of indifference.",
+  "Cellexia Gift Teaser":
+    "The 'a surprise is coming' tease before box two — anticipation exactly at the highest-churn charge.",
   "Cellexia Milestone Reached":
     "Celebrating tenure makes the subscription feel like progress worth keeping.",
   "Cellexia Rewards Unlocked":

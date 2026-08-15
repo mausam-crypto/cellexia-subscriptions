@@ -517,6 +517,39 @@ async function handleSubscriptionContractsCreate({
   } catch (err) {
     console.error("[webhooks] survey link failed", contract.id, err);
   }
+
+  // First-order tag (tagging setting group, v1.23.0): the origin order gets
+  // its tag HERE — the moment the contract is mirrored and proven ours — not
+  // in ORDERS_CREATE, which races the contract webhook and cannot decide
+  // ownership. ORDERS_CREATE also never sees renewal orders (source_name
+  // early return); those get the repeat tag in finishSuccessSettlement.
+  // Guarded like every tail step: tagging never fails a webhook.
+  try {
+    await maybeTagOriginOrder(shop.id, contract.id);
+  } catch (err) {
+    console.error("[webhooks] first-order tag failed", contract.id, err);
+  }
+}
+
+/**
+ * Shared by the CREATE handler and the UPDATE catch-up branch (a lost create
+ * webhook's catch-up IS the contract's create moment — the acquisition rule).
+ * Demo/ownership/idempotency gating lives in maybeTagSubscriptionOrder.
+ */
+async function maybeTagOriginOrder(
+  shopId: string,
+  contractId: string,
+): Promise<void> {
+  const contract = await prisma.subscriptionContract.findUnique({
+    where: { id: contractId },
+  });
+  if (!contract?.originOrderId) return;
+  const { maybeTagSubscriptionOrder } = await import(
+    "~/lib/tagging/tags.server"
+  );
+  await maybeTagSubscriptionOrder(shopId, contract, contract.originOrderId, "first", {
+    orderName: contract.originOrderName,
+  });
 }
 
 /**
@@ -617,6 +650,12 @@ async function handleSubscriptionContractsUpdate({
       await linkSurveyOnContractCreate(shop.id, after.id);
     } catch (err) {
       console.error("[webhooks] catch-up survey link failed", after.id, err);
+    }
+    // And for the first-order tag (see maybeTagOriginOrder).
+    try {
+      await maybeTagOriginOrder(shop.id, after.id);
+    } catch (err) {
+      console.error("[webhooks] catch-up first-order tag failed", after.id, err);
     }
     return;
   }
@@ -842,6 +881,26 @@ export async function finishSuccessSettlement(
         source,
         payload: eventPayload,
       });
+    }
+  }
+
+  // Repeat-order tag (tagging setting group, v1.23.0): renewal orders never
+  // reach ORDERS_CREATE (source_name early return), so the tag rides the
+  // settlement tail — which BOTH claim winners funnel into (success webhook
+  // and stale-attempt sweep), so a lost webhook cannot strand the tag.
+  // Redrive-safe: the taggedOrderId-keyed event guard inside skips an order
+  // already tagged, and the Shopify add is a no-op when the tag is present.
+  // Guarded here too (not just inside): tagging never fails a settlement.
+  if (updated.orderId) {
+    try {
+      const { maybeTagSubscriptionOrder } = await import(
+        "~/lib/tagging/tags.server"
+      );
+      await maybeTagSubscriptionOrder(shopId, contract, updated.orderId, "repeat", {
+        orderName: updated.orderName,
+      });
+    } catch (err) {
+      console.error("[webhooks] repeat-order tag failed", updated.orderId, err);
     }
   }
 

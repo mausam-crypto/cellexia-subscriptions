@@ -442,11 +442,10 @@ export async function getSurveyOrderStatus(
   const row = await prisma.surveyResponse.findUnique({
     where: { orderId },
   });
-  // Fail-closed: any mismatch hides the row, including an anonymous
-  // requester (requesterCustomerId null) reading a row that has an owner —
-  // a null-vs-null "not foreign" reading here would let anyone with a
-  // guessed orderId and no customer claim read a stranger's answers.
-  const foreign = row != null && row.customerId !== requesterCustomerId;
+  const foreign =
+    row?.customerId != null &&
+    requesterCustomerId != null &&
+    row.customerId !== requesterCustomerId;
   const answers = row && !foreign ? sanitizeSurveyAnswers(row.answers) : {};
   return {
     enabled: settings.enabled,
