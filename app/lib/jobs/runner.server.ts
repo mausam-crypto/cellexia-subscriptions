@@ -780,12 +780,21 @@ async function isDue(job: JobDef, now: Date): Promise<boolean> {
   return elapsedMinutes >= job.everyMinutes;
 }
 
-async function acquireLock(
+/**
+ * Claims the named JobLock lease for `owner` — atomically at the DB (an
+ * expired lease is reclaimed by ONE updateMany; a missing row by ONE
+ * create), so two instances can never both win. Exported (v1.25.0) so the
+ * Klaviyo flow task runner (setup-task.server.ts) can make its one-task-
+ * per-shop rule hold across instances with a short lease instead of a
+ * read-then-write on its own record; `leaseMs` defaults to the job lease.
+ */
+export async function acquireLock(
   name: string,
   now: Date,
   owner: string,
+  leaseMs: number = LOCK_LEASE_MS,
 ): Promise<boolean> {
-  const lease = new Date(now.getTime() + LOCK_LEASE_MS);
+  const lease = new Date(now.getTime() + leaseMs);
 
   const claimed = await prisma.jobLock.updateMany({
     where: { name, lockedUntil: { lt: now } },
@@ -810,11 +819,15 @@ async function acquireLock(
  * losing the lease to another owner is loud in the logs because it means the
  * duplicate-runner protection is gone for the rest of this run.
  */
-async function renewLock(name: string, owner: string): Promise<void> {
+export async function renewLock(
+  name: string,
+  owner: string,
+  leaseMs: number = LOCK_LEASE_MS,
+): Promise<void> {
   try {
     const renewed = await prisma.jobLock.updateMany({
       where: { name, owner },
-      data: { lockedUntil: new Date(Date.now() + LOCK_LEASE_MS) },
+      data: { lockedUntil: new Date(Date.now() + leaseMs) },
     });
     if (renewed.count === 0) {
       console.error(
@@ -826,7 +839,8 @@ async function renewLock(name: string, owner: string): Promise<void> {
   }
 }
 
-async function releaseLock(name: string, owner: string): Promise<void> {
+/** Owner-scoped release — never throws (a failed release only delays a lease). */
+export async function releaseLock(name: string, owner: string): Promise<void> {
   try {
     // Only the current owner releases; an expired-and-reclaimed lease stays.
     await prisma.jobLock.updateMany({

@@ -18,6 +18,7 @@ import {
   Button,
   Card,
   Checkbox,
+  ChoiceList,
   Divider,
   InlineGrid,
   InlineStack,
@@ -66,8 +67,24 @@ import { isKlaviyoConfigured } from "~/lib/klaviyo/client.server";
 import {
   getProducts,
   getSubscribableProducts,
+  listMarkets,
 } from "~/lib/graphql/index.server";
-import type { AdminClient, ShopifyProduct } from "~/lib/graphql/index.server";
+import type {
+  AdminClient,
+  ShopifyMarket,
+  ShopifyProduct,
+} from "~/lib/graphql/index.server";
+import { getSetting } from "~/lib/settings/settings.server";
+import {
+  publishWidgetMarketsMetafield,
+  readWidgetMarketsMetafield,
+  saveWidgetMarkets,
+} from "~/lib/widget/widget-markets.server";
+import {
+  marketAllowed,
+  widgetMarketsDiverged,
+  type WidgetMarketsSetting,
+} from "~/lib/widget/widget-markets";
 import {
   OURS_ONLY,
   getOwnershipCounts,
@@ -193,6 +210,40 @@ const UNREAD_STOREFRONT_FLAG: StorefrontFlag = {
   diverged: false,
 };
 
+/**
+ * Where the buy box shows (v1.25.0): the setting, the shop's markets (for
+ * the picker; `readable: false` when Shopify could not be read — the card
+ * then keeps the saved handles editable but cannot offer new ones), and the
+ * cellexia.widget_markets metafield read back the way the storefront reads
+ * it — same contract as StorefrontFlag: an unreadable metafield claims
+ * nothing.
+ */
+interface WidgetMarketsView {
+  setting: WidgetMarketsSetting;
+  markets: ShopifyMarket[];
+  marketsReadable: boolean;
+  metafield: StorefrontFlag;
+}
+
+const UNREAD_WIDGET_MARKETS: WidgetMarketsView = {
+  setting: { mode: "all", handles: [] },
+  markets: [],
+  marketsReadable: false,
+  metafield: UNREAD_STOREFRONT_FLAG,
+};
+
+/** Human summary of the market rule, for the card and the audit toast. */
+function describeWidgetMarkets(
+  setting: WidgetMarketsSetting,
+  markets: ShopifyMarket[],
+): string {
+  if (setting.mode !== "selected") return "every market";
+  const names = setting.handles.map(
+    (handle) => markets.find((m) => m.handle === handle)?.name ?? handle,
+  );
+  return names.length === 0 ? "no market" : names.join(", ");
+}
+
 interface ActionData {
   intent: string;
   ok: boolean;
@@ -205,6 +256,13 @@ interface ActionData {
    * itself instead of opening a blank page.
    */
   report?: DoctorReport;
+  /**
+   * preview-storefront only (v1.25.0): the doctor's market-hidden WARN
+   * detail when the tab was opened onto a page that shows no buy box
+   * (excluded market / drifted market metafield). Rendered as a persistent
+   * banner beside the transient toast — the tab itself explains nothing.
+   */
+  marketHidden?: string;
 }
 
 const stringArraySchema = z.array(z.string());
@@ -437,6 +495,34 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     };
   }
 
+  // Where the buy box shows (v1.25.0): the setting is a cheap DB read; the
+  // market list and the metafield read-back are Shopify reads — contained
+  // like the others, skipped for ?q= fetcher requests.
+  let widgetMarkets: WidgetMarketsView = UNREAD_WIDGET_MARKETS;
+  if (query.length < SEARCH_MIN_CHARS) {
+    const setting = await getSetting(shop.id, "widgetMarkets");
+    let markets: ShopifyMarket[] = [];
+    let marketsReadable = false;
+    try {
+      markets = await listMarkets(admin);
+      marketsReadable = true;
+    } catch (err) {
+      console.error("[preview] markets read failed", err);
+    }
+    let metafield: StorefrontFlag = UNREAD_STOREFRONT_FLAG;
+    try {
+      const value = await readWidgetMarketsMetafield(admin);
+      metafield = {
+        value,
+        readable: true,
+        diverged: widgetMarketsDiverged(setting, value),
+      };
+    } catch (err) {
+      console.error("[preview] widget_markets metafield read failed", err);
+    }
+    widgetMarkets = { setting, markets, marketsReadable, metafield };
+  }
+
   const subscriberMatches: SubscriberMatch[] = matches.map((m) => ({
     email: m.email,
     name: [m.firstName, m.lastName].filter(Boolean).join(" ") || null,
@@ -464,6 +550,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     products,
     subscriberMatches,
     otherApps,
+    widgetMarkets,
   });
 };
 
@@ -481,7 +568,7 @@ async function markPreviewed(
 }
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
+  const { session, admin } = await authenticate.admin(request);
   const shop = await getPrimaryShop();
   if (!shop) {
     throw new Response("App is not installed on any shop", { status: 503 });
@@ -643,6 +730,76 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     });
   }
 
+  if (intent === "save-widget-markets") {
+    // Where the buy box shows (v1.25.0). saveWidgetMarkets validates against
+    // the live market list, writes the setting, publishes the storefront
+    // metafield (rolling the setting back if that fails) and logs its own
+    // admin.action event — don't double-log here.
+    const mode = String(formData.get("mode") ?? "");
+    let handles: unknown = [];
+    try {
+      handles = JSON.parse(String(formData.get("handles") ?? "[]"));
+    } catch {
+      return json<ActionData>(
+        { intent, ok: false, toast: "Market selection could not be read — reload and try again" },
+        { status: 400 },
+      );
+    }
+    const result = await saveWidgetMarkets(shop.domain, { mode, handles }, actor);
+    if (!result.ok) {
+      return json<ActionData>(
+        { intent, ok: false, toast: result.error },
+        { status: result.code === "publish_failed" ? 502 : 400 },
+      );
+    }
+    let markets: ShopifyMarket[] = [];
+    try {
+      markets = await listMarkets(admin);
+    } catch {
+      // The toast then names handles instead of market names — fine.
+    }
+    return json<ActionData>({
+      intent,
+      ok: true,
+      toast:
+        result.setting.mode === "selected"
+          ? `Saved — the buy box now shows only in: ${describeWidgetMarkets(result.setting, markets)}`
+          : "Saved — the buy box shows in every market",
+    });
+  }
+
+  if (intent === "resync-widget-markets") {
+    // Push the setting into cellexia.widget_markets again. Used when the
+    // read-back banner shows the storefront disagreeing with the setting —
+    // e.g. a metafield edited by hand, or a write that failed after the
+    // setting was saved.
+    const setting = await getSetting(shop.id, "widgetMarkets");
+    const publish = await publishWidgetMarketsMetafield(admin, setting);
+    await logEvent({
+      shopId: shop.id,
+      type: "admin.action",
+      source: "ADMIN",
+      actor,
+      payload: {
+        action: "widget_markets_resynced",
+        value: setting,
+        ok: publish.ok,
+        error: publish.error ?? null,
+      },
+    });
+    return json<ActionData>({
+      intent,
+      ok: publish.ok,
+      toast: publish.ok
+        ? `Storefront market rule re-synced — the buy box shows in ${
+            setting.mode === "selected"
+              ? `${setting.handles.length} selected market${setting.handles.length === 1 ? "" : "s"}`
+              : "every market"
+          }`
+        : `Re-sync failed: ${publish.error ?? "unknown error"}`,
+    });
+  }
+
   if (intent === "run-doctor") {
     // runPreviewDoctor never throws (every step is contained) and logs its
     // own admin.action event — don't double-log here.
@@ -667,6 +824,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     // Neither un-vetted path ticks the "Storefront previewed" checklist
     // item — see the `vetted` gate below.
     let doctorSkipped = false;
+    // v1.25.0: a READY verdict whose storefront_markup step is the
+    // market-hidden WARN (excluded market, or a drifted market metafield —
+    // the doctor tags both `code: market_hidden`). WARN never blocks, so the
+    // tab still opens, but that page shows NO widget by construction: it
+    // must not tick "Storefront previewed" (the blank page the item exists
+    // to catch), and the WARN's explanation must reach the merchant instead
+    // of being discarded — the storefront itself raises no diagnostic card
+    // there (no gated root, no no-group marker, so previewBoot() never
+    // validates the token).
+    let marketHidden: DoctorStep | null = null;
     if (!openAnyway) {
       try {
         const report = await runPreviewDoctor(
@@ -684,6 +851,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             toast: `Preview blocked${blocked ? ` — ${blocked.label}` : ""}: see the diagnosis for the fix`,
           });
         }
+        marketHidden =
+          report.steps.find(
+            (step) =>
+              step.key === "storefront_markup" && step.code === "market_hidden",
+          ) ?? null;
       } catch (err) {
         console.error("[preview] doctor run before preview failed", err);
         doctorSkipped = true;
@@ -700,8 +872,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       // the checklist item exists to catch; a checklist that says
       // "previewed" off a blank page defeats its purpose. Un-vetted opens
       // stay un-ticked — fixing the diagnosis and previewing again ticks it
-      // — and the audit event says which kind this was.
-      const vetted = !openAnyway && !doctorSkipped;
+      // — and the audit event says which kind this was. A market-hidden
+      // page (doctor READY, but the probed page renders no widget) is not
+      // vetted either: it is exactly the blank page the item must not tick
+      // on.
+      const vetted = !openAnyway && !doctorSkipped && marketHidden === null;
       if (vetted) {
         await markPreviewed(shop.id, "previewedStorefront", actor);
       }
@@ -716,6 +891,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           checklistPreviewedStorefront: vetted,
           ...(openAnyway ? { openAnyway: true } : {}),
           ...(doctorSkipped ? { doctorSkipped: true } : {}),
+          ...(marketHidden ? { marketHidden: true } : {}),
         },
       });
       return json<ActionData>({
@@ -732,7 +908,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
                 toast:
                   "Preview opened despite the blocked diagnosis — “Storefront previewed” stays unticked until a preview passes the diagnosis.",
               }
-            : {}),
+            : marketHidden
+              ? {
+                  toast: `Preview opened, but this page shows no buy box: ${marketHidden.detail} “Storefront previewed” was not ticked.`,
+                  marketHidden: marketHidden.detail,
+                }
+              : {}),
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -1093,6 +1274,60 @@ export default function PreviewPage() {
   const proxyIdentity = data.proxyIdentity;
   const otherApps: OtherAppsView = data.otherApps ?? EMPTY_OTHER_APPS;
   const otherAppsPresent = hasOtherApps(otherApps);
+
+  // Where the buy box shows (v1.25.0). Local draft of the market rule, reset
+  // whenever the saved setting changes (after a save round-trip).
+  const widgetMarkets: WidgetMarketsView =
+    data.widgetMarkets ?? UNREAD_WIDGET_MARKETS;
+  const savedMarketsKey = JSON.stringify(widgetMarkets.setting);
+  const [marketMode, setMarketMode] = useState<WidgetMarketsSetting["mode"]>(
+    widgetMarkets.setting.mode,
+  );
+  const [marketHandles, setMarketHandles] = useState<string[]>(
+    widgetMarkets.setting.handles,
+  );
+  const [marketsBaseline, setMarketsBaseline] = useState(savedMarketsKey);
+  useEffect(() => {
+    if (savedMarketsKey !== marketsBaseline) {
+      setMarketsBaseline(savedMarketsKey);
+      setMarketMode(widgetMarkets.setting.mode);
+      setMarketHandles(widgetMarkets.setting.handles);
+    }
+  }, [savedMarketsKey, marketsBaseline, widgetMarkets.setting]);
+  const marketsFetcher = useFetcher<ActionData>();
+  useFetcherToast(marketsFetcher);
+  const marketsResyncFetcher = useFetcher<ActionData>();
+  useFetcherToast(marketsResyncFetcher);
+  const knownHandles = new Set(widgetMarkets.markets.map((m) => m.handle));
+  // Saved handles whose market no longer exists on the shop (deleted in
+  // Shopify): shown, never re-submitted — the server rejects unknown handles,
+  // and silently keeping them would wedge the Save button forever. Only
+  // judged when the market list was actually readable.
+  const staleMarketHandles = widgetMarkets.marketsReadable
+    ? marketHandles.filter((h) => !knownHandles.has(h))
+    : [];
+  const submittableHandles = widgetMarkets.marketsReadable
+    ? marketHandles.filter((h) => knownHandles.has(h))
+    : marketHandles;
+  const marketsDirty =
+    JSON.stringify({ mode: marketMode, handles: submittableHandles }) !==
+    savedMarketsKey;
+  const marketsIncomplete =
+    marketMode === "selected" && submittableHandles.length === 0;
+  const primaryMarket = widgetMarkets.markets.find((m) => m.primary) ?? null;
+  // The preview link opens the primary domain = the primary market. When the
+  // SAVED rule excludes it, the preview tab shows a page without the widget.
+  const primaryMarketHidden =
+    primaryMarket !== null &&
+    !marketAllowed(widgetMarkets.setting, primaryMarket.handle);
+  const toggleMarketHandle = (handle: string, on: boolean) =>
+    setMarketHandles((current) =>
+      on
+        ? current.includes(handle)
+          ? current
+          : [...current, handle]
+        : current.filter((h) => h !== handle),
+    );
 
   // Storefront flag re-sync (shown only when the read-back disagrees).
   const resyncFetcher = useFetcher<ActionData>();
@@ -1535,6 +1770,163 @@ export default function PreviewPage() {
           </Card>
         ) : null}
 
+        {/* ── Where the buy box shows (markets) ── */}
+        <Card>
+          <BlockStack gap="300">
+            <InlineStack align="space-between" blockAlign="center" wrap>
+              <Text as="h2" variant="headingMd">
+                Where the buy box shows
+              </Text>
+              <Badge tone={widgetMarkets.setting.mode === "selected" ? "attention" : "success"}>
+                {widgetMarkets.setting.mode === "selected"
+                  ? `${widgetMarkets.setting.handles.length} of ${
+                      widgetMarkets.marketsReadable
+                        ? widgetMarkets.markets.length
+                        : "?"
+                    } markets`
+                  : "All markets"}
+              </Badge>
+            </InlineStack>
+            <Text as="p" variant="bodySm" tone="subdued">
+              Show the subscription option in every Shopify Market, or only in
+              the markets you pick. Visitors in other markets see the product
+              page without the subscription option; the app itself stays live
+              — renewals, the customer portal and emails are not affected.
+              Independent of the launch mode above.
+            </Text>
+            {widgetMarkets.metafield.diverged ? (
+              <Banner
+                tone="warning"
+                title="Your storefront isn't applying this market setting"
+                action={{
+                  content: "Re-sync",
+                  loading: marketsResyncFetcher.state !== "idle",
+                  onAction: () =>
+                    marketsResyncFetcher.submit(
+                      { intent: "resync-widget-markets" },
+                      { method: "post" },
+                    ),
+                }}
+              >
+                <p>
+                  {`The app says the buy box shows in ${describeWidgetMarkets(
+                    widgetMarkets.setting,
+                    widgetMarkets.markets,
+                  )}, but the cellexia.widget_markets value your theme reads ${
+                    widgetMarkets.metafield.value === null
+                      ? "was never written (it shows the widget everywhere)"
+                      : "says something else"
+                  }. Re-sync it so product pages follow this setting.`}
+                </p>
+              </Banner>
+            ) : null}
+            <ChoiceList
+              title="Markets"
+              titleHidden
+              choices={[
+                {
+                  label: "All markets (default)",
+                  value: "all",
+                  helpText:
+                    "Every visitor who can see the product sees the subscription option.",
+                },
+                {
+                  label: "Only these markets",
+                  value: "selected",
+                  helpText:
+                    "The subscription option appears only for visitors shopping in the markets ticked below. Visitors in other markets see the product page without the subscription option — products sold only on subscription (Shopify's “require a selling plan”) cannot be added to the cart there; unpublish those products from the hidden markets, or keep them subscription-optional.",
+                },
+              ]}
+              selected={[marketMode]}
+              onChange={(selected) =>
+                setMarketMode(selected[0] === "selected" ? "selected" : "all")
+              }
+            />
+            {marketMode === "selected" ? (
+              widgetMarkets.markets.length === 0 ? (
+                <Banner tone="info">
+                  <p>
+                    {widgetMarkets.marketsReadable
+                      ? "Shopify reports no markets for this shop — there is nothing to pick from. Keep “All markets”."
+                      : "Your markets could not be loaded from Shopify right now — reload the page to pick markets."}
+                  </p>
+                </Banner>
+              ) : (
+                <Box paddingInlineStart="600">
+                  <BlockStack gap="100">
+                    {widgetMarkets.markets.map((market) => (
+                      <Checkbox
+                        key={market.id}
+                        label={
+                          <InlineStack gap="200" blockAlign="center">
+                            <Text as="span" variant="bodyMd">
+                              {market.name}
+                            </Text>
+                            <Text as="span" variant="bodySm" tone="subdued">
+                              {market.handle}
+                            </Text>
+                            {market.primary ? <Badge>Primary</Badge> : null}
+                            {market.enabled ? null : (
+                              // A draft/disabled market: Shopify lists it,
+                              // no visitor resolves it — ticking ONLY such
+                              // markets hides the buy box everywhere (the
+                              // widget_markets self-check says so).
+                              <Badge tone="attention">Disabled — no visitors</Badge>
+                            )}
+                          </InlineStack>
+                        }
+                        checked={marketHandles.includes(market.handle)}
+                        onChange={(on) => toggleMarketHandle(market.handle, on)}
+                      />
+                    ))}
+                    {staleMarketHandles.length > 0 ? (
+                      <Text as="p" variant="bodySm" tone="subdued">
+                        {`No longer a market on this shop (dropped when you save): ${staleMarketHandles.join(", ")}`}
+                      </Text>
+                    ) : null}
+                  </BlockStack>
+                </Box>
+              )
+            ) : null}
+            <InlineStack gap="300" blockAlign="center" wrap>
+              <Button
+                variant="primary"
+                disabled={!marketsDirty || marketsIncomplete}
+                loading={marketsFetcher.state !== "idle"}
+                onClick={() =>
+                  marketsFetcher.submit(
+                    {
+                      intent: "save-widget-markets",
+                      mode: marketMode,
+                      handles: JSON.stringify(submittableHandles),
+                    },
+                    { method: "post" },
+                  )
+                }
+              >
+                Save
+              </Button>
+              {marketsIncomplete ? (
+                <Text as="p" variant="bodySm" tone="critical">
+                  Pick at least one market — with none selected the buy box
+                  would be hidden everywhere (use Revert to setup for that).
+                </Text>
+              ) : marketsDirty ? (
+                <Text as="p" variant="bodySm" tone="subdued">
+                  Unsaved — product pages follow the saved rule until you save.
+                </Text>
+              ) : (
+                <Text as="p" variant="bodySm" tone="subdued">
+                  {`Currently: the buy box shows in ${describeWidgetMarkets(
+                    widgetMarkets.setting,
+                    widgetMarkets.markets,
+                  )}.`}
+                </Text>
+              )}
+            </InlineStack>
+          </BlockStack>
+        </Card>
+
         {/* ── Storefront preview ── */}
         <Card>
           <BlockStack gap="300">
@@ -1547,6 +1939,11 @@ export default function PreviewPage() {
               unchanged page. Works the same whether the widget loads through
               the app embed (Theme settings → App embeds) or the theme block.
             </Text>
+            {primaryMarketHidden && primaryMarket ? (
+              <Text as="p" variant="bodySm" tone="subdued">
+                {`Note: your primary market (${primaryMarket.name}) is not in the markets the buy box shows in, and the preview link opens your primary domain — that page will show no subscription option, by design. Preview from a domain of a selected market to see the widget.`}
+              </Text>
+            ) : null}
             {products.length === 0 ? (
               <Banner
                 tone="info"
@@ -1621,6 +2018,16 @@ export default function PreviewPage() {
                         </Button>
                       </Box>
                     </BlockStack>
+                  </Banner>
+                ) : null}
+                {storefrontFetcher.data?.ok && storefrontFetcher.data.marketHidden ? (
+                  <Banner
+                    tone="warning"
+                    title="The preview opened, but that page shows no buy box"
+                  >
+                    <p>
+                      {`${storefrontFetcher.data.marketHidden} “Storefront previewed” was not ticked.`}
+                    </p>
                   </Banner>
                 ) : null}
                 <Text as="p" variant="bodySm" tone="subdued">

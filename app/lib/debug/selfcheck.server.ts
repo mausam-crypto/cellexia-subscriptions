@@ -17,6 +17,16 @@ import {
 } from "~/lib/launch/launch.server";
 import { STOREFRONT_MARKERS } from "~/lib/launch/doctor.server";
 import {
+  WIDGET_MARKETS_METAFIELD_KEY,
+  WIDGET_MARKETS_METAFIELD_NAMESPACE,
+  auditSelectedHandles,
+  marketAllowed,
+  parseHiddenMarketFromHtml,
+  readWidgetMarketsMetafield,
+  widgetMarketsDiverged,
+} from "~/lib/widget/widget-markets.server";
+import { listMarkets } from "~/lib/graphql/markets.server";
+import {
   OURS_ONLY,
   OWNERSHIP_OURS,
   OWNERSHIP_UNKNOWN,
@@ -148,6 +158,14 @@ const STOREFRONT_PROBE_PRODUCTS = 5;
 // cellexia.launch_status metafield is anything but byte-exact "live"
 // (tests/liquid/render.test.ts pins the Liquid half).
 const LAUNCH_GATED_ATTR = 'data-cellexia-gated="true"';
+// Attributes cx-buybox-core.liquid renders ONLY after its market gate passed
+// (the widget root, gated or not, and the no-owned-group marker; an excluded
+// market renders neither — tests/liquid/market-visibility.test.ts pins it).
+// Their presence therefore proves the storefront judged the market allowed.
+const MARKET_GATE_PASSED_ATTRS = [
+  "data-cellexia-buybox",
+  "data-cellexia-no-owned-group",
+] as const;
 
 /** A normal desktop browser UA — storefront CDNs vary responses on UA. */
 const DESKTOP_UA =
@@ -569,6 +587,76 @@ const CHECKS: CheckDef[] = [
     },
   },
   {
+    key: "widget_markets",
+    label: "Market visibility setting and storefront agree",
+    category: "Launch & storefront",
+    remediation:
+      "Preview & launch → Where the buy box shows → Re-sync — the buy box reads the cellexia.widget_markets metafield, so a diverged value shows (or hides) the widget in the wrong markets.",
+    run: async (ctx) => {
+      // v1.25.0: the setting is what the admin sees, the metafield is what
+      // every product page reads. Compared the way Liquid evaluates it
+      // (absent ⇔ all markets; "selected" lists as exact-string sets).
+      const [setting, value] = await Promise.all([
+        getSetting(ctx.shop.id, "widgetMarkets"),
+        ctx.admin().then((admin) => readWidgetMarketsMetafield(admin)),
+      ]);
+      const wanted =
+        setting.mode === "selected"
+          ? `only ${setting.handles.length} market(s): ${setting.handles.join(", ")}`
+          : "all markets";
+      if (widgetMarketsDiverged(setting, value)) {
+        return {
+          status: "FAIL",
+          detail: `The app says the buy box shows in ${wanted}, but the ${WIDGET_MARKETS_METAFIELD_NAMESPACE}.${WIDGET_MARKETS_METAFIELD_KEY} metafield reads ${value === null ? "(missing)" : value.length > 200 ? `${value.slice(0, 200)}…` : value}.`,
+        };
+      }
+      const synced = `storefront metafield ${value === null ? "(absent — every market, as the default demands)" : "matches"}`;
+      if (setting.mode !== "selected") {
+        return { status: "PASS", detail: `Buy box shown in ${wanted}; ${synced}.` };
+      }
+      // Setting and metafield agree — but do the saved handles still name
+      // LIVE markets? Save validates handles against the market list, yet a
+      // market can be deleted, renamed or left as a draft afterwards (or was
+      // a draft when picked); the Liquid then matches no visitor and the buy
+      // box is dark in every market with every other check green. Judged
+      // against the live list; an unreadable list is a note, never a verdict.
+      let markets: Awaited<ReturnType<typeof listMarkets>>;
+      try {
+        markets = await listMarkets(await ctx.admin());
+      } catch (err) {
+        return {
+          status: "PASS",
+          detail: `Buy box shown in ${wanted}; ${synced}. Could not verify the selected handles against the live market list (${errorMessage(err)}) — re-run in a moment.`,
+        };
+      }
+      const audit = auditSelectedHandles(setting, markets);
+      const editHint =
+        "Preview & launch → Where the buy box shows — edit the list so it names only markets that exist and are active on this shop.";
+      const problems = [
+        ...audit.missing.map((h) => `“${h}” is no longer a market on this shop`),
+        ...audit.disabled.map((h) => `“${h}” is a draft/disabled market (no visitor resolves it)`),
+      ];
+      if (audit.live.length === 0) {
+        return {
+          status: "FAIL",
+          detail: `None of the selected markets is a live market on this shop (${problems.join("; ")}) — the buy box is hidden in EVERY market although the setting and the storefront metafield agree.`,
+          remediation: editHint,
+        };
+      }
+      if (problems.length > 0) {
+        return {
+          status: "WARN",
+          detail: `Selected market ${problems.join("; ")} — the buy box shows only in the remaining ${audit.live.length}: ${audit.live.join(", ")}.`,
+          remediation: editHint,
+        };
+      }
+      return {
+        status: "PASS",
+        detail: `Buy box shown in ${wanted}; ${synced}; every selected handle is a live market.`,
+      };
+    },
+  },
+  {
     key: "selling_plans",
     label: "Selling plans synced",
     category: "Launch & storefront",
@@ -778,6 +866,33 @@ const CHECKS: CheckDef[] = [
         };
       }
       const html = await response.text();
+      // Market visibility (v1.25.0) BEFORE the gate verdict: an excluded
+      // market renders only the inert market-hidden template (which still
+      // carries the app-snippet marker and no gate attribute), so a probe
+      // from that market would otherwise report "visible as expected" while
+      // LIVE (false) or "NOT launch-gated" while SETUP (false). Judge the
+      // marker against the SETTING: hidden because the merchant asked for
+      // it is a PASS; hidden while the setting allows the market means the
+      // storefront metafield drifted — FAIL with the re-sync fix.
+      const hiddenMarket = parseHiddenMarketFromHtml(html);
+      if (hiddenMarket !== null) {
+        const setting = await getSetting(ctx.shop.id, "widgetMarkets");
+        const marketLabel = hiddenMarket
+          ? `market “${hiddenMarket}”`
+          : "a storefront that resolved no market handle";
+        if (!marketAllowed(setting, hiddenMarket)) {
+          return {
+            status: "PASS",
+            detail: `Widget hidden on ${url} (${marketLabel}) as your market setting demands — the launch gate is not judged from this market; the buy box is only shown in: ${setting.handles.join(", ") || "(none)"}.`,
+          };
+        }
+        return {
+          status: "FAIL",
+          detail: `The storefront hides the widget on ${url} (${marketLabel}) but the app allows that market (${setting.mode === "selected" ? `only ${setting.handles.join(", ")}` : "all markets"}) — the cellexia.widget_markets metafield the theme reads has drifted from the setting.`,
+          remediation:
+            "Re-save the market setting on Preview & launch → Where the buy box shows (or press Re-sync there); if you changed it moments ago this can be page caching — re-run in a few minutes.",
+        };
+      }
       const marker = STOREFRONT_MARKERS.find((m) => html.includes(m));
       const live = (await ctx.launch()).mode === "LIVE";
       if (!marker) {
@@ -787,6 +902,52 @@ const CHECKS: CheckDef[] = [
             ? `Fetched ${url} and found none of our markup — the buy box is NOT on the live product page, so it sells nothing.`
             : `Our markup is not on ${url} yet — enable the app block/embed on the published theme before go-live (the go-live checklist tracks this).`,
         };
+      }
+      // The INVERSE market drift: the page rendered the widget (or the
+      // no-owned-group marker — both only render once the Liquid's market
+      // gate passed) although the setting EXCLUDES the market this host
+      // serves. The probe hits the primary domain, i.e. the primary market,
+      // and the rendered widget carries no market handle, so the handle
+      // comes from the live market list. Real-world causes: the v1.25.0 ZIP
+      // applied without `npm run deploy` (the pre-v1.25.0 Liquid ignores
+      // the metafield and shows the buy box everywhere — the widget_markets
+      // check still PASSes because setting and metafield agree), or a
+      // metafield the theme cannot parse. Only judged under "selected" and
+      // only when the page landed where it was asked (a market redirect —
+      // e.g. a /en-us/ subfolder chosen for THIS host's location — would
+      // render a market that is not the primary one, so the inference would
+      // not hold); an unreadable market list is a note on the PASS, never a
+      // verdict.
+      let marketNote = "";
+      const setting = await getSetting(ctx.shop.id, "widgetMarkets");
+      const marketGatePassed = MARKET_GATE_PASSED_ATTRS.some((attr) =>
+        html.includes(attr),
+      );
+      const landedElsewhere =
+        Boolean(response.url) && !response.url.startsWith(url);
+      if (setting.mode === "selected" && marketGatePassed && landedElsewhere) {
+        marketNote = ` The page redirected to ${response.url}, so which market it rendered is unknown — the market rule was not judged.`;
+      } else if (setting.mode === "selected" && marketGatePassed) {
+        let primaryHandle: string | null = null;
+        try {
+          primaryHandle =
+            (await listMarkets(await ctx.admin())).find((m) => m.primary)
+              ?.handle ?? null;
+        } catch (err) {
+          marketNote = ` Could not verify the market rule against the live market list (${errorMessage(err)}) — re-run in a moment.`;
+        }
+        if (primaryHandle !== null && !marketAllowed(setting, primaryHandle)) {
+          return {
+            status: "FAIL",
+            detail: `The buy box is rendered on ${url} although market “${primaryHandle}” (the primary market, which this host serves) is excluded by your setting (only ${setting.handles.join(", ")}) — the storefront extension is probably not deployed (the theme still runs a pre-v1.25.0 Liquid that ignores the market rule) or the cellexia.widget_markets metafield is stale.`,
+            remediation:
+              "Run `npm run deploy` from the app folder, then Preview & launch → Where the buy box shows → Re-sync; if you changed the setting moments ago this can be page caching — re-run in a few minutes.",
+          };
+        }
+        if (primaryHandle === null && marketNote === "") {
+          marketNote =
+            " Could not tell which market this host serves (no primary market reported) — the market rule was not judged.";
+        }
       }
       const gated = html.includes(LAUNCH_GATED_ATTR);
       if (live && gated) {
@@ -805,7 +966,7 @@ const CHECKS: CheckDef[] = [
         status: "PASS",
         detail: `Widget markup found on ${url} (“${marker}”), ${
           live ? "visible as expected for a LIVE store" : "launch-gated as expected in SETUP"
-        }.`,
+        }.${marketNote}`,
       };
     },
   },
@@ -1608,6 +1769,15 @@ const CHECKS: CheckDef[] = [
         UNCOVERED_STATUSES.has(r.status),
       );
       const errored = setup.rows.filter((r) => r.status === "error");
+      // A run that Klaviyo's creation limit (or the run budget) ended early
+      // leaves `rate_limited` rows, and a metric Klaviyo has not registered
+      // yet stays `pending_metric` — neither is delivered, yet neither is
+      // in UNCOVERED_STATUSES (the alert sweep deliberately waits for its
+      // daily re-verify to turn them into a real "missing" rather than
+      // nagging mid-setup). This check must not read them as covered.
+      const waiting = setup.rows.filter(
+        (r) => r.status === "rate_limited" || r.status === "pending_metric",
+      );
       const problems: string[] = [];
       if (uncovered.length > 0) {
         problems.push(
@@ -1619,6 +1789,13 @@ const CHECKS: CheckDef[] = [
       if (errored.length > 0) {
         problems.push(
           `${errored.length} metric(s) failed their last setup attempt: ${errored
+            .map((r) => r.metric)
+            .join(", ")}`,
+        );
+      }
+      if (waiting.length > 0) {
+        problems.push(
+          `${waiting.length} metric(s) not covered yet — the last setup run stopped before them; open Emails → Klaviyo delivery setup and click Create my flows again: ${waiting
             .map((r) => r.metric)
             .join(", ")}`,
         );
@@ -1644,11 +1821,17 @@ const CHECKS: CheckDef[] = [
             "Open Emails to trigger a fresh verification, and check the alerts_run job on the Audit page.",
         };
       }
+      // Only what is TRUE: rows delivered by a live flow, by the app, or
+      // deliberately off — never a bare row count.
+      const covered = setup.rows.filter(
+        (r) => r.status === "live" || r.status === "app_delivers" || r.status === "off",
+      ).length;
+      const other = setup.rows.length - covered;
       return {
         status: "PASS",
-        detail: `All ${setup.rows.length} delivery metrics are covered (cached verdict${
+        detail: `All ${covered} delivery metrics are covered (cached verdict${
           setup.checkedAt ? `, verified ${Math.round(checkedAgeHours)}h ago` : ""
-        }).`,
+        })${other > 0 ? ` — ${other} row(s) not yet verified` : ""}.`,
       };
     },
   },

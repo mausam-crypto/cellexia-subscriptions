@@ -4,6 +4,129 @@ All notable changes to Cellexia Subscriptions. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [SemVer](https://semver.org) as contracted in [docs/UPDATE.md](docs/UPDATE.md).
 
+## [1.25.0] — 2026-08-15
+
+**Market-scoped buy box, and an Emails / Klaviyo setup that is instant and
+reliable.** Two merchant asks. (1) **Where the buy box shows** — a new card
+on Preview & launch: the app stays live everywhere, but the subscription
+widget can be limited to specific Shopify **markets** (read live from the
+store; default = every market, a no-op nothing has to sync). The rule is
+published as the shop metafield `cellexia.widget_markets`; the storefront
+Liquid resolves `localization.market.handle` and, in an excluded market,
+renders only an inert `<template data-cellexia-market-hidden>` — no widget
+markup, no JSON island, no plan ids, and deliberately not the "another
+app" marker, so nothing else in the widget can misfire. Save is atomic
+(setting → metafield, rolled back on failure), a typo can never hide a
+country (handles are validated against the live market list; "only these
+markets" with none selected is refused), and the Buy box designer's market
+preview says "— hidden" for excluded markets. The Preview Doctor and the
+Debug self-check read the marker before judging the launch gate, a new
+`widget_markets` self-check flags setting ⇄ metafield drift, a saved
+market that stops existing, and the inverse drift (widget visible in an
+excluded market — the tell-tale of an undeployed extension). (2) **The
+Emails area rework** — the reported "incredibly slow" buttons, the empty
+delivery checklist ("No emails found" even after Check again) and the
+throttling on Create my flows all had root causes and all are gone: the
+overview route was a Remix layout PARENT, so its 14-query loader + email
+render ran on every visit to the checklist and the editor and after every
+click there — the child pages are now escaped flat routes (same URLs);
+the checklist loader made a live Klaviyo verification on every visit that
+fetched every flow's definition one request at a time against a 60/min
+endpoint — any store with more than ~50 flows (including the ~27 this
+setup creates) got 429s, one 429 made the whole index fatal, and a fatal
+index rendered zero rows; and Create my flows ran synchronously inside the
+click with a 12-flow cap. Now: coverage is read with ONE request
+(`GET /api/metrics/?include=flow-triggers`, the metric → flow map with
+flow status), every Klaviyo call retries 429 honoring Retry-After, a
+failed read keeps the last known rows (never an empty table while a key
+is connected), pages render instantly from the cache, and both
+verification and setup run as **background tasks** with a live progress
+bar polled from `/app/emails/setup/status` — no per-run cap, every
+missing flow gets created at Klaviyo's pace, a Klaviyo hiccup waits and
+continues instead of erroring, "click again in a minute" is gone. Two
+tabs, an app restart mid-run and a stale key are all handled and tested.
+**Requires `npm run deploy` (the theme extension's Liquid changed).** No
+migration, no new env vars, no scope changes.
+
+> Update notes: `npm ci` → restart → `npm run deploy` (extension). Then
+> (1) open **Preview & launch → Where the buy box shows** — leave "All
+> markets" unless you want to limit it; (2) open **Emails → Klaviyo
+> delivery setup**: the checklist fills in from a background check within
+> seconds; if any row is not green click **Create my flows** once and
+> watch the progress bar — it finishes on its own. The Debug page's
+> `widget_markets` check confirms the storefront extension is deployed.
+
+### Added
+
+- `widgetMarkets` setting (`{ mode: "all" | "selected", handles[] }`,
+  Preview & launch owns it), shop metafield `cellexia.widget_markets`
+  (`{v:1,mode,handles}`), `app/lib/widget/widget-markets.ts` (isomorphic
+  helpers) + `widget-markets.server.ts` (publish / save-with-rollback /
+  divergence), Liquid market gate in `cx-buybox-core.liquid`, audit
+  actions `widget_markets_saved` / `widget_markets_resynced`, self-check
+  `widget_markets` (39 checks), designer "— hidden" hint,
+  `ShopifyMarket.enabled` in the markets read.
+- Klaviyo: `listMetricFlowIndex` (one-request metric → flow index with
+  per-metric fallback), module-private retry wrapper (429 Retry-After,
+  GET 5xx backoff, POST never re-sent), `setup-task.server.ts` background
+  task runner (one task per shop, in-process map + persisted
+  `klaviyoFlowSetup.task`, JobLock lease across instances, heartbeat,
+  interrupted-run detection), `cachedCoverageRows` + status `unchecked`,
+  `/app/emails/setup/status` polling route, `onProgress` on
+  `verifyFlowCoverage` / `runGuidedSetup`.
+- `auditSelectedHandles` (saved market handles vs the live market list:
+  missing / disabled / live) behind the `widget_markets` self-check and
+  the Preview picker's "Disabled — no visitors" badge; the exported
+  JobLock lease helpers (`acquireLock` / `renewLock` / `releaseLock` from
+  `app/lib/jobs/runner.server.ts`, optional lease length) reused by the
+  flow task for cross-instance mutual exclusion.
+- Tests: `market-visibility` (Liquid), `widget-markets`,
+  `klaviyo-setup-task` (lease, orphaned run, heartbeat/throttle, in-flight
+  double start, failed-read write abort), `klaviyo-setup-route` (loader
+  auto-verify throttle, save-key during a run), `emails-routes` static
+  pins; rewritten `klaviyo-flows` (index shape, retry, pacing, no per-flow
+  definition GET, referenced-but-not-included flow is never "missing",
+  duplicate metric names, budget exhaustion, sweep skip while a task runs,
+  re-entrancy). 180 files / 3628 tests, `tsc` 0, build green.
+
+### Changed
+
+- Route files: `app.emails.setup.tsx` → `app.emails_.setup.tsx`,
+  `app.emails.$template.tsx` → `app.emails_.$template.tsx` (URLs
+  unchanged); `app.emails.tsx` is a leaf route and no longer revalidates
+  on tab switches; the editor no longer revalidates after a test send.
+- Setup page: zero Klaviyo calls in the loader (auto-starts a background
+  check when the cache is older than 10 min), Create my flows / Check
+  again start tasks and return immediately, rows always shown (cached),
+  new copy for `rate_limited` ("Klaviyo is busy — continues on next run")
+  and `unchecked` ("Not checked yet"); saving a key while a check runs
+  queues a re-check with the new key.
+- Guided setup: no per-run cap; ≥ 4.1 s between flow creations (Create
+  Flow is 15/min), 8-minute run budget, then the next click continues;
+  post-run re-read resolves ambiguous POSTs; seeds/template reuse/merchant
+  flows untouched — unchanged.
+- Self-check `klaviyo_flow_coverage` WARNs on `rate_limited` /
+  `pending_metric` rows (was PASS); the daily coverage alert sweep skips
+  while a setup task is running; `storefront_widget` reads the
+  market-hidden marker first and FAILs on the inverse drift; the Preview
+  Doctor's `storefront_markup` distinguishes "hidden by your setting" from
+  "hidden but your setting allows it (re-sync)"; `preview-storefront`
+  no longer ticks "Storefront previewed" when the primary market is
+  hidden.
+- Docs: ARCHITECTURE (Klaviyo row, Launch & preview market visibility,
+  route map), OPERATIONS §14 + new §23 runbook, KLAVIYO_SETUP, extension
+  README.
+
+### Fixed
+
+- Empty delivery checklist / "No emails found" after Check again; Create
+  my flows ending in throttling; slow navigation across the Emails pages
+  (root causes above).
+- `updateFlowSetupSetting` no longer treats a failed settings read as an
+  empty cache (would have wiped rows / `setupRanAt`).
+- Duplicate metric names across integrations no longer resolve to the
+  wrong metric id (API-integration metric preferred).
+
 ## [1.24.0] — 2026-08-14
 
 **Dynamic gifts, truthful gift emails, and the experiment kernel** — the

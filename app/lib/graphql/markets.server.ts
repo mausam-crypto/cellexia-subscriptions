@@ -19,6 +19,7 @@ const MARKETS_QUERY = `#graphql
         name
         handle
         primary
+        enabled
       }
     }
   }
@@ -31,6 +32,7 @@ interface MarketsResponse {
       name?: string | null;
       handle?: string | null;
       primary?: boolean | null;
+      enabled?: boolean | null;
     } | null> | null;
   } | null;
 }
@@ -43,12 +45,22 @@ export interface ShopifyMarket {
   handle: string;
   /** True for the shop's primary market. */
   primary: boolean;
+  /**
+   * False for a draft/disabled market (v1.25.0): the `markets` connection
+   * lists those too, but no visitor ever resolves one on the storefront —
+   * a market-visibility selection made only of such markets hides the buy
+   * box everywhere. Missing in the API answer counts as enabled, so an
+   * older API shape can never mislabel a live market as inactive.
+   */
+  enabled: boolean;
 }
 
 /**
  * Every market on the shop (first 50 — Shopify caps shops far below that),
  * primary market first, then alphabetical. Nodes without a handle are
  * dropped: the storefront could never resolve a config entry for them.
+ * Draft/disabled markets are KEPT (flagged `enabled: false`) so a saved
+ * handle can still be recognised as a market rather than as a typo.
  */
 export async function listMarkets(admin: AdminClient): Promise<ShopifyMarket[]> {
   const data = await gql<MarketsResponse>(admin, MARKETS_QUERY, { first: 50 });
@@ -61,6 +73,7 @@ export async function listMarkets(admin: AdminClient): Promise<ShopifyMarket[]> 
       name: node.name ?? node.handle,
       handle: node.handle,
       primary: node.primary ?? false,
+      enabled: node.enabled ?? true,
     });
   }
   return markets.sort((a, b) => {

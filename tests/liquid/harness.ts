@@ -989,6 +989,16 @@ export interface MakeContextOptions extends ProductFixtureOptions {
    * the group default, never darken the widget.
    */
   variantDefaults?: unknown;
+  /**
+   * shop.metafields.cellexia.widget_markets.value — the MARKET VISIBILITY
+   * metafield (v1.25.0): `{v:1, mode:"all"|"selected", handles:[…]}`.
+   * `undefined` (the default) = the metafield is ABSENT — every shop that
+   * never touched "Where the buy box shows", and the state all pre-v1.25.0
+   * tests render under (shown in every market). Anything else is passed
+   * through verbatim so tests can hand it malformed values; the snippet
+   * shows the widget for anything but byte-exact `mode == 'selected'`.
+   */
+  widgetMarkets?: unknown;
   /** request.locale.iso_code */
   locale?: string;
   /**
@@ -1069,6 +1079,12 @@ export function makeContext(options: MakeContextOptions = {}): RenderContext {
   if (options.variantDefaults !== undefined) {
     cellexiaMetafields.variant_defaults = {
       value: options.variantDefaults,
+      type: "json",
+    };
+  }
+  if (options.widgetMarkets !== undefined) {
+    cellexiaMetafields.widget_markets = {
+      value: options.widgetMarkets,
       type: "json",
     };
   }

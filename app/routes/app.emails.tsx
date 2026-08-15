@@ -2,13 +2,10 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs, SerializeFrom } from "@remix-run/node";
 import { json } from "@remix-run/node";
 import {
-  Outlet,
   useActionData,
   useFetcher,
   useLoaderData,
-  useLocation,
   useNavigation,
-  useParams,
   useSearchParams,
   useSubmit,
 } from "@remix-run/react";
@@ -71,6 +68,14 @@ import {
  *
  * Plus the Design tab (brand kit driving the shared email shell) and the
  * Activity tab (NotificationLog sent log).
+ *
+ * Route shape (v1.25.0): this is a LEAF route. The setup wizard
+ * (`app.emails_.setup.tsx`) and the per-template editor
+ * (`app.emails_.$template.tsx`) use Remix's escaped flat-route names — same
+ * URLs, but no longer nested under this page — so this loader (a dozen
+ * settings reads + the sent log + a design preview render) runs only for
+ * the overview itself, never on a child's document load or after a child
+ * action. Tab switches (`?tab=`) don't re-run it either.
  */
 
 const LOG_PAGE_SIZE = 100;
@@ -378,23 +383,44 @@ function senderBadge(
     : { label: "Auto · Cellexia" };
 }
 
+/** True when the two search strings differ only in the `tab` parameter (or not at all). */
+function onlyTabDiffers(a: URLSearchParams, b: URLSearchParams): boolean {
+  const strip = (params: URLSearchParams): string => {
+    const copy = new URLSearchParams(params);
+    copy.delete("tab");
+    copy.sort();
+    return copy.toString();
+  };
+  return strip(a) === strip(b);
+}
+
 /**
  * Preview posts render draft copy/design and change no state — re-running
  * this route's heavy loader (settings + log queries + a preview render) on
- * every debounced keystroke would only slow the editor down.
+ * every debounced keystroke would only slow the editor down. Likewise a
+ * tab switch (`?tab=design|activity`) is pure client state: the loader
+ * already returned every tab's data. `?logTemplate=` DOES change the
+ * loader's query and keeps the default.
  */
 export const shouldRevalidate: ShouldRevalidateFunction = ({
   formData,
+  currentUrl,
+  nextUrl,
   defaultShouldRevalidate,
 }) => {
   const intent = formData?.get("intent");
   if (intent === "preview" || intent === "preview-design") return false;
+  if (
+    !formData &&
+    currentUrl.pathname === nextUrl.pathname &&
+    onlyTabDiffers(currentUrl.searchParams, nextUrl.searchParams)
+  ) {
+    return false;
+  }
   return defaultShouldRevalidate;
 };
 
 export default function EmailsPage() {
-  const params = useParams();
-  const location = useLocation();
   const data = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const shopify = useAppBridge();
@@ -424,15 +450,6 @@ export default function EmailsPage() {
     { id: "design", content: "Design" },
     { id: "activity", content: "Sent log" },
   ];
-
-  // Child routes (/app/emails/:template editor, /app/emails/setup wizard) —
-  // this component is their layout parent in Remix flat routes, so it must
-  // yield to the Outlet for ANY deeper path, not only the dynamic one.
-  // After every hook above, so the hook order stays stable across the
-  // overview ↔ child navigation.
-  if (params.template || /\/app\/emails\/.+/.test(location.pathname)) {
-    return <Outlet />;
-  }
 
   return (
     <Page

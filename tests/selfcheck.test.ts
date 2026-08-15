@@ -149,6 +149,22 @@ const mocks = vi.hoisted(() => {
     },
     klaviyoSetting: { value: { privateApiKey: "" } },
     mailTransportSetting: { value: { smtpPass: "" } },
+    // v1.25.0 market visibility: the setting + the raw metafield the theme
+    // reads (null = never written = every market).
+    widgetMarketsSetting: {
+      value: { mode: "all", handles: [] as string[] } as {
+        mode: "all" | "selected";
+        handles: string[];
+      },
+    },
+    widgetMarketsMetafield: { value: null as string | null },
+    // The shop's live market list (primary first) — what widget_markets
+    // audits saved handles against and what storefront_widget uses to name
+    // the market the probed primary domain serves.
+    listMarkets: vi.fn(async (): Promise<unknown[]> => [
+      { id: "gid://shopify/Market/1", name: "Switzerland", handle: "ch", primary: true, enabled: true },
+      { id: "gid://shopify/Market/2", name: "Germany", handle: "de", primary: false, enabled: true },
+    ]),
   };
 });
 
@@ -208,6 +224,7 @@ vi.mock("~/lib/settings/settings.server", () => ({
     if (key === "klaviyoFlowSetup") return mocks.flowSetupSetting.value;
     if (key === "klaviyo") return mocks.klaviyoSetting.value;
     if (key === "mailTransport") return mocks.mailTransportSetting.value;
+    if (key === "widgetMarkets") return mocks.widgetMarketsSetting.value;
     if (key === "lifecycle") {
       return {
         surpriseGiftOnCycle2: true,
@@ -240,23 +257,42 @@ vi.mock("~/lib/settings/settings.server", () => ({
 }));
 
 vi.mock("~/lib/graphql/metafields.server", () => ({
-  getShopMetafield: vi.fn(async (): Promise<unknown> => ({
-    id: "gid://shopify/Metafield/1",
-    namespace: "cellexia",
-    key: "plan_groups",
-    type: "json",
-    value: JSON.stringify({
-      v: 2,
-      groupIds: ["1"],
-      planIds: ["11"],
-      planSets: [["11"]],
-      appId: "4242",
-    }),
-  })),
+  getShopMetafield: vi.fn(
+    async (_admin: unknown, _namespace: string, key: string): Promise<unknown> => {
+      if (key === "widget_markets") {
+        return mocks.widgetMarketsMetafield.value === null
+          ? null
+          : {
+              id: "gid://shopify/Metafield/2",
+              namespace: "cellexia",
+              key: "widget_markets",
+              type: "json",
+              value: mocks.widgetMarketsMetafield.value,
+            };
+      }
+      return {
+        id: "gid://shopify/Metafield/1",
+        namespace: "cellexia",
+        key: "plan_groups",
+        type: "json",
+        value: JSON.stringify({
+          v: 2,
+          groupIds: ["1"],
+          planIds: ["11"],
+          planSets: [["11"]],
+          appId: "4242",
+        }),
+      };
+    },
+  ),
 }));
 
 vi.mock("~/lib/graphql/sellingPlans.server", () => ({
   getCurrentAppId: vi.fn(async (): Promise<string> => "4242"),
+}));
+
+vi.mock("~/lib/graphql/markets.server", () => ({
+  listMarkets: mocks.listMarkets,
 }));
 
 vi.mock("~/lib/graphql/appInstallation.server", () => ({
@@ -436,6 +472,12 @@ beforeEach(() => {
   };
   mocks.klaviyoSetting.value = { privateApiKey: "" };
   mocks.mailTransportSetting.value = { smtpPass: "" };
+  mocks.widgetMarketsSetting.value = { mode: "all", handles: [] };
+  mocks.widgetMarketsMetafield.value = null;
+  mocks.listMarkets.mockResolvedValue([
+    { id: "gid://shopify/Market/1", name: "Switzerland", handle: "ch", primary: true, enabled: true },
+    { id: "gid://shopify/Market/2", name: "Germany", handle: "de", primary: false, enabled: true },
+  ]);
   stubHealthyFetch();
 });
 
@@ -465,6 +507,8 @@ describe("self-check registry", () => {
       "email_templates",
       "stored_secrets",
       "event_provenance",
+      // v1.25.0: market visibility setting ⇄ storefront metafield.
+      "widget_markets",
     ]) {
       expect(SELF_CHECK_KEYS).toContain(key);
     }
@@ -820,6 +864,291 @@ describe("the comprehensive live-store checks (v1.22.0)", () => {
     expect(checkOf(report, "storefront_widget")?.status).toBe("WARN");
   });
 
+  // ── v1.25.0 market visibility ─────────────────────────────────────────────
+
+  /** The excluded-market page: only the inert marker, no gate, no widget. */
+  function stubMarketHiddenFetch(handle: string) {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) =>
+        String(input).includes("/products/")
+          ? new Response(
+              `<html><!-- BEGIN app snippet: cx-buybox-core --><template class="cx-buybox-nogroup" data-cellexia-market-hidden hidden style="display:none!important" data-cellexia-diag-market="${handle}"></template><!-- END app snippet --></html>`,
+              { status: 200 },
+            )
+          : new Response(
+              '<html><div class="cxs-portal" data-cellexia-portal></div></html>',
+              { status: 200 },
+            ),
+      ),
+    );
+  }
+
+  it("storefront_widget PASSes a market-hidden page when the setting excludes that market — the launch gate is not judged (LIVE and SETUP alike)", async () => {
+    mocks.widgetMarketsSetting.value = { mode: "selected", handles: ["ch"] };
+    stubMarketHiddenFetch("fr");
+
+    for (const mode of ["LIVE", "SETUP"] as const) {
+      mocks.launchMode.value = mode;
+      const report = await runSelfCheck("cellexia.myshopify.com");
+      const check = checkOf(report, "storefront_widget");
+      expect(check?.status, mode).toBe("PASS");
+      expect(check?.detail).toContain("“fr”");
+      expect(check?.detail).toContain("market setting");
+    }
+  });
+
+  it("storefront_widget PASSes a market-hidden page with a BLANK handle under “Only these markets” (fails closed as designed)", async () => {
+    mocks.widgetMarketsSetting.value = { mode: "selected", handles: ["ch"] };
+    stubMarketHiddenFetch("");
+    const report = await runSelfCheck("cellexia.myshopify.com");
+    const check = checkOf(report, "storefront_widget");
+    expect(check?.status).toBe("PASS");
+    expect(check?.detail).toContain("no market handle");
+  });
+
+  it("storefront_widget FAILs a market-hidden page when the setting ALLOWS that market (metafield drift) — with the re-save fix", async () => {
+    // Setting says all markets, but the theme hides "ch": the metafield the
+    // storefront reads is not the one the app believes it published.
+    mocks.widgetMarketsSetting.value = { mode: "all", handles: [] };
+    stubMarketHiddenFetch("ch");
+    let report = await runSelfCheck("cellexia.myshopify.com");
+    let check = checkOf(report, "storefront_widget");
+    expect(check?.status).toBe("FAIL");
+    expect(check?.detail).toContain("“ch”");
+    expect(check?.detail).toContain("app allows");
+    expect(check?.remediation).toContain("Where the buy box shows");
+
+    // Same with a selected list that DOES include the hidden market.
+    mocks.widgetMarketsSetting.value = { mode: "selected", handles: ["ch", "de"] };
+    report = await runSelfCheck("cellexia.myshopify.com");
+    check = checkOf(report, "storefront_widget");
+    expect(check?.status).toBe("FAIL");
+  });
+
+  it("storefront_widget: the market marker never masquerades as a gate verdict — a LIVE store with a plain gated page still FAILs", async () => {
+    // Regression guard on the ordering: the marker check runs first, but a
+    // page WITHOUT the marker goes through the untouched gate logic.
+    mocks.widgetMarketsSetting.value = { mode: "selected", handles: ["ch"] };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) =>
+        String(input).includes("/products/")
+          ? new Response(
+              '<html><div class="cx-buybox" data-cellexia-buybox hidden data-cellexia-gated="true"></div></html>',
+              { status: 200 },
+            )
+          : new Response(
+              '<html><div class="cxs-portal" data-cellexia-portal></div></html>',
+              { status: 200 },
+            ),
+      ),
+    );
+    const report = await runSelfCheck("cellexia.myshopify.com");
+    expect(checkOf(report, "storefront_widget")?.status).toBe("FAIL");
+  });
+
+  it("storefront_widget FAILs the INVERSE drift: the widget is rendered on the primary market although the setting excludes it (stale extension / stale metafield)", async () => {
+    // The v1.25.0 ZIP applied without `npm run deploy`: the theme still runs
+    // the pre-v1.25.0 Liquid, which ignores the metafield and renders the
+    // widget everywhere. Setting says "only de", the probe hits the primary
+    // domain (= primary market "ch"), and setting ⇄ metafield still agree
+    // (widget_markets stays PASS) — only this probe can see it.
+    mocks.widgetMarketsSetting.value = { mode: "selected", handles: ["de"] };
+    mocks.widgetMarketsMetafield.value = JSON.stringify({ v: 1, mode: "selected", handles: ["de"] });
+    for (const mode of ["LIVE", "SETUP"] as const) {
+      // LIVE renders the ungated widget, SETUP the gated one — a gated render
+      // in an excluded market is the same proof (market-hidden wins over the
+      // launch gate in the deployed Liquid).
+      mocks.launchMode.value = mode;
+      const report = await runSelfCheck("cellexia.myshopify.com");
+      const check = checkOf(report, "storefront_widget");
+      expect(check?.status, mode).toBe("FAIL");
+      expect(check?.detail).toContain("“ch”");
+      expect(check?.detail).toContain("excluded by your setting");
+      expect(check?.detail).toContain("only de");
+      expect(check?.remediation).toContain("npm run deploy");
+      expect(check?.remediation).toContain("Re-sync");
+      expect(checkOf(report, "widget_markets")?.status).toBe("PASS");
+    }
+  });
+
+  it("storefront_widget: the widget rendered on a primary market the setting INCLUDES is the ordinary verdict (no false drift)", async () => {
+    mocks.widgetMarketsSetting.value = { mode: "selected", handles: ["ch"] };
+    mocks.widgetMarketsMetafield.value = JSON.stringify({ v: 1, mode: "selected", handles: ["ch"] });
+    const report = await runSelfCheck("cellexia.myshopify.com");
+    const check = checkOf(report, "storefront_widget");
+    expect(check?.status).toBe("PASS");
+    expect(check?.detail).toContain("visible as expected");
+    expect(check?.detail).not.toContain("Could not");
+    // Under "all" the market list is never consulted for this probe.
+    mocks.widgetMarketsSetting.value = { mode: "all", handles: [] };
+    mocks.listMarkets.mockClear();
+    await runSelfCheck("cellexia.myshopify.com");
+    expect(mocks.listMarkets).not.toHaveBeenCalled();
+  });
+
+  it("storefront_widget: a page that REDIRECTED elsewhere (market subfolder) is not judged for inverse drift — the rendered market is unknown", async () => {
+    // Shopify's location redirect can land the app host on /en-us/… — a
+    // market that is not the primary one, so "widget rendered + primary
+    // excluded" would be a false FAIL. Note, not verdict.
+    mocks.widgetMarketsSetting.value = { mode: "selected", handles: ["de"] };
+    mocks.widgetMarketsMetafield.value = JSON.stringify({ v: 1, mode: "selected", handles: ["de"] });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) =>
+        String(input).includes("/products/")
+          ? ({
+              ok: true,
+              status: 200,
+              url: "https://cellexialabs.com/en-us/products/renewal-serum",
+              text: async (): Promise<string> =>
+                '<html><div class="cx-buybox" data-cellexia-buybox></div></html>',
+            } as unknown as Response)
+          : new Response('<html><div class="cxs-portal" data-cellexia-portal></div></html>', { status: 200 }),
+      ),
+    );
+    const report = await runSelfCheck("cellexia.myshopify.com");
+    const check = checkOf(report, "storefront_widget");
+    expect(check?.status).toBe("PASS");
+    expect(check?.detail).toContain("redirected to https://cellexialabs.com/en-us/products/renewal-serum");
+    expect(check?.detail).toContain("market rule was not judged");
+    // Only the widget_markets audit read the market list — this probe did not.
+    expect(mocks.listMarkets).toHaveBeenCalledTimes(1);
+  });
+
+  it("storefront_widget: an unreadable market list skips the inverse-drift judgement with a note — the gate verdict stands", async () => {
+    mocks.widgetMarketsSetting.value = { mode: "selected", handles: ["de"] };
+    mocks.widgetMarketsMetafield.value = JSON.stringify({ v: 1, mode: "selected", handles: ["de"] });
+    mocks.listMarkets.mockRejectedValue(new Error("read_markets denied"));
+    const report = await runSelfCheck("cellexia.myshopify.com");
+    const check = checkOf(report, "storefront_widget");
+    expect(check?.status).toBe("PASS");
+    expect(check?.detail).toContain("visible as expected");
+    expect(check?.detail).toContain("Could not verify the market rule");
+    expect(check?.detail).toContain("read_markets denied");
+  });
+
+  it("widget_markets WARNs when a saved handle is no longer a market or is a draft/disabled market, naming the remaining live ones", async () => {
+    mocks.widgetMarketsSetting.value = { mode: "selected", handles: ["ch", "eu", "gone"] };
+    mocks.widgetMarketsMetafield.value = JSON.stringify({ v: 1, mode: "selected", handles: ["ch", "eu", "gone"] });
+    mocks.listMarkets.mockResolvedValue([
+      { id: "gid://shopify/Market/1", name: "Switzerland", handle: "ch", primary: true, enabled: true },
+      { id: "gid://shopify/Market/9", name: "EU (draft)", handle: "eu", primary: false, enabled: false },
+    ]);
+    const report = await runSelfCheck("cellexia.myshopify.com");
+    const check = checkOf(report, "widget_markets");
+    expect(check?.status).toBe("WARN");
+    expect(check?.detail).toContain("“gone” is no longer a market");
+    expect(check?.detail).toContain("“eu” is a draft/disabled market");
+    expect(check?.detail).toContain("remaining 1: ch");
+    expect(check?.remediation).toContain("Where the buy box shows");
+    expect(check?.remediation).toContain("edit the list");
+  });
+
+  it("widget_markets FAILs when NONE of the saved handles is a live market — hidden everywhere with setting and metafield in agreement", async () => {
+    mocks.widgetMarketsSetting.value = { mode: "selected", handles: ["eu"] };
+    mocks.widgetMarketsMetafield.value = JSON.stringify({ v: 1, mode: "selected", handles: ["eu"] });
+    mocks.listMarkets.mockResolvedValue([
+      { id: "gid://shopify/Market/1", name: "Switzerland", handle: "ch", primary: true, enabled: true },
+      { id: "gid://shopify/Market/9", name: "EU (draft)", handle: "eu", primary: false, enabled: false },
+    ]);
+    let report = await runSelfCheck("cellexia.myshopify.com");
+    let check = checkOf(report, "widget_markets");
+    expect(check?.status).toBe("FAIL");
+    expect(check?.detail).toContain("hidden in EVERY market");
+    expect(check?.remediation).toContain("Where the buy box shows");
+    expect(report.verdict).toBe("BROKEN");
+
+    // A saved market deleted in Shopify afterwards: same dark storefront.
+    mocks.widgetMarketsSetting.value = { mode: "selected", handles: ["gone"] };
+    mocks.widgetMarketsMetafield.value = JSON.stringify({ v: 1, mode: "selected", handles: ["gone"] });
+    report = await runSelfCheck("cellexia.myshopify.com");
+    check = checkOf(report, "widget_markets");
+    expect(check?.status).toBe("FAIL");
+    expect(check?.detail).toContain("“gone” is no longer a market");
+  });
+
+  it("widget_markets: an unreadable market list is a note on the PASS, never a verdict; the divergence FAIL still wins over the audit", async () => {
+    mocks.widgetMarketsSetting.value = { mode: "selected", handles: ["ch"] };
+    mocks.widgetMarketsMetafield.value = JSON.stringify({ v: 1, mode: "selected", handles: ["ch"] });
+    mocks.listMarkets.mockRejectedValue(new Error("read_markets denied"));
+    let report = await runSelfCheck("cellexia.myshopify.com");
+    let check = checkOf(report, "widget_markets");
+    expect(check?.status).toBe("PASS");
+    expect(check?.detail).toContain("Could not verify the selected handles");
+    expect(check?.detail).toContain("read_markets denied");
+
+    // Diverged AND unverifiable → the divergence FAIL, unchanged wording.
+    mocks.widgetMarketsMetafield.value = null;
+    report = await runSelfCheck("cellexia.myshopify.com");
+    check = checkOf(report, "widget_markets");
+    expect(check?.status).toBe("FAIL");
+    expect(check?.detail).toContain("(missing)");
+  });
+
+  it("widget_markets PASSes the default (all markets, metafield never written)", async () => {
+    const report = await runSelfCheck("cellexia.myshopify.com");
+    const check = checkOf(report, "widget_markets");
+    expect(check?.status).toBe("PASS");
+    expect(check?.detail).toContain("all markets");
+    expect(check?.detail).toContain("absent");
+  });
+
+  it("widget_markets PASSes when the published value matches the selected list (order and duplicates ignored)", async () => {
+    mocks.widgetMarketsSetting.value = { mode: "selected", handles: ["ch", "de"] };
+    mocks.widgetMarketsMetafield.value = JSON.stringify({
+      v: 1,
+      mode: "selected",
+      handles: ["de", "ch", "de"],
+    });
+    const report = await runSelfCheck("cellexia.myshopify.com");
+    const check = checkOf(report, "widget_markets");
+    expect(check?.status).toBe("PASS");
+    expect(check?.detail).toContain("only 2 market(s): ch, de");
+  });
+
+  it("widget_markets FAILs when the storefront metafield disagrees with the setting, naming the re-sync fix", async () => {
+    // Setting restricts, storefront never written (shows everywhere).
+    mocks.widgetMarketsSetting.value = { mode: "selected", handles: ["ch"] };
+    mocks.widgetMarketsMetafield.value = null;
+    let report = await runSelfCheck("cellexia.myshopify.com");
+    let check = checkOf(report, "widget_markets");
+    expect(check?.status).toBe("FAIL");
+    expect(check?.detail).toContain("(missing)");
+    expect(check?.remediation).toContain("Where the buy box shows");
+    expect(report.verdict).toBe("BROKEN");
+
+    // Setting says all markets, storefront still restricts (a stale write).
+    mocks.widgetMarketsSetting.value = { mode: "all", handles: [] };
+    mocks.widgetMarketsMetafield.value = JSON.stringify({
+      v: 1,
+      mode: "selected",
+      handles: ["ch"],
+    });
+    report = await runSelfCheck("cellexia.myshopify.com");
+    check = checkOf(report, "widget_markets");
+    expect(check?.status).toBe("FAIL");
+    expect(check?.detail).toContain('"selected"');
+
+    // Different lists.
+    mocks.widgetMarketsSetting.value = { mode: "selected", handles: ["ch", "de"] };
+    report = await runSelfCheck("cellexia.myshopify.com");
+    expect(checkOf(report, "widget_markets")?.status).toBe("FAIL");
+
+    // Unparsable JSON is drift too — a re-sync rewrites the canonical value.
+    mocks.widgetMarketsMetafield.value = "{not json";
+    report = await runSelfCheck("cellexia.myshopify.com");
+    expect(checkOf(report, "widget_markets")?.status).toBe("FAIL");
+  });
+
+  it("widget_markets is in the Launch & storefront category, right beside launch_flag", async () => {
+    const report = await runSelfCheck("cellexia.myshopify.com");
+    const keys = report.checks.map((c) => c.key);
+    expect(keys.indexOf("widget_markets")).toBe(keys.indexOf("launch_flag") + 1);
+    expect(checkOf(report, "widget_markets")?.category).toBe("Launch & storefront");
+  });
+
   it("renewal_readiness flags ACTIVE contracts with no next billing date", async () => {
     mocks.contractCount.mockImplementation(
       async (args?: { where?: { nextBillingDate?: unknown } }) =>
@@ -924,6 +1253,52 @@ describe("the comprehensive live-store checks (v1.22.0)", () => {
     expect(
       report.checks.find((c) => c.key === "klaviyo_flow_coverage")?.status,
     ).toBe("PASS");
+  });
+
+  it("klaviyo_flow_coverage WARNs on rate_limited / pending_metric rows (a run that stopped early) — never PASS 'all covered'; PASS counts only live/app_delivers/off", async () => {
+    // A guided run that Klaviyo's Create Flow limit ended after 1 of 3 flows:
+    // the leftover rows are rate_limited (not in UNCOVERED_STATUSES, so the
+    // alert sweep waits for its daily re-verify) — the self-check must still
+    // say so instead of "All 3 delivery metrics are covered".
+    mocks.flowSetupSetting.value = {
+      checkedAt: new Date().toISOString(),
+      lastAttemptAt: new Date().toISOString(),
+      setupRanAt: new Date().toISOString(),
+      rows: [
+        { metric: "Cellexia Upcoming order", status: "live" },
+        { metric: "Cellexia Payment failed", status: "rate_limited" },
+        { metric: "Cellexia Order shipped", status: "rate_limited" },
+      ],
+    };
+    let report = await runSelfCheck("cellexia.myshopify.com");
+    let check = report.checks.find((c) => c.key === "klaviyo_flow_coverage");
+    expect(check?.status).toBe("WARN");
+    expect(check?.detail).toContain("2 metric(s) not covered yet");
+    expect(check?.detail).toContain("Cellexia Payment failed");
+    expect(check?.detail).toContain("Cellexia Order shipped");
+    expect(check?.detail).toMatch(/Create my flows again/);
+
+    // A seeded metric Klaviyo has not registered yet is not covered either.
+    mocks.flowSetupSetting.value.rows = [
+      { metric: "Cellexia Upcoming order", status: "live" },
+      { metric: "Cellexia Gift Teaser", status: "pending_metric" },
+    ];
+    report = await runSelfCheck("cellexia.myshopify.com");
+    check = report.checks.find((c) => c.key === "klaviyo_flow_coverage");
+    expect(check?.status).toBe("WARN");
+    expect(check?.detail).toContain("1 metric(s) not covered yet");
+    expect(check?.detail).toContain("Cellexia Gift Teaser");
+
+    // PASS detail counts only what is genuinely covered.
+    mocks.flowSetupSetting.value.rows = [
+      { metric: "Cellexia Upcoming order", status: "live" },
+      { metric: "Cellexia Order shipped", status: "app_delivers" },
+      { metric: "Cellexia Resume Reminder", status: "off" },
+    ];
+    report = await runSelfCheck("cellexia.myshopify.com");
+    check = report.checks.find((c) => c.key === "klaviyo_flow_coverage");
+    expect(check?.status).toBe("PASS");
+    expect(check?.detail).toContain("All 3 delivery metrics are covered");
   });
 
   it("email_templates WARNs when a merchant override leaves a placeholder unresolved", async () => {

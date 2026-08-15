@@ -63,6 +63,30 @@ export const settingsSchemas = {
       previewedPortal: false,
     }),
 
+  /**
+   * Where the buy box shows (v1.25.0) — market-scoped widget visibility,
+   * orthogonal to the launch mode. `all` (default) = every Shopify Market;
+   * `selected` = only markets whose handle is listed (exact
+   * `localization.market.handle` match — the storefront rule in
+   * cx-buybox-core.liquid). Mirrored to the `cellexia.widget_markets` shop
+   * metafield (`{v:1, mode, handles}`; ABSENT ⇔ all markets, so a shop that
+   * never touched this needs no sync). Machine-readable by the Preview &
+   * launch page only — the generic Settings page never renders it. A separate
+   * key rather than a field on `launch` on purpose: every `launch` field is
+   * required, so a new one would make existing LIVE rows fail to parse and
+   * fall back to SETUP. `selected` with zero handles (hidden everywhere) is
+   * refused at save time — never what a merchant meant.
+   */
+  widgetMarkets: z
+    .object({
+      mode: z.enum(["all", "selected"]).default("all"),
+      handles: z
+        .array(z.string().trim().min(1).max(255))
+        .max(50)
+        .default([]),
+    })
+    .default({ mode: "all", handles: [] }),
+
   /** Discount stacking rules — subscription discount vs promo codes vs referral credit. */
   discountStacking: z
     .object({
@@ -871,11 +895,56 @@ export const settingsSchemas = {
             flowId: z.string().default(""),
             flowName: z.string().default(""),
             ours: z.boolean().default(false),
+            /** Row-level explanation shown under the checklist entry (v1.25.0). */
+            detail: z.string().default(""),
           }),
         )
         .default([]),
+      /**
+       * v1.25.0 — the background verify/setup task record (setup-task.server.ts)
+       * so other instances/tabs/reloads can follow a run; report = SetupReport.
+       */
+      task: z
+        .object({
+          id: z.string(),
+          kind: z.enum(["verify", "setup"]),
+          state: z.enum(["running", "done", "failed"]),
+          startedAt: z.string(),
+          updatedAt: z.string(),
+          finishedAt: z.string().nullable().default(null),
+          step: z.string().default(""),
+          message: z.string().default(""),
+          done: z.number().default(0),
+          total: z.number().default(0),
+          report: z
+            .object({
+              ok: z.boolean(),
+              fatal: z.string().optional(),
+              seeded: z.array(z.string()).default([]),
+              rows: z.array(
+                z.object({
+                  key: z.string(),
+                  metric: z.string(),
+                  name: z.string(),
+                  templates: z.array(z.string()).default([]),
+                  why: z.string().default(""),
+                  status: z.string(),
+                  flowId: z.string().default(""),
+                  flowName: z.string().default(""),
+                  ours: z.boolean().default(false),
+                  detail: z.string().default(""),
+                }),
+              ),
+              checkedAt: z.string(),
+            })
+            .nullable()
+            .default(null),
+          error: z.string().nullable().default(null),
+        })
+        .nullable()
+        .default(null),
     })
-    .default({ checkedAt: null, lastAttemptAt: null, setupRanAt: null, rows: [] }),
+    .default({ checkedAt: null, lastAttemptAt: null, setupRanAt: null, rows: [], task: null }),
 
   /**
    * INTERNAL / MACHINE-WRITTEN — learned churn-risk model state. Written

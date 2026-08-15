@@ -24,9 +24,15 @@ import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
  *  - the fail-open path is NOT silent: a doctor that itself throws still
  *    opens the preview, but the response carries a "diagnosis was skipped"
  *    toast and the audit event records doctorSkipped: true;
- *  - only a doctor-vetted open ticks "Storefront previewed": both un-vetted
- *    opens (openAnyway over a BLOCKED verdict, and the fail-open path) leave
- *    the checklist alone and record checklistPreviewedStorefront: false;
+ *  - only a doctor-vetted open ticks "Storefront previewed": the un-vetted
+ *    opens (openAnyway over a BLOCKED verdict, the fail-open path, and — since
+ *    v1.25.0 — a READY verdict whose storefront_markup step is the
+ *    market-hidden WARN, `code: "market_hidden"`) leave the checklist alone
+ *    and record checklistPreviewedStorefront: false;
+ *  - the market-hidden WARN is judged against the widgetMarkets SETTING: the
+ *    merchant's own exclusion names the picker, a hidden page the setting
+ *    allows names the drifted metafield + Re-sync, an unreadable setting
+ *    stays neutral;
  *  - mutation check on the proxy-identity assertion: flip the probe to a
  *    foreign body, watch the step FAIL, restore it, watch it PASS again.
  *
@@ -147,6 +153,9 @@ const mocks = vi.hoisted(() => ({
   probeProxyIdentity: vi.fn(async (): Promise<unknown> => ({})),
   buildStorefrontPreviewUrl: vi.fn(async (): Promise<string> => ""),
   markChecklist: vi.fn(async (): Promise<void> => {}),
+  // Settings rows (the REAL getSetting runs over this): null → registry
+  // default, i.e. widgetMarkets { mode: "all" }.
+  settingFindUnique: vi.fn(async (): Promise<unknown> => null),
 }));
 
 /** This app's own numeric App id, as the mocked Admin API reports it. */
@@ -155,6 +164,7 @@ const OUR_APP_ID = "4477001";
 vi.mock("~/db.server", () => ({
   default: {
     sellingPlanConfig: { findMany: mocks.configFindMany },
+    setting: { findUnique: mocks.settingFindUnique },
   },
 }));
 
@@ -209,6 +219,7 @@ vi.mock("~/lib/klaviyo/client.server", () => ({
 vi.mock("~/lib/graphql/index.server", () => ({
   getProducts: vi.fn(async () => []),
   getSubscribableProducts: vi.fn(async () => []),
+  listMarkets: vi.fn(async () => []),
 }));
 vi.mock("~/lib/ownership/foreign-groups.server", () => ({
   scanForeignSellingPlanGroups: vi.fn(),
@@ -234,6 +245,7 @@ vi.mock("@shopify/polaris", () => {
     Button: stub,
     Card: stub,
     Checkbox: stub,
+    ChoiceList: stub,
     Divider: stub,
     InlineGrid: stub,
     InlineStack: stub,
@@ -320,6 +332,7 @@ beforeEach(() => {
   mocks.buildStorefrontPreviewUrl.mockResolvedValue(
     `${PRODUCT_URL}?cx_preview=signed-token`,
   );
+  mocks.settingFindUnique.mockResolvedValue(null);
   fetchMock.mockReset();
   fetchMock.mockResolvedValue(htmlResponse(HTML_WITH_MARKER));
   vi.stubGlobal("fetch", fetchMock);
@@ -769,6 +782,112 @@ describe("storefront_markup — the end-to-end HTML probe", () => {
     expect(s.detail).toContain("DRAFT");
     expect(fetchMock).not.toHaveBeenCalled(); // no page to probe
   });
+
+  // ── v1.25.0 market visibility ─────────────────────────────────────────────
+
+  /**
+   * The excluded-market page: cx-buybox-core renders ONLY the inert
+   * market-hidden template — which still sits inside Shopify's app-snippet
+   * comment wrapper, i.e. carries one of STOREFRONT_MARKERS. Without the
+   * marker-first branch this would PASS as "markup found" over a page that
+   * will never show the widget.
+   */
+  const HTML_MARKET_HIDDEN =
+    '<html><body><!-- BEGIN app snippet: cx-buybox-core --><template class="cx-buybox-nogroup" data-cellexia-market-hidden hidden style="display:none!important" data-cellexia-diag-market="fr"></template><!-- END app snippet --></body></html>';
+
+  /** The merchant's own choice: "Only these markets" without "fr". */
+  const SETTING_ONLY_CH = { value: { mode: "selected", handles: ["ch"] } };
+
+  it("WARNs (never FAILs, never blocks) a page hidden by the market setting, naming the market — when the SETTING really excludes it", async () => {
+    mocks.settingFindUnique.mockResolvedValue(SETTING_ONLY_CH);
+    fetchMock.mockResolvedValue(htmlResponse(HTML_MARKET_HIDDEN));
+    const report = await runPreviewDoctor(SHOP_DOMAIN, PRODUCT_GID);
+    const s = step(report, "storefront_markup");
+    expect(s.status).toBe("WARN");
+    expect(s.code).toBe("market_hidden");
+    expect(s.detail).toContain("market setting");
+    expect(s.detail).toContain("“fr”");
+    expect(s.detail).toContain("www.cellexialabs.com");
+    expect(s.detail).toContain("launch gate cannot be judged");
+    expect(s.detail).toContain("Where the buy box shows");
+    // The wording came from READING the setting, not from the marker alone.
+    expect(mocks.settingFindUnique).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { shopId_key: { shopId: SHOP.id, key: "widgetMarkets" } },
+      }),
+    );
+    // WARN never blocks preview-storefront.
+    expect(report.verdict).toBe("READY");
+    expect(report.firstBlockedStep).toBeUndefined();
+  });
+
+  it("the market-hidden WARN names a blank handle honestly (storefront without a market)", async () => {
+    mocks.settingFindUnique.mockResolvedValue(SETTING_ONLY_CH);
+    fetchMock.mockResolvedValue(
+      htmlResponse(HTML_MARKET_HIDDEN.replace('data-cellexia-diag-market="fr"', 'data-cellexia-diag-market=""')),
+    );
+    const report = await runPreviewDoctor(SHOP_DOMAIN, PRODUCT_GID);
+    const s = step(report, "storefront_markup");
+    expect(s.status).toBe("WARN");
+    expect(s.code).toBe("market_hidden");
+    expect(s.detail).toContain("no market handle");
+    expect(s.detail).not.toContain("“”");
+  });
+
+  it("DRIFT: a market-hidden page while the setting ALLOWS that market is not blamed on the setting — it names the drifted metafield and Re-sync", async () => {
+    // Setting = the default "all markets" (no row), yet the theme hides
+    // "fr": the metafield the theme reads is not what the app published (a
+    // hand edit, a racing save, a write that landed after a rollback). The
+    // old wording told the merchant to "add" a market that is already
+    // allowed — the wrong control.
+    fetchMock.mockResolvedValue(htmlResponse(HTML_MARKET_HIDDEN));
+    let report = await runPreviewDoctor(SHOP_DOMAIN, PRODUCT_GID);
+    let s = step(report, "storefront_markup");
+    expect(s.status).toBe("WARN");
+    expect(s.code).toBe("market_hidden");
+    expect(s.detail).toContain("“fr”");
+    expect(s.detail).toContain("your setting allows it");
+    expect(s.detail).toContain("all markets");
+    expect(s.detail).toContain("drifted");
+    expect(s.detail).not.toContain("add this market");
+    expect(s.remediation).toContain("Where the buy box shows");
+    expect(s.remediation).toContain("Re-sync");
+    expect(report.verdict).toBe("READY");
+
+    // Same with a selected list that DOES include the hidden market.
+    mocks.settingFindUnique.mockResolvedValue({
+      value: { mode: "selected", handles: ["fr", "ch"] },
+    });
+    report = await runPreviewDoctor(SHOP_DOMAIN, PRODUCT_GID);
+    s = step(report, "storefront_markup");
+    expect(s.status).toBe("WARN");
+    expect(s.detail).toContain("only fr, ch");
+    expect(s.detail).toContain("drifted");
+  });
+
+  it("an unreadable setting keeps the WARN neutral — it asserts nothing about the merchant's choice", async () => {
+    mocks.settingFindUnique.mockRejectedValue(new Error("settings table locked"));
+    fetchMock.mockResolvedValue(htmlResponse(HTML_MARKET_HIDDEN));
+    const report = await runPreviewDoctor(SHOP_DOMAIN, PRODUCT_GID);
+    const s = step(report, "storefront_markup");
+    expect(s.status).toBe("WARN");
+    expect(s.code).toBe("market_hidden");
+    expect(s.detail).toContain("“fr”");
+    expect(s.detail).toContain("could not be read");
+    expect(s.detail).not.toContain("by your market setting");
+    expect(s.detail).not.toContain("drifted");
+    // Contained: the doctor did not crash and the verdict is unchanged.
+    expect(report.steps).toHaveLength(CHAIN.length);
+    expect(report.verdict).toBe("READY");
+  });
+
+  it("the market marker is checked BEFORE the generic markers — a page with both markup and no marker still PASSes", async () => {
+    // Ordinary live page (no market marker): the untouched PASS path.
+    fetchMock.mockResolvedValue(htmlResponse(HTML_WITH_MARKER));
+    const report = await runPreviewDoctor(SHOP_DOMAIN, PRODUCT_GID);
+    expect(step(report, "storefront_markup").status).toBe("PASS");
+    expect(step(report, "storefront_markup").code).toBeUndefined();
+  });
 });
 
 // ── Verdict and ordering ─────────────────────────────────────────────────────
@@ -931,8 +1050,9 @@ describe("preview-storefront action — gated on the doctor's verdict", () => {
     expect(String(body.url)).toContain("cx_preview=");
     expect(body.report).toBeUndefined();
     // A clean pre-flight carries no toast — the skipped-diagnosis note
-    // below must be reserved for the fail-open path.
+    // below must be reserved for the fail-open path — and no market note.
     expect(body.toast).toBeUndefined();
+    expect(body.marketHidden).toBeUndefined();
     // The gate genuinely ran (one doctor audit event, verdict READY)…
     expect(doctorRunEvents()).toEqual([
       expect.objectContaining({ verdict: "READY" }),
@@ -975,5 +1095,46 @@ describe("preview-storefront action — gated on the doctor's verdict", () => {
     // the exact blank page "Storefront previewed" exists to catch. A later
     // preview whose diagnosis actually runs and passes ticks it.
     expect(mocks.markChecklist).not.toHaveBeenCalled();
+  });
+
+  it("market-hidden (doctor READY + storefront_markup WARN market_hidden): opens the tab, explains it, does NOT tick “Storefront previewed”", async () => {
+    // The primary market is excluded by the merchant's setting: the doctor
+    // stays READY (WARN never blocks) but the preview tab — primary domain =
+    // primary market — will show no widget, and the storefront raises no
+    // diagnostic there (no gated root, no no-group marker). The old flow
+    // discarded the WARN, opened a blank tab and ticked the checklist.
+    mocks.settingFindUnique.mockResolvedValue({
+      value: { mode: "selected", handles: ["ch"] },
+    });
+    fetchMock.mockResolvedValue(
+      htmlResponse(
+        '<html><body><!-- BEGIN app snippet: cx-buybox-core --><template class="cx-buybox-nogroup" data-cellexia-market-hidden hidden style="display:none!important" data-cellexia-diag-market="fr"></template><!-- END app snippet --></body></html>',
+      ),
+    );
+    const { body } = await runPreviewIntent();
+
+    // WARN never blocks: the preview still opens…
+    expect(body.ok).toBe(true);
+    expect(String(body.url)).toContain("cx_preview=");
+    expect(doctorRunEvents()).toEqual([expect.objectContaining({ verdict: "READY" })]);
+    // …but the merchant is told WHY the page will show no buy box, and the
+    // checklist is left alone; the audit event records the un-vetted open.
+    expect(String(body.toast)).toContain("shows no buy box");
+    expect(String(body.toast)).toContain("market setting");
+    expect(String(body.toast)).toContain("“fr”");
+    expect(String(body.toast)).toContain("“Storefront previewed” was not ticked");
+    // …persistently too (the card renders this as a banner; a toast fades).
+    expect(String(body.marketHidden)).toContain("“fr”");
+    expect(body.report).toBeUndefined();
+    expect(mocks.markChecklist).not.toHaveBeenCalled();
+    const created = mocks.logEvent.mock.calls
+      .map(([event]) => event.payload)
+      .find((payload) => payload.action === "storefront_preview_created");
+    expect(created).toMatchObject({
+      marketHidden: true,
+      checklistPreviewedStorefront: false,
+    });
+    expect(created).not.toHaveProperty("openAnyway");
+    expect(created).not.toHaveProperty("doctorSkipped");
   });
 });

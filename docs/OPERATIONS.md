@@ -20,7 +20,7 @@ Subscriptions) unless a shell command is shown.
    90-day MRR trend, the 12-week new-vs-churned chart, the forecast teaser
    (with its accuracy grade chip) and the top open failed payments.
 2. **Debug** — the self-check verdict chip should read **Healthy**. The same
-   38 checks re-run automatically every 30 minutes (`selfcheck_run`, also in
+   39 checks re-run automatically every 30 minutes (`selfcheck_run`, also in
    setup mode); a **Broken** verdict raises one CRITICAL `SELF_CHECK_FAILED`
    alert (emailed to Settings → alerts → `emailTo`) and every failing row on
    the page carries a named fix. The alert auto-resolves when a later run
@@ -262,7 +262,7 @@ scheduler liveness (last job tick); it returns non-200 when a subsystem is down.
 
 The admin **Debug** page is the wide companion to this endpoint: where
 `/api/health` answers "is the process alive" for an external monitor, the
-Debug self-check probes 38 feature-level facts on the live store (billing
+Debug self-check probes 39 feature-level facts on the live store (billing
 pipeline shapes, dunning cases, the portal fetched through the real app
 proxy, webhook delivery evidence, granted API scopes, secrets, Klaviyo
 outbox, settings integrity, gift-promise configuration) every 30 minutes and
@@ -344,6 +344,80 @@ local dev harness behind `PORTAL_COOKIE_DEV=1` (see `.env.example`).
 **Preview opened but the widget is not there?** That is the
 [§20 "Widget not showing?" runbook](#20-runbook--widget-not-showing): run the
 Preview Doctor first.
+
+**Where the buy box shows — market visibility (v1.25.0).** The card of that
+name on Preview & launch (just above Storefront preview) limits the buy box
+to specific Shopify Markets while the app stays live everywhere else:
+**All markets (default)** or **Only these markets** + a checkbox per market
+(name, handle, the shop's primary market tagged) → **Save**. Visitors in an
+unlisted market see the ordinary product page without the subscription
+option; renewals, the portal, emails and the launch mode are untouched. Under
+the hood it is the settings key `widgetMarkets` (`mode`, `handles`) mirrored
+into the shop metafield `cellexia.widget_markets` (`{"v":1,"mode":…,
+"handles":[…]}`) — the metafield is what the buy-box Liquid reads, matching
+the visitor's `localization.market.handle` **exactly** against the list; a
+missing metafield means "every market", so a shop that never touched the card
+has nothing to sync. Save writes the setting first, then the metafield, and
+rolls the setting back if the metafield write fails (you get the error, nothing
+changed — retry). Saves are on the Audit page as `admin.action` /
+`widget_markets_saved` (with the previous value). Operational notes:
+
+- **"Only these markets" with nothing ticked cannot be saved** — that would
+  hide the buy box everywhere; the real kill switch is Revert to setup.
+  Handles are validated against the live market list on save; a saved market
+  that was later deleted in Shopify is listed as stale and dropped on the next
+  save.
+- **Draft / disabled markets** are listed in the picker with a
+  "Disabled — no visitors" badge (Shopify's `markets` query returns them, but
+  no visitor ever resolves one). Ticking only such markets — or keeping a
+  market that is later deleted or disabled — hides the buy box in every
+  market while the setting and the metafield still agree; the Debug
+  self-check `widget_markets` audits the saved handles against the live
+  market list every tick: **WARN** when a saved handle is no longer a market
+  or is disabled ("the buy box shows only in the remaining N"), **FAIL** when
+  none of them is a live market ("hidden in EVERY market"). Fix: edit the
+  list on the card.
+- **Subscription-only products** (Shopify "require a selling plan"): in a
+  hidden market the buy box is not rendered at all, so no `selling_plan`
+  reaches the theme's add-to-cart form and Shopify refuses the add — such a
+  product is **unbuyable** in every market you exclude. This is deliberate
+  (the gate never leaks subscription UI into a hidden market); the card's help
+  text says so. If you sell subscription-only products, unpublish them from
+  the excluded markets (Shopify admin → Markets → products) or make them
+  subscription-optional.
+- **Preview link vs. primary market**: the storefront preview opens your
+  primary domain, i.e. the primary market. If that market is excluded, the
+  preview shows a page without the widget by design (the card says so under
+  Storefront preview); the Preview Doctor's markup step reports **Check**
+  rather than a failure and never blocks the preview — but the wording is
+  judged against your setting: "hidden … by your market setting … add this
+  market under Where the buy box shows" when you excluded it, "the storefront
+  hides the buy box … but your setting allows it — Re-sync" when the
+  metafield drifted. Either way **Preview storefront** still opens the tab,
+  the toast repeats the explanation, and "Storefront previewed" is NOT ticked
+  off that page (audit `storefront_preview_created` records
+  `marketHidden: true`). Preview from a domain/URL of an included market
+  instead.
+- **Drift banner + Re-sync**: the page reads `cellexia.widget_markets` back
+  and, when it disagrees with the setting (a hand-edited metafield, a failed
+  write), shows a warning banner with **Re-sync** (audit:
+  `widget_markets_resynced`). The Debug self-check `widget_markets` fails on
+  the same drift, and its `storefront_widget` probe reports a market-hidden
+  page as PASS when the setting excludes that market and FAIL ("the app allows
+  it") when it does not. The INVERSE drift is caught too: when the probed
+  primary-domain page renders the buy box although your setting excludes the
+  primary market, `storefront_widget` FAILs ("the storefront extension is
+  probably not deployed … or the metafield is stale") — the signature of a
+  ZIP applied without `npm run deploy` (see below), which the setting ⇄
+  metafield comparison alone can never see.
+- **Designer**: the Buy box designer's **Preview market** select labels
+  excluded markets "— hidden" and shows an info banner when one is selected;
+  per-market presets still save for them (they apply the moment the market is
+  added back).
+- **Deploy**: v1.25.0 changed the extension's Liquid, so `npm run deploy` is
+  required — until it runs, the theme ignores the metafield and shows the buy
+  box everywhere; the `storefront_widget` self-check names exactly that state
+  once a market is excluded (previous bullet).
 
 ## 15. Runbook — buy box design
 
@@ -1031,7 +1105,9 @@ nothing on the store is changed) and names the first closed gate:
 6. **Widget markup reaches the live product page** — the doctor fetches the
    real PDP HTML and looks for our markers; missing markers mean the
    extension is not deployed or the app embed is off on the published theme
-   (§16).
+   (§16). Since v1.25.0 a page hidden by the market setting (§14, "Where the
+   buy box shows") is reported as **Check** naming the market — the primary
+   domain the doctor probes may simply be an excluded market; not a failure.
 7. **Launch mode** — informational: SETUP means hidden-until-previewed by
    design.
 
@@ -1155,3 +1231,61 @@ recorded and the readout windows on it. The settings value
 the experiment overlays the test value at the decision point only, and the
 discount stacking cap still applies afterwards. Change the underlying setting
 mid-experiment and you have changed the control arm mid-flight: don't.
+
+## 23. Runbook — Klaviyo delivery setup (Emails → Klaviyo delivery setup)
+
+**How it works since v1.25.0.** Opening the page is instant: it shows the
+cached delivery checklist (one row per subscription email; "Not checked
+yet" until the first verification) and, when the cache is older than ten
+minutes, starts a background verification — the header shows
+**Checking…** and rows update on their own within a few seconds. **Check
+again** does the same on demand. **Create my flows** starts a background
+setup: a progress bar in step 2 reads "Creating flow 4 of 12 — …" while
+it works; you can leave the page and come back — the run keeps going and
+the page picks it up. No verification or flow creation runs inside a web
+request anymore (saving a key still checks it against Klaviyo once — a few
+seconds, 15 s at most — before it is stored, so a wrong key is never
+saved; a key saved while a run is in flight is re-checked automatically
+when that run finishes), and the Emails overview no longer reloads its
+whole catalog when you use the setup page or an email editor. One run per
+store at a time, across every app instance (a short database lease).
+
+**Why runs pace themselves.** Klaviyo lets an account create at most 15
+flows a minute (100 a day) and read flows at 60 a minute; the setup creates
+one flow every ~4 seconds and reads coverage with a single request, so a
+full first run for ~27 emails takes about two minutes. When Klaviyo answers
+"slow down" (429) the run waits the time Klaviyo asks for and continues; if
+Klaviyo keeps refusing (the daily cap, or minutes of throttling) the
+remaining rows read **Klaviyo is busy — continues on next run** and the
+next click carries on from there — nothing is ever created twice (every
+run lists before it creates).
+
+**Symptoms and what they mean.**
+
+- *Rows say "Not checked yet" and nothing happens* → the key is not
+  connected (step 1 badge), or a verification failed: a yellow banner
+  above the checklist says why (usually the key lacks Metrics: Read /
+  Flows: Full — step 1 lists the four scopes). The last known rows stay
+  visible; the table is never blank while a key is connected.
+- *"The last run did not finish"* (red banner) → the app restarted while
+  a run was working (a deploy, a crash), or the run threw. Just click
+  again — runs are idempotent.
+- *"Flow setup is already running (maybe in another tab)"* → one run per
+  store at a time; the page follows the running one. A run that stops
+  reporting for 90 s counts as interrupted and no longer blocks a new
+  start.
+- *Rows stuck on "Waiting for Klaviyo"* → the metric was just seeded and
+  Klaviyo has not registered it yet (it usually does within the run);
+  click **Create my flows** once more a minute later.
+- *`KLAVIYO_FLOW_COVERAGE` alert / Debug `klaviyo_flow_coverage` WARN* →
+  the daily re-check found a flow deleted or paused; open the page — the
+  checklist names it; **Create my flows** restores it. The Debug check also
+  WARNs "N metric(s) not covered yet" while rows sit at **Klaviyo is
+  busy** / **Waiting for Klaviyo** after a run stopped early — click
+  **Create my flows** again (the alert sweep itself stays quiet until its
+  daily re-verify turns those rows into a real "missing").
+
+Under the hood: `app/lib/klaviyo/setup-task.server.ts` (task runner,
+state in `klaviyoFlowSetup.task`), `flows.server.ts` (index, retry, setup),
+`/app/emails/setup/status` (the DB-only polling endpoint). Audit trail:
+`admin.action` `klaviyo_flow_setup` per completed setup run.

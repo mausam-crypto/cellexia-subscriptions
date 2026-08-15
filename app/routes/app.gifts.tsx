@@ -297,6 +297,67 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           : "FIXED",
       repeatsAnnually: formData.get("repeatsAnnually") === "true",
     };
+    // Dynamic rules carry the pool they were configured against (the modal
+    // edits the shop-wide pool in place). Validated with the registry's own
+    // pool schema so a bad payload can never corrupt the stored value.
+    let poolUpdate: SettingsValue<"gifts">["pool"] | null = null;
+    const poolJsonRaw = String(formData.get("poolJson") ?? "").trim();
+    if (candidate.selection === "DYNAMIC" && poolJsonRaw !== "") {
+      let poolCandidate: unknown;
+      try {
+        poolCandidate = JSON.parse(poolJsonRaw);
+      } catch {
+        return json<ActionData>(
+          { intent, ok: false, errors: { pool: "Invalid gift pool payload" } },
+          { status: 422 },
+        );
+      }
+      // The group schema is wrapped in .default(); reach through to the
+      // inner object's pool field for a standalone validator.
+      const poolParsed = settingsSchemas.gifts
+        .removeDefault()
+        .shape.pool.safeParse(poolCandidate);
+      if (!poolParsed.success) {
+        return json<ActionData>(
+          {
+            intent,
+            ok: false,
+            errors: {
+              pool: `Gift pool rejected: ${poolParsed.error.issues[0]?.message ?? "invalid"}`,
+            },
+          },
+          { status: 422 },
+        );
+      }
+      poolUpdate = poolParsed.data;
+    }
+    const currentGifts = await getSetting(shop.id, "gifts");
+    const effectivePool = poolUpdate ?? currentGifts.pool;
+    // A Dynamic rule with an empty pool has nothing to pick from — refuse
+    // rather than quietly behave like a Fixed rule.
+    if (candidate.selection === "DYNAMIC" && effectivePool.length === 0) {
+      return json<ActionData>(
+        {
+          intent,
+          ok: false,
+          errors: {
+            pool: "Add at least one product to the gift pool for a dynamic gift.",
+          },
+        },
+        { status: 422 },
+      );
+    }
+    // Dynamic fallback defaults to the first pool product (the modal does the
+    // same client-side; this covers direct posts).
+    if (
+      candidate.selection === "DYNAMIC" &&
+      candidate.variantId === "" &&
+      effectivePool.length > 0
+    ) {
+      candidate.variantId = effectivePool[0].variantId;
+      candidate.variantTitle = effectivePool[0].variantTitle ?? null;
+    }
+
     const parsed = ruleSchema.safeParse(candidate);
     if (!parsed.success) {
       const errors: Record<string, string> = {};
@@ -310,6 +371,42 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       return json<ActionData>({ intent, ok: false, errors }, { status: 422 });
     }
     const values = parsed.data;
+
+    if (poolUpdate) {
+      // Same write path as the Gift pool card: keep pairings/survey/max as
+      // they are, drop pairing entries pointing at products no longer in the
+      // pool.
+      const poolIds = new Set(poolUpdate.map((p) => p.variantId));
+      const prune = (rec: Record<string, string[]>) =>
+        Object.fromEntries(
+          Object.entries(rec)
+            .map(([k, v]) => [k, v.filter((id) => poolIds.has(id))] as const)
+            .filter(([, v]) => v.length > 0),
+        );
+      await setSetting(
+        shop.id,
+        "gifts",
+        {
+          ...currentGifts,
+          pool: poolUpdate,
+          pairings: prune(currentGifts.pairings),
+          surveyPairings: prune(currentGifts.surveyPairings),
+        },
+        actor,
+      );
+      await logEvent({
+        shopId: shop.id,
+        type: "admin.action",
+        source: "ADMIN",
+        actor,
+        payload: {
+          action: "gifts_config_updated",
+          via: "gift_rule_form",
+          poolSize: poolUpdate.length,
+          previousPoolSize: currentGifts.pool.length,
+        },
+      });
+    }
     // Keep only the field matching the trigger; the rest are noise.
     const orderIndex =
       values.trigger === "ORDER_INDEX" ? values.orderIndex : null;
@@ -487,6 +584,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
 // ── Variant picker ───────────────────────────────────────────────────────────
 
+type GiftsConfig = SettingsValue<"gifts">;
+
 function GiftVariantPicker({
   currencyCode,
   selectedId,
@@ -494,6 +593,10 @@ function GiftVariantPicker({
   error,
   onSelect,
   onClear,
+  label = "Gift variant",
+  helpText = "Added to the qualifying order as a zero-priced line.",
+  placeholder = "Search for the gift product…",
+  excludeIds = [],
 }: {
   currencyCode: string;
   selectedId: string | null;
@@ -501,6 +604,12 @@ function GiftVariantPicker({
   error?: string;
   onSelect: (variantId: string, label: string) => void;
   onClear: () => void;
+  label?: string;
+  helpText?: string;
+  placeholder?: string;
+  /** Multi-pick mode: variants already chosen, hidden from the results so
+   * the search stays open for the next pick. */
+  excludeIds?: readonly string[];
 }) {
   const fetcher = useFetcher<ActionData>();
   const [query, setQuery] = useState("");
@@ -524,7 +633,7 @@ function GiftVariantPicker({
     return (
       <BlockStack gap="100">
         <Text as="p" variant="bodyMd" fontWeight="medium">
-          Gift variant
+          {label}
         </Text>
         <InlineStack gap="150">
           <Tag onRemove={onClear}>{selectedLabel ?? selectedId}</Tag>
@@ -533,19 +642,26 @@ function GiftVariantPicker({
     );
   }
 
+  const visible = results
+    .map((product) => ({
+      ...product,
+      variants: product.variants.filter((v) => !excludeIds.includes(v.id)),
+    }))
+    .filter((product) => product.variants.length > 0);
+
   return (
     <BlockStack gap="200">
       <TextField
-        label="Gift variant"
+        label={label}
         autoComplete="off"
         value={query}
         onChange={setQuery}
-        placeholder="Search for the gift product…"
-        helpText="Added to the qualifying order as a zero-priced line."
+        placeholder={placeholder}
+        helpText={helpText}
         loading={fetcher.state !== "idle"}
         error={error}
       />
-      {results.length > 0 && query.trim().length >= 2 ? (
+      {visible.length > 0 && query.trim().length >= 2 ? (
         <Box
           borderColor="border"
           borderWidth="025"
@@ -553,9 +669,9 @@ function GiftVariantPicker({
           padding="150"
         >
           <BlockStack gap="100">
-            {results.flatMap((product) =>
+            {visible.flatMap((product) =>
               product.variants.map((variant) => {
-                const label =
+                const variantLabel =
                   variant.title && variant.title !== "Default Title"
                     ? `${product.title} — ${variant.title}`
                     : product.title;
@@ -565,9 +681,9 @@ function GiftVariantPicker({
                     variant="tertiary"
                     textAlign="left"
                     fullWidth
-                    onClick={() => onSelect(variant.id, label)}
+                    onClick={() => onSelect(variant.id, variantLabel)}
                   >
-                    {`${label} (${formatMoney(variant.priceCents, currencyCode)})`}
+                    {`${variantLabel} (${formatMoney(variant.priceCents, currencyCode)})`}
                   </Button>
                 );
               }),
@@ -575,6 +691,89 @@ function GiftVariantPicker({
           </BlockStack>
         </Box>
       ) : null}
+    </BlockStack>
+  );
+}
+
+/**
+ * Multi-product pool editor shared by the rule form (Dynamic mode) and the
+ * Gift pool card: the current pool as removable rows with a COGS field, plus
+ * a search that stays open so several products can be added in a row.
+ */
+function PoolEditor({
+  pool,
+  costDrafts,
+  currencyCode,
+  onAdd,
+  onRemove,
+  onCostChange,
+}: {
+  pool: GiftsConfig["pool"];
+  costDrafts: Record<string, string>;
+  currencyCode: string;
+  onAdd: (variantId: string, label: string) => void;
+  onRemove: (variantId: string) => void;
+  onCostChange: (variantId: string, value: string) => void;
+}) {
+  return (
+    <BlockStack gap="200">
+      {pool.length === 0 ? (
+        <Text as="p" tone="subdued" variant="bodySm">
+          No products in the pool yet — search below and add several. Your
+          normal products work; the picker never gives a customer something
+          they already receive.
+        </Text>
+      ) : (
+        <BlockStack gap="150">
+          {pool.map((entry) => (
+            <InlineStack
+              key={entry.variantId}
+              gap="300"
+              blockAlign="center"
+              wrap
+            >
+              <Box minWidth="220px">
+                <Text as="span" fontWeight="medium">
+                  {entry.variantTitle ?? entry.variantId}
+                </Text>
+              </Box>
+              <Box maxWidth="150px">
+                <TextField
+                  label="COGS"
+                  labelHidden
+                  autoComplete="off"
+                  type="number"
+                  min={0}
+                  step={0.01}
+                  prefix={currencyCode}
+                  placeholder="Shopify cost"
+                  value={costDrafts[entry.variantId] ?? ""}
+                  onChange={(v) => onCostChange(entry.variantId, v)}
+                />
+              </Box>
+              <Button
+                size="slim"
+                tone="critical"
+                variant="tertiary"
+                onClick={() => onRemove(entry.variantId)}
+              >
+                Remove
+              </Button>
+            </InlineStack>
+          ))}
+        </BlockStack>
+      )}
+      <GiftVariantPicker
+        currencyCode={currencyCode}
+        selectedId={null}
+        selectedLabel={null}
+        onSelect={onAdd}
+        onClear={() => {}}
+        label="Add products to the pool"
+        helpText="Pick as many as you like — the search stays open. Cost left blank uses Shopify's cost per item."
+        placeholder="Search your products…"
+        excludeIds={pool.map((p) => p.variantId)}
+      />
     </BlockStack>
   );
 }
@@ -618,6 +817,7 @@ function RuleFormModal({
   prefill,
   open,
   currencyCode,
+  gifts,
   errors,
   saving,
   onClose,
@@ -627,11 +827,24 @@ function RuleFormModal({
   prefill: RulePrefill | null;
   open: boolean;
   currencyCode: string;
+  gifts: GiftsConfig;
   errors: Record<string, string>;
   saving: boolean;
   onClose: () => void;
   onSave: (fd: FormData) => void;
 }) {
+  // The pool is shop-wide (shared by every dynamic gift moment) — the modal
+  // edits the same pool the Gift pool card does, so a Dynamic rule can be
+  // set up end to end in one place: several products in, one fallback out.
+  const [pool, setPool] = useState<GiftsConfig["pool"]>(gifts.pool);
+  const [poolCostDrafts, setPoolCostDrafts] = useState<Record<string, string>>(
+    Object.fromEntries(
+      gifts.pool.map((p) => [
+        p.variantId,
+        p.unitCostCents > 0 ? (p.unitCostCents / 100).toFixed(2) : "",
+      ]),
+    ),
+  );
   const [name, setName] = useState(rule?.name ?? prefill?.name ?? "");
   const [trigger, setTrigger] = useState<string>(
     rule?.trigger ?? prefill?.trigger ?? "ORDER_INDEX",
@@ -653,7 +866,11 @@ function RuleFormModal({
   );
   const [announce, setAnnounce] = useState(rule?.announceInAdvance ?? false);
   const [active, setActive] = useState(rule?.active ?? true);
-  const [selection, setSelection] = useState<string>(rule?.selection ?? "FIXED");
+  // New rules default to Dynamic when a pool already exists — that is the
+  // mode the whole gift system is built around; Fixed stays one click away.
+  const [selection, setSelection] = useState<string>(
+    rule?.selection ?? (gifts.pool.length > 0 ? "DYNAMIC" : "FIXED"),
+  );
   const [repeatsAnnually, setRepeatsAnnually] = useState(
     rule?.repeatsAnnually ?? false,
   );
@@ -669,13 +886,35 @@ function RuleFormModal({
       "daysSubscribed",
       trigger === "DAYS_SUBSCRIBED" ? daysSubscribed : "",
     );
-    fd.set("variantId", variantId ?? "");
-    fd.set("variantTitle", variantTitle ?? "");
+    // Dynamic rules: the fallback defaults to the first pool product when
+    // none was picked explicitly — one less thing to explain.
+    const effectiveVariantId =
+      variantId ?? (selection === "DYNAMIC" ? (pool[0]?.variantId ?? null) : null);
+    const effectiveVariantTitle =
+      variantTitle ??
+      (selection === "DYNAMIC" ? (pool[0]?.variantTitle ?? null) : null);
+    fd.set("variantId", effectiveVariantId ?? "");
+    fd.set("variantTitle", effectiveVariantTitle ?? "");
     fd.set("unitCost", unitCost);
     fd.set("announceInAdvance", String(announce));
     fd.set("active", String(active));
     fd.set("selection", selection);
     fd.set("repeatsAnnually", String(repeatsAnnually));
+    if (selection === "DYNAMIC") {
+      fd.set(
+        "poolJson",
+        JSON.stringify(
+          pool.map((p) => {
+            const draft = (poolCostDrafts[p.variantId] ?? "").trim();
+            const cents = draft === "" ? 0 : centsFromDecimalString(draft);
+            return {
+              ...p,
+              unitCostCents: Number.isNaN(cents) || cents < 0 ? 0 : cents,
+            };
+          }),
+        ),
+      );
+    }
     onSave(fd);
   };
 
@@ -745,16 +984,53 @@ function RuleFormModal({
           <Select
             label="Gift selection"
             options={[
-              { label: "Fixed — always this product", value: "FIXED" },
+              { label: "Fixed — always this one product", value: "FIXED" },
               {
-                label: "Dynamic — pick the best product per customer",
+                label: "Dynamic — pick the best product per customer from a pool",
                 value: "DYNAMIC",
               },
             ]}
             value={selection}
             onChange={setSelection}
-            helpText="Dynamic picks from the gift pool below: always something the customer doesn't already have, ranked by your pairings. The product picked here becomes the fallback."
+            helpText="Fixed gives everyone the same product. Dynamic chooses per customer from the gift pool: always something they don't already have, ranked by your pairings."
           />
+          {selection === "DYNAMIC" ? (
+            <BlockStack gap="200">
+              <Text as="p" variant="bodyMd" fontWeight="medium">
+                Gift pool
+              </Text>
+              <Text as="p" tone="subdued" variant="bodySm">
+                The products this gift may be picked from — several, not one.
+                Each customer gets the best match that they don't already
+                receive. The pool is shared by every dynamic gift moment (this
+                rule, the cancel-flow save, the win-back perk, the day-90
+                reward, the milestone ladder). Pairings and survey tiebreakers
+                are set on the Gift pool card below.
+              </Text>
+              {errors.pool ? (
+                <Text as="p" tone="critical" variant="bodySm">
+                  {errors.pool}
+                </Text>
+              ) : null}
+              <PoolEditor
+                pool={pool}
+                costDrafts={poolCostDrafts}
+                currencyCode={currencyCode}
+                onAdd={(id, label) => {
+                  if (pool.some((p) => p.variantId === id)) return;
+                  setPool([
+                    ...pool,
+                    { variantId: id, variantTitle: label, unitCostCents: 0 },
+                  ]);
+                }}
+                onRemove={(id) => setPool(pool.filter((p) => p.variantId !== id))}
+                onCostChange={(id, v) =>
+                  setPoolCostDrafts({ ...poolCostDrafts, [id]: v })
+                }
+              />
+              <Divider />
+            </BlockStack>
+          ) : null}
           <GiftVariantPicker
             currencyCode={currencyCode}
             selectedId={variantId}
@@ -768,6 +1044,12 @@ function RuleFormModal({
               setVariantId(null);
               setVariantTitle(null);
             }}
+            label={selection === "DYNAMIC" ? "Fallback product (optional)" : "Gift product"}
+            helpText={
+              selection === "DYNAMIC"
+                ? "Only used when nothing in the pool suits a customer. Leave empty to use the first pool product."
+                : "Added to the qualifying order as a zero-priced line."
+            }
           />
           <TextField
             label="Unit cost (COGS)"
@@ -795,8 +1077,6 @@ function RuleFormModal({
 }
 
 // ── Gift pool & pairings ─────────────────────────────────────────────────────
-
-type GiftsConfig = SettingsValue<"gifts">;
 
 /**
  * Ordered multi-pick over the pool: click an unselected gift to append it
@@ -937,55 +1217,13 @@ function GiftPoolCard({
           </Text>
         </BlockStack>
         <Divider />
-        {pool.length === 0 ? (
-          <Text as="p" tone="subdued">
-            The pool is empty — dynamic picks fall back to each rule's fixed
-            product, and pool-dependent gifts (cancel save, day-90 reward,
-            ladder) quietly stand down.
-          </Text>
-        ) : (
-          <BlockStack gap="200">
-            {pool.map((entry) => (
-              <InlineStack key={entry.variantId} gap="300" blockAlign="center" wrap>
-                <Box minWidth="240px">
-                  <Text as="span" fontWeight="medium">
-                    {entry.variantTitle ?? entry.variantId}
-                  </Text>
-                </Box>
-                <Box maxWidth="160px">
-                  <TextField
-                    label="COGS"
-                    labelHidden
-                    autoComplete="off"
-                    type="number"
-                    min={0}
-                    step={0.01}
-                    prefix={currencyCode}
-                    placeholder="Shopify cost"
-                    value={costDrafts[entry.variantId] ?? ""}
-                    onChange={(v) =>
-                      setCostDrafts({ ...costDrafts, [entry.variantId]: v })
-                    }
-                  />
-                </Box>
-                <Button
-                  size="slim"
-                  tone="critical"
-                  variant="tertiary"
-                  onClick={() => removePoolEntry(entry.variantId)}
-                >
-                  Remove
-                </Button>
-              </InlineStack>
-            ))}
-          </BlockStack>
-        )}
-        <GiftVariantPicker
+        <PoolEditor
+          pool={pool}
+          costDrafts={costDrafts}
           currencyCode={currencyCode}
-          selectedId={null}
-          selectedLabel={null}
-          onSelect={addPoolEntry}
-          onClear={() => {}}
+          onAdd={addPoolEntry}
+          onRemove={removePoolEntry}
+          onCostChange={(id, v) => setCostDrafts({ ...costDrafts, [id]: v })}
         />
         <Divider />
         <BlockStack gap="200">
@@ -1326,8 +1564,9 @@ export default function GiftsPage() {
               <BlockStack gap="200">
                 <Text as="p" variant="bodySm">
                   The lifecycle engine expects these three moments (timings come
-                  from Settings → Lifecycle). Create the matching rule and pick
-                  a variant:
+                  from Settings → Lifecycle). Create the matching rule — choose
+                  Dynamic to pick from a pool of several products per customer,
+                  or Fixed for one product for everyone:
                 </Text>
                 {builtIns.map((item) => (
                   <InlineStack
@@ -1458,6 +1697,7 @@ export default function GiftsPage() {
           prefill={prefill}
           open={modalOpen}
           currencyCode={currencyCode}
+          gifts={gifts}
           errors={ruleErrors}
           saving={busy && navIntent === "save-rule"}
           onClose={() => {

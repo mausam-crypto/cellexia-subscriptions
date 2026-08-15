@@ -2,6 +2,19 @@
 {%- if product != blank and product.selling_plan_groups.size > 0 -%}
 {%- liquid
 # OWNERSHIP: render OUR allow-listed group or render NOTHING; no allow-list means no widget. TWO factors, BOTH mandatory: (a) the group's app_id equals cx_allow.appId — the app id this app stamps onto its own groups and publishes about itself; app ids read the same from the Admin API and from Liquid, and app_id is nil unless the owning app stamped it. It is NOT secret (any app can stamp any string onto its own groups), so it never decides alone. (b) the group's LIVE selling plan ids EXACTLY equal one entry of cx_allow.planSets — same members, same count, exact string equality entry by entry, never a joined list, never any-member. Exact set equality is the load-bearing choice: an any-member rule lets ONE corrupted planIds entry render a competitor's single-plan group whose owner copied our public app id; under set equality any tamper of an existing set darkens the widget (fails closed) and rendering a foreign group requires authoring its complete set. Selling PLAN ids are numeric and identical in both APIs; GROUP ids are not (opaque storefront identifiers vs numeric admin ids — the v1.6.6 outage), so cx_allow.groupIds and the legacy any-member cx_allow.planIds still travel in the metafield for the Preview Doctor and the pre-v1.6.9 extension but this gate never reads them. Missing either factor renders nothing, fails closed. Full essay: README "Core snippet internals"; proof: tests/liquid/two-apps.test.ts.
+assign cx_market_handle = ''
+if localization.market.handle != blank
+assign cx_market_handle = localization.market.handle | append: ''
+endif
+# MARKET VISIBILITY: cellexia.widget_markets {v, mode, handles}; absent or mode not selected shows everywhere; selected shows only an EXACT member of handles (blank fails closed); an excluded market renders only the market-hidden template at the end. README "Core snippet internals".
+assign cx_wm = shop.metafields.cellexia.widget_markets.value
+assign cx_market_ok = true
+if cx_wm and cx_wm.mode == 'selected'
+assign cx_market_ok = false
+if cx_market_handle != blank and cx_wm.handles contains cx_market_handle
+assign cx_market_ok = true
+endif
+endif
 assign cx_allow = shop.metafields.cellexia.plan_groups.value
 assign cx_allow_plan_count = cx_allow.planIds | size
 assign cx_allow_sets = cx_allow.planSets
@@ -52,7 +65,7 @@ endif
 endfor
 endif
 -%}
-{%- if cx_group_found -%}
+{%- if cx_group_found and cx_market_ok -%}
 {%- comment -%} From here to the matching else branch: the widget itself (the render snapshot pins the output). {%- endcomment -%}
 {%- liquid
 # Launch gate: hidden until live; missing metafield fails closed.
@@ -72,11 +85,7 @@ assign cx_preset = cx_source
 elsif cx_cfg and cx_cfg.preset
 assign cx_preset = cx_cfg.preset
 assign cx_use_cfg = true
-# Per-market preset (config.markets, v1.6.0) keyed by market HANDLE; nil-safe, exact key, unknown preset falls back to the base preset.
-assign cx_market_handle = ''
-if localization.market.handle != blank
-assign cx_market_handle = localization.market.handle | append: ''
-endif
+# Per-market preset (config.markets, v1.6.0) keyed by market HANDLE (assigned at the top of the snippet); nil-safe, exact key, unknown preset falls back to the base preset.
 if cx_market_handle != blank and cx_cfg.markets
 assign cx_market_entry = cx_cfg.markets[cx_market_handle]
 if cx_market_entry and cx_market_entry.preset != blank
@@ -1264,7 +1273,7 @@ assign a_first_raw = a.price | money | strip_html | replace: '&nbsp;', ' ' | re
 </style>
 </noscript>
 </div>
-{%- else -%}
+{%- elsif cx_market_ok -%}
 {%- liquid
 # NO OWNED GROUP: render NOTHING but this invisible admin-diagnostic marker (three hiding layers; carries none of the widget hooks) — README "Core snippet internals". Its data-cellexia-diag-* attributes say WHY nothing matched: every group on the product with its app id and truncated name, whether an allow-list was published, how many legacy plan ids and how many plan SETS it carries (plan-count 3 with set-count 0 reads as a pre-v1.6.9 metafield), and which appId it expects ('none' when the field is missing — the group app ids alongside make an unstamped group readable in the same inspector view).
 assign cx_diag_groups = ''
@@ -1284,5 +1293,6 @@ if cx_diag_allow_app_id == blank
 assign cx_diag_allow_app_id = 'none'
 endif
 -%}<template class="cx-buybox-nogroup" data-cellexia-no-owned-group hidden style="display:none!important" data-cellexia-diag-group-count="{{ product.selling_plan_groups.size }}" data-cellexia-diag-groups="{{ cx_diag_groups | escape }}" data-cellexia-diag-allowlist="{{ cx_diag_allow }}" data-cellexia-diag-plan-count="{{ cx_allow_plan_count }}" data-cellexia-diag-set-count="{{ cx_allow_set_count }}" data-cellexia-diag-allow-app-id="{{ cx_diag_allow_app_id | escape }}"></template>
+{%- else -%}<template class="cx-buybox-nogroup" data-cellexia-market-hidden hidden style="display:none!important" data-cellexia-diag-market="{{ cx_market_handle | escape }}"></template>
 {%- endif -%}
 {%- endif -%}

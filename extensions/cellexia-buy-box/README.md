@@ -361,6 +361,105 @@ diagnostic" (why the marker is a `<template>` with three independent
 layers against theme CSS), "Design presets", "Text resolution and
 templates" and "Theme add-to-cart price sync".
 
+### Market visibility (`cellexia.widget_markets`, v1.25.0)
+
+"The app is live, but the buy box only shows in these Shopify Markets." The
+first thing the core snippet does — before ownership, before the launch gate
+— is resolve the market handle (`localization.market.handle`, nil-safe, the
+same assign the per-market preset lookup reuses further down) and read the
+shop metafield `cellexia.widget_markets`, published by the app's **Preview &
+launch → Where the buy box shows** card:
+
+```json
+{"v":1,"mode":"all","handles":[]}
+{"v":1,"mode":"selected","handles":["ch","de"]}
+```
+
+The rule, in Liquid, is four lines:
+
+```liquid
+assign cx_wm = shop.metafields.cellexia.widget_markets.value
+assign cx_market_ok = true
+if cx_wm and cx_wm.mode == 'selected'
+assign cx_market_ok = false
+if cx_market_handle != blank and cx_wm.handles contains cx_market_handle
+assign cx_market_ok = true
+endif
+endif
+```
+
+- **Anything but byte-exact `mode == 'selected'` shows the widget everywhere**
+  — an absent metafield, `"all"`, an unknown mode, a mode-less object. So a
+  shop that never touched the card has nothing to sync, and the
+  metafield-absent render is byte-identical to v1.24.0 (the golden snapshots
+  render with it absent).
+- **`selected` shows the widget only for an EXACT member of `handles`.**
+  Plain Liquid array `contains`: no trim, no case folding — `"CH"`, `" ch"`,
+  `"ch2"` are not `"ch"`, the same rule the launch gate applies to `"live"`
+  and the per-market preset lookup applies to its keys. A blank handle, or a
+  storefront that does not expose `localization.market` at all, **fails
+  closed** under `selected` (there is no way to know it is an allowed
+  market).
+- **Excluded market ⇒ nothing but an inert marker.** The widget branch is
+  `{%- if cx_group_found and cx_market_ok -%}`, the no-owned-group branch is
+  `{%- elsif cx_market_ok -%}`, and the final `else` renders exactly
+
+  ```html
+  <template class="cx-buybox-nogroup" data-cellexia-market-hidden hidden
+            style="display:none!important"
+            data-cellexia-diag-market="fr"></template>
+  ```
+
+  — no widget markup, no JSON island, no `<script>`, no plan ids, no
+  `data-cellexia-gated` (a gated widget would be REVEALED by any admin
+  preview link, would trip the Debug self-check's "still launch-gated" FAIL,
+  and would ship the full markup to a market you chose to hide), and
+  deliberately **not** `data-cellexia-no-owned-group`, so `buy-box.js`'s
+  "plans from another app" diagnostic card can never fire on a market the
+  merchant hid. Market-hidden therefore wins over no-owned-group AND over the
+  launch gate (a SETUP store in an excluded market renders no gated widget
+  either). The three hiding layers are the same as the no-group marker's; the
+  one attribute, `data-cellexia-diag-market`, names the handle the page
+  resolved (escaped once) for the inspector, the Preview Doctor (WARN "hidden
+  … by your market setting — the launch gate cannot be judged from this
+  market") and the self-check (PASS when the setting excludes that market,
+  FAIL "the app allows it" when it does not).
+- **The app embed** still renders its (empty, hidden) wrapper around the
+  marker; `buy-box-embed.js` already handles an empty wrapper (placed but
+  kept `[hidden]`, no placement diagnostic) — this is exactly today's
+  no-owned-group path, and no JS changed for the feature. `previewBoot()`
+  finds neither a gated widget nor a no-group marker, so it makes no fetch
+  and raises no wrong card.
+- **The preview link opens the primary domain**, i.e. the primary market. If
+  the primary market is excluded, the preview shows a page without the widget
+  by design; the Preview & launch card says so, the preview toast repeats the
+  doctor's explanation, and "Storefront previewed" is not ticked off that
+  page.
+- **Subscription-only products** (`product.requires_selling_plan`) get NO
+  exemption from the gate: in an excluded market they render the same inert
+  marker, so no `selling_plan` input reaches the theme form and Shopify
+  refuses the add-to-cart — such a product is unbuyable in every hidden
+  market. Deliberate (the gate never leaks subscription UI into a market the
+  merchant hid); the fix is Markets-side (unpublish the product there) or
+  making it subscription-optional. Pinned in the test file below.
+- **Inverse drift** (a ZIP applied without `npm run deploy`, so the theme
+  still runs a pre-v1.25.0 Liquid that ignores the metafield): the rendered
+  widget carries no version or market stamp, so the app's `storefront_widget`
+  self-check infers it — widget markup on the primary domain while the
+  setting excludes the primary market → FAIL "extension probably not
+  deployed / metafield stale". No bytes were added to the Liquid for this
+  (the size budget is nearly exhausted).
+
+Pinned by `tests/liquid/market-visibility.test.ts` (both install shapes:
+absent / all / selected-member render; non-member → marker only, no
+buybox/gated/no-group/island; no localization drop and blank handle → hidden;
+exact-match near-miss loop; `selected` without handles → hidden; unknown mode
+→ shown; foreign-group-only + hidden market → market marker not the no-group
+marker; SETUP + hidden market → no gated markup; `requires_selling_plan` +
+hidden market → marker only, no `selling_plan` input) and, app-side, by
+`tests/widget-markets.test.ts` (publish / rollback / divergence detector /
+`auditSelectedHandles` / `listMarkets.enabled`).
+
 ## Install as app embed (recommended — works on every theme)
 
 Some themes — including the client's custom "Sleepify Theme" on
@@ -613,7 +712,10 @@ side effects. One-time-only products keep their normal PDP.
 Other behaviours worth knowing:
 
 - **Subscription-only products** (`requires_selling_plan`): the one-time card
-  is not rendered and subscription is forced on.
+  is not rendered and subscription is forced on. In a market the merchant
+  excluded under "Where the buy box shows" (v1.25.0) the widget is not
+  rendered at all, so such a product cannot be added to the cart there — see
+  "Market visibility" above.
 - **Variant deep links** (`?variant=`): initial server render prices the
   deep-linked variant; JS also re-reads the URL on history navigation.
 - **Multiple selling plan groups** on one product: the block uses the first
@@ -1018,6 +1120,12 @@ harnesses) that do not expose `localization.market` simply render the base
 preset — and `data-cellexia-preset` (and therefore the `_cellexia_design`
 attribution property) always carries the **resolved** preset. The
 storefront preview link shows the market of the domain you open it on.
+
+Per-market *visibility* (whether the widget renders at all in a market) is
+a separate rule read from `cellexia.widget_markets` before ownership — see
+"Market visibility" under Core snippet internals. A `config.markets` entry
+for an excluded market still saves and applies the moment the market is
+added back on Preview & launch.
 
 ### App config vs the `design_source` block setting
 

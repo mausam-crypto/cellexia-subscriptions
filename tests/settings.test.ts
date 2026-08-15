@@ -54,8 +54,39 @@ describe("settings registry", () => {
         "lifecycle",
         "winback",
         "alerts",
+        // v1.25.0: market-scoped buy-box visibility (Preview & launch owns it).
+        "widgetMarkets",
       ]),
     );
+  });
+
+  it("widgetMarkets defaults to every market and is a SEPARATE key from launch (a required launch field would demote LIVE rows to SETUP)", () => {
+    expect(defaultFor("widgetMarkets")).toEqual({ mode: "all", handles: [] });
+    // Field-level defaults: a partial stored row still parses (additive).
+    expect(settingsSchemas.widgetMarkets.parse({ mode: "selected", handles: ["ch"] })).toEqual({
+      mode: "selected",
+      handles: ["ch"],
+    });
+    expect(settingsSchemas.widgetMarkets.parse({})).toEqual({ mode: "all", handles: [] });
+    // Handles are trimmed, non-empty, ≤255 chars, ≤50 entries; mode is a closed enum.
+    expect(settingsSchemas.widgetMarkets.parse({ mode: "selected", handles: [" ch "] }).handles).toEqual(["ch"]);
+    expect(settingsSchemas.widgetMarkets.safeParse({ mode: "selected", handles: [""] }).success).toBe(false);
+    expect(settingsSchemas.widgetMarkets.safeParse({ mode: "some", handles: [] }).success).toBe(false);
+    expect(
+      settingsSchemas.widgetMarkets.safeParse({
+        mode: "selected",
+        handles: Array.from({ length: 51 }, (_, i) => `m${i}`),
+      }).success,
+    ).toBe(false);
+    // The launch schema is untouched: every field still required, no market field.
+    expect(Object.keys(defaultFor("launch")).sort()).toEqual([
+      "confirmedKlaviyo",
+      "confirmedThemeBlock",
+      "mode",
+      "previewedPortal",
+      "previewedStorefront",
+      "wentLiveAt",
+    ]);
   });
 
   it("carries NO buyBox group — buy-box presentation is controlled where the widget reads it", () => {

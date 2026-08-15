@@ -162,14 +162,19 @@ interface ActionData {
 
 /**
  * Preview posts render draft copy and change no state — skip the loader
- * re-run (parent overview loader included) that Remix would otherwise do
- * after every debounced keystroke.
+ * re-run that Remix would otherwise do after every debounced keystroke.
+ * A test send changes no state either (it never writes NotificationLog),
+ * so it skips the re-run too; `save` keeps the default because the
+ * baseline-resync effect needs the fresh loader data. (Since v1.25.0 this
+ * route is no longer nested under the Emails overview — escaped file name
+ * — so the overview's heavy loader is never involved here at all.)
  */
 export const shouldRevalidate: ShouldRevalidateFunction = ({
   formData,
   defaultShouldRevalidate,
 }) => {
-  if (formData?.get("intent") === "preview") return false;
+  const intent = formData?.get("intent");
+  if (intent === "preview" || intent === "send-test") return false;
   return defaultShouldRevalidate;
 };
 

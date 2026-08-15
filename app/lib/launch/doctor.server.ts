@@ -17,6 +17,12 @@ import {
   parsePlanIdsJson,
 } from "~/lib/ownership/ownership.server";
 import { getLaunchState, probeProxyIdentity } from "./launch.server";
+import { getSetting } from "~/lib/settings/settings.server";
+import {
+  marketAllowed,
+  parseHiddenMarketFromHtml,
+  type WidgetMarketsSetting,
+} from "~/lib/widget/widget-markets.server";
 
 /**
  * Preview Doctor — walks the storefront-widget render chain and says WHICH
@@ -60,6 +66,15 @@ export interface DoctorStep {
   status: DoctorStepStatus;
   detail: string;
   remediation?: string;
+  /**
+   * Machine-readable tag for outcomes a caller must act on beyond the
+   * status (v1.25.0): `market_hidden` marks a storefront_markup WARN whose
+   * page will show NO widget (excluded market, or a drifted market
+   * metafield) — the preview action then opens the tab but must not tick
+   * "Storefront previewed" off a blank page. Callers match this, never the
+   * detail text.
+   */
+  code?: "market_hidden";
 }
 
 export interface DoctorReport {
@@ -645,6 +660,60 @@ export async function runPreviewDoctor(
       }
 
       const html = await response.text();
+      // Market visibility (v1.25.0) BEFORE the marker verdict: an excluded
+      // market renders only the inert market-hidden template, which still
+      // carries the app-snippet comment marker — so without this branch the
+      // step would PASS ("markup found") over a page that will never show
+      // the widget, and the preview tab (primary domain = primary market)
+      // would open blank. WARN, never FAIL — a WARN never blocks
+      // preview-storefront — but the WORDING is judged against the setting
+      // (mirrors the self-check): hidden because the merchant excluded this
+      // market names the picker; hidden although the setting allows it
+      // means the metafield the theme reads drifted, and the fix is Re-sync
+      // — telling the merchant to "add" a market that is already allowed
+      // would point at the wrong control. Both carry `code: market_hidden`
+      // so the preview action never ticks "Storefront previewed" off this
+      // page. The setting read is contained: unreadable → the neutral
+      // wording that asserts nothing about the merchant's choice.
+      const hiddenMarket = parseHiddenMarketFromHtml(html);
+      if (hiddenMarket !== null) {
+        const marketLabel = hiddenMarket
+          ? `market “${hiddenMarket}”`
+          : "a storefront that resolved no market handle";
+        let setting: WidgetMarketsSetting | null = null;
+        try {
+          setting = await getSetting(shop.id, "widgetMarkets");
+        } catch (err) {
+          console.error("[doctor] widgetMarkets setting read failed", err);
+        }
+        if (setting === null) {
+          return {
+            status: "WARN",
+            code: "market_hidden",
+            detail: `Hidden on ${host} by the market rule your theme reads (${marketLabel}) — the launch gate cannot be judged from this market, and the app's own market setting could not be read to say whether that is intended. Check “Where the buy box shows” on Preview & launch.`,
+          };
+        }
+        if (!marketAllowed(setting, hiddenMarket)) {
+          return {
+            status: "WARN",
+            code: "market_hidden",
+            detail: `Hidden on ${host} by your market setting (${
+              hiddenMarket
+                ? `market “${hiddenMarket}” is not in the allowed list: ${setting.handles.join(", ") || "(none)"}`
+                : "this storefront resolved no market handle, and “Only these markets” hides the widget when the market is unknown"
+            }) — the launch gate cannot be judged from this market. Preview from an allowed market's domain, or add this market under “Where the buy box shows” on Preview & launch.`,
+          };
+        }
+        return {
+          status: "WARN",
+          code: "market_hidden",
+          detail: `The storefront hides the buy box on ${host} (${marketLabel}) but your setting allows it (${
+            setting.mode === "selected" ? `only ${setting.handles.join(", ")}` : "all markets"
+          }) — the cellexia.widget_markets metafield the theme reads has drifted from the setting, so this preview would open without the widget.`,
+          remediation:
+            "Preview & launch → Where the buy box shows → Re-sync (or re-save the setting); if you changed it moments ago this can be page caching — re-run in a few minutes.",
+        };
+      }
       const marker = STOREFRONT_MARKERS.find((m) => html.includes(m));
       if (marker) {
         return {

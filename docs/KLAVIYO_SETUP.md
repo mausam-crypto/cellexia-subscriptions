@@ -71,15 +71,28 @@ You do not need to build any flow by hand anymore. Open the app's
    whose subject/body render the app's `content_*` properties. Metrics
    Klaviyo has never seen are registered with harmless seed events
    (`cellexia_send:"false"` — a seed can never send). Emails you already
-   deliver with your own LIVE flow are detected and left untouched.
-3. **Step 3** is the permanent green-check checklist, re-verified against
-   Klaviyo on every visit — and daily by the alert scan, which raises
-   `KLAVIYO_FLOW_COVERAGE` if a flow is ever deleted or paused.
+   deliver with your own LIVE flow are detected and left untouched. Since
+   v1.25.0 the run happens **in the background, with a progress bar**
+   ("Creating flow 4 of 12 — …"), creates *every* missing flow in one go at
+   the pace Klaviyo allows (one every ~4 s; a full first run takes about
+   two minutes — you can leave the page and come back), and waits out
+   Klaviyo's "slow down" answers instead of stopping; only a sustained
+   refusal leaves rows at **Klaviyo is busy — continues on next run**.
+3. **Step 3** is the permanent green-check checklist. It opens instantly
+   from the app's cache (rows read "Not checked yet" until the first
+   verification) and re-verifies against Klaviyo in the background when the
+   cache is older than ten minutes or when you click **Check again** —
+   with a single request, so it is fast even on accounts with hundreds of
+   flows — and daily by the alert scan, which raises
+   `KLAVIYO_FLOW_COVERAGE` if a flow is ever deleted or paused. If a
+   verification cannot read Klaviyo, the last known rows stay and a banner
+   says what to fix; the checklist is never empty while a key is connected.
 
 **Templates added by app updates join the same way.** When an update ships a
 new customer email — v1.24.0 added the gift teaser (metric
-`Cellexia Gift Teaser`) — the checklist simply shows one more missing flow on
-your next visit, and **Create my flows** creates just that one. Flows that
+`Cellexia Gift Teaser`) — the checklist simply shows one more row ("Not
+checked yet", then "Not set up" once verified) on your next visit, and
+**Create my flows** creates just that one. Flows that
 already exist are never touched. The v1.24.0 *enrichment* of the existing
 gift emails (announcement, milestone, rewards unlocked, win-back perk — now
 carrying the actual product's photo, retail value and arrival date where the

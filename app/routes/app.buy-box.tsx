@@ -10,6 +10,7 @@ import {
 import { useAppBridge } from "@shopify/app-bridge-react";
 import {
   Badge,
+  Banner,
   BlockStack,
   Box,
   Button,
@@ -35,6 +36,11 @@ import { authenticate } from "~/shopify.server";
 import { getPrimaryShop } from "~/lib/shop/install.server";
 import { logEvent } from "~/lib/events/log.server";
 import { getLaunchState } from "~/lib/launch/launch.server";
+import { getSetting } from "~/lib/settings/settings.server";
+import {
+  marketAllowed,
+  type WidgetMarketsSetting,
+} from "~/lib/widget/widget-markets";
 import { getDesignPerformance } from "~/lib/analytics/queries.server";
 import {
   getDraftOrPublished,
@@ -123,13 +129,18 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     throw new Response("App is not installed on any shop", { status: 503 });
   }
 
-  const [draftOrPublished, revisions, performance, launch, markets] =
+  const [draftOrPublished, revisions, performance, launch, markets, widgetMarkets] =
     await Promise.all([
       getDraftOrPublished(shop.id),
       listRevisions(shop.id),
       getDesignPerformance(shop.id, 30),
       getLaunchState(shop.id),
       listMarketsSafe(admin),
+      // Where the buy box shows (v1.25.0, owned by Preview & launch): the
+      // designer only READS it, to label excluded markets in the preview
+      // select — a per-market preset for a market the widget never renders
+      // in is a confusing thing to design without knowing.
+      getSetting(shop.id, "widgetMarkets"),
     ]);
 
   const revisionViews: RevisionView[] = revisions.map((r) => {
@@ -151,6 +162,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     revisions: revisionViews,
     performance,
     markets,
+    widgetMarkets,
   });
 };
 
@@ -567,6 +579,7 @@ export default function BuyBoxDesignerPage() {
   const savedConfig = data.savedConfig as WidgetDesignConfig;
   const revisions = data.revisions as RevisionView[];
   const markets = data.markets as ShopifyMarket[];
+  const widgetMarkets = data.widgetMarkets as WidgetMarketsSetting;
   const { performance, launchMode, isDraft } = data;
 
   // Editor state: the draft config, reset whenever the server-side config
@@ -881,6 +894,11 @@ export default function BuyBoxDesignerPage() {
                         {market.primary ? (
                           <Badge tone="info">Primary</Badge>
                         ) : null}
+                        {market.enabled ? null : (
+                          // Draft/disabled market (v1.25.0 `enabled`): the
+                          // preset still saves and applies once activated.
+                          <Badge tone="attention">Disabled</Badge>
+                        )}
                         <Text as="span" tone="subdued" variant="bodySm">
                           {market.handle}
                         </Text>
@@ -1482,7 +1500,9 @@ export default function BuyBoxDesignerPage() {
                         value: "",
                       },
                       ...markets.map((market) => ({
-                        label: `${market.name} — ${presetName(resolveMarketPreset(market.handle))}`,
+                        label: `${market.name} — ${presetName(resolveMarketPreset(market.handle))}${
+                          marketAllowed(widgetMarkets, market.handle) ? "" : " — hidden"
+                        }`,
                         value: market.handle,
                       })),
                     ]}
@@ -1490,6 +1510,21 @@ export default function BuyBoxDesignerPage() {
                     onChange={setPreviewMarket}
                     helpText="Renders the preset that market resolves to — a client-side preview only, nothing is published."
                   />
+                ) : null}
+                {previewMarket && !marketAllowed(widgetMarkets, previewMarket) ? (
+                  <Banner
+                    tone="info"
+                    title="Hidden in this market by your Preview & launch setting"
+                    action={{ content: "Open Preview & launch", url: "/app/preview" }}
+                  >
+                    <p>
+                      Visitors shopping in{" "}
+                      {markets.find((m) => m.handle === previewMarket)?.name ?? previewMarket}{" "}
+                      see the product page without the subscription option
+                      (&quot;Where the buy box shows&quot;). The design below is what
+                      they would see if you added the market there.
+                    </p>
+                  </Banner>
                 ) : null}
                 <Box
                   borderColor="border"
