@@ -754,6 +754,51 @@ describe("CUSTOMERS_REDACT scrubs every acq* column", () => {
     }
   });
 
+  /**
+   * The one column family the anonymizer must NOT touch. Merchant decision
+   * v1.26.0 (design measurement): the origin design label is a property of
+   * the CHECKOUT (which buy-box design / preselect was live), not of the
+   * person, and the Results tab's kept-rate / LTGP-by-design readouts must
+   * survive a redact. Pinned by name from the schema so a future widening of
+   * the schema-derived sweep (e.g. `origin\w+`) or a well-meaning addition to
+   * the anonymizer fails here instead of silently destroying the readouts.
+   */
+  it("RETAINS every originDesign* column (merchant decision v1.26.0: the design label survives CUSTOMERS_REDACT)", async () => {
+    // The five columns, read from the schema so the list cannot drift.
+    const schema = readFileSync(
+      fileURLToPath(new URL("../prisma/schema.prisma", import.meta.url)),
+      "utf8",
+    );
+    const model = schema.match(/model SubscriptionContract \{[\s\S]*?\n\}/)?.[0];
+    const designColumns = [...model!.matchAll(/^\s{2}(originDesign\w+)\s/gm)].map(
+      (m) => m[1],
+    );
+    expect(designColumns.sort()).toEqual([
+      "originDesignKey",
+      "originDesignPreselect",
+      "originDesignRevisionId",
+      "originDesignSource",
+      "originDesignStampedAt",
+    ]);
+
+    await runRedact();
+    expect(mocks.contractUpdateMany).toHaveBeenCalledTimes(1);
+    const { data } = mocks.contractUpdateMany.mock.calls[0][0] as {
+      data: Record<string, unknown>;
+    };
+    for (const column of designColumns) {
+      expect(
+        Object.prototype.hasOwnProperty.call(data, column),
+        `${column} must be ABSENT from the redact updateMany data (merchant decision v1.26.0: originDesign* survive CUSTOMERS_REDACT)`,
+      ).toBe(false);
+    }
+    // No other write path in the handler touches the contract rows either.
+    for (const call of mocks.contractUpdateMany.mock.calls) {
+      const written = (call[0] as { data: Record<string, unknown> }).data;
+      expect(Object.keys(written).some((k) => k.startsWith("originDesign"))).toBe(false);
+    }
+  });
+
   it("also anonymizes the identity columns alongside the profile", async () => {
     await runRedact();
     const { data } = mocks.contractUpdateMany.mock.calls[0][0] as {

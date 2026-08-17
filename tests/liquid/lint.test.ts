@@ -1076,6 +1076,80 @@ describe("attribute namespace", () => {
     }
   });
 
+  // ── 5d. The two hidden line properties are spelled ONE way everywhere ────
+
+  /**
+   * v1.26.0: the design-measurement exposure stamp `_cellexia_seen`
+   * ("<preset>|<s|o|u>") is written by TWO files — buy-box.js into the theme's
+   * product form, buy-box-embed.js into AJAX cart bodies — and parsed by the
+   * ORDERS_CREATE webhook under ONE name (SEEN_PROPERTY in
+   * app/lib/design-measurement/shared.ts). A spelling drift in either writer
+   * would silently drop that install shape's orders from the take-rate
+   * denominator, and nothing downstream could tell. So the property names
+   * a served file may write are PINNED: every browser script names both
+   * (in code, comments blanked), the maintainer README documents both, and
+   * no other `_cellexia_*` / `_cx_*` property-shaped token exists in the
+   * served tree — a near-miss (`_cellexia_seen_`, `_cellexia_exposure`,
+   * `_cx_seen`) fails here before it ships.
+   */
+  const LINE_PROPERTIES = ["_cellexia_design", "_cellexia_seen"] as const;
+  const PROPERTY_TOKEN = /\b_(?:cx|cellexia)_[a-z_]+/g;
+
+  it("writes _cellexia_seen (and _cellexia_design) from every browser script, spelled identically", () => {
+    for (const name of browserScripts()) {
+      const source = withCommentsBlanked(name, readAsset(name));
+      for (const property of LINE_PROPERTIES) {
+        expect(
+          source,
+          `${name} must write properties[${property}] in code, not just prose`,
+        ).toContain(`[${property}]`);
+      }
+    }
+    /* Both writers use the bracketed form-field spelling of the seen key. */
+    for (const name of browserScripts()) {
+      expect(readAsset(name)).toContain("properties[_cellexia_seen]");
+    }
+  });
+
+  it("pins the exact set of line-property tokens the served tree may write", () => {
+    const seenTokens = new Set<string>();
+    const offenders: string[] = [];
+    for (const file of everyExtensionFile().filter(isScanned)) {
+      const source = withCommentsBlanked(file, read(file));
+      for (const match of source.matchAll(PROPERTY_TOKEN)) {
+        seenTokens.add(match[0]);
+        if (!(LINE_PROPERTIES as readonly string[]).includes(match[0])) {
+          const line = source.slice(0, match.index ?? 0).split("\n").length;
+          offenders.push(`${repoPath(file)}:${line} ${match[0]}`);
+        }
+      }
+    }
+    expect(
+      offenders,
+      "a line-property token that is not one of the two pinned names: the " +
+        `webhook parses exactly ${LINE_PROPERTIES.join(" and ")}:\n${offenders.join("\n")}`,
+    ).toEqual([]);
+    /* Non-vacuity: both pinned names really are written somewhere. */
+    expect([...seenTokens].sort()).toEqual([...LINE_PROPERTIES].sort());
+  });
+
+  it("documents both line properties in the maintainer README under the same names", () => {
+    const readme = read(join(EXTENSION_DIR, "README.md"));
+    for (const property of LINE_PROPERTIES) {
+      expect(readme, `README documents ${property}`).toContain(`\`${property}\``);
+    }
+    /* No near-miss spelling in the README either (its historic `_cx_design`
+       mention is the documented pre-rename name and stays). */
+    const stray = [...readme.matchAll(PROPERTY_TOKEN)]
+      .map((match) => match[0])
+      .filter(
+        (token) =>
+          !(LINE_PROPERTIES as readonly string[]).includes(token) &&
+          token !== "_cx_design",
+      );
+    expect(stray, stray.join(", ")).toEqual([]);
+  });
+
   // ── 5c. Every DOCUMENT-LEVEL query is qualified ──────────────────────────
 
   /** See documentQueriesIn at module scope for what counts as document-level. */

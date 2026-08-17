@@ -18,7 +18,6 @@ import {
   Card,
   Checkbox,
   ChoiceList,
-  DataTable,
   Divider,
   InlineGrid,
   InlineStack,
@@ -41,7 +40,6 @@ import {
   marketAllowed,
   type WidgetMarketsSetting,
 } from "~/lib/widget/widget-markets";
-import { getDesignPerformance } from "~/lib/analytics/queries.server";
 import {
   getDraftOrPublished,
   listRevisions,
@@ -65,6 +63,7 @@ import {
   type WidgetDesignTextOverride,
 } from "~/lib/widget/presets";
 import { BuyBoxPreview } from "~/components/buybox-preview";
+import { DesignResults } from "~/components/design-results";
 
 /**
  * Admin — Buy box designer.
@@ -74,10 +73,13 @@ import { BuyBoxPreview } from "~/components/buybox-preview";
  * placement), per-Shopify-Market preset selection (v1.6.0 — config.markets,
  * keyed by market handle; everything but the preset inherits the main
  * design), a live preview with a market-preview select, draft + publish
- * with revision history (instant restore), and per-design take-rate
- * attribution. Publishing mirrors the config to the cellexia.buybox_design
- * shop metafield; a shop with no published revision keeps rendering exactly
- * as v1.0.0 did.
+ * with revision history (instant restore), and, since v1.26.0, a Results
+ * tab (app/components/design-results.tsx, fed lazily by the
+ * /app/buy-box/results resource route) that replaced the old bottom
+ * "Design performance" card: take rate, kept rates, guardrails and the
+ * design calendar per named design. Publishing mirrors the config to the
+ * cellexia.buybox_design shop metafield; a shop with no published revision
+ * keeps rendering exactly as v1.0.0 did.
  */
 
 // ── Shared view types ────────────────────────────────────────────────────────
@@ -88,6 +90,8 @@ interface RevisionView {
   createdAt: string;
   createdBy: string | null;
   publishedAt: string | null;
+  /** Merchant-given design name (v1.26.0), null when unnamed. */
+  label: string | null;
   /** Null when the stored config no longer validates (cannot be loaded). */
   config: WidgetDesignConfig | null;
 }
@@ -129,11 +133,13 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     throw new Response("App is not installed on any shop", { status: 503 });
   }
 
-  const [draftOrPublished, revisions, performance, launch, markets, widgetMarkets] =
+  // No design-performance query here since v1.26.0: the Results tab loads
+  // its scoreboard lazily from /app/buy-box/results, so the designer page
+  // itself stays fast.
+  const [draftOrPublished, revisions, launch, markets, widgetMarkets] =
     await Promise.all([
       getDraftOrPublished(shop.id),
       listRevisions(shop.id),
-      getDesignPerformance(shop.id, 30),
       getLaunchState(shop.id),
       listMarketsSafe(admin),
       // Where the buy box shows (v1.25.0, owned by Preview & launch): the
@@ -151,6 +157,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       createdAt: r.createdAt.toISOString(),
       createdBy: r.createdBy,
       publishedAt: r.publishedAt ? r.publishedAt.toISOString() : null,
+      label: r.label ?? null,
       config: parsed.success ? parsed.data : null,
     };
   });
@@ -160,7 +167,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     isDraft: draftOrPublished.isDraft,
     launchMode: launch.mode,
     revisions: revisionViews,
-    performance,
     markets,
     widgetMarkets,
   });
@@ -179,6 +185,17 @@ function parseConfigField(formData: FormData): unknown {
   return JSON.parse(String(formData.get("config") ?? ""));
 }
 
+/**
+ * Optional design name from the publish modal (v1.26.0). Absent field =
+ * undefined (leave any existing label alone); present-but-empty = null.
+ * Length/whitespace normalisation happens in design.server.
+ */
+function parseLabelField(formData: FormData): string | null | undefined {
+  if (!formData.has("label")) return undefined;
+  const raw = String(formData.get("label") ?? "").trim();
+  return raw === "" ? null : raw;
+}
+
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const shop = await getPrimaryShop();
@@ -195,6 +212,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         shop.id,
         parseConfigField(formData),
         actor,
+        { label: parseLabelField(formData) },
       );
       await logEvent({
         shopId: shop.id,
@@ -228,14 +246,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   if (intent === "publish") {
     try {
+      const label = parseLabelField(formData);
       const draft = await saveDraftRevision(
         shop.id,
         parseConfigField(formData),
         actor,
+        { label },
       );
       // publishRevision re-validates, mirrors the config to the shop
       // metafield and logs its own admin.action event.
-      await publishRevision(shop.id, draft.id, actor);
+      await publishRevision(shop.id, draft.id, actor, { label });
       const launch = await getLaunchState(shop.id);
       return json<ActionData>({
         intent,
@@ -580,7 +600,7 @@ export default function BuyBoxDesignerPage() {
   const revisions = data.revisions as RevisionView[];
   const markets = data.markets as ShopifyMarket[];
   const widgetMarkets = data.widgetMarkets as WidgetMarketsSetting;
-  const { performance, launchMode, isDraft } = data;
+  const { launchMode, isDraft } = data;
 
   // Editor state: the draft config, reset whenever the server-side config
   // actually changes (after save/publish/restore).
@@ -610,6 +630,8 @@ export default function BuyBoxDesignerPage() {
   const [previewMarket, setPreviewMarket] = useState("");
 
   const [publishOpen, setPublishOpen] = useState(false);
+  /** Optional design name typed in the publish modal (v1.26.0). */
+  const [publishLabel, setPublishLabel] = useState("");
   const [pendingPreset, setPendingPreset] = useState<PresetKey | null>(null);
   const [loadTarget, setLoadTarget] = useState<RevisionView | null>(null);
   const [restoreTarget, setRestoreTarget] = useState<RevisionView | null>(null);
@@ -619,7 +641,10 @@ export default function BuyBoxDesignerPage() {
     if (actionData.toast) {
       shopify.toast.show(actionData.toast, { isError: !actionData.ok });
     }
-    if (actionData.ok && actionData.intent === "publish") setPublishOpen(false);
+    if (actionData.ok && actionData.intent === "publish") {
+      setPublishOpen(false);
+      setPublishLabel("");
+    }
     if (actionData.ok && actionData.intent === "restore") setRestoreTarget(null);
   }, [actionData, shopify]);
 
@@ -699,7 +724,13 @@ export default function BuyBoxDesignerPage() {
 
   const submitConfig = (intent: "save-draft" | "publish") =>
     submit(
-      { intent, config: JSON.stringify(cleanConfig(draft)) },
+      intent === "publish"
+        ? {
+            intent,
+            config: JSON.stringify(cleanConfig(draft)),
+            label: publishLabel,
+          }
+        : { intent, config: JSON.stringify(cleanConfig(draft)) },
       { method: "post" },
     );
 
@@ -746,13 +777,12 @@ export default function BuyBoxDesignerPage() {
     { id: "text", content: "Text" },
     { id: "style", content: "Style" },
     { id: "behavior", content: "Behavior" },
+    { id: "results", content: "Results" },
   ];
-
-  const performanceRows = performance.rows.map((row) => [
-    presetName(row.designKey),
-    String(row.subscriptionOrders),
-    `${row.sharePct}%`,
-  ]);
+  // The Results tab is a full-width readout (several data tables), so the
+  // live preview column steps aside while it is selected; every editor tab
+  // keeps the two-column editor + preview layout.
+  const resultsTab = tab === 4;
 
   return (
     <Page
@@ -1139,7 +1169,11 @@ export default function BuyBoxDesignerPage() {
         </Card>
 
         {/* ── Editor + live preview ── */}
-        <InlineGrid columns={{ xs: 1, lg: 2 }} gap="400" alignItems="start">
+        <InlineGrid
+          columns={{ xs: 1, lg: resultsTab ? 1 : 2 }}
+          gap="400"
+          alignItems="start"
+        >
           <Card>
             <BlockStack gap="300">
               <Tabs tabs={editorTabs} selected={tab} onSelect={setTab} fitted />
@@ -1446,120 +1480,126 @@ export default function BuyBoxDesignerPage() {
                   />
                 </BlockStack>
               ) : null}
+
+              {tab === 4 ? (
+                <DesignResults markets={markets} launchMode={launchMode} />
+              ) : null}
             </BlockStack>
           </Card>
 
-          <div style={{ position: "sticky", top: "16px" }}>
-            <Card>
-              <BlockStack gap="300">
-                <InlineStack align="space-between" blockAlign="center" wrap>
-                  <Text as="h2" variant="headingMd">
-                    Live preview
-                  </Text>
-                  <InlineStack gap="200" wrap>
-                    <ButtonGroup variant="segmented">
-                      <Button
-                        size="slim"
-                        pressed={previewWidth === "desktop"}
-                        onClick={() => setPreviewWidth("desktop")}
-                      >
-                        Desktop
-                      </Button>
-                      <Button
-                        size="slim"
-                        pressed={previewWidth === "mobile"}
-                        onClick={() => setPreviewWidth("mobile")}
-                      >
-                        Mobile
-                      </Button>
-                    </ButtonGroup>
-                    <ButtonGroup variant="segmented">
-                      <Button
-                        size="slim"
-                        pressed={previewState === "subscription"}
-                        onClick={() => setPreviewState("subscription")}
-                      >
-                        Subscription
-                      </Button>
-                      <Button
-                        size="slim"
-                        pressed={previewState === "one_time"}
-                        onClick={() => setPreviewState("one_time")}
-                      >
-                        One-time
-                      </Button>
-                    </ButtonGroup>
+          {resultsTab ? null : (
+            <div style={{ position: "sticky", top: "16px" }}>
+              <Card>
+                <BlockStack gap="300">
+                  <InlineStack align="space-between" blockAlign="center" wrap>
+                    <Text as="h2" variant="headingMd">
+                      Live preview
+                    </Text>
+                    <InlineStack gap="200" wrap>
+                      <ButtonGroup variant="segmented">
+                        <Button
+                          size="slim"
+                          pressed={previewWidth === "desktop"}
+                          onClick={() => setPreviewWidth("desktop")}
+                        >
+                          Desktop
+                        </Button>
+                        <Button
+                          size="slim"
+                          pressed={previewWidth === "mobile"}
+                          onClick={() => setPreviewWidth("mobile")}
+                        >
+                          Mobile
+                        </Button>
+                      </ButtonGroup>
+                      <ButtonGroup variant="segmented">
+                        <Button
+                          size="slim"
+                          pressed={previewState === "subscription"}
+                          onClick={() => setPreviewState("subscription")}
+                        >
+                          Subscription
+                        </Button>
+                        <Button
+                          size="slim"
+                          pressed={previewState === "one_time"}
+                          onClick={() => setPreviewState("one_time")}
+                        >
+                          One-time
+                        </Button>
+                      </ButtonGroup>
+                    </InlineStack>
                   </InlineStack>
-                </InlineStack>
-                {markets.length > 0 ? (
-                  <Select
-                    label="Preview market"
-                    options={[
-                      {
-                        label: `Default — all markets (${presetName(draft.preset)})`,
-                        value: "",
-                      },
-                      ...markets.map((market) => ({
-                        label: `${market.name} — ${presetName(resolveMarketPreset(market.handle))}${
-                          marketAllowed(widgetMarkets, market.handle) ? "" : " — hidden"
-                        }`,
-                        value: market.handle,
-                      })),
-                    ]}
-                    value={previewMarket}
-                    onChange={setPreviewMarket}
-                    helpText="Renders the preset that market resolves to — a client-side preview only, nothing is published."
-                  />
-                ) : null}
-                {previewMarket && !marketAllowed(widgetMarkets, previewMarket) ? (
-                  <Banner
-                    tone="info"
-                    title="Hidden in this market by your Preview & launch setting"
-                    action={{ content: "Open Preview & launch", url: "/app/preview" }}
-                  >
-                    <p>
-                      Visitors shopping in{" "}
-                      {markets.find((m) => m.handle === previewMarket)?.name ?? previewMarket}{" "}
-                      see the product page without the subscription option
-                      (&quot;Where the buy box shows&quot;). The design below is what
-                      they would see if you added the market there.
-                    </p>
-                  </Banner>
-                ) : null}
-                <Box
-                  borderColor="border"
-                  borderWidth="025"
-                  borderRadius="200"
-                  padding="400"
-                  background="bg-surface"
-                >
-                  <div
-                    style={{
-                      maxWidth: previewWidth === "mobile" ? 375 : 720,
-                      margin: "0 auto",
-                    }}
-                  >
-                    <BuyBoxPreview
-                      config={draft}
-                      preset={previewPreset}
-                      locale={textLocale}
-                      selected={previewState}
+                  {markets.length > 0 ? (
+                    <Select
+                      label="Preview market"
+                      options={[
+                        {
+                          label: `Default — all markets (${presetName(draft.preset)})`,
+                          value: "",
+                        },
+                        ...markets.map((market) => ({
+                          label: `${market.name} — ${presetName(resolveMarketPreset(market.handle))}${
+                            marketAllowed(widgetMarkets, market.handle) ? "" : " — hidden"
+                          }`,
+                          value: market.handle,
+                        })),
+                      ]}
+                      value={previewMarket}
+                      onChange={setPreviewMarket}
+                      helpText="Renders the preset that market resolves to — a client-side preview only, nothing is published."
                     />
-                  </div>
-                </Box>
-                <Text as="p" variant="bodySm" tone="subdued">
-                  Preview uses a sample product (Cellexia Renewal Serum,
-                  CHF 68.00, 20% first order / 10% ongoing, every 6–12 weeks)
-                  in a frame styled after cellexialabs.com. Final rendering
-                  can differ slightly by theme — always confirm with the
-                  storefront preview.
-                </Text>
-                <Box>
-                  <Button url="/app/preview">View on your store</Button>
-                </Box>
-              </BlockStack>
-            </Card>
-          </div>
+                  ) : null}
+                  {previewMarket && !marketAllowed(widgetMarkets, previewMarket) ? (
+                    <Banner
+                      tone="info"
+                      title="Hidden in this market by your Preview & launch setting"
+                      action={{ content: "Open Preview & launch", url: "/app/preview" }}
+                    >
+                      <p>
+                        Visitors shopping in{" "}
+                        {markets.find((m) => m.handle === previewMarket)?.name ?? previewMarket}{" "}
+                        see the product page without the subscription option
+                        (&quot;Where the buy box shows&quot;). The design below is what
+                        they would see if you added the market there.
+                      </p>
+                    </Banner>
+                  ) : null}
+                  <Box
+                    borderColor="border"
+                    borderWidth="025"
+                    borderRadius="200"
+                    padding="400"
+                    background="bg-surface"
+                  >
+                    <div
+                      style={{
+                        maxWidth: previewWidth === "mobile" ? 375 : 720,
+                        margin: "0 auto",
+                      }}
+                    >
+                      <BuyBoxPreview
+                        config={draft}
+                        preset={previewPreset}
+                        locale={textLocale}
+                        selected={previewState}
+                      />
+                    </div>
+                  </Box>
+                  <Text as="p" variant="bodySm" tone="subdued">
+                    Preview uses a sample product (Cellexia Renewal Serum,
+                    CHF 68.00, 20% first order / 10% ongoing, every 6–12 weeks)
+                    in a frame styled after cellexialabs.com. Final rendering
+                    can differ slightly by theme — always confirm with the
+                    storefront preview.
+                  </Text>
+                  <Box>
+                    <Button url="/app/preview">View on your store</Button>
+                  </Box>
+                </BlockStack>
+              </Card>
+            </div>
+          )}
         </InlineGrid>
 
         {/* ── Revision history ── */}
@@ -1599,7 +1639,9 @@ export default function BuyBoxDesignerPage() {
                     >
                       <InlineStack gap="200" blockAlign="center" wrap>
                         <Text as="span" fontWeight="medium">
-                          {presetName(rev.preset)}
+                          {rev.label
+                            ? `${rev.label} (${presetName(rev.preset)})`
+                            : presetName(rev.preset)}
                         </Text>
                         {rev.publishedAt ? (
                           <Badge tone="success">Published</Badge>
@@ -1638,44 +1680,6 @@ export default function BuyBoxDesignerPage() {
             )}
           </BlockStack>
         </Card>
-
-        {/* ── Design performance ── */}
-        <Card>
-          <BlockStack gap="300">
-            <Text as="h2" variant="headingMd">
-              Design performance — last {performance.rangeDays} days
-            </Text>
-            {performance.rows.length === 0 ? (
-              <Text as="p" tone="subdued">
-                No design-attributed subscription orders yet. Every
-                subscription add-to-cart is stamped with the active design
-                key, so rows appear here as soon as subscription orders
-                arrive
-                {launchMode === "SETUP" ? " (after you go live)" : ""}.
-              </Text>
-            ) : (
-              <BlockStack gap="200">
-                <DataTable
-                  columnContentTypes={["text", "numeric", "numeric"]}
-                  headings={["Design", "Subscription orders", "Share"]}
-                  rows={performanceRows}
-                />
-                <Text as="p" variant="bodySm" tone="subdued">
-                  {`${performance.totalAttributed} attributed subscription order${performance.totalAttributed === 1 ? "" : "s"}`}
-                  {performance.checkoutDenominator > 0
-                    ? ` across ${performance.checkoutDenominator} subscribable checkouts (the take-rate denominator).`
-                    : "."}
-                </Text>
-              </BlockStack>
-            )}
-            <Text as="p" variant="bodySm" tone="subdued">
-              Methodology: change one design at a time, and watch PDP
-              conversion rate AND subscription take rate for at least a full
-              traffic cycle (7+ days) before judging it. If conversion dips,
-              restore the previous design instantly from the revision history.
-            </Text>
-          </BlockStack>
-        </Card>
       </BlockStack>
 
       {/* ── Publish confirm ── */}
@@ -1703,6 +1707,15 @@ export default function BuyBoxDesignerPage() {
               You can restore any previous design instantly from the revision
               history.
             </Text>
+            <TextField
+              label="Name this design (optional)"
+              value={publishLabel}
+              onChange={setPublishLabel}
+              autoComplete="off"
+              maxLength={80}
+              placeholder="Test 2: subscription preselected"
+              helpText="Shown in the revision history and in the Results tab, so each measurement period reads as a named design."
+            />
           </BlockStack>
         </Modal.Section>
       </Modal>

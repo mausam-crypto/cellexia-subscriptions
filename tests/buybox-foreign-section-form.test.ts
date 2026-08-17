@@ -91,10 +91,13 @@ interface RunOptions {
   widgetInSection?: boolean;
   /** Rewrite buy-box.js before it runs — used only by the vacuity guard. */
   mutate?: (source: string) => string;
+  /** Alternative server-rendered widget markup (default: the live render). */
+  widgetMarkup?: string;
 }
 
 interface RunResult {
   document: DocumentNode;
+  window: Record<string, unknown>;
   widget: ElementNode | null;
   sourceChanged: boolean;
   form: (selector: string) => ElementNode;
@@ -112,7 +115,8 @@ function run(options: RunOptions = {}): RunResult {
   documentNode.documentElement = html;
 
   const widgetInSection = options.widgetInSection !== false;
-  const sectionInner = (options.sectionHtml ?? "") + (widgetInSection ? WIDGET_MARKUP : "");
+  const widgetMarkup = options.widgetMarkup ?? WIDGET_MARKUP;
+  const sectionInner = (options.sectionHtml ?? "") + (widgetInSection ? widgetMarkup : "");
   parseHtml(
     `<main><div id="shopify-section-${SECTION_ID}" class="shopify-section">` +
       `<h1>Cellexia Serum</h1>${sectionInner}</div></main>`,
@@ -127,7 +131,7 @@ function run(options: RunOptions = {}): RunResult {
     // the widget outside), closest('.shopify-section') misses, so
     // findProductForm takes the document-wide PROVE-ownership path.
     const holder = new ElementNode("div");
-    parseHtml(WIDGET_MARKUP, holder);
+    parseHtml(widgetMarkup, holder);
     for (const child of [...holder.childNodes]) {
       body.appendChild(child);
     }
@@ -194,6 +198,7 @@ function run(options: RunOptions = {}): RunResult {
 
   return {
     document: documentNode,
+    window: windowStub,
     widget: documentNode.querySelector(".cx-buybox[data-cellexia-buybox]"),
     sourceChanged: source !== original,
     form: (selector: string) => {
@@ -204,18 +209,43 @@ function run(options: RunOptions = {}): RunResult {
   };
 }
 
-/** Everything applySellingPlan/applyDesignProp could have written into a form. */
+/**
+ * Everything applySellingPlan/applyDesignProp could have written into a form
+ * — the plan field, the design property and (v1.26.0) the always-on
+ * `_cellexia_seen` exposure property, which is stamped on one-time adds too
+ * and so would poison a foreign form even while one-time is selected.
+ */
 function poison(form: ElementNode): string[] {
   const findings: string[] = [];
   for (const input of form.querySelectorAll("input")) {
     const name = input.getAttribute("name") ?? "";
     if (name === "selling_plan") findings.push(`selling_plan=${input.value}`);
     if (name.indexOf("_cellexia_design") !== -1) findings.push(name);
+    if (name.indexOf("_cellexia_seen") !== -1) findings.push(name);
     for (const attribute of input.attributes.keys()) {
       if (attribute.startsWith("data-cellexia-")) findings.push(attribute);
     }
   }
   return findings;
+}
+
+/** The widget's own radios, by mode value. */
+function radioFor(page: RunResult, mode: "subscription" | "one_time"): ElementNode {
+  const radio = page.widget!.querySelector(
+    `input[data-cellexia-option="${mode}"]`,
+  );
+  if (!radio) throw new Error(`no ${mode} radio in the widget`);
+  return radio;
+}
+
+/** Click a purchase option exactly as the browser reports it. */
+function selectMode(page: RunResult, mode: "subscription" | "one_time"): void {
+  const wanted = radioFor(page, mode);
+  const other = radioFor(page, mode === "subscription" ? "one_time" : "subscription");
+  other.checked = false;
+  wanted.checked = true;
+  wanted.dispatchEvent(new EventShim("change", { bubbles: true }));
+  flushTimers();
 }
 
 describe("a section whose only form is another product's quick-add", () => {
@@ -253,6 +283,178 @@ describe("a section whose only form is another product's quick-add", () => {
     expect(planInput!.getAttribute("data-cellexia-plan-input")).toBe("own");
     // …and product B's stayed clean.
     expect(poison(foreign)).toEqual([]);
+  });
+});
+
+// ── The theme-form seen stamp (v1.26.0) ─────────────────────────────────────
+//
+// The form path is the second writer of `properties[_cellexia_seen]` (the
+// first is buy-box-embed.js's cart-request patch, for formless themes). Its
+// contract mirrors the patcher's: the input is enabled with
+// "<preset>|<s|o|u>" whenever the widget is visible — one-time selected or
+// not — while `_cellexia_design` keeps its subscription-only gate, and both
+// are released with the form when the widget hides.
+
+describe("the seen exposure input in the product's OWN form", () => {
+  function seenInput(form: ElementNode): ElementNode | null {
+    return form.querySelector('input[name="properties[_cellexia_seen]"]');
+  }
+  function designInput(form: ElementNode): ElementNode | null {
+    return form.querySelector("input[data-cellexia-design-prop]");
+  }
+
+  it("is stamped with <preset>|s at boot (subscription preselected) next to the design prop", () => {
+    const page = run({ sectionHtml: OWN_FORM });
+    const own = page.form(".own-form");
+    const seen = seenInput(own);
+    expect(seen).not.toBeNull();
+    expect(seen!.getAttribute("type")).toBe("hidden");
+    expect(seen!.value).toBe("classic|s");
+    expect(seen!.disabled).toBe(false);
+    // Exactly one seen input, however many times the write path re-ran.
+    expect(own.querySelectorAll('input[name="properties[_cellexia_seen]"]')).toHaveLength(1);
+    // The design prop is there too, enabled, with the preset alone.
+    expect(designInput(own)!.value).toBe("classic");
+    expect(designInput(own)!.disabled).toBe(false);
+  });
+
+  it("stays enabled on a one-time selection while the design prop is disabled", () => {
+    const page = run({ sectionHtml: OWN_FORM });
+    const own = page.form(".own-form");
+    selectMode(page, "one_time");
+
+    // One-time: no plan, no design attribution — but the visitor SAW the
+    // design, so the exposure still travels with the add-to-cart.
+    expect(own.querySelector('input[name="selling_plan"]')!.value).toBe("");
+    expect(designInput(own)!.disabled).toBe(true);
+    expect(designInput(own)!.value).toBe("");
+    expect(seenInput(own)!.disabled).toBe(false);
+    expect(seenInput(own)!.value).toBe("classic|s");
+
+    // …and back: everything is reinstated, still exactly one seen input.
+    selectMode(page, "subscription");
+    expect(own.querySelector('input[name="selling_plan"]')!.value).toBe(PLAN_ID);
+    expect(designInput(own)!.disabled).toBe(false);
+    expect(seenInput(own)!.value).toBe("classic|s");
+    expect(own.querySelectorAll('input[name="properties[_cellexia_seen]"]')).toHaveLength(1);
+  });
+
+  it("is never written into a foreign quick-add form, in either mode", () => {
+    const page = run({ sectionHtml: FOREIGN_QUICK_ADD + OWN_FORM });
+    const foreign = page.form(".quick-add-form");
+    expect(seenInput(foreign)).toBeNull();
+    selectMode(page, "one_time");
+    expect(seenInput(foreign)).toBeNull();
+    expect(poison(foreign)).toEqual([]);
+    // Product A's own form still carries it.
+    expect(seenInput(page.form(".own-form"))!.value).toBe("classic|s");
+  });
+
+  it("is released (disabled, blanked) with the design prop when the widget hides", () => {
+    const page = run({ sectionHtml: OWN_FORM });
+    const own = page.form(".own-form");
+    expect(seenInput(own)!.disabled).toBe(false);
+
+    // Hide the widget the way the launch gate does and re-run the write path
+    // through the public seam: applySellingPlan releases the form.
+    page.widget!.setAttribute("hidden", "hidden");
+    const subs = page.window.CellexiaSubs as { resync: () => void };
+    subs.resync();
+    flushTimers();
+
+    expect(seenInput(own)!.disabled).toBe(true);
+    expect(seenInput(own)!.value).toBe("");
+    expect(designInput(own)!.disabled).toBe(true);
+    expect(own.querySelector('input[name="selling_plan"]')).toBeNull();
+
+    // Revealed again: reinstated, same single input.
+    page.widget!.removeAttribute("hidden");
+    subs.resync();
+    flushTimers();
+    expect(seenInput(own)!.disabled).toBe(false);
+    expect(seenInput(own)!.value).toBe("classic|s");
+    expect(own.querySelectorAll('input[name="properties[_cellexia_seen]"]')).toHaveLength(1);
+  });
+
+  it("is absent from the theme form while the shop is in setup mode (write gate)", async () => {
+    const gated = await renderWidget({ launchStatus: "setup" });
+    const page = run({ sectionHtml: OWN_FORM, widgetMarkup: gated });
+    const own = page.form(".own-form");
+    expect(page.widget!.hasAttribute("hidden")).toBe(true);
+    expect(seenInput(own)).toBeNull();
+    expect(poison(own)).toEqual([]);
+  });
+
+  // ── The preselect suffix, derived from the island (not assumed) ──────────
+  //
+  // Preselect is the experiment's second variable (merchant decision
+  // v1.26.0: tracked on its own). Every render above has subscription
+  // preselected, so a buy-box.js that hard-wired the suffix to "s" would
+  // pass them all; the two cases below render the REAL Liquid with the block
+  // setting "Preselect subscription" OFF, and once with an island that has
+  // no `preselect` field, so the derivation itself is measured.
+
+  it("reads <preset>|o when the block setting preselects one-time (real Liquid render)", async () => {
+    const oneTimeMarkup = await renderWidget({
+      launchStatus: "live",
+      blockSettings: { preselect_subscription: false },
+    });
+    // Vacuity guard: same preset, only the island's preselect flag flipped.
+    expect(oneTimeMarkup).not.toBe(WIDGET_MARKUP);
+    expect(oneTimeMarkup).toMatch(/"preselect":\s*false/);
+    expect(WIDGET_MARKUP).toMatch(/"preselect":\s*true/);
+
+    const page = run({ sectionHtml: OWN_FORM, widgetMarkup: oneTimeMarkup });
+    const own = page.form(".own-form");
+    const subs = page.window.CellexiaSubs as {
+      getState: () => Record<string, unknown> | null;
+    };
+    // The widget's public state carries the render decision as a boolean.
+    expect(subs.getState()).toMatchObject({
+      preselect: false,
+      design: "classic",
+      mode: "one_time",
+    });
+    // One-time is the checked option at boot: seen "classic|o" enabled, no
+    // plan, design prop disabled.
+    expect(seenInput(own)!.value).toBe("classic|o");
+    expect(seenInput(own)!.disabled).toBe(false);
+    expect(own.querySelector('input[name="selling_plan"]')?.value ?? "").toBe("");
+    expect(designInput(own)?.disabled ?? true).toBe(true);
+
+    // Switching TO subscription does not rewrite history: the suffix says
+    // what was RENDERED, the mode says what was CHOSEN.
+    selectMode(page, "subscription");
+    expect(subs.getState()).toMatchObject({ preselect: false, mode: "subscription" });
+    expect(own.querySelector('input[name="selling_plan"]')!.value).toBe(PLAN_ID);
+    expect(designInput(own)!.value).toBe("classic");
+    expect(designInput(own)!.disabled).toBe(false);
+    expect(seenInput(own)!.value).toBe("classic|o");
+    expect(own.querySelectorAll('input[name="properties[_cellexia_seen]"]')).toHaveLength(1);
+  });
+
+  it("reads <preset>|u when the island carries no `preselect` field (unknown, never a guess)", () => {
+    // An island without the flag (hand-edited or foreign markup): the form
+    // path derives the suffix from the raw island, so it can and must say
+    // "unknown" instead of fabricating a value for the tracked variable.
+    const legacy = WIDGET_MARKUP.replace(/"preselect":\s*true,\s*/, "");
+    expect(legacy).not.toBe(WIDGET_MARKUP); // vacuity guard: the field was there
+    expect(legacy).not.toMatch(/"preselect"/);
+
+    const page = run({ sectionHtml: OWN_FORM, widgetMarkup: legacy });
+    const own = page.form(".own-form");
+    const subs = page.window.CellexiaSubs as {
+      getState: () => Record<string, unknown> | null;
+    };
+    // getState() keeps its boolean contract (absent reads as false)…
+    expect(subs.getState()).toMatchObject({ preselect: false, design: "classic" });
+    // …while the form stamp says unknown, in both modes.
+    expect(seenInput(own)!.value).toBe("classic|u");
+    expect(seenInput(own)!.disabled).toBe(false);
+    selectMode(page, "one_time");
+    expect(seenInput(own)!.value).toBe("classic|u");
+    expect(seenInput(own)!.disabled).toBe(false);
+    expect(own.querySelectorAll('input[name="properties[_cellexia_seen]"]')).toHaveLength(1);
   });
 });
 

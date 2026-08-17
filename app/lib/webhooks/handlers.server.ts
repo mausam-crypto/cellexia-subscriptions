@@ -33,6 +33,10 @@ import {
   timeToPurchaseSeconds,
   type AcquisitionCapture,
 } from "~/lib/acquisition/sanitize";
+// Type-only: the runtime seam into design measurement is a lazy import inside
+// contained blocks (see linkContractDesignContained / the ORDERS_CREATE fact
+// write), so this module never statically loads the measurement module.
+import type { RecordSubscribableOrderInput } from "~/lib/design-measurement/facts.server";
 
 /**
  * Webhook topic handlers.
@@ -529,6 +533,12 @@ async function handleSubscriptionContractsCreate({
   } catch (err) {
     console.error("[webhooks] first-order tag failed", contract.id, err);
   }
+
+  // Design measurement join (v1.26.0): the origin order's SubscribableOrder
+  // fact becomes "subscribed" and the contract's originDesign* are stamped
+  // write-once. Same create-moment rule as acquisition/survey/tags, same
+  // containment (the helper swallows and logs).
+  await linkContractDesignContained(shop.id, contract.id);
 }
 
 /**
@@ -657,6 +667,8 @@ async function handleSubscriptionContractsUpdate({
     } catch (err) {
       console.error("[webhooks] catch-up first-order tag failed", after.id, err);
     }
+    // And for the design measurement join (see linkContractDesignContained).
+    await linkContractDesignContained(shop.id, after.id, "catch-up ");
     return;
   }
 
@@ -1778,6 +1790,76 @@ export function designPropertyOf(li: Payload): string | null {
   );
 }
 
+/**
+ * The buy-box widget's exposure marker (v1.26.0, design measurement):
+ * `_cellexia_seen` = `<preset>|<p>` (p: `s` subscription preselected, `o`
+ * one-time preselected, `u` unknown), stamped on EVERY add-to-cart of our
+ * product while the widget is visible — one-time AND subscription — so the
+ * order fact can tell "saw design X and chose one-time" apart from "never saw
+ * the widget". Unlike `_cellexia_design` it is NOT proof of a subscription
+ * add. Parsing/sanitizing lives in app/lib/design-measurement/shared.ts
+ * (parseSeenValue); the webhook only lifts the raw value. The name is kept as
+ * a local literal (mirroring shared.ts's SEEN_PROPERTY) so this module keeps
+ * zero static imports from the measurement module — every call into it below
+ * is a lazy, contained seam like the other cross-module hooks.
+ */
+const SEEN_PROPERTY = "_cellexia_seen";
+
+/** A line's raw `_cellexia_seen` value, null when absent. Exported for tests. */
+export function seenPropertyOf(li: Payload): string | null {
+  return lineProperty(li, SEEN_PROPERTY);
+}
+
+/**
+ * A line's selling plan id in whatever form the REST payload carries it:
+ * `selling_plan_allocation.selling_plan.id`, then `selling_plan_id`, then
+ * `selling_plan` (an object with `id`, or a bare id). Stringified numeric ids
+ * or GIDs — the design fact writer accepts any id form. Null when the line
+ * has no plan marker at all.
+ */
+function sellingPlanIdOf(li: Payload): string | null {
+  const allocation = asRecord(li.selling_plan_allocation);
+  const allocationPlan = asRecord(allocation?.selling_plan);
+  const plan = asRecord(li.selling_plan);
+  const candidates: unknown[] = [
+    allocationPlan?.id,
+    allocation?.selling_plan_id,
+    li.selling_plan_id,
+    plan ? plan.id : li.selling_plan,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.length > 0) return candidate;
+    if (typeof candidate === "number" && Number.isFinite(candidate)) {
+      return String(Math.trunc(candidate));
+    }
+  }
+  return null;
+}
+
+/**
+ * Design measurement join (v1.26.0): mark the contract's origin-order fact as
+ * subscribed and stamp originDesign* WRITE-ONCE (facts.server owns the rule —
+ * COUNTABLE contracts only, idempotent). Shared by the CREATE tail, the
+ * UPDATE catch-up branch (a lost create webhook's catch-up IS the create
+ * moment — the same rule as acquisition/survey/tags) and ORDERS_CREATE when
+ * the contract mirror already exists. Lazy seam + contained: analytics
+ * plumbing never fails a webhook.
+ */
+async function linkContractDesignContained(
+  shopId: string,
+  contractId: string,
+  logPrefix = "",
+): Promise<void> {
+  try {
+    const { linkContractDesign } = await import(
+      "~/lib/design-measurement/facts.server"
+    );
+    await linkContractDesign(shopId, contractId);
+  } catch (err) {
+    console.error(`[webhooks] ${logPrefix}design link failed`, contractId, err);
+  }
+}
+
 // ── Acquisition capture (data foundation — docs/DATA_FOUNDATION.md) ──────────
 
 /**
@@ -2062,6 +2144,17 @@ export async function enrichAcquisitionOnContractCreate(
  * contract's originOrderId. Contained: acquisition can never fail the
  * webhook.
  *
+ * Design fact feed (v1.26.0, docs/ARCHITECTURE.md "Design measurement"): for
+ * every subscribable order — including one the checkout.subscribable dedupe
+ * already counted — one PII-free SubscribableOrder row is written through
+ * recordSubscribableOrder (app/lib/design-measurement/facts.server, lazy
+ * import, contained): per-line design/seen properties, selling plan ids,
+ * isOurProduct, promo, device/country/currency/total, the email only to flag
+ * staff. The `_cellexia_seen` exposure marker (seenPropertyOf) is read from
+ * one-time lines too. When the contract mirror already exists the fact is
+ * joined to it right away (linkContractDesign); otherwise the contract-create
+ * tail does it. The checkout.subscribable payload gains `seen` (additive).
+ *
  * Idempotency: the route layer dedupes exact redeliveries on
  * X-Shopify-Webhook-Id (WebhookReceipt); a manual redelivery carries a NEW
  * webhook id, so each event family below additionally guards on its OWN
@@ -2150,24 +2243,39 @@ async function handleOrdersCreate({
   // per the handler doc above, REST payloads do not always include a
   // selling-plan marker on line items, so gating anything strictly on the
   // marker silently drops the payload variant the fallback exists for.
-  let containsSubscribable = hasSellingPlanLine;
-  if (!containsSubscribable) {
-    const configs = await prisma.sellingPlanConfig.findMany({
-      where: { shopId: shop.id, active: true },
-      select: { productIds: true },
-    });
-    const subscribable = new Set<string>();
-    for (const config of configs) {
-      for (const pid of asArray(config.productIds)) {
-        const s = asString(pid);
-        if (s) subscribable.add(s);
-      }
+  //
+  // The active SellingPlanConfig.productIds set is read on EVERY order since
+  // v1.26.0 (it used to be read only when no line carried a marker): the
+  // design fact below needs per-line `isOurProduct` — a subscription order
+  // whose marker proves it subscribable still has to tell OUR product's lines
+  // from a foreign vendor's plan lines (ownership "ours"/"foreign"/"mixed").
+  // The containsSubscribable verdict itself is unchanged: marker on any line,
+  // else any line's product in the set.
+  const configs = await prisma.sellingPlanConfig.findMany({
+    where: { shopId: shop.id, active: true },
+    select: { productIds: true },
+  });
+  const subscribable = new Set<string>();
+  for (const config of configs) {
+    for (const pid of asArray(config.productIds)) {
+      const s = asString(pid);
+      if (s) subscribable.add(s);
     }
-    containsSubscribable = lineItems.some((li) => {
-      const productGid = toGid("Product", pick(li, "product_id"));
-      return productGid != null && subscribable.has(productGid);
-    });
   }
+  const isOurProductLine = (li: Payload): boolean => {
+    const productGid = toGid("Product", pick(li, "product_id"));
+    return productGid != null && subscribable.has(productGid);
+  };
+  const containsSubscribable =
+    hasSellingPlanLine || lineItems.some(isOurProductLine);
+
+  // Hoisted out of the acquisition block so the design fact below can reuse
+  // what it computed: the sanitized capture (its device class) and the
+  // contract mirror already keyed to this order (the webhook-race lookup).
+  // Both stay null when the block does not run or fails — the fact writer
+  // tolerates either.
+  let capture: AcquisitionCapture | null = null;
+  let originContract: SubscriptionContract | null = null;
 
   // ── Acquisition capture (subscribable orders) ─────────────────────────────
   // Stash the sanitized bundle keyed by orderId, then persist directly when
@@ -2186,7 +2294,7 @@ async function handleOrdersCreate({
   // Guarded — acquisition must never fail order processing.
   if (containsSubscribable) {
     try {
-      const capture = acquisitionFromOrderPayload(
+      capture = acquisitionFromOrderPayload(
         payload,
         lineItems,
         orderGid,
@@ -2219,6 +2327,7 @@ async function handleOrdersCreate({
         const contract = await prisma.subscriptionContract.findFirst({
           where: { shopId: shop.id, originOrderId: orderGid },
         });
+        originContract = contract;
         if (contract && contract.acqRaw == null) {
           const admin = await getAdmin(shopDomain).catch(() => null);
           await applyAcquisitionToContract(shop.id, contract, capture, admin);
@@ -2274,38 +2383,138 @@ async function handleOrdersCreate({
 
   if (!containsSubscribable) return;
 
-  if (orderGid) {
-    const alreadyCounted = await prisma.subscriberEvent.findFirst({
-      where: {
-        shopId: shop.id,
-        type: "checkout.subscribable",
-        payload: { path: ["orderId"], equals: orderGid },
-      },
-      select: { id: true },
-    });
-    if (alreadyCounted) return;
+  // Exposure markers (`_cellexia_seen`, v1.26.0): lifted from EVERY line, not
+  // only subscription adds — the widget stamps them on one-time adds too, and
+  // "saw the design, chose one-time" is exactly the signal the design fact
+  // exists to keep. Raw values; parsing/sanitizing is the fact writer's job.
+  const seenValues = new Set<string>();
+  for (const li of lineItems) {
+    const seen = seenPropertyOf(li);
+    if (seen) seenValues.add(seen);
   }
 
-  await logEvent({
-    shopId: shop.id,
-    email: orderEmail,
-    type: "checkout.subscribable",
-    source: "WEBHOOK",
-    payload: {
-      orderId: orderGid,
-      orderName: asString(payload.name),
-      hasSellingPlanLine,
-      // Per-market join context (v1.6.0 serves different design presets per
-      // market concurrently): the presentment currency identifies the market
-      // side of the checkout and designKeys ties the denominator row to the
-      // presets actually shown — without them take-rate-by-design divides
-      // one design's conversions by a denominator polluted with every other
-      // design's traffic, and the data to fix that retroactively was never
-      // collected.
-      presentmentCurrencyCode: asString(payload.presentment_currency),
-      designKeys: [...designKeys].sort(),
-    },
-  });
+  // The checkout.subscribable dedupe is a DECISION, not an early return, since
+  // v1.26.0: the design fact below must run for every subscribable order —
+  // a redelivery after the event landed but before the fact row was written
+  // (crash, DB blip in the contained block) is repaired by the fact writer's
+  // own idempotent upsert, exactly the per-family rule above. The event
+  // itself still logs at most once per order id.
+  let alreadyCounted = false;
+  if (orderGid) {
+    alreadyCounted =
+      (await prisma.subscriberEvent.findFirst({
+        where: {
+          shopId: shop.id,
+          type: "checkout.subscribable",
+          payload: { path: ["orderId"], equals: orderGid },
+        },
+        select: { id: true },
+      })) != null;
+  }
+
+  if (!alreadyCounted) {
+    await logEvent({
+      shopId: shop.id,
+      email: orderEmail,
+      type: "checkout.subscribable",
+      source: "WEBHOOK",
+      payload: {
+        orderId: orderGid,
+        orderName: asString(payload.name),
+        hasSellingPlanLine,
+        // Per-market join context (v1.6.0 serves different design presets per
+        // market concurrently): the presentment currency identifies the market
+        // side of the checkout and designKeys ties the denominator row to the
+        // presets actually shown — without them take-rate-by-design divides
+        // one design's conversions by a denominator polluted with every other
+        // design's traffic, and the data to fix that retroactively was never
+        // collected.
+        presentmentCurrencyCode: asString(payload.presentment_currency),
+        designKeys: [...designKeys].sort(),
+        // v1.26.0 (additive): the distinct exposure markers on the order, so
+        // the nightly design_facts_backfill can rebuild a SubscribableOrder
+        // row from this event alone when the direct write below was lost.
+        seen: [...seenValues].sort(),
+      },
+    });
+  }
+
+  // ── Design fact (SubscribableOrder, v1.26.0 design measurement) ───────────
+  // One PII-free row per subscribable order: what design (and preselect) the
+  // shopper saw, whether a subscription line was on the order, ownership of
+  // the lines, promo/mixed/transition/staff flags — the population the Buy
+  // box designer's Results tab reads take rate / kept rates / LTGP from.
+  // Written HERE for every subscribable order (idempotent upsert keyed by
+  // order id — a redelivery re-completes, never duplicates) and joined to the
+  // contract by linkContractDesign from whichever side of the webhook race
+  // arrives second. Contained: analytics plumbing never fails a webhook.
+  if (orderGid) {
+    try {
+      const { recordSubscribableOrder } = await import(
+        "~/lib/design-measurement/facts.server"
+      );
+      const address =
+        asRecord(payload.shipping_address) ??
+        asRecord(payload.billing_address) ??
+        {};
+      const processedAtRaw = asString(pick(payload, "processed_at", "created_at"));
+      const processedAtParsed = processedAtRaw ? new Date(processedAtRaw) : null;
+      const processedAt =
+        processedAtParsed && !Number.isNaN(processedAtParsed.getTime())
+          ? processedAtParsed
+          : new Date();
+      const units = lineItems.reduce(
+        (sum, li) => sum + Math.max(0, asNumber(li.quantity) ?? 0),
+        0,
+      );
+      // Any discount at all — code OR automatic (discount_applications also
+      // lists automatic discounts and scripts) — flags the row as promo, so
+      // a promo week never masquerades as a design effect.
+      const promo =
+        asArray(payload.discount_codes).length > 0 ||
+        asArray(payload.discount_applications).length > 0;
+      // Every line, ours or not: the writer derives ownership from
+      // isOurProduct + the plan ids (foreign vendor's plan lines stay
+      // visible as "foreign"/"mixed" instead of vanishing).
+      const factLines = lineItems.map((li) => ({
+        variantId: toGid("ProductVariant", pick(li, "variant_id")),
+        productId: toGid("Product", pick(li, "product_id")),
+        sellingPlanId: sellingPlanIdOf(li),
+        designProp: designPropertyOf(li),
+        seenProp: seenPropertyOf(li),
+        isOurProduct: isOurProductLine(li),
+        quantity: Math.max(0, asNumber(li.quantity) ?? 0),
+      }));
+      const factInput: RecordSubscribableOrderInput = {
+        shopId: shop.id,
+        orderId: orderGid,
+        orderName: asString(payload.name),
+        processedAt,
+        countryCode: asString(address.country_code),
+        currencyCode: asString(payload.presentment_currency),
+        deviceType: capture?.acqDeviceType ?? null,
+        sourceName: asString(payload.source_name)?.slice(0, 40) ?? null,
+        orderTotalCents: centsFromAmountString(pick(payload, "total_price")),
+        units: units > 0 ? units : null,
+        // Used by the writer ONLY to compute the `staff` flag (excludeEmails);
+        // the row itself never stores it.
+        orderEmail,
+        hasSellingPlanLine,
+        lines: factLines,
+        promo,
+      };
+      await recordSubscribableOrder(factInput);
+    } catch (err) {
+      console.error("[webhooks] design fact failed", orderGid, err);
+    }
+  }
+
+  // Contract mirror already here (contract webhook won the race): join the
+  // fact to it now. Otherwise the contract-create tail (or the catch-up
+  // branch / nightly backfill) performs the same idempotent link.
+  if (originContract) {
+    await linkContractDesignContained(shop.id, originContract.id);
+  }
 }
 
 /** Any of the selling-plan markers REST order payloads may carry on a line. */
@@ -3666,6 +3875,12 @@ async function handleCustomersRedact({
         // identity). Without this stamp the acqRaw-null row would re-enter
         // origin_order_backfill's capped acqPending window forever.
         acqPickupExhaustedAt: new Date(),
+        // originDesign* (originDesignKey / Preselect / RevisionId / Source /
+        // StampedAt, migration 0025) are INTENTIONALLY RETAINED: merchant
+        // decision v1.26.0 — the design label is a property of the checkout
+        // (which buy-box design was live), not of the person, and the
+        // Results tab's kept-rate/LTGP-by-design readouts must survive a
+        // redact. Do not add them here.
       },
     });
   }

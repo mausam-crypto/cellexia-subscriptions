@@ -596,6 +596,23 @@ const registry: JobDef[] = [
     },
   },
   {
+    // Design measurement repair lane (v1.26.0): rebuilds SubscribableOrder
+    // fact rows the ORDERS_CREATE path missed (from the checkout.subscribable
+    // event feed + acquisition stash + calendar), joins facts to countable
+    // contracts and stamps originDesign* write-once, recomputes the staff /
+    // transition flags over the last 90 days, refreshes the country → market
+    // cache. Every step contained and capped at 2,000 rows. Ungated:
+    // analytics plumbing, no customer contact — like origin_order_backfill.
+    name: "design_facts_backfill",
+    everyMinutes: 1440,
+    fn: async (now) => {
+      const { runDesignFactsBackfill } = await import(
+        "~/lib/design-measurement/backfill.server"
+      );
+      return runDesignFactsBackfill(now);
+    },
+  },
+  {
     // Re-attempts the refund matches the REFUNDS_CREATE handler had to give
     // up on: a refund can arrive before its attempt/origin mirror exists
     // (webhook race, pre-import history), and the unmatched-refund guard

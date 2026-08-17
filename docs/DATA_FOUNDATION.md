@@ -166,7 +166,13 @@ the backfill's pickup window rather than be re-scanned nightly forever.
 **Any new acq column must be added to the anonymizer in
 `app/lib/webhooks/handlers.server.ts` in the same change that adds it.**
 Origin-order *money* columns are retained (legitimate financial records, no
-personal data).
+personal data). The `originDesign*` columns (Part 4, v1.26.0) are the one
+other explicit exception: they are NOT `acq*` columns and are deliberately
+retained through the redact, see Part 4 for the reasoning. The visit ledger
+`WidgetVisitorDay` (Part 4, v1.27.0) is outside the redact for a simpler
+reason: it holds no personal data at all (a random browser-local id, day,
+design, market, device class and counts), so no row can be traced to a
+customer and there is nothing to clear.
 
 ### Where it surfaces today
 
@@ -209,7 +215,11 @@ personal data).
 - **Device take-rate** — buy-box conversion and survival by `acqDeviceType`,
   feeding preset choice in the designer. *(Device-segmented survival/LTGP
   shipped v1.15.0; per-device take rate remains future work — the checkout
-  denominator carries no device.)*
+  denominator carries no device.)* Partially addressed in v1.26.0: the
+  `SubscribableOrder` fact row (Part 4) carries `deviceType` (the same
+  reduced device class, taken from the acquisition capture of the order), so
+  a per-device take rate is computable from the fact table; no admin surface
+  shows it yet.
 - **Value-band survival** — do bigger first orders churn less?
   `acqOrderValueBand` (and the raw total in `acqRaw`) make that a query, not
   a project. *(Shipped v1.15.0 as the first-order value segment.)*
@@ -237,3 +247,199 @@ LTGP (`predicted-ltgp.server.ts`), the subscriber-page survey card and the
 `survey.answered` Klaviyo metric. GDPR: survey rows carry no free text and
 no PII beyond the customer GID; contract deletion is impossible outside
 demo resets, whose contracts never link surveys.
+
+## Part 4 — Design measurement facts (v1.26.0, migration 0025; visits v1.27.0, migration 0026)
+
+<a name="part-4"></a>
+
+The third foundation surface answers "which buy-box design did each
+subscribable order see, and did it subscribe?" It lands, per the additive
+rule, in one new fact table, one new cache table, five nullable columns on
+`SubscriptionContract` and one on `WidgetDesignRevision`. Nothing existing
+was renamed or re-typed; v1.25 code runs unchanged against the schema.
+v1.27.0 adds the matching denominator, "how many visitors saw each design",
+in one more additive table, `WidgetVisitorDay` (migration 0026, no ALTER):
+v1.26 code runs unchanged against it and a rollback leaves the rows in
+place, unread.
+Engine and readouts: [ARCHITECTURE.md, Design measurement](ARCHITECTURE.md#design-measurement).
+
+### The `_cellexia_seen` carrier (storefront)
+
+`properties[_cellexia_seen]` = `<preset>|<p>`, `p` in `s` (subscription was
+preselected on the rendered widget), `o` (one-time preselected) or `u`
+(unknown), for example `subscription_max|s`. Both storefront writers stamp
+it on EVERY add-to-cart of our product's variants while the widget is
+visible, one-time and subscription alike; `_cellexia_design` keeps its old
+meaning (subscription adds only). Foreign variants and foreign-plan lines are
+never touched, an existing non-empty value is never overwritten, and a hidden
+or gated widget stamps nothing. It is buyer-writable input like any line
+property: the parser (`parseSeenValue`, `app/lib/design-measurement/shared.ts`)
+sanitizes the key to lowercase `/^[a-z0-9_]{1,40}$/` and treats anything but
+`s`/`o` (or `sub`/`one`) as unknown; the raw value is never stored.
+
+### `checkout.subscribable` payload
+
+Additive key `seen: [...]`: the distinct `_cellexia_seen` values found on the
+order's lines, sorted. Everything else in the payload (`orderId`,
+`orderName`, `hasSellingPlanLine`, `presentmentCurrencyCode`, `designKeys`)
+is unchanged. The nightly `design_facts_backfill` rebuilds a fact row from
+this event alone when the direct write was lost.
+
+### `SubscribableOrder` (one row per subscribable storefront order)
+
+PII-free by construction: no email, no customer id, no address beyond the
+country code. Written by `recordSubscribableOrder`
+(`app/lib/design-measurement/facts.server.ts`) from ORDERS_CREATE for every
+`containsSubscribable` order and by the nightly backfill; upsert on the
+unique `(shopId, orderId)`; on update the join fields (`subscribed`,
+`contractId`, `subscribedAt`) are never touched. Free-text fields are
+length-capped (`orderName` 40, `sourceName` 40, `deviceType` 16,
+`currencyCode` 8, `countryCode` ISO-2 or null).
+
+| Field | Type | Source | Meaning |
+|---|---|---|---|
+| `orderId` | `String` | order GID | Unique per shop with `shopId`. |
+| `orderName` | `String?` | order `name` | Display only. |
+| `processedAt` | `DateTime` | order `processed_at` (fallback `created_at`, then now) | The instant the design calendar and the maturity gates use. |
+| `countryCode` | `String?` | shipping (fallback billing) `country_code` | ISO-2, uppercased; anything else null. |
+| `currencyCode` | `String?` | order `presentment_currency` | Context only. |
+| `marketHandle` | `String?` | `MarketCountryMap` lookup on `countryCode` | The Shopify market the design was chosen for; null = unknown, resolves to the default design. |
+| `deviceType` | `String?` | the acquisition capture's `acqDeviceType` for the same order | `"mobile" \| "desktop" \| "tablet"` or null; the full user agent is never stored. |
+| `sourceName` | `String?` | order `source_name` | Shopify channel, capped 40. |
+| `orderTotalCents` | `Int?` | order `total_price` | For AOV per design. |
+| `units` | `Int?` | Σ line quantities | Basket size. |
+| `designKey` | `String?` | resolution ladder | The preset key the shopper saw; null = unknown. |
+| `designPreselect` | `String?` | resolution ladder | `"sub" \| "one" \| null` (unknown). |
+| `designRevisionId` | `String?` | design calendar | The `WidgetDesignRevision` live for the order's market at `processedAt`. |
+| `designSource` | `String` | resolution ladder | `"seen" \| "design_prop" \| "calendar" \| "none"`, best evidence first: `_cellexia_seen` on any of our lines, else `_cellexia_design`, else the calendar (withheld when the store was in SETUP or the market was hidden by `widgetMarkets`), else none. |
+| `calendarDesignKey` | `String?` | design calendar | What the ledger said regardless of the ladder, for the stamped-vs-calendar agreement audit. |
+| `hasSellingPlanLine` | `Boolean` | payload | Any line carried a selling-plan marker. |
+| `ownership` | `String` | plan ids on the lines vs our own plan-id set | `"ours" \| "foreign" \| "mixed" \| "none"`; foreign-only orders are excluded from the readouts and counted as excluded. When our own plan-id set is known to be incomplete, an unmatched plan is not declared foreign. |
+| `exposure` | `Boolean` | lines | Any widget-stamped property on any line. |
+| `subscribed` | `Boolean` | `linkContractDesign` | A COUNTABLE (non-demo, OURS) contract has this order as `originOrderId`. |
+| `contractId` | `String?` | `linkContractDesign` | That contract; no FK, survives contract deletion. |
+| `subscribedAt` | `DateTime?` | `linkContractDesign` | Contract `firstChargeAt` (fallback `createdAt`). |
+| `promo` | `Boolean` | `discount_codes` or `discount_applications` non-empty | Hygiene flag: a promo week must not read as a design effect. |
+| `mixed` | `Boolean` | lines | Several designs stamped on one order, or our product bought both as subscription and one-time. |
+| `transition` | `Boolean` | design calendar | A publish happened within 24 hours before the order (carry-over risk); recomputed nightly over the rows since `designMeasurement.startedAt` (all rows when unset, capped 5,000). |
+| `staff` | `Boolean` | checkout email in `designMeasurement.excludeEmails` | Computed at write time from the email, which is never stored; re-stamped from the `checkout.subscribable` event's email when the Results tab saves the email list, and nightly over the same range as `transition`. |
+
+Indexes: unique `(shopId, orderId)`; `(shopId, processedAt)`;
+`(shopId, designKey, processedAt)`; `(shopId, contractId)`.
+
+### `SubscriptionContract.originDesign*` (write-once) and the redact exception
+
+| Field | Type | Meaning |
+|---|---|---|
+| `originDesignKey` | `String?` | Preset key of the design that acquired this subscriber; null = unknown. |
+| `originDesignPreselect` | `String?` | `"sub" \| "one" \| null`: was subscription preselected on the widget that sold this. |
+| `originDesignRevisionId` | `String?` | The revision live at checkout (calendar). |
+| `originDesignSource` | `String?` | `"seen" \| "design_prop" \| "calendar" \| "none"`. |
+| `originDesignStampedAt` | `DateTime?` | Set once by `linkContractDesign`; the guard of the write-once rule (`updateMany ... where originDesignStampedAt: null`). |
+
+Stamped from the order's fact row when it exists; when it does not (order
+predates the feature, lost webhook) from `widget.design_attributed` events,
+then the calendar, then `"none"`, and only once the contract is older than
+48 hours (`LINK_NO_FACT_GRACE_MS`) so the webhook race cannot burn the slot
+on a guess. Consumers: the analytics segment dimensions `design` and
+`preselect`, read-only.
+
+**CUSTOMERS_REDACT does NOT clear these columns.** This is an explicit,
+documented exception to the "every acq column joins the anonymizer" rule
+above, decided by the merchant in v1.26.0: the design label is a property of
+the checkout (which buy-box design was live and how it was rendered), not of
+the person, it identifies nobody, and clearing it would punch holes in the
+kept-rate and LTGP-by-design readouts for every redacted subscriber. The
+anonymizer in `app/lib/webhooks/handlers.server.ts` carries a comment saying
+so; do not add `originDesign*` to it. `SubscribableOrder` itself holds no
+personal data and needs no redact step.
+
+### `WidgetVisitorDay` (v1.27.0, one row per visitor per shop-day per design and preselect)
+
+The visit ledger: the conversion denominator that pairs with
+`SubscribableOrder`. Written only by the storefront beacon
+(`buy-box-embed.js` section 4, `GET /apps/cellexia-subs/w`,
+`app/routes/proxy.w.tsx`, `recordVisit` in
+`app/lib/design-measurement/visits.server.ts`); the theme block alone sends
+nothing, so a theme-block-only install has no rows here. Upsert on the
+unique `(shopId, day, vid, designKey, designPreselect)`: a `view` beacon
+adds one to `views` (created with 1), `engage` sets `engaged`, `atc` sets
+`addedToCart` and, when the subscription option was added, `addedSubscription`;
+`engage` and `atc` create the row with `views 0` when no view landed first,
+so an add to cart without a prior view still counts a visit. Every event
+refreshes `lastSeenAt`; the identity columns are written on create only,
+so a later beacon carrying nothing never blanks them.
+
+**PII stance.** Nothing here identifies a person: `vid` is a random
+browser-local id (16 URL-safe characters, `localStorage["cellexia_vid"]`,
+falling back to `sessionStorage`, then to a per-page value), not a customer
+id, not a cookie, not tied to an email or an order; no IP, no user agent
+and no page URL are stored (the User-Agent is only read in memory by the
+route's bot filter). Merchant decision (v1.27.0): no consent gate. There is
+nothing to redact: `CUSTOMERS_REDACT` does not touch this table because no
+row can be traced to a customer.
+
+**Retention.** Rows whose `day` is older than 400 days
+(`VISIT_RETENTION_DAYS`, cutoff computed in the shop timezone) are deleted
+by the nightly `design_facts_backfill` (`prune_visits`, its last step).
+Rows carrying a `countryCode` but a null `marketHandle` (written before the
+market map was filled) are mapped by the same job's flags step
+(`recomputeVisitMarkets`, oldest first, capped 5,000 per run).
+
+| Field | Type | Source | Meaning |
+|---|---|---|---|
+| `day` | `String` | `visitDayKey(now, shop.ianaTimezone)` at the server | `YYYY-MM-DD` in the shop timezone; the day the visitor is counted on. |
+| `vid` | `String` | beacon `vid` | Anonymous browser-local visitor id, validated `/^[A-Za-z0-9_-]{8,32}$/`; anything else drops the beacon. |
+| `designKey` | `String` | beacon `d` through `sanitizeDesignKey` | The preset key the widget rendered (`state.design`). |
+| `designPreselect` | `String` | beacon `p` (`s` / `o` / `u`) | `"sub" \| "one" \| "u"`, NOT NULL, default `"u"` (unknown: an older `buy-box.js`). Same vocabulary as the order stamp, so numerator and denominator join on the identical key. |
+| `countryCode` | `String?` | beacon `c` (`window.Shopify.country`) | ISO-2 uppercase or null; anything else null (never a dropped beacon). |
+| `marketHandle` | `String?` | `MarketCountryMap` lookup on `countryCode` | The Shopify market; null = unknown (mapped later by `recomputeVisitMarkets`). |
+| `deviceType` | `String?` | beacon `dv` (`m` / `t` / `d`) | `"mobile" \| "tablet" \| "desktop"` or null; from viewport width and pointer type, no user agent. |
+| `views` | `Int` | `view` beacons | Page views on which the widget was at least half on screen for a full second. |
+| `engaged` | `Boolean` | `engage` beacon | The visitor interacted with the widget (or the ultra-max satellite line). |
+| `addedToCart` | `Boolean` | `atc` beacon | Our product was added to the cart from a page where the widget was visible. |
+| `addedSubscription` | `Boolean` | `atc` beacon with `m=s` | The add carried the subscription option. |
+| `firstSeenAt` / `lastSeenAt` | `DateTime` | server clock | First and most recent beacon for the row; `lastSeenAt` is what the `widget_visits` self-check and the "Last visit" tile read. |
+
+Indexes (four): unique `(shopId, day, vid, designKey, designPreselect)`;
+`(shopId, day)` (the summary and the presence probes `hasVisits` /
+`firstVisitDay`); `(shopId, designKey, day)`; `(shopId, lastSeenAt)` (the
+"last visit" top-1 and the `widget_visits` self-check's since-count, so
+neither sorts the shop's whole ledger).
+
+**Beacon parameters** (`GET /apps/cellexia-subs/w?…`, all in the query
+string, HMAC-signed by the app proxy like every proxy request): `e`
+(`view` / `engage` / `atc`), `d` (design key), `p` (`s` / `o` / `u`), `v`
+(variant id), `c` (country), `cur` (active currency), `dv` (device class),
+`vid` (visitor id), `pv` (8-character page-view id, unique per page load),
+`t` (`Date.now()`), and on `atc` only `m` (`s` subscription / `o` one-time).
+`v`, `cur`, `pv` and `t` are transport-only: the server ignores them and
+stores nothing from them. Each event goes out at most once per page load
+per design and preselect (`atc` also per mode; `atc` fires whenever an
+intercepted cart request targets one of our variants, stamps injected or
+already present, and never for a foreign variant). No beacon leaves the page
+in admin preview (`cx_preview=` in the URL), in the theme editor
+(`Shopify.designMode === true`) or while `getState()` is null (widget
+hidden, launch-gated or absent). Server side, a beacon whose User-Agent
+matches a crawler token as a whole word, a headless/audit tool prefix or a
+named crawler is dropped (`VISIT_BOT_UA_RE`; a device name that merely
+contains "bot", such as CUBOT phones, is not a bot).
+
+### `MarketCountryMap` (cache)
+
+`(shopId, countryCode)` unique → `marketHandle`, `marketName`. Rebuilt from
+the Admin API Market regions (enabled markets only, primary market first, a
+country served by two markets keeps the first) by the nightly
+`design_facts_backfill` (its first step, so the rows it then writes resolve
+against a filled map) and after every design publish, both contained; an
+empty API answer never wipes a working map, and a missing entry resolves to
+the default design (`marketHandle = null`), never to an error. Cache only:
+safe to truncate, it refills on the next refresh.
+
+### The write-once rule, restated for this part
+
+`SubscribableOrder` rows are re-derivable facts (a redelivered order webhook
+or the backfill may rewrite the design and hygiene columns; the join columns
+are only ever set by `linkContractDesign`). `originDesign*` are stamped once
+and never rewritten: a subscriber is attributed to exactly the design that
+acquired them, forever, even after later republishes change the calendar.

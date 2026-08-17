@@ -513,10 +513,13 @@ Embed behaviours worth knowing:
   `/cart/add` and `/cart/add.js` POST bodies — FormData, urlencoded, JSON
   `items[]` or flat JSON alike, including the bracket form jQuery produces
   for an `items[]` payload (`items[0][id]=…`, injected per matching item).
-  Requests are matched against **this product's variant ids**, so other
-  vendors' cart calls (bundle widgets, upsells) pass through byte-identical;
-  so does everything when one-time is selected, the widget is hidden, or
-  anything at all errors. An add-to-cart can never break. Covered by
+  Since v1.26.0 it also stamps the `properties[_cellexia_seen]` exposure
+  property on every matching item in **both** modes (see "The
+  `_cellexia_seen` line property" below). Requests are matched against **this product's variant
+  ids**, so other vendors' cart calls (bundle widgets, upsells) pass through
+  byte-identical; so does everything when the widget is hidden or anything
+  at all errors, and a one-time selection adds nothing but the seen stamp.
+  An add-to-cart can never break. Covered by
   `tests/embed-cart-injection.test.ts`, which drives the real file through
   `window.fetch` and asserts on the outgoing bodies.
 - **Variant tracking (layered, event-independent since v1.6.8).** Events
@@ -607,6 +610,11 @@ Embed behaviours worth knowing:
   mutation checks that disable the poll and the disagreement rules and
   prove the respective tests fail without them, and by the two-nets
   vacuity guard in `tests/buybox-foreign-section-form.test.ts`.
+- **Visit beacon (v1.27.0).** With the app embed enabled, `buy-box-embed.js`
+  also reports exposed visits (view, engage, add to cart) per design and
+  preselect to the app proxy, which is what the Results tab's conversion
+  columns are built from. Details, wire format and the "needs the app
+  embed" caveat: "Visit beacon (v1.27.0)" below.
 
 ### Anchor-selector troubleshooting
 
@@ -791,7 +799,8 @@ storefront until the merchant explicitly goes live from the app admin.
   for everyone else), so only their checkout ever shows subscription terms.
 - **The gate is a WRITE gate, not just a visual one.** A hidden widget also
   writes nothing into the theme's product form: `buy-box.js` skips its
-  `selling_plan` / `properties[_cellexia_design]` injection entirely while the
+  `selling_plan` / `properties[_cellexia_design]` / `properties[_cellexia_seen]`
+  injection entirely while the
   widget (or a wrapper around it) carries `hidden`, and removes anything it
   had written if it becomes hidden. Without that, a setup-mode shop on a
   Dawn-family theme would still have the preselected plan sitting in the
@@ -1247,6 +1256,144 @@ only ever writes the current name; the ORDERS_CREATE handler accepts **both**,
 preferring the current one, so orders placed — and carts that were already
 open — before the merchant updated the extension are still attributed.
 
+### The `_cellexia_seen` line property (design exposure, v1.26.0)
+
+`_cellexia_design` only travels with subscription adds, so on its own it can
+say which design produced a subscription but not how many shoppers SAW that
+design and bought one-time instead: no denominator, no take rate per design.
+`properties[_cellexia_seen]` closes that gap. Its value is
+`<preset>|<p>` where `p` is `s` (the widget rendered with the subscription
+preselected), `o` (one-time preselected) or `u` (unknown), for example
+`subscription_max|s`. Rules, identical for both writers:
+
+- It is stamped on **every** add-to-cart of this product's variants while the
+  widget is visible: one-time AND subscription. `_cellexia_design` keeps its
+  exact previous semantics (subscription adds only, value = preset). Preselect
+  is deliberately its own variable, encoded here, because it is the single
+  biggest take-rate lever and must be measurable independently of the preset.
+- Foreign lines stay byte-identical: other vendors' variants, and any line
+  carrying a selling plan that is not provably ours (a foreign plan id, or any
+  plan id while one-time is selected) get no stamp at all.
+- An existing non-empty `_cellexia_seen` value is never overwritten (a value
+  that already travelled records the exposure at the moment it was written).
+- Nothing is stamped while the widget is hidden, gated or absent: the same
+  write gate as `selling_plan` and `_cellexia_design`, so an order placed
+  without seeing the widget stays distinguishable from one that saw it.
+
+Two writers, one spelling (`tests/liquid/lint.test.ts` pins the name in both
+files and in this README):
+
+- **Theme-form themes** (`buy-box.js`, `applyDesignProp`): an always-on hidden
+  `<input type="hidden" name="properties[_cellexia_seen]">` in the bound
+  product form, enabled with the seen value whenever the widget is visible,
+  disabled and blanked by `releaseForm()` exactly like the design prop. It is
+  found by its **name** rather than a `data-cellexia-*` hook: it is always our
+  own input (never adopted from the theme), and the Liquid ⇄ JS DOM-contract
+  test in `tests/liquid/render.test.ts` treats every `data-cellexia-*` hook the
+  JS queries as one the Liquid must render.
+- **Formless AJAX themes** (`buy-box-embed.js`, `exposureState()`): the cart
+  request patch runs whenever `getState()` is non-null (any mode; the old
+  `activeSubState()` ran only for a selected subscription) and stamps
+  `_cellexia_seen` on our-variant targets in every body shape (JSON `items[]`,
+  flat JSON, urlencoded flat, urlencoded `items[i][…]`, FormData flat,
+  FormData `items[i][…]`); `selling_plan` + `_cellexia_design` are still added
+  only in subscription mode. A line that already carries OUR plan id gets
+  whichever of design / seen is missing.
+
+Both install shapes stamp it: the theme-form path (`buy-box.js`, the hidden
+input above) and the AJAX cart-request patch (`buy-box-embed.js`), so a
+one-time add carries `_cellexia_seen` on every supported theme, not only on
+formless ones.
+
+One cosmetic side effect worth knowing: Shopify merges cart lines only when
+variant AND properties match. A one-time line added on the product page
+(stamped) and a one-time line of the same variant added somewhere without
+the widget (collection quick-add, cart upsell, a bystander app) no longer
+merge into one line with quantity 2; they show as two lines. Checkout,
+totals and the selling plan are unaffected. The same was already true of
+subscription lines because of `selling_plan` and `_cellexia_design`.
+
+`getState()` exposes the render decision as `preselect: true|false` (the
+island's `preselect` field, i.e. the widget rendered subscription as the
+default), and the `cx:buybox:change` detail carries the same `preselect` flag.
+The ORDERS_CREATE webhook parses the value (`parseSeenValue` in
+`app/lib/design-measurement/shared.ts`) into the `SubscribableOrder` fact
+row and the contract's `originDesign*` fields; the Buy box designer's Results
+tab reads take rate, kept rates and LTGP per design from there.
+
+### Visit beacon (v1.27.0)
+
+Take rate per design has orders as its denominator, so a design that quietly
+sells fewer orders but converts more of them to subscriptions reads as a
+winner. The honest comparison is per exposed visit: orders per 100 visits and
+subscriptions per 100 visits, keyed by exactly the same design and preselect
+as the `_cellexia_seen` order stamp, so numerator and denominator agree. The
+visit beacon in `buy-box-embed.js` (section 4 of the file) records that
+denominator. It is measurement only: every entry point is wrapped, nothing is
+awaited, and a beacon that cannot be sent is simply not sent. An add-to-cart
+can never break because of it (pinned by `tests/embed-visits.test.ts`, which
+drives the real files with an `Image` constructor that throws).
+
+**Needs the app embed.** The beacon lives in `buy-box-embed.js`, which only
+loads when the app embed is enabled in the theme editor. A theme-block-only
+install (the section app block without the app embed) gets no visit tracking:
+orders still carry `_cellexia_seen`, take rate per design still works, but
+the Results tab shows "no visits yet" and the conversion columns stay empty.
+Enable the app embed to get visits; the block still wins the placement and
+the embed stays dormant, only the beacon runs.
+
+**What is sent, and when.** One `GET /apps/cellexia-subs/w?…` per event, as
+an image pixel (`new Image().src`; `fetch(keepalive, no-cors)` only where
+`Image` is missing), never awaited:
+
+- `e=view` once the widget root (`.cx-buybox[data-cellexia-buybox]`) has been
+  at least half in the viewport for a full second (IntersectionObserver;
+  without one, 1.5 s after boot if the widget is visible). A scroll-past or a
+  background tab never counts.
+- `e=engage` on the first pointerdown / click / keydown / change inside the
+  root (or the ultra_max satellite line).
+- `e=atc` when a cart request the fetch / XHR patch intercepted targets one
+  of this product's variants, whether the patch injected the stamps or found
+  them already there (a theme that serialises the product form buy-box.js
+  already stamped and sends it without a submit event; `m=s` when the
+  subscription is selected, `m=o` for a one-time line; another vendor's
+  variant never counts), and, for theme-form installs, on the capture-phase
+  `submit` of a `/cart/add` form that carries our enabled
+  `properties[_cellexia_seen]` input (`m` from the widget's current mode).
+
+Each event goes out at most once per page load per design + preselect (atc:
+per mode too, so a shopper who adds one-time and then the subscription sets
+both flags on the server, never twice for one). Common parameters: `d`
+(design = preset), `p` (`s` / `o` / `u`, the same preselect code as the seen
+stamp), `v` (variant id), `c` (`Shopify.country`, uppercase ISO-2, else
+empty), `cur` (`Shopify.currency.active`, else empty), `dv` (`m` / `t` / `d`
+from viewport width and pointer type), `vid` (visitor id), `pv` (page-view
+id, 8 characters per load), `t` (`Date.now()`).
+
+**The visitor id** is a browser-local anonymous id (16 URL-safe characters
+from `crypto.getRandomValues` where available, `Math.random` otherwise; it is
+not an experiment assignment, so the experiment kernel's no-RNG rule does not
+apply). It is stored under `localStorage["cellexia_vid"]`, falls back to
+`sessionStorage`, then to a per-page value; it is validated on read so a
+tampered value never reaches the URL. It carries no personal data and no
+consent gate is needed (merchant decision, v1.27.0). The server counts a
+visitor once per day per design and preselect
+(`WidgetVisitorDay`, `app/lib/design-measurement/visits.server.ts`).
+
+**Never measured:** an admin preview (`?cx_preview=` in the page URL creates
+no observer and sends nothing, while the cart stamps still work), the theme
+editor (Online Store > Customize sets `Shopify.designMode`; the merchant
+clicking through designs there is not a shopper, so the beacon is off and no
+observer is created, while the cart stamps still work), and any moment
+`getState()` answers null (widget hidden, launch-gated, parked or absent): a
+visitor who cannot see the widget was not exposed to a design.
+
+**Verifying on a store:** open a product page with the app embed enabled and
+watch the network tab for a request to `/apps/cellexia-subs/w?e=view…` about
+a second after the widget is on screen (204 No Content). The Debug self-check
+`widget_visits` warns when the store is live with recent widget orders but
+no visit rows at all (beacon not deployed, app embed disabled, or blocked).
+
 ## Settings and the CRO rationale
 
 | Setting | Default | Why |
@@ -1331,19 +1478,24 @@ locales.
   form, and re-initializes on `shopify:section:load` for the theme editor.
 - Alongside `selling_plan` it maintains the hidden
   `properties[_cellexia_design]` design-attribution input (see above) — enabled
-  with the preset key when subscription is selected, disabled otherwise.
+  with the preset key when subscription is selected, disabled otherwise. Since
+  v1.26.0 it also maintains the always-on `properties[_cellexia_seen]` exposure
+  input (`<preset>|<s|o|u>`), enabled whenever the widget is visible in either
+  mode.
 - Every preset funnels into the same state machine: radios
   (classic/tiles/value_stack/planner), `role=tab` buttons with arrow-key
   support (toggle), the inline checkbox, and frequency chips all call the
   same `setMode()`/`render()`; price nodes carry stable `data-cellexia-*` hooks
   in every preset, never preset-specific classes.
 - A `cx:buybox:change` CustomEvent (detail: `variantId`, `sellingPlanId`,
-  `mode`, `design`) bubbles from the block for pixels/analytics to hook into.
+  `mode`, `design`, `preselect`) bubbles from the block for pixels/analytics
+  to hook into.
 - Each widget registers on the guarded `window.CellexiaSubs` global
   (`getState()` / `setVariant()`); `getState()` returns `null` while the
   widget is hidden (launch-gated or unmounted embed), which is what lets
   `buy-box-embed.js` patch cart requests only for a selection the visitor
-  can actually see.
+  can actually see. Its shape: `{ mode, design, preselect, variantId,
+  variantIds, sellingPlanId }`.
 
 ## Accessibility
 

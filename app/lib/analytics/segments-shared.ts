@@ -20,6 +20,23 @@ export type DiscountBand = (typeof DISCOUNT_BANDS)[number];
 
 export const DEVICE_TYPES = ["mobile", "desktop", "tablet"] as const;
 
+/**
+ * Buy-box preselect vocabulary (v1.26.0) — which option the widget rendered
+ * as the default at the subscriber's first checkout: "sub" (subscription
+ * preselected) or "one" (one-time preselected). Mirrors
+ * SubscriptionContract.originDesignPreselect; duplicated here rather than
+ * imported from ~/lib/design-measurement/shared so this module keeps its
+ * zero-dependency guarantee for client components.
+ */
+export const DESIGN_PRESELECT_SEGMENT_VALUES = ["sub", "one"] as const;
+
+/**
+ * Buy-box design keys are widget preset keys ("subscription_max", …) —
+ * lowercase snake_case, capped at 40 chars. Shared with the server parser
+ * so the URL param and the stored value can never disagree on shape.
+ */
+export const DESIGN_KEY_RE = /^[a-z0-9_]{1,40}$/;
+
 export interface AnalyticsSegment {
   /** ISO country code (uppercase) or "unknown". */
   country?: string;
@@ -35,6 +52,17 @@ export interface AnalyticsSegment {
   device?: string;
   /** acqOrderValueBand label ("0_25" … "200_plus") or "unknown". */
   valueBand?: string;
+  /**
+   * Buy-box design (widget preset key, e.g. "subscription_max") the
+   * subscriber's first checkout came through, or "unknown" (v1.26.0 —
+   * SubscriptionContract.originDesignKey).
+   */
+  design?: string;
+  /**
+   * Which buy-box option was preselected at that first checkout: "sub" |
+   * "one" | "unknown" (v1.26.0 — SubscriptionContract.originDesignPreselect).
+   */
+  preselect?: string;
 }
 
 export const SEGMENT_DIMENSIONS = [
@@ -45,6 +73,8 @@ export const SEGMENT_DIMENSIONS = [
   "discountBand",
   "device",
   "valueBand",
+  "design",
+  "preselect",
 ] as const satisfies ReadonlyArray<keyof AnalyticsSegment>;
 
 export type SegmentDimension = (typeof SEGMENT_DIMENSIONS)[number];
@@ -58,6 +88,8 @@ export const SEGMENT_PARAM_NAMES: Record<SegmentDimension, string> = {
   discountBand: "discount",
   device: "device",
   valueBand: "value",
+  design: "design",
+  preselect: "preselect",
 };
 
 const DISCOUNT_BAND_LABELS: Record<string, string> = {
@@ -67,6 +99,23 @@ const DISCOUNT_BAND_LABELS: Record<string, string> = {
   "20_30": "20–30%",
   "30_plus": "30% or more",
 };
+
+const PRESELECT_LABELS: Record<string, string> = {
+  sub: "Subscription preselected",
+  one: "One-time preselected",
+};
+
+/**
+ * "subscription_max" → "Subscription max": a widget preset key rendered as
+ * plain words. Kept local (rather than importing the design-measurement
+ * presetDisplayName) so this module stays dependency-free; the two must
+ * agree on the shape, which is trivial for snake_case keys.
+ */
+function designKeyLabel(key: string): string {
+  const words = key.replace(/_+/g, " ").trim();
+  if (words === "") return key;
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
 
 /** Human label for a dimension value ("unknown" always reads "Unknown"). */
 export function segmentValueLabel(
@@ -100,6 +149,10 @@ export function segmentValueLabel(
       return value.charAt(0).toUpperCase() + value.slice(1);
     case "valueBand":
       return value === "200_plus" ? "200+" : value.replace(/_/g, "–");
+    case "design":
+      return designKeyLabel(value);
+    case "preselect":
+      return PRESELECT_LABELS[value] ?? value;
     default:
       return value;
   }

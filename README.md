@@ -42,7 +42,18 @@ conversion; minimise voluntary and involuntary churn.**
   from the main design), preview, revision history with one-click restore,
   and take-rate reporting per design — all configured in-app and published
   to a metafield; the theme block is added once and never needs touching
-  again.
+  again. Since v1.26.0 the designer's **Results** tab measures each design
+  like a merchant would: take rate with a real denominator (every
+  subscribable order records the design it saw and whether subscription was
+  preselected), kept subscribers at 30/60/90 days, quick cancels, LTGP per
+  subscriber, a weekly-orders guardrail and a sample-size grade, plus a
+  design calendar to read Shopify's own reports against. Since v1.27.0 the
+  buy box also records its own visits (a tiny first-party beacon through the
+  app proxy: one visitor per day per design, no personal data, no cookie),
+  so the same tab shows conversion (orders and subscriptions per 100 visits),
+  kept subscribers per 100 visits, a conversion-based guardrail and a
+  compare-against-the-reference card with a plain "chance it is really
+  better".
 - **Safe alongside another subscription app** — the store can run a second
   subscription app (cellexialabs.com runs Joy) without risk: every contract is
   classified `OURS` / `FOREIGN` / `UNKNOWN` from its selling plans, and only
@@ -86,7 +97,9 @@ conversion; minimise voluntary and involuntary churn.**
   survival curves split by churn cause; **self-improving churn risk** (a
   learned model trains nightly on the store's own history and replaces the
   heuristic only once provably better — status always visible); take rate
-  (incl. per buy-box design); dunning recovery; five backtested forecast
+  (per buy-box design on the designer's Results tab, and every analytics
+  view filterable by buy-box design and preselected option since v1.26.0);
+  dunning recovery; five backtested forecast
   models with honest A–D accuracy grades, self-measured weekly so model
   selection keeps improving; plain-language insight cards.
 - **Acquisition data foundation** — source/UTM, geo, device and first-order

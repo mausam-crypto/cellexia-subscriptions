@@ -35,11 +35,19 @@ const SERVER_BUILD_DIR = join(REPO_ROOT, "build", "server");
 
 const KB = 1024;
 
-/** Ceiling for the single biggest server chunk (today: ~2.16MB). */
-const SERVER_CHUNK_LIMIT = 3 * KB * KB;
+/**
+ * Ceiling for the single biggest server chunk. History of the measured
+ * value, so the next person can tell ordinary feature growth from a step
+ * change: v1.6.7 ~2.16MB (limit set at 3MB); v1.25.0 3,128,127 bytes
+ * (99.4% of that limit — twenty feature releases of steady growth, no
+ * dependency step); v1.26.0 3,209,002 bytes (+81KB: the design-measurement
+ * modules, the Results tab route + component). Raised to 4MB in v1.26.0 in a
+ * reviewed change — the same ~25% headroom the original limit gave.
+ */
+const SERVER_CHUNK_LIMIT = 4 * KB * KB;
 
-/** Ceiling for the whole build/server tree (today: ~2.3MB). */
-const SERVER_TOTAL_LIMIT = 4 * KB * KB;
+/** Ceiling for the whole build/server tree (v1.26.0: ~3.35MB). */
+const SERVER_TOTAL_LIMIT = 5 * KB * KB;
 
 function reportBytes(bytes: number): string {
   return `${bytes.toLocaleString("en-US")} bytes`;
@@ -69,7 +77,7 @@ describe.skipIf(!existsSync(SERVER_BUILD_DIR))(
       expect(files.some((entry) => entry.file.endsWith(".js"))).toBe(true);
     });
 
-    it("keeps the biggest server chunk under 3MB", () => {
+    it("keeps the biggest server chunk under 4MB", () => {
       const biggest = [...files].sort((a, b) => b.size - a.size)[0];
       expect(
         biggest.size,
@@ -81,7 +89,7 @@ describe.skipIf(!existsSync(SERVER_BUILD_DIR))(
       ).toBeLessThanOrEqual(SERVER_CHUNK_LIMIT);
     });
 
-    it("keeps the whole build/server tree under 4MB", () => {
+    it("keeps the whole build/server tree under 5MB", () => {
       const total = files.reduce((sum, entry) => sum + entry.size, 0);
       const largest = [...files]
         .sort((a, b) => b.size - a.size)

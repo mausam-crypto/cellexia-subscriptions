@@ -328,6 +328,10 @@ these inside the storefront preview session above):
 3. **One-time add unaffected**: select one-time (or a product with no plan)
    → add to cart → no selling plan, no `_cellexia_design` property, normal price —
    the theme's own add-to-cart must behave exactly as before the embed.
+   Since v1.26.0 the one exception is the hidden `_cellexia_seen` property
+   (`<preset>|s`, `|o` or `|u`), which a one-time add of the plan product
+   DOES carry while the widget is visible; a product with no plan, and any
+   other vendor's add, must still carry nothing.
 4. **Theme cart UX intact**: the mini-cart/cart drawer still opens and
    updates normally after both kinds of add, and any other purchase widgets
    on the page (e.g. a bundle app) still add their own products correctly.
@@ -354,14 +358,30 @@ live PDP):
    must follow the selected variant in every preset.
 3. Select the subscription option → add to cart → the cart line carries the
    **selling plan** (frequency text visible on the line) *and* the hidden
-   **`_cellexia_design` line property** = the active preset key. It is
+   **`_cellexia_design` line property** = the active preset key (and, since
+   v1.26.0, **`_cellexia_seen`** = the preset key plus `|s` or `|o`
+   according to which option the widget preselected). It is
    underscore-prefixed, so themes and checkout hide it from customers —
    verify it via `https://<store>/cart.js` (JSON) or on the resulting test
    order's line properties. After the order, the Audit page logs
    `widget.design_attributed`.
 4. **One-time path unaffected**: select one-time → add to cart → the line has
    **no** selling plan and **no** `_cellexia_design` property, and checkout is the
-   theme's normal flow.
+   theme's normal flow. Since v1.26.0 the line does carry the hidden
+   `_cellexia_seen` property (same preset key); that is expected, and the
+   order then appears on the Buy box designer's Results tab as a one-time
+   order under that design.
+   - **Visit beacon (v1.27.0)**, on the LIVE widget only, in a normal
+     browser tab (the admin preview and the theme editor's preview frame
+     deliberately send nothing) and only with the app embed enabled: with
+     the browser network tab open, load the product page and, about a second
+     after the widget is on screen, expect `GET /apps/cellexia-subs/w?e=view…`
+     answered `204`; click inside the widget once, expect an `e=engage`
+     request; add to cart, expect `e=atc&m=s` (subscription) or `e=atc&m=o`
+     (one-time), also on themes whose form was already stamped and needed no
+     injection. Each fires once per page load. `localStorage` holds
+     `cellexia_vid` (16 random characters) and no cookie is set. The cart
+     request itself must be unchanged whether or not the beacon succeeded.
 5. **Subscription max preset** (v1.6.0) — run these four checks whenever it
    is (or a market resolves to) the active preset; they verify the
    compliance guardrails that keep "quiet" from meaning "hidden":

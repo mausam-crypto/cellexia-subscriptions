@@ -257,6 +257,27 @@ model SubscriptionContract {
   originOrderRefundedCents        Int       @default(0)
   originOrderProcessedAt          DateTime?
   originOrderCurrencyCode         String?
+  // Buy-box design of the origin checkout (migration 0025, v1.26.0) — the
+  // per-subscriber copy of SubscribableOrder's design record so retention,
+  // survival and LTGP can be split by widget design (segment dimensions
+  // "design" / "preselect"). WRITE-ONCE: stamped when the origin order's
+  // design fact is joined (contract create tail, ORDERS_CREATE race path or
+  // the nightly design_facts_backfill), never overwritten — a subscriber is
+  // attributed to exactly the design that acquired them, forever.
+  // DELIBERATELY NOT in the acq* family: a design label is not personal
+  // data, and the merchant decided (v1.26.0) it must survive
+  // CUSTOMERS_REDACT so LTGP-by-design stays whole. Do NOT add these to the
+  // redact anonymizer's null list.
+  //   originDesignKey        preset key ("subscription_max"…), null = unknown
+  //   originDesignPreselect  "sub" | "one" | null(unknown) — was subscription
+  //                          preselected on the widget that sold this?
+  //   originDesignRevisionId WidgetDesignRevision.id live at checkout (calendar)
+  //   originDesignSource     "seen" | "design_prop" | "calendar" | "none"
+  originDesignKey                 String?
+  originDesignPreselect           String?
+  originDesignRevisionId          String?
+  originDesignSource              String?
+  originDesignStampedAt           DateTime?
   // Origin money mirror, continued (migration 0016): the tax share of the
   // origin total (getOrderSummary), so net-of-tax revenue math can stop
   // treating the checkout payment as tax-free; and the origin order's first
@@ -750,20 +771,20 @@ enum GiftGrantStatus {
 }
 
 model GiftGrant {
-  id         String          @id @default(cuid())
-  contractId String
-  ruleId     String?
-  cycleIndex Int // the billing cycle the gift ships with
-  variantId  String
-  status     GiftGrantStatus @default(SCHEDULED)
-  addedAt    DateTime?
-  removedAt  DateTime?
+  id            String          @id @default(cuid())
+  contractId    String
+  ruleId        String?
+  cycleIndex    Int // the billing cycle the gift ships with
+  variantId     String
+  status        GiftGrantStatus @default(SCHEDULED)
+  addedAt       DateTime?
+  removedAt     DateTime?
   // Stamped at the ADDED→SHIPPED settlement flip (migration 0016) so
   // analytics can count this gift's COGS even after mirror hygiene later
   // flips the grant REMOVED — the ship fact survives the status machine.
   // Null on grants that shipped before 0016 (status alone said SHIPPED but
   // not when, and lost it on REMOVED).
-  shippedAt  DateTime?
+  shippedAt     DateTime?
   // COGS stamped at grant time for dynamically picked gifts (migration 0024),
   // where the rule's unitCostCents describes the fallback variant, not the
   // picked one. Analytics read grant.unitCostCents → rule.unitCostCents →
@@ -772,8 +793,8 @@ model GiftGrant {
   // Producer label (migration 0024): RULE | LADDER | FIRST_ORDER | SAVE_FLOW
   // | WINBACK | REWARDS | MANUAL. Lets analytics split gift spend by origin;
   // null on pre-0024 grants (origin recoverable from ruleId/cycle 0 only).
-  source     String?
-  createdAt  DateTime        @default(now())
+  source        String?
+  createdAt     DateTime        @default(now())
 
   contract SubscriptionContract @relation(fields: [contractId], references: [id], onDelete: Cascade)
   rule     GiftRule?            @relation(fields: [ruleId], references: [id], onDelete: SetNull)
@@ -1103,13 +1124,120 @@ model AvailabilitySnapshot {
 model WidgetDesignRevision {
   id          String    @id @default(cuid())
   shopId      String
-  preset      String // classic | toggle | tiles | inline | value_stack | planner
+  preset      String // one of PRESET_KEYS (app/lib/widget/presets.ts) — 8 presets since v1.6.x
   config      Json // widgetDesignConfigSchema (app/lib/widget/presets.ts), version:1
   createdBy   String? // admin user email / "system"
   publishedAt DateTime?
   createdAt   DateTime  @default(now())
+  // Merchant-given name for the design (migration 0025, v1.26.0) — "Test 1:
+  // sub preselected", shown in the revision history and the Results tab so a
+  // measurement period reads as a named design, not a cuid. Optional.
+  label       String?
 
   @@index([shopId, createdAt])
+}
+
+// ── Design measurement (v1.26.0, migration 0025) ────────────────────────────
+//
+// One row per SUBSCRIBABLE storefront order (the take-rate denominator
+// population — the same order set the "checkout.subscribable" event feed
+// counts, now as a relational fact instead of a JSON payload) carrying the
+// buy-box design the shopper saw, whether the order started a subscription,
+// and the hygiene flags a per-design readout must disclose. Written by
+// ORDERS_CREATE (app/lib/design-measurement/facts.server.ts), completed by the
+// contract-create tail (subscribed/contractId) and the nightly
+// design_facts_backfill job. PII-free by construction: no email, no customer
+// id — nothing here needs CUSTOMERS_REDACT.
+//
+// design* resolution ladder (designSource): "seen" (the widget's always-on
+// `_cellexia_seen` line property — preset|preselect, stamped on one-time AND
+// subscription adds of our product) → "design_prop" (`_cellexia_design`,
+// subscription adds only) → "calendar" (the design the published-revision
+// ledger says was live for the order's market at processedAt) → "none".
+// calendarDesignKey is always recorded alongside so stamped-vs-calendar
+// agreement can be audited.
+model SubscribableOrder {
+  id                 String    @id @default(cuid())
+  shopId             String
+  orderId            String // gid://shopify/Order/…
+  orderName          String?
+  processedAt        DateTime // order processed_at (created_at fallback)
+  countryCode        String? // shipping (billing fallback) country, ISO-2
+  currencyCode       String? // presentment currency
+  marketHandle       String? // resolved via MarketCountryMap; null = unknown
+  deviceType         String? // "mobile" | "desktop" | "tablet" | null
+  sourceName         String? // payload.source_name ("web", "shop_app", "pos", …), length-capped
+  orderTotalCents    Int? // shop-currency total_price
+  units              Int?
+  designKey          String? // resolved preset key
+  designPreselect    String? // "sub" | "one" | null(unknown)
+  designRevisionId   String? // WidgetDesignRevision.id from the calendar
+  designSource       String // "seen" | "design_prop" | "calendar" | "none"
+  calendarDesignKey  String? // what the ledger said, for the agreement audit
+  hasSellingPlanLine Boolean   @default(false)
+  ownership          String // "ours" | "foreign" | "mixed" | "none" — selling-plan ids on the lines
+  exposure           Boolean   @default(false) // any widget-stamped property on any line
+  subscribed         Boolean   @default(false) // a COUNTABLE contract has originOrderId = orderId
+  contractId         String? // that contract (no FK — survives contract deletion)
+  subscribedAt       DateTime?
+  promo              Boolean   @default(false) // discount codes / discount applications on the order
+  mixed              Boolean   @default(false) // several designs, or sub + one-time of our product
+  transition         Boolean   @default(false) // within 24h after a design publish (carry-over risk)
+  staff              Boolean   @default(false) // order email in designMeasurement.excludeEmails
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  @@unique([shopId, orderId])
+  @@index([shopId, processedAt])
+  @@index([shopId, designKey, processedAt])
+  @@index([shopId, contractId])
+}
+
+// Storefront visit ledger (v1.27.0, migration 0026): one row per anonymous
+// visitor per shop-day per (design, preselect) they saw the buy box under —
+// the CONVERSION denominator that pairs with SubscribableOrder's take-rate
+// numerator, written by the widget's own beacon (buy-box-embed.js →
+// GET /apps/cellexia-subs/w, app/routes/proxy.w.tsx). "vid" is a random
+// browser-local id (no personal data, no cookie), so nothing here needs
+// CUSTOMERS_REDACT; rows older than the retention window are pruned by
+// design_facts_backfill. Counts are visitor-days ("visits"), deliberately:
+// a person returning on another day counts again, and the readout says so.
+model WidgetVisitorDay {
+  id                String   @id @default(cuid())
+  shopId            String
+  day               String // YYYY-MM-DD in the shop timezone
+  vid               String // anonymous visitor id, 8–32 chars [A-Za-z0-9_-]
+  designKey         String // resolved preset key the widget rendered
+  designPreselect   String   @default("u") // "sub" | "one" | "u" (unknown)
+  countryCode       String? // window.Shopify.country at view time
+  marketHandle      String? // via MarketCountryMap; null = unknown
+  deviceType        String? // "mobile" | "desktop" | "tablet"
+  views             Int      @default(0) // page views where the widget was on screen
+  engaged           Boolean  @default(false) // interacted with the widget
+  addedToCart       Boolean  @default(false) // added our product from the widget page
+  addedSubscription Boolean  @default(false) // …with the subscription option
+  firstSeenAt       DateTime @default(now())
+  lastSeenAt        DateTime @default(now())
+
+  @@unique([shopId, day, vid, designKey, designPreselect])
+  @@index([shopId, day])
+  @@index([shopId, designKey, day])
+  @@index([shopId, lastSeenAt]) // lastVisitAt top-1 + self-check "since" count without a ledger sort
+}
+
+// Country → Shopify market handle, refreshed from the Admin API (Market
+// regions) by design_facts_backfill and at design publish. Orders carry a
+// country, not a market; the buy-box design is chosen per market. Cache
+// only — rebuilt from Shopify whenever stale.
+model MarketCountryMap {
+  id           String   @id @default(cuid())
+  shopId       String
+  countryCode  String
+  marketHandle String
+  marketName   String?
+  updatedAt    DateTime @updatedAt
+
+  @@unique([shopId, countryCode])
 }
 
 // ── Migration / import ────────────────────────────────────────────────────────
@@ -1190,14 +1318,14 @@ model SurveyResponse {
 // triggered first exposure — a convenience pointer for readouts, deliberately
 // no FK (mirrors CustomerTagState): the row must survive contract deletion.
 model ExperimentAssignment {
-  id             String    @id @default(cuid())
+  id             String   @id @default(cuid())
   shopId         String
   experimentKey  String
   unit           String // lowercased customer email
   arm            String
   contractId     String?
-  firstExposedAt DateTime  @default(now())
-  createdAt      DateTime  @default(now())
+  firstExposedAt DateTime @default(now())
+  createdAt      DateTime @default(now())
 
   @@unique([shopId, experimentKey, unit])
   @@index([shopId, experimentKey, arm])

@@ -4,6 +4,220 @@ All notable changes to Cellexia Subscriptions. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [SemVer](https://semver.org) as contracted in [docs/UPDATE.md](docs/UPDATE.md).
 
+## [1.27.0] — 2026-08-16
+
+**Conversion per widget design, measured by the app itself.** v1.26.0 gave
+every order a design; this release gives every VISIT one, so the Results tab
+compares each design and each "was subscription preselected" setting on the
+same footing: visits, conversion (orders per 100 visits), subscription
+conversion (subscriptions per 100 visits), take rate, kept take rate at
+30/60/90 days, and the one number that combines conversion and net take
+rate, **kept subscribers per 100 visits (30 days)**. The buy-box embed
+script now sends a tiny first-party beacon through the app proxy
+(`GET /apps/cellexia-subs/w`) at three moments: when the widget has been on
+screen for a second (`view`), on the first interaction (`engage`) and on add
+to cart with the option chosen (`atc`, one-time or subscription). It carries
+only the design, preselect, variant, market country and currency, a device
+class, a random browser-local visitor id and a page-view id plus timestamp
+(no personal data, no cookie, no consent prompt per merchant decision); it never fires in admin preview, in the theme editor or
+while the widget is hidden, and it can never break add to cart (fully
+contained; the cart request goes out unchanged even if the beacon throws).
+The server keeps one row per visitor per shop-day per design and preselect
+(`WidgetVisitorDay`, migration 0026, pruned after 400 days), drops bots and
+anything received while the store is not live, and rate-limits per visitor
+and per shop; after the proxy signature check every answer is a silent 204. Guardrails judge weekly
+CONVERSION once both the reference and the design have two full weeks of
+visits (raw weekly orders remain the fallback until then), a
+"Compare against the reference" card states each design's difference in
+points with a plain "chance it is really better" for conversion, take rate
+and kept 30d, the weekly table gains visits and conversion per design, the
+typed-in Shopify sessions stay as an optional cross-check, and a
+`widget_visits` self-check warns when a live store records orders with
+widget exposure but no visits (extension not deployed or app embed off).
+**Requires `npm run setup` (migration 0026; 0025 too when coming from
+v1.25) AND `npm run deploy` (buy-box-embed.js changed; Liquid unchanged at
+89,934 bytes of 90,112).** No new scopes, webhooks or env vars.
+
+> Update notes: `npm ci` → `npm run setup` → deploy / restart the server →
+> `npm run deploy` (extension) → confirm the app embed is enabled in the
+> theme editor (visit tracking runs from the embed script) → open a product
+> page and check the network tab for `/apps/cellexia-subs/w?e=view…` →
+> Buy box designer → Results shows Visits and Conversion columns. Full
+> checklist in [docs/RELEASE_NOTES_v1.27.0.md](docs/RELEASE_NOTES_v1.27.0.md).
+
+### Added
+
+- **Visit beacon** in `extensions/cellexia-buy-box/assets/buy-box-embed.js`
+  (section 4): `view` / `engage` / `atc` once per page load per design and
+  preselect; params `e d p v c cur dv vid pv t` (+ `m` on `atc`); vid in
+  `localStorage` key `cellexia_vid` (falls back to sessionStorage, then per
+  page); Image transport, `fetch(keepalive)` fallback; skipped with
+  `cx_preview=`, in the theme editor (`Shopify.designMode`) or with a hidden
+  widget; `atc` fires for any cart request that targets our variant, even
+  when the body already carried every stamp. README section "Visit beacon".
+- **`GET /apps/cellexia-subs/w`** (`app/routes/proxy.w.tsx`): proxy
+  signature first, then always 204 `no-store`; drops when the store is not
+  LIVE (verdict cached 60 s), bot user agents, invalid params, over the
+  per-visitor (60/min) or per-shop (3,000/min) token buckets. The bot filter
+  matches crawler tokens as whole words and named crawlers, never a device
+  name that merely contains "bot".
+- **`WidgetVisitorDay`** ledger (`app/lib/design-measurement/visits.server.ts`):
+  upsert per event, `visitSummary`, `lastVisitAt`, `pruneVisits` (400 days,
+  run by `design_facts_backfill`), `recomputeVisitMarkets` (flags step).
+- **Scoreboard**: per-row `visits` and `conversion` (orders per 100 visits,
+  subscriptions per 100 visits, kept subscribers per 100 matured visits at
+  30d, add-to-cart %, subscription pick %), weekly `visits`, guardrail
+  `basis` (conversion primary, orders fallback), `comparison` vs the
+  most-orders reference (payload only; the tab computes its own card against
+  the design picked under "Compare against"), totals `visits` / coverage /
+  `visitsRecorded` / `lastVisitAt`.
+- **Results tab**: Visits, Conversion, Subscription conversion and Kept
+  subscribers per 100 visits (30d) columns; Compare against the reference
+  card; conversion-based guardrail wording; weekly visits and conversion;
+  data-quality visit lines and the beacon warning; guide text.
+- **`widget_visits`** self-check.
+
+### Changed
+
+- The typed-in Shopify sessions table is now labelled an optional
+  cross-check; the app's own visits are the primary conversion denominator.
+- `buy-box-embed.js` is 73,998 bytes (was 54,299; ceiling 114,688).
+- Conversion figures are time-aligned: orders per 100 visits, subscriptions
+  per 100 visits and kept subscribers per 100 visits count only orders placed
+  on days with recorded visits (the tab says "orders counted since <date>"
+  when the beacon started after the range did), and are shown with two real
+  decimals; take rate and kept rates keep counting every order.
+- The "Compare against the reference" card and the "chance it beats the
+  reference" column share the design picked under "Compare against" (default:
+  most orders); guardrails keep their fixed baseline, the design with the most
+  orders, and say so.
+- Conversion guardrail weeks qualify on visits, so a week with traffic and no
+  orders counts as zero conversion instead of being skipped.
+
+### Migration notes
+
+- Migration `0026_widget_visits` is additive (one new table with four
+  indexes). Rolling back leaves the rows unread. Deploy order: server first, then the extension.
+
+## [1.26.0] — 2026-08-16
+
+**Measure the buy box like a merchant, not like a dashboard: subscription
+take rate, kept take rate net of cancellations, weekly-orders guardrails,
+lifetime gross profit and conversion, all per widget design and per
+"was subscription preselected", with the design as a filter across every
+analytics view.** Before this release the app could only count subscription
+orders per design (the "Design performance" card): one-time buyers of the
+same product carried no design, so no design ever had a real denominator,
+the design never reached the subscriber record, and nothing could say
+whether a design that sells more subscriptions also keeps them. Now every
+subscribable storefront order becomes a PII-free fact row
+(`SubscribableOrder`) carrying the design the shopper saw, whether
+subscription was preselected, the market, hygiene flags (promotion, mixed
+cart, design just changed, staff buyer, other app's plan, no widget
+exposure) and, once the contract webhook lands, whether it started a
+subscription. The widget stamps a second, always-on hidden line property
+`_cellexia_seen` = `<preset>|<s|o|u>` on EVERY add-to-cart of our product
+(one-time and subscription); when it is missing the app falls back to the
+subscription-only `_cellexia_design` property, then to a design calendar
+rebuilt from the published-revision history per market, and otherwise
+records "no exposure" rather than guessing. Each subscriber gets a
+write-once copy (`originDesign*`, deliberately kept through
+CUSTOMERS_REDACT: a design label is not personal data and the merchant
+wants LTGP by design to stay whole), which makes **Buy-box design** and
+**Preselected option** the 8th and 9th analytics filter dimensions:
+cohorts, LTGP, survival, churn and the segment forecast all split by design
+with no new maths. The **Buy box designer gains a Results tab** (loaded
+lazily, cached 10 minutes, one click to refresh): a scoreboard per design
+and preselect (orders, subscribed, take rate, kept at 30/60/90 days with a
+maturity gate, quick cancels within 14 days, one-time share, LTGP per
+subscriber at 3 and 6 months, a plain "chance it beats the reference" and a
+sample grade), guardrail verdicts against a tolerated weekly-orders drop and
+a minimum-orders floor (both editable), a weekly table with optional
+product-page sessions typed in from Shopify Analytics for conversion per
+week, a data-quality card (seen coverage, calendar agreement, no-exposure
+and staff/foreign exclusions), the design calendar to read Shopify's own
+reports against, and a "how to read this" guide with sample-size guidance.
+Publishing a design can now carry a name (shown in history and results). A
+nightly `design_facts_backfill` job rebuilds fact rows from the historical
+event feed, links late contracts, stamps missing subscriber designs and
+refreshes the country-to-market map; a `design_facts` Debug self-check
+watches the feed. **Requires `npm run setup` (migration 0025, additive) AND
+`npm run deploy` (both storefront JS assets changed; Liquid unchanged at
+89,934 bytes of the 90,112 budget).** No new scopes, webhooks or env vars.
+
+> Update notes: `npm ci` → `npm run setup` (migration 0025) → deploy /
+> restart the server → `npm run deploy` (extension) → open **Buy box
+> designer → Results** and, under Guardrails and settings, enter your staff
+> and test-buyer emails and the measurement start date. Read
+> [docs/RELEASE_NOTES_v1.26.0.md](docs/RELEASE_NOTES_v1.26.0.md) for the
+> storefront checks and the rollback notes.
+
+### Added
+
+- **`SubscribableOrder` fact table** (migration 0025): one row per
+  subscribable storefront order (the take-rate denominator population)
+  written by ORDERS_CREATE through `app/lib/design-measurement/facts.server.ts`,
+  completed by the contract-create tail (`subscribed`, `contractId`) and the
+  nightly backfill. Design resolution ladder: `_cellexia_seen` → `_cellexia_design`
+  → design calendar (published revisions per market, gated by the widget's
+  market visibility and launch mode) → none; `calendarDesignKey` is always
+  kept for the agreement audit. No email, no customer id.
+- **`_cellexia_seen` storefront line property** (`extensions/cellexia-buy-box/assets/buy-box.js`
+  and `buy-box-embed.js`): `<preset>|<s|o|u>` stamped on every add-to-cart of
+  our product's variants while the widget is visible, in every request shape
+  the embed already patches; `getState()` and the `cx:buybox:change` detail
+  expose `preselect`. `_cellexia_design` keeps its exact semantics
+  (subscription adds only). Foreign lines stay byte-identical; a hidden or
+  gated widget stamps nothing.
+- **Subscriber design columns** `originDesignKey`, `originDesignPreselect`,
+  `originDesignRevisionId`, `originDesignSource`, `originDesignStampedAt`
+  on `SubscriptionContract` (write-once; retained through CUSTOMERS_REDACT by
+  merchant decision) and `WidgetDesignRevision.label`.
+- **Analytics filter dimensions** `design` and `preselect` (URL params
+  `design`, `preselect`) in `segments-shared.ts` / `segments.server.ts` and
+  the analytics filter bar; explicit Unknown buckets; the banner points
+  take-rate-by-design to the Results tab.
+- **Buy box designer → Results tab** (`app/components/design-results.tsx`,
+  resource route `GET/POST /app/buy-box/results`, engine
+  `app/lib/design-measurement/scoreboard.server.ts`, pure statistics in
+  `types.ts`): scoreboard, guardrails and editable settings, weekly view with
+  optional sessions, data quality, design calendar, guide.
+- **`designMeasurement` settings group**: `startedAt`, `excludeEmails`,
+  `guardrailMaxOrderDropPct` (default 10), `guardrailMinOrdersPerWeek`
+  (default 20), `weeklySessions`.
+- **`design_facts_backfill` job** (daily, ungated) and **`design_facts`
+  self-check** (Debug page).
+- **`MarketCountryMap`** cache (country → Shopify market handle) refreshed at
+  design publish and nightly, so per-market designs can be attributed from an
+  order's shipping country.
+- Optional **design name** in the publish dialog; labels shown in revision
+  history and in the Results tab.
+
+### Changed
+
+- The bottom **Design performance** card on the Buy box designer is gone
+  (its numbers were a share of attributed subscription orders, not a take
+  rate); the page loader no longer runs that query. `getDesignPerformance`
+  stays for compatibility and is documented as superseded.
+- `checkout.subscribable` event payload gains `seen: [...]` (additive).
+- Server-bundle tracked-growth ceilings raised (biggest chunk 3 → 4 MiB,
+  whole build/server tree 4 → 5 MiB): v1.25.0 already sat at 99.4% of the
+  old chunk line after twenty feature releases; this release adds about 81 KB.
+- One-time cart lines of the same variant now differ by the `_cellexia_seen`
+  property when one add happened on the product page and another elsewhere
+  (they no longer merge into one line). Cosmetic; documented in the
+  extension README.
+
+### Migration notes
+
+- Migration `0025_design_measurement` is additive (five nullable columns on
+  `SubscriptionContract`, one on `WidgetDesignRevision`, two new tables);
+  v1.25 code runs unchanged against it. Rolling the server back leaves the
+  rows in place; the deployed extension keeps stamping `_cellexia_seen`,
+  which older servers ignore.
+- Deploy order on a live store: server first (it tolerates orders with or
+  without the new property), then `npm run deploy` for the extension.
+
 ## [1.25.0] — 2026-08-15
 
 **Market-scoped buy box, and an Emails / Klaviyo setup that is instant and

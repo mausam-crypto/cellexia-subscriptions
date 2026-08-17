@@ -271,10 +271,25 @@ big enough to mean anything — a single store takes months to reach *usable*,
 and that is the honest answer, not a bug.
 
 Still backlog (no experiment wiring yet — test by changing one setting for a
-full traffic cycle, §9 methodology):
+full traffic cycle, §9 methodology). Since v1.26.0 the buy-box items (1, 2, 7
+below, and any preset switch) are measured on the **Buy box designer →
+Results** tab rather than by eye: every subscribable order is recorded with
+the design it saw and whether subscription was preselected, so the tab
+shows take rate, kept subscribers at 30/60/90 days, quick cancels and LTGP
+per design and per preselect, with a weekly-orders guardrail and a sample
+grade. It is a measurement, not a randomized experiment: still change one
+thing at a time, run whole weeks, keep the same design in every market, and
+name the design when you publish
+([OPERATIONS.md §15](./OPERATIONS.md#15-runbook--buy-box-design), "Running a
+design test"):
 
-1. **Buy-box preselect on/off** (`preselectSubscription`) — preselect lifts take
-   rate; verify it doesn't lift early involuntary churn (accidental subs).
+1. **Buy-box preselect on/off** (Behavior → Preselected option) — preselect
+   lifts take rate; verify it doesn't lift early involuntary churn
+   (accidental subs). Since v1.26.0 preselect is tracked as its own variable:
+   the Results tab shows "design, sub preselected" and "design, one-time
+   preselected" as separate rows, and the Analytics filter bar has a
+   **Preselected option** filter, so quick cancels and kept rates can be read
+   per preselect without a separate test.
 2. **Badge copy** (`badgeText`): "Most popular" vs "Save 20%" vs "Best value".
 3. **Savings format** (theme editor → buy-box block → `savings_format`):
    PERCENT vs ABSOLUTE vs BOTH —
@@ -383,7 +398,12 @@ betting the whole store:
    on the subscriber page and as a Klaviyo profile property), so you can
    tie the subscribers the test window delivered back to the switched
    market. PDP conversion per market comes from Shopify analytics filtered
-   to the market's domain.
+   to the market's domain. *Since v1.26.0 the performance card is replaced
+   by the designer's **Results** tab: pick the switched market in its Market
+   select and read take rate, kept rates and the guardrail for that market
+   alone; the widget's `_cellexia_seen` property records the resolved preset
+   on one-time adds too, so the take rate has a real denominator. The
+   Analytics page can also filter every view by **Buy-box design**.*
 3. A take-rate lift that costs more conversions than it earns in LTGP is a
    loss — judge on §7, cohort LTGP.
 4. **Restore in one click**: clear the market's row back to "Default (use
@@ -416,7 +436,12 @@ domain ([OPERATIONS.md §15](./OPERATIONS.md#15-runbook--buy-box-design)).
    (take-rate by design, fed by the `_cellexia_design` attribution on every
    subscription add-to-cart) and the **Analytics** tab
    (`takeRateNum/takeRateDen`). A take-rate lift that costs more conversions
-   than it earns in LTGP is a loss — judge per §7, on cohort LTGP.
+   than it earns in LTGP is a loss — judge per §7, on cohort LTGP. *Since
+   v1.26.0 read both on the designer's **Results** tab: its guardrail watches
+   weekly orders per design (the conversion side, without leaving the app),
+   its scoreboard gives take rate per design and per preselect with a sample
+   grade, and typing the week's product-page sessions from Shopify Analytics
+   into the tab turns orders into a conversion rate per week.*
 4. **Instant rollback**: the designer's revision history restores any previous
    design in one click; the storefront follows within minutes, with no theme
    edit and no downtime in either direction.

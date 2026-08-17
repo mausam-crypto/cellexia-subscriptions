@@ -81,8 +81,11 @@ import { renderEmbed } from "./liquid/harness";
  *   e. the theme's own add-to-cart price follows the selection, and the
  *      foreign widget's identical price string is left alone;
  *   f. the cart request the theme fires by XHR carries the selling plan and
- *      the _cellexia_design attribution — and is byte-identical when the
- *      shopper chose one-time;
+ *      the _cellexia_design attribution — plus, since v1.26.0, the
+ *      _cellexia_seen exposure stamp ("<preset>|<s|o|u>"), which is ALSO the
+ *      only thing stamped when the shopper chose one-time (the take-rate
+ *      denominator), and is absent, like everything else, while the widget
+ *      is gated;
  *   g. a pill click lands on the CLICKED variant even while the bystander
  *      FBT row still names the previous one — and the dirty, whitespace-
  *      padded pill id is trimmed before it reaches the widget;
@@ -115,6 +118,12 @@ const FOREIGN_VARIANT = "9999999999999";
 /** The FBT widget's second row: another product entirely, never ours. */
 const FBT_FOREIGN_VARIANT = "9999999999901";
 const PLAN_ID = "6881100003";
+/**
+ * The design-measurement exposure stamp the REAL widget produces here: the
+ * harness renders the default design (preset "classic") with the
+ * subscription preselected → "classic|s".
+ */
+const SEEN = "classic|s";
 const ATC_LABEL = `Add to cart - ${ONE_TIME_MONEY}`;
 /**
  * The OTHER pill's data-val-id EXACTLY as the live page ships it: the id
@@ -198,10 +207,22 @@ const FUTURE_COLLISION =
 // The app embed's server-rendered markup, rendered once from the real Liquid.
 let EMBED_LIVE = "";
 let EMBED_SETUP = "";
+/**
+ * The same embed rendered with the OTHER value of the experiment's second
+ * variable: a published design whose behavior.preselect is "one_time" (the
+ * embed block hard-codes preselect_subscription: true, so the published
+ * config is the only way the app embed renders one-time as the default).
+ * Same preset ("classic"), so every difference below is the preselect alone.
+ */
+let EMBED_LIVE_ONE_TIME = "";
 
 beforeAll(async () => {
   EMBED_LIVE = await renderEmbed({ launchStatus: "live" });
   EMBED_SETUP = await renderEmbed({ launchStatus: "setup" });
+  EMBED_LIVE_ONE_TIME = await renderEmbed({
+    launchStatus: "live",
+    config: { preset: "classic", behavior: { preselect: "one_time" } },
+  });
 });
 
 // ── Building and running one page ────────────────────────────────────────────
@@ -250,6 +271,13 @@ interface BuildOptions {
   runAssets?: boolean;
   /** Also put an element carrying OUR attributes (not our class) first. */
   futureCollision?: boolean;
+  /**
+   * Alternative server-rendered embed markup (default: EMBED_LIVE, or
+   * EMBED_SETUP under launchStatus "setup"). Used to run the REAL assets over
+   * a render whose preselect differs (EMBED_LIVE_ONE_TIME) or over a legacy
+   * island (see the preselect describe block).
+   */
+  embedMarkup?: string;
 }
 
 function buildPage(options: BuildOptions = {}): Page {
@@ -276,7 +304,8 @@ function buildPage(options: BuildOptions = {}): Page {
   // element the theme rendered — the ordering that made the bare lookup pick
   // the other vendor's element.
   parseHtml(
-    options.launchStatus === "setup" ? EMBED_SETUP : EMBED_LIVE,
+    options.embedMarkup ??
+      (options.launchStatus === "setup" ? EMBED_SETUP : EMBED_LIVE),
     body,
   );
 
@@ -1137,6 +1166,15 @@ describe("cart requests from a theme with no product form", () => {
     ).toEqual([]);
   });
 
+  it("reports the rendered preselect through getState() (the seen stamp's source)", () => {
+    // The harness renders the default design: subscription preselected. The
+    // flag is the widget's RENDER decision, so it must not follow the mode.
+    const page = buildPage();
+    expect(currentState(page)).toMatchObject({ preselect: true, design: "classic" });
+    selectMode(page, "one_time");
+    expect(currentState(page)).toMatchObject({ preselect: true, mode: "one_time" });
+  });
+
   it("injects into the jQuery items[] urlencoded body", () => {
     const page = buildPage();
     const original =
@@ -1147,6 +1185,7 @@ describe("cart requests from a theme with no product form", () => {
     expect(page.sent[page.sent.length - 1].method).toBe("POST");
     expect(out.get("items[0][selling_plan]")).toBe(PLAN_ID);
     expect(out.get("items[0][properties][_cellexia_design]")).toBe("classic");
+    expect(out.get("items[0][properties][_cellexia_seen]")).toBe(SEEN);
     // …without disturbing what the theme sent.
     expect(out.get("items[0][id]")).toBe(OUR_VARIANT);
     expect(out.get("items[0][quantity]")).toBe("1");
@@ -1167,8 +1206,10 @@ describe("cart requests from a theme with no product form", () => {
     expect(out).not.toBe(form);
     expect(out.get("items[0][selling_plan]")).toBe(PLAN_ID);
     expect(out.get("items[0][properties][_cellexia_design]")).toBe("classic");
+    expect(out.get("items[0][properties][_cellexia_seen]")).toBe(SEEN);
     expect(out.get("items[0][id]")).toBe(OUR_VARIANT);
     expect(form.get("items[0][selling_plan]")).toBeNull();
+    expect(form.get("items[0][properties][_cellexia_seen]")).toBeNull();
   });
 
   it("injects into a JSON items[] body", () => {
@@ -1182,7 +1223,10 @@ describe("cart requests from a theme with no product form", () => {
     ) as { items: Array<Record<string, unknown>> };
 
     expect(out.items[0].selling_plan).toBe(Number(PLAN_ID));
-    expect(out.items[0].properties).toEqual({ _cellexia_design: "classic" });
+    expect(out.items[0].properties).toEqual({
+      _cellexia_design: "classic",
+      _cellexia_seen: SEEN,
+    });
     expect(out.items[0].id).toBe(Number(OUR_VARIANT));
   });
 
@@ -1193,6 +1237,7 @@ describe("cart requests from a theme with no product form", () => {
     );
     expect(out.get("selling_plan")).toBe(PLAN_ID);
     expect(out.get("properties[_cellexia_design]")).toBe("classic");
+    expect(out.get("properties[_cellexia_seen]")).toBe(SEEN);
   });
 
   it("carries the plan for the variant the shopper switched to", () => {
@@ -1217,7 +1262,7 @@ describe("cart requests from a theme with no product form", () => {
    * stamped, the theme's own plan value is untouched, and a plan id that is
    * not ours keeps the byte-identical pass-through.
    */
-  it("completes a body that already carries OUR selling plan with the design", () => {
+  it("completes a body that already carries OUR selling plan with the design (and seen)", () => {
     const page = buildPage();
     const original =
       `items%5B0%5D%5Bid%5D=${OUR_VARIANT}&items%5B0%5D%5Bquantity%5D=1` +
@@ -1225,6 +1270,7 @@ describe("cart requests from a theme with no product form", () => {
     const out = new URLSearchParams(String(page.xhrPost(original)));
 
     expect(out.get("items[0][properties][_cellexia_design]")).toBe("classic");
+    expect(out.get("items[0][properties][_cellexia_seen]")).toBe(SEEN);
     // Completed, not rewritten: the theme's plan value survives, exactly once.
     expect(out.getAll("items[0][selling_plan]")).toEqual([PLAN_ID]);
     expect(out.get("items[0][id]")).toBe(OUR_VARIANT);
@@ -1236,6 +1282,8 @@ describe("cart requests from a theme with no product form", () => {
 
   it("leaves a body carrying another app's selling plan byte-identical", () => {
     const page = buildPage();
+    // Another app's line: no plan rewrite, no design, and no seen stamp
+    // either — a foreign subscription is not our exposure to record.
     const original =
       `items%5B0%5D%5Bid%5D=${OUR_VARIANT}&items%5B0%5D%5Bselling_plan%5D=123`;
     expect(page.xhrPost(original)).toBe(original);
@@ -1246,7 +1294,7 @@ describe("cart requests from a theme with no product form", () => {
     selectMode(page, "one_time");
     // A stale plan the theme kept serializing is not provably this page
     // view's choice once one-time is selected — and stripping it is not the
-    // patcher's job either.
+    // patcher's job either. Not provably ours ⇒ no seen stamp either.
     const original =
       `items%5B0%5D%5Bid%5D=${OUR_VARIANT}&items%5B0%5D%5Bselling_plan%5D=${PLAN_ID}`;
     expect(page.xhrPost(original)).toBe(original);
@@ -1255,7 +1303,7 @@ describe("cart requests from a theme with no product form", () => {
   it("passes another vendor's add-to-cart through byte-identical", () => {
     const page = buildPage();
     // The page's OTHER cx-namespace widget posting its own product: rewriting
-    // it would 422 their checkout.
+    // it would 422 their checkout — and it gets no exposure stamp either.
     const original =
       `items%5B0%5D%5Bid%5D=${FOREIGN_VARIANT}&items%5B0%5D%5Bquantity%5D=1`;
     expect(page.xhrPost(original)).toBe(original);
@@ -1263,50 +1311,235 @@ describe("cart requests from a theme with no product form", () => {
     const form = new FormData();
     form.append("id", FOREIGN_VARIANT);
     expect(page.xhrPost(form)).toBe(form);
+
+    // …in both modes.
+    selectMode(page, "one_time");
+    expect(page.xhrPost(original)).toBe(original);
+    expect(page.xhrPost(form)).toBe(form);
   });
 
-  it("touches nothing at all once the shopper picks one-time", () => {
+  it("stamps ONLY the exposure once the shopper picks one-time (the take-rate denominator)", () => {
     const page = buildPage();
     selectMode(page, "one_time");
     expect(currentState(page)).toMatchObject({
       mode: "one_time",
       sellingPlanId: null,
+      preselect: true,
     });
 
-    const encoded =
-      `items%5B0%5D%5Bid%5D=${OUR_VARIANT}&items%5B0%5D%5Bquantity%5D=1`;
-    expect(page.xhrPost(encoded)).toBe(encoded);
+    const encoded = new URLSearchParams(
+      String(
+        page.xhrPost(
+          `items%5B0%5D%5Bid%5D=${OUR_VARIANT}&items%5B0%5D%5Bquantity%5D=1`,
+        ),
+      ),
+    );
+    expect(encoded.get("items[0][properties][_cellexia_seen]")).toBe(SEEN);
+    expect(encoded.get("items[0][id]")).toBe(OUR_VARIANT);
+    expect(encoded.get("items[0][quantity]")).toBe("1");
 
-    const flat = `id=${OUR_VARIANT}&quantity=1`;
-    expect(page.xhrPost(flat)).toBe(flat);
+    const flat = new URLSearchParams(
+      String(page.xhrPost(`id=${OUR_VARIANT}&quantity=1`)),
+    );
+    expect(flat.get("properties[_cellexia_seen]")).toBe(SEEN);
 
-    const json = JSON.stringify({
-      items: [{ id: Number(OUR_VARIANT), quantity: 1 }],
+    const json = JSON.parse(
+      String(
+        page.xhrPost(
+          JSON.stringify({ items: [{ id: Number(OUR_VARIANT), quantity: 1 }] }),
+        ),
+      ),
+    ) as { items: Array<Record<string, unknown>> };
+    expect(json.items[0]).toEqual({
+      id: Number(OUR_VARIANT),
+      quantity: 1,
+      properties: { _cellexia_seen: SEEN },
     });
-    expect(page.xhrPost(json)).toBe(json);
 
     const form = new FormData();
     form.append("items[0][id]", OUR_VARIANT);
     form.append("items[0][quantity]", "1");
-    expect(page.xhrPost(form)).toBe(form);
+    const formOut = page.xhrPost(form) as FormData;
+    expect(formOut).toBeInstanceOf(FormData);
+    expect(formOut.get("items[0][properties][_cellexia_seen]")).toBe(SEEN);
+    expect(form.get("items[0][properties][_cellexia_seen]")).toBeNull();
 
+    // No subscription and no design attribution went out on any of them.
     for (const request of page.sent) {
-      expect(String(request.body)).not.toContain("selling_plan");
-      expect(String(request.body)).not.toContain("_cellexia_design");
+      const body =
+        request.body instanceof FormData
+          ? new URLSearchParams(
+              [...request.body.entries()].map(([k, v]) => [k, String(v)]),
+            ).toString()
+          : String(request.body);
+      expect(body).not.toContain("selling_plan");
+      expect(body).not.toContain("_cellexia_design");
     }
+  });
+
+  it("never overwrites a seen value that already travelled", () => {
+    const page = buildPage();
+    selectMode(page, "one_time");
+    const stamped =
+      `items%5B0%5D%5Bid%5D=${OUR_VARIANT}` +
+      `&items%5B0%5D%5Bproperties%5D%5B_cellexia_seen%5D=tiles%7Co`;
+    expect(page.xhrPost(stamped)).toBe(stamped);
+
+    selectMode(page, "subscription");
+    const out = new URLSearchParams(String(page.xhrPost(stamped)));
+    expect(out.getAll("items[0][properties][_cellexia_seen]")).toEqual(["tiles|o"]);
+    expect(out.get("items[0][selling_plan]")).toBe(PLAN_ID);
+    expect(out.get("items[0][properties][_cellexia_design]")).toBe("classic");
   });
 
   it("touches nothing while the shop is still in setup mode", () => {
     const page = buildPage({ launchStatus: "setup" });
-    const original =
-      `items%5B0%5D%5Bid%5D=${OUR_VARIANT}&items%5B0%5D%5Bquantity%5D=1`;
-    // The visitor cannot see a purchase option, so nothing may reach the cart.
-    expect(page.xhrPost(original)).toBe(original);
+    // The visitor cannot see a purchase option, so nothing may reach the
+    // cart: no plan, no design — and no seen stamp, so an order placed with
+    // the widget hidden stays distinguishable from one that saw it.
+    expect(currentState(page)).toBeNull();
+    for (const original of [
+      `items%5B0%5D%5Bid%5D=${OUR_VARIANT}&items%5B0%5D%5Bquantity%5D=1`,
+      `id=${OUR_VARIANT}&quantity=1`,
+      JSON.stringify({ items: [{ id: Number(OUR_VARIANT), quantity: 1 }] }),
+    ]) {
+      expect(page.xhrPost(original)).toBe(original);
+    }
+    const form = new FormData();
+    form.append("id", OUR_VARIANT);
+    expect(page.xhrPost(form)).toBe(form);
   });
 
   it("leaves requests that are not a cart add alone", () => {
     const page = buildPage();
     const original = `items%5B0%5D%5Bid%5D=${OUR_VARIANT}`;
     expect(page.xhrPost(original, "/cart/change.js")).toBe(original);
+  });
+});
+
+// ── The preselect variable, rendered the OTHER way ───────────────────────────
+
+/**
+ * Preselect is the experiment's second variable (merchant decision v1.26.0:
+ * tracked on its own, never inferred from the mode). Every other real render
+ * in this file has the subscription preselected, so a buy-box.js that
+ * hard-wired getState().preselect to true and the seen suffix to "s" would
+ * pass all of them: this block renders the REAL Liquid with one-time
+ * preselected (and once with a legacy island that has no `preselect` field
+ * at all) and drives the REAL assets, so the derivation itself is measured.
+ */
+describe("the preselect variable, rendered the other way", () => {
+  /** The suffix the widget derives from the island for THIS render. */
+  const SEEN_ONE_TIME = "classic|o";
+  const SEEN_UNKNOWN = "classic|u";
+
+  it("the one-time-preselected render is a real render of the same preset", () => {
+    // Vacuity guard: the two renders differ ONLY in the island's preselect
+    // flag (and whatever the Liquid keys off it), never in the preset.
+    expect(EMBED_LIVE_ONE_TIME).not.toBe(EMBED_LIVE);
+    expect(EMBED_LIVE).toMatch(/"preselect":\s*true/);
+    expect(EMBED_LIVE_ONE_TIME).toMatch(/"preselect":\s*false/);
+    expect(EMBED_LIVE_ONE_TIME).not.toMatch(/"preselect":\s*true/);
+  });
+
+  it("reports preselect false through getState() and stamps <preset>|o on a one-time add", () => {
+    const page = buildPage({ embedMarkup: EMBED_LIVE_ONE_TIME });
+    expect(page.widget).not.toBeNull();
+    // The rendered default IS one-time here, so mode and preselect agree
+    // at boot — and both are false/one_time for different reasons.
+    expect(currentState(page)).toMatchObject({
+      preselect: false,
+      design: "classic",
+      mode: "one_time",
+      sellingPlanId: null,
+    });
+
+    const flat = new URLSearchParams(
+      String(page.xhrPost(`id=${OUR_VARIANT}&quantity=1`)),
+    );
+    expect(flat.get("properties[_cellexia_seen]")).toBe(SEEN_ONE_TIME);
+    expect(flat.get("selling_plan")).toBeNull();
+    expect(flat.get("properties[_cellexia_design]")).toBeNull();
+
+    const encoded = new URLSearchParams(
+      String(
+        page.xhrPost(
+          `items%5B0%5D%5Bid%5D=${OUR_VARIANT}&items%5B0%5D%5Bquantity%5D=1`,
+        ),
+      ),
+    );
+    expect(encoded.get("items[0][properties][_cellexia_seen]")).toBe(SEEN_ONE_TIME);
+
+    const json = JSON.parse(
+      String(
+        page.xhrPost(
+          JSON.stringify({ items: [{ id: Number(OUR_VARIANT), quantity: 1 }] }),
+        ),
+      ),
+    ) as { items: Array<Record<string, unknown>> };
+    expect(json.items[0].properties).toEqual({ _cellexia_seen: SEEN_ONE_TIME });
+  });
+
+  it("keeps the |o suffix after the shopper switches TO subscription (render decision, not the mode)", () => {
+    const page = buildPage({ embedMarkup: EMBED_LIVE_ONE_TIME });
+    selectMode(page, "subscription");
+    expect(currentState(page)).toMatchObject({
+      preselect: false,
+      mode: "subscription",
+      sellingPlanId: PLAN_ID,
+    });
+
+    const out = new URLSearchParams(
+      String(page.xhrPost(`id=${OUR_VARIANT}&quantity=1`)),
+    );
+    // Subscription add: plan + design + seen — and seen still says the
+    // widget was rendered with one-time preselected.
+    expect(out.get("selling_plan")).toBe(PLAN_ID);
+    expect(out.get("properties[_cellexia_design]")).toBe("classic");
+    expect(out.get("properties[_cellexia_seen]")).toBe(SEEN_ONE_TIME);
+    expect(out.get("properties[_cellexia_seen]")).not.toBe(SEEN);
+  });
+
+  /**
+   * The AJAX path's "u": buy-box-embed.js documents it as "a buy-box.js that
+   * predates the field" — the CDN edge skew this store is known for (one
+   * asset version per edge), where the NEW companion patches requests over a
+   * pre-v1.26.0 buy-box.js whose getState() has no `preselect` key. The
+   * island itself has carried `preselect` since the v1.9.0 baseline, so an
+   * island without it is not a production state on this path (getState()
+   * coerces it to a boolean anyway); the theme-form path's own island
+   * derivation, where "u" IS reachable, is pinned in
+   * tests/buybox-foreign-section-form.test.ts.
+   */
+  it("a getState() without a `preselect` key (older buy-box.js under the new companion) yields <preset>|u, never a guess", () => {
+    const page = buildPage({
+      mutateBuyBox: (source) =>
+        source.replace(
+          /\n\s*preselect: data\.preselect === true,\n/,
+          "\n",
+        ),
+    });
+    expect(page.buyBoxSourceChanged).toBe(true); // vacuity guard
+    expect(page.widget).not.toBeNull();
+    const state = currentState(page) as Record<string, unknown>;
+    expect(state).not.toHaveProperty("preselect");
+    expect(state).toMatchObject({ design: "classic", mode: "subscription" });
+
+    // Subscription add: plan + design + seen "…|u".
+    const out = new URLSearchParams(
+      String(page.xhrPost(`id=${OUR_VARIANT}&quantity=1`)),
+    );
+    expect(out.get("selling_plan")).toBe(PLAN_ID);
+    expect(out.get("properties[_cellexia_design]")).toBe("classic");
+    expect(out.get("properties[_cellexia_seen]")).toBe(SEEN_UNKNOWN);
+
+    // One-time add: seen "…|u" alone.
+    selectMode(page, "one_time");
+    const oneTime = new URLSearchParams(
+      String(page.xhrPost(`id=${OUR_VARIANT}&quantity=1`)),
+    );
+    expect(oneTime.get("properties[_cellexia_seen]")).toBe(SEEN_UNKNOWN);
+    expect(oneTime.get("selling_plan")).toBeNull();
+    expect(oneTime.get("properties[_cellexia_design]")).toBeNull();
   });
 });

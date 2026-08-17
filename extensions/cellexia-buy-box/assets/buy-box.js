@@ -27,10 +27,11 @@
  *    Anything this widget wrote before it became hidden is undone; when it
  *    is legitimately revealed (validated preview token, embed mount) the
  *    write path is re-run through CellexiaSubs.resync().
- *  - Stamp subscription add-to-carts with a hidden line property
- *    `properties[_cellexia_design]` = the wrapper's data-cellexia-preset, so the
- *    ORDERS_CREATE webhook can attribute take-rate per design. The property
- *    is disabled (not submitted) whenever one-time purchase is selected.
+ *  - Stamp add-to-carts with hidden line properties for the ORDERS_CREATE
+ *    webhook: `properties[_cellexia_seen]` = "<preset>|<s|o|u>" on EVERY
+ *    add while the widget is visible (design measurement: exposure +
+ *    preselect, v1.26.0), `properties[_cellexia_design]` = the preset on
+ *    subscription adds only (disabled whenever one-time is selected).
  *  - Drive all eight design presets from the same state machine:
  *    radios (classic/tiles/value_stack/planner/subscription_max), role=tab
  *    toggle buttons (with arrow-key keyboard support), the inline checkbox,
@@ -91,15 +92,14 @@
      hosts an unrelated vendor that owns the "cx" namespace — a
      <div class="cx cx--self-contained" data-cx-embed> inside the buy column,
      plus cx-i18n / cx-cart-config / cx-pdp-config / cx-embed-config script
-     ids. Our storefront attributes were formerly data-cx-* too, so a bare
-     attribute lookup matched THAT vendor's element (it comes earlier in the
-     DOM), we marked and adopted markup we do not own, and our own widget
-     never mounted — an invisible buy box on the one store that matters. The
-     attributes are namespaced data-cellexia-* now; qualifying every lookup
-     with our own class as well is the second, independent net. The class
-     names stay cx-buybox* — they do not collide with that vendor's
-     .cx / .cx--self-contained. See assets/buy-box-embed.js for the full
-     write-up. Do not relax either layer. */
+     ids. Our attributes were formerly data-cx-* too, so a bare attribute
+     lookup matched THAT vendor's element (earlier in the DOM), we adopted
+     markup we do not own, and our own widget never mounted — an invisible
+     buy box on the one store that matters. The attributes are data-cellexia-*
+     now; qualifying every lookup with our own class as well is the second,
+     independent net (class names stay cx-buybox*, no collision with .cx /
+     .cx--self-contained). Full write-up in assets/buy-box-embed.js. Do not
+     relax either layer. */
   var OWN_WIDGET = '.cx-buybox[data-cellexia-buybox]';
   var OWN_WRAPPER = '.cx-buybox-embed[data-cellexia-embed]';
   var OWN_GATED = '.cx-buybox[data-cellexia-gated]';
@@ -529,24 +529,21 @@
      What this module does — and deliberately does not do:
 
       - It is a MONEY-STRING SWAP, not a price re-render. It walks the
-        target's TEXT NODES (never innerHTML, never a node the theme owns
-        structurally) and replaces occurrences of the exact one-time money
-        string with the subscription one. Both strings are formatted by
-        Liquid with the shop's own money_format — this file never formats
-        money, here as everywhere else.
+        target's TEXT NODES (never innerHTML) and replaces the exact one-time
+        money string with the subscription one. Both strings are formatted by
+        Liquid with the shop's money_format — this file never formats money.
       - If the one-time string is not in the element, it does NOTHING. No
-        currency regex, no guessing which number is the price: a theme whose
-        button reads "Add to cart" is simply left alone, silently.
+        currency regex, no guessing which number is the price: a button that
+        reads "Add to cart" is simply left alone, silently.
       - Everything it changed is recorded, so selecting one-time (or the
-        widget becoming hidden/gated/detached) restores the theme's own text
-        exactly.
+        widget becoming hidden/gated/detached) restores the theme's own text.
       - It re-applies when the theme rewrites the button — Sleepify's own JS
-        rewrites that label on every variant change — via a MutationObserver
-        per target, plus the widget's normal variant/plan/mode events.
+        does, on every variant change — via a MutationObserver per target,
+        plus the widget's normal variant/plan/mode events.
       - Our own writes happen with the observers disconnected and a
-        re-entrancy flag set, so we can never hear ourselves; and a write
-        budget switches the module off (restoring the theme's text) if some
-        theme insists on rewriting the button in response to our write.
+        re-entrancy flag set, so we can never hear ourselves; a write budget
+        switches the module off (restoring the theme's text) if a theme
+        insists on rewriting the button in response to our write.
       - Every entry point is wrapped in try/catch. A failure leaves the theme
         untouched and can never block add-to-cart: this module never touches
         the form, the submit handler or the cart payload.
@@ -554,9 +551,9 @@
      Scope: the widget's own product area. Targets are looked up by walking
      UP from the widget and taking the first ancestor that contains a match,
      so a header cart pill or a cart drawer is normally out of reach by
-     construction. The exclusion list below is applied at every level anyway —
-     it is what protects the last-resort document-wide lookup, and the case
-     where the widget and the theme's button share no ancestor below <body>. */
+     construction. The exclusion list below is applied at every level anyway:
+     it protects the last-resort document-wide lookup, and the case where the
+     widget and the theme's button share no ancestor below <body>. */
 
   /* The elements themes print the add-to-cart price in. The first two entries
      are the client's custom "Sleepify" theme (div.pdp__grey > div.pdp__actions
@@ -1597,10 +1594,12 @@
           input.value = '';
         }
       }
-      var prop = form.querySelector('input[data-cellexia-design-prop]');
-      if (prop) {
-        prop.disabled = true;
-        prop.value = '';
+      var props = form.querySelectorAll(
+        'input[data-cellexia-design-prop], input[name="properties[_cellexia_seen]"]'
+      );
+      for (var p = 0; p < props.length; p++) {
+        props[p].disabled = true;
+        props[p].value = '';
       }
     }
 
@@ -1647,12 +1646,31 @@
       return field;
     }
 
-    /* Hidden line property stamping the active design on subscription
-       add-to-carts (read by the ORDERS_CREATE webhook for take-rate-by-
-       design analytics). Disabled — not submitted — for one-time carts. */
+    /* Hidden line properties read by the ORDERS_CREATE webhook (design
+       measurement): `_cellexia_seen` = "<preset>|<s|o|u>" (s/o = subscription
+       / one-time preselected on the rendered widget) on EVERY add-to-cart
+       while the widget is visible — one-time adds are the take-rate
+       denominator; `_cellexia_design` = preset on subscription adds only,
+       disabled (not submitted) for one-time. Both released with the form.
+       The seen input is found by its name: it is always ours, never adopted. */
     function applyDesignProp(subscriptionSelected) {
       if (!form || widgetHidden()) {
         return;
+      }
+      var seen = form.querySelector('input[name="properties[_cellexia_seen]"]');
+      if (!seen) {
+        seen = document.createElement('input');
+        seen.type = 'hidden';
+        seen.name = 'properties[_cellexia_seen]';
+        form.appendChild(seen);
+      }
+      seen.disabled = false;
+      var seenValue =
+        preset +
+        '|' +
+        (data.preselect === true ? 's' : data.preselect === false ? 'o' : 'u');
+      if (seen.value !== seenValue) {
+        seen.value = seenValue;
       }
       var prop = form.querySelector('input[data-cellexia-design-prop]');
       if (subscriptionSelected) {
@@ -1702,7 +1720,8 @@
                 variantId: state.variantId,
                 sellingPlanId: next || null,
                 mode: state.mode,
-                design: preset
+                design: preset,
+                preselect: data.preselect === true
               }
             })
           );
@@ -1987,6 +2006,9 @@
           return {
             mode: state.mode,
             design: preset,
+            /* the widget RENDERED subscription as the default (a tracked
+               design-measurement variable, independent of the mode now) */
+            preselect: data.preselect === true,
             variantId: String(state.variantId),
             variantIds: Object.keys(data.variants),
             sellingPlanId:
@@ -2271,43 +2293,30 @@
 
          1. readThemeVariant() — the authoritative re-read: the theme's
             [name="id"] input-or-select (our bound form first, then a
-            READ-ONLY document-wide scan that skips our own markup), and —
-            v1.11.0, from the SECOND live Sleepify defect — elements that
-            carry a variant id only as an ATTRIBUTE (data-variant-id /
-            data-val-id / data-variant): the client's pills moved to
-            data-val-id, the page has NO [name="id"] field at all, and the
-            only other signal is another vendor's product rows updating on
-            their own schedule, which a naive read raced into a widget
-            permanently one click behind. Then ?variant=, else keep the
-            current variant. A page can carry SEVERAL such signals for this
-            product (quick-buy modal, sticky add-to-cart bar, bystander
-            widgets), so when island-known values DISAGREE the scan settles
-            on evidence instead of document order — see readThemeVariant's
-            tier list: changed-value first, then fields (with the
-            own-section tiebreak), then the theme's own active-selection
-            paint, then passive markers; an unpicked swatch is never
-            evidence. A numeric id the island does NOT know, appearing in
-            our bound form or in a FIELD we watched hold our own ids, is
-            CONCLUSIVE: the product gained a variant after plan sync, and
-            the widget parks (below) rather than quote another variant's
-            prices — a mere marker can never park it;
+            READ-ONLY document-wide scan that skips our own markup) and, since
+            v1.11.0 (the SECOND live Sleepify defect: pills moved to
+            data-val-id, NO [name="id"] field on the page, and a bystander
+            vendor's rows updating on their own schedule raced a naive read
+            into a widget permanently one click behind), elements carrying a
+            variant id only as an ATTRIBUTE. Then ?variant=, else keep the
+            current variant. When island-known signals DISAGREE the scan
+            settles on evidence, not document order — see its tier list. A
+            numeric id the island does NOT know, in our bound form or a FIELD
+            we watched hold our ids, is CONCLUSIVE: the product gained a
+            variant after plan sync and the widget parks (below); a mere
+            marker can never park it;
          2. click delegation over the product area (host section, else the
-            bound form, else the whole page): any click schedules a re-read
-            on the next macrotask and again at +350ms, because themes update
-            their state asynchronously;
-         3. a 600ms poll of the same field — a string compare against the
-            current variant, only while the document is visible, ONE
-            interval per widget, cleared on pagehide and on detach, re-armed
-            by resync() — which catches ANY switching mechanism, including
-            pure-JS themes with no clicks near us. The poll reuses the last
-            scan's field list (validated for liveness) and only re-runs the
-            document-wide query every 10th tick; click-driven re-reads
-            always re-query, so a form the theme just opened is seen at the
-            interaction that opened it.
+            bound form, else the whole page): a re-read on the next macrotask
+            and again at +350ms — themes update their state asynchronously;
+         3. a 600ms poll of the same field, only while the document is
+            visible, ONE interval per widget, cleared on pagehide/detach,
+            re-armed by resync() — catches ANY switching mechanism. It reuses
+            the last scan's field list and re-runs the document-wide query
+            only every 10th tick; click-driven re-reads always re-query.
 
        All three funnel into onVariantMaybeChanged(), whose render() repaints
-       every price surface of every preset from the island matrix and
-       re-anchors the theme add-to-cart price sync. */
+       every price surface from the island matrix and re-anchors the theme
+       add-to-cart price sync. */
 
     /** Island row exists for this id? (own-property — never the prototype). */
     function knownVariant(value) {
@@ -2482,30 +2491,27 @@
      * never sold is not evidence this product changed, so only a real
      * [name="id"] field may park the widget.
      *
-     * Evidence tiers, strongest first (v1.11.0 — from the live Sleepify
-     * defect where the ONLY page-level signals were the pills' data-val-id
-     * attributes and another vendor's data-variant-id rows that update on
-     * their own schedule; a one-shot read of those rows put the widget
-     * permanently one click behind the shopper):
+     * Evidence tiers, strongest first (v1.11.0 — the live Sleepify defect:
+     * the ONLY page-level signals were the pills' data-val-id attributes and
+     * another vendor's data-variant-id rows updating on their own schedule;
+     * a one-shot read of those rows left the widget one click behind):
      *   1. the bound form's [name="id"] — conclusive, as before;
      *   2. a FIELD whose value CHANGED since the last read (the one the
-     *      shopper is driving — a laggy field self-corrects here the
-     *      moment it catches up);
+     *      shopper is driving — a laggy field self-corrects the moment it
+     *      catches up);
      *   3. [name="id"] fields, unanimous, then the own-section tiebreak —
-     *      the canonical form state stays above any mere marker, so a
-     *      foreign element wearing a "selected" class can never override
-     *      it;
+     *      canonical form state stays above any mere marker, so a foreign
+     *      element wearing a "selected" class can never override it;
      *   4. the theme's own "this is selected" paint: active-signal carriers
      *      (checked radio, aria-selected/pressed, active/selected class),
      *      changed first then unanimous — also the fallback when fields
      *      disagree beyond the section tiebreak;
      *   5. passive current-variant markers (another widget's row naming one
-     *      of OUR variants), changed first then unanimous, and only when no
-     *      field and no active carrier said anything — the weakest evidence
-     *      never overrides the theme's own state. Changes compete only
-     *      WITHIN their tier: a bystander row settling late (to the
-     *      previous click's variant) must never outrank the unchanged
-     *      active pill the shopper is looking at.
+     *      of OUR variants), changed first then unanimous, only when no
+     *      field and no active carrier said anything. Changes compete only
+     *      WITHIN their tier: a bystander row settling late (to the previous
+     *      click's variant) must never outrank the unchanged active pill
+     *      the shopper is looking at.
      * Unpicked options (a swatch without the active signal) are never
      * evidence: each pill permanently names its OWN variant.
      */

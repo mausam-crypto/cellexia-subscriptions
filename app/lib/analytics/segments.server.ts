@@ -44,6 +44,18 @@ import { COUNTABLE_CONTRACT, contractTaxCountry } from "./queries.server";
  * - device:       acqDeviceType ("mobile" | "desktop" | "tablet").
  * - valueBand:    acqOrderValueBand (first-order value deciles, edges owned
  *                 by the acquisition sanitizer).
+ * - design:       the buy-box design (widget preset key) the subscriber's
+ *                 first checkout came through — originDesignKey, stamped
+ *                 write-once by the design-measurement facts writer
+ *                 (v1.26.0). Read-only here: this module never resolves the
+ *                 design ladder itself. Take rate BY design is not a segment
+ *                 view (its denominator is orders, not contracts) — it
+ *                 lives in Buy box designer → Results.
+ * - preselect:    which buy-box option was rendered as the default at that
+ *                 first checkout — originDesignPreselect "sub" | "one"
+ *                 (v1.26.0). Tracked as its own dimension because the
+ *                 merchant usually preselects subscription and wants to
+ *                 read the two variables apart.
  *
  * Every dimension has an explicit UNKNOWN bucket rather than silently
  * dropping unattributed contracts — an imported book with no acquisition
@@ -57,6 +69,8 @@ import { COUNTABLE_CONTRACT, contractTaxCountry } from "./queries.server";
 // without dragging this server module into the client bundle — re-exported
 // verbatim here so server code keeps one import surface.
 export {
+  DESIGN_KEY_RE,
+  DESIGN_PRESELECT_SEGMENT_VALUES,
   DEVICE_TYPES,
   DISCOUNT_BANDS,
   SEGMENT_DIMENSIONS,
@@ -70,6 +84,8 @@ export type {
   SegmentDimension,
 } from "./segments-shared";
 import {
+  DESIGN_KEY_RE,
+  DESIGN_PRESELECT_SEGMENT_VALUES,
   DEVICE_TYPES,
   DISCOUNT_BANDS,
   SEGMENT_DIMENSIONS,
@@ -168,6 +184,27 @@ export function parseSegmentFromParams(
     }
   }
 
+  // v1.26.0: buy-box design + preselect. Same fail-safe rule — a malformed
+  // preset key or an unknown preselect token drops its dimension.
+  const design = raw("design");
+  if (design) {
+    const lower = design.toLowerCase();
+    if (lower === UNKNOWN_SEGMENT_VALUE || DESIGN_KEY_RE.test(lower)) {
+      segment.design = lower;
+    }
+  }
+
+  const preselect = raw("preselect");
+  if (preselect) {
+    const lower = preselect.toLowerCase();
+    if (
+      lower === UNKNOWN_SEGMENT_VALUE ||
+      (DESIGN_PRESELECT_SEGMENT_VALUES as readonly string[]).includes(lower)
+    ) {
+      segment.preselect = lower;
+    }
+  }
+
   return segment;
 }
 
@@ -192,6 +229,9 @@ export interface SegmentSourceContract {
   acqOrderValueBand: string | null;
   originOrderTotalCents: number | null;
   originOrderDiscountCents: number | null;
+  /** v1.26.0 design measurement stamps (write-once; null = not attributed). */
+  originDesignKey: string | null;
+  originDesignPreselect: string | null;
   lines: Array<{ productId: string; isGift: boolean; title?: string }>;
 }
 
@@ -355,6 +395,36 @@ export function contractValueBandValue(
 }
 
 /**
+ * Buy-box design the subscriber came through (v1.26.0): the write-once
+ * originDesignKey, validated against the preset-key shape so a hostile or
+ * malformed stored value buckets as unknown rather than leaking into the
+ * filter bar. Foreign / pre-tracking / unattributed contracts read unknown.
+ */
+export function contractDesignValue(
+  contract: Pick<SegmentSourceContract, "originDesignKey">,
+): string {
+  const key = contract.originDesignKey?.trim().toLowerCase() ?? "";
+  return DESIGN_KEY_RE.test(key) ? key : UNKNOWN_SEGMENT_VALUE;
+}
+
+/**
+ * Which buy-box option was preselected at the first checkout (v1.26.0):
+ * "sub" | "one" from originDesignPreselect, else unknown — including the
+ * storefront's explicit "u" (unknown) token, which the facts writer stores
+ * as null.
+ */
+export function contractPreselectValue(
+  contract: Pick<SegmentSourceContract, "originDesignPreselect">,
+): string {
+  const preselect = contract.originDesignPreselect?.trim().toLowerCase() ?? "";
+  return (DESIGN_PRESELECT_SEGMENT_VALUES as readonly string[]).includes(
+    preselect,
+  )
+    ? preselect
+    : UNKNOWN_SEGMENT_VALUE;
+}
+
+/**
  * First-order discount depth from the mirrored origin money:
  * discount ÷ (total + discount) — the discount's share of the PRE-discount
  * order value (the total is mirrored as charged, i.e. post-discount).
@@ -436,6 +506,15 @@ export function contractMatchesSegment(
   ) {
     return false;
   }
+  if (segment.design != null && contractDesignValue(contract) !== segment.design) {
+    return false;
+  }
+  if (
+    segment.preselect != null &&
+    contractPreselectValue(contract) !== segment.preselect
+  ) {
+    return false;
+  }
   return true;
 }
 
@@ -455,6 +534,8 @@ const SEGMENT_SOURCE_SELECT = {
   acqOrderValueBand: true,
   originOrderTotalCents: true,
   originOrderDiscountCents: true,
+  originDesignKey: true,
+  originDesignPreselect: true,
   lines: { select: { productId: true, isGift: true, title: true } },
 } as const;
 
@@ -519,6 +600,10 @@ export interface SegmentOptions {
   discountBands: SegmentOption[];
   devices: SegmentOption[];
   valueBands: SegmentOption[];
+  /** v1.26.0: buy-box design keys seen on the countable book (+ unknown). */
+  designs: SegmentOption[];
+  /** v1.26.0: "sub" / "one" / unknown, in that fixed order. */
+  preselects: SegmentOption[];
 }
 
 /** Cap per dimension so a high-cardinality value space cannot flood the UI. */
@@ -608,6 +693,20 @@ export async function getSegmentOptions(
       (discountBandOrder.get(b.value) ?? 99),
   );
 
+  // Preselect is a two-value vocabulary: fixed order (sub, one, unknown)
+  // rather than frequency, so the select reads the same on every book.
+  const preselectOrder = new Map<string, number>(
+    [...DESIGN_PRESELECT_SEGMENT_VALUES, UNKNOWN_SEGMENT_VALUE].map(
+      (value, i) => [value, i],
+    ),
+  );
+  const preselects = toOptions(
+    tally(contracts.map(contractPreselectValue)),
+  ).sort(
+    (a, b) =>
+      (preselectOrder.get(a.value) ?? 99) - (preselectOrder.get(b.value) ?? 99),
+  );
+
   return {
     totalContracts: contracts.length,
     countries: toOptions(tally(contracts.map(contractCountryValue))),
@@ -617,5 +716,7 @@ export async function getSegmentOptions(
     discountBands,
     devices: toOptions(tally(contracts.map(contractDeviceValue))),
     valueBands,
+    designs: toOptions(tally(contracts.map(contractDesignValue))),
+    preselects,
   };
 }

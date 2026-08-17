@@ -22,28 +22,45 @@
  *  2. PATCH CART REQUESTS: themes like cellexialabs.com's "Sleepify" have NO
  *     <form action="/cart/add"> — add-to-cart is a jQuery XHR. window.fetch
  *     and XMLHttpRequest are wrapped once; POSTs whose path ends in
- *     /cart/add or /cart/add.js get the selected selling_plan (and the
- *     properties[_cellexia_design] attribution) injected into the body, whatever
- *     its shape: FormData, URLSearchParams, urlencoded string, JSON
- *     items[], flat JSON {id, quantity} — and, in the encoded shapes, the
- *     bracket form jQuery produces for an items[] payload
- *     ("items[0][id]=…", per item). When one-time is selected, the widget is
- *     absent, gated-hidden, or anything at all goes wrong, the request passes
- *     through byte-identical — an add-to-cart must never break, and OTHER
- *     vendors' cart calls (e.g. the page's bundle widget posting a different
- *     product) must never be touched. A line that ALREADY carries a
- *     selling_plan is completed, never rewritten: when it is OUR OWN plan id
- *     — a theme that serializes the widget's adopted selling_plan field into
- *     a hand-built payload without copying the properties input — the
- *     missing _cellexia_design attribution is stamped on (otherwise every
- *     such order gets the subscription but loses take-rate-by-design
- *     reporting, invisibly), while any other plan id passes through
- *     byte-identical.
+ *     /cart/add or /cart/add.js get patched, whatever the body's shape:
+ *     FormData, URLSearchParams, urlencoded string, JSON items[], flat JSON
+ *     {id, quantity} — and, in the encoded shapes, the bracket form jQuery
+ *     produces for an items[] payload ("items[0][id]=…", per item). Two
+ *     stamps, two gates (v1.26.0):
+ *       - properties[_cellexia_seen] = "<preset>|<s|o|u>" goes on EVERY
+ *         line of OUR product while the widget is visible — one-time AND
+ *         subscription. It is the design-measurement exposure record: the
+ *         ORDERS_CREATE webhook needs to know which design (and whether the
+ *         subscription was preselected: s = yes, o = one-time preselected,
+ *         u = unknown) the shopper SAW, for the one-time orders as much as
+ *         for the subscriptions, or take rate per design has no denominator.
+ *         An existing non-empty seen value is never overwritten.
+ *       - selling_plan + properties[_cellexia_design] go on ONLY when the
+ *         subscription is selected (unchanged semantics: design = preset).
+ *     When the widget is absent, gated-hidden, or anything at all goes
+ *     wrong, the request passes through byte-identical — an add-to-cart
+ *     must never break, and OTHER vendors' cart calls (e.g. the page's
+ *     bundle widget posting a different product) must never be touched. A
+ *     line that ALREADY carries a selling_plan is completed, never
+ *     rewritten: when it is OUR OWN plan id — a theme that serializes the
+ *     widget's adopted selling_plan field into a hand-built payload without
+ *     copying the properties inputs — the missing _cellexia_design and
+ *     _cellexia_seen properties are stamped on (otherwise every such order
+ *     gets the subscription but loses take-rate-by-design reporting,
+ *     invisibly), while any other plan id passes through byte-identical
+ *     (that line is another app's, and gets no seen stamp either).
  *  3. TRACK VARIANTS: forward the theme's custom variant picker
  *     (.pdp__options) into the widget so prices stay correct — clicks as well
  *     as change events, since swatch buttons/labels fire no change event —
  *     followed by a re-read of ?variant= and, failing that, of the theme's
  *     own current-variant field.
+ *  4. VISIT BEACON (v1.27.0): an anonymous, cookie-free GET pixel to the app
+ *     proxy (/apps/cellexia-subs/w) that records, per widget design and
+ *     preselect, that a visitor SAW the widget (view), touched it (engage) and
+ *     added to cart (atc). It is the denominator the Results tab needs to
+ *     compare designs on conversion (orders per 100 exposed visits) and not
+ *     only on take rate. Measurement only: every branch is contained, nothing
+ *     is awaited, and a beacon that cannot be sent is simply not sent.
  *
  * State is read exclusively via the guarded window.CellexiaSubs global that
  * buy-box.js maintains.
@@ -169,23 +186,47 @@
   }
 
   /**
-   * The active subscription selection, or null. Null whenever the widget is
-   * absent, launch-gated/hidden, or has one-time selected — the callers
-   * treat null as "do not touch anything".
+   * The VISIBLE widget's state, or null. Null whenever the widget is absent
+   * or launch-gated/hidden (getState() itself answers null then) — the
+   * callers treat null as "do not touch anything". Any mode counts: a
+   * one-time selection is exposure too, and gets the seen stamp (v1.26.0;
+   * this used to be activeSubState(), subscription-only). Whether the line
+   * ALSO gets selling_plan + _cellexia_design is subscriptionSelected().
    */
-  function activeSubState() {
+  function exposureState() {
     try {
       if (typeof subs.getState !== 'function') {
         return null;
       }
       var state = subs.getState();
-      if (!state || state.mode !== 'subscription' || !state.sellingPlanId) {
-        return null;
-      }
-      return state;
+      return state || null;
     } catch (err) {
       return null;
     }
+  }
+
+  /** The subscription branch of the patch: a plan is selected and known. */
+  function subscriptionSelected(state) {
+    return !!(state && state.mode === 'subscription' && state.sellingPlanId);
+  }
+
+  /**
+   * properties[_cellexia_seen] value: "<preset>|<p>", p = s (subscription
+   * was preselected on the rendered widget), o (one-time was), u (unknown:
+   * a buy-box.js that predates the field). Same spelling as buy-box.js's
+   * theme-form input; the webhook parses it (design-measurement/shared).
+   */
+  function preselectCode(state) {
+    return state.preselect === true ? 's' : state.preselect === false ? 'o' : 'u';
+  }
+
+  function seenValue(state) {
+    return String(state.design) + '|' + preselectCode(state);
+  }
+
+  /** A property value that already records something (never overwrite it). */
+  function hasValue(value) {
+    return value != null && String(value) !== '';
   }
 
   function matchesVariant(id, state) {
@@ -509,6 +550,10 @@
       if (inner && !inner.hasAttribute('hidden')) {
         wrapper.removeAttribute('hidden');
       }
+      /* A (re)mounted root is a root the visit beacon may not be watching
+         yet (a section re-render replaces the node). Contained, hoisted, and
+         a no-op until the beacon module below has booted. */
+      observeVisitRoots();
       /* The embed may have been dormant when buy-box.js booted (the section
          app block owned the page at that moment); now that it is the mounted
          widget, ask for a re-scan — init() is idempotent and skips widgets it
@@ -642,13 +687,17 @@
    * items[] / flat-JSON injection. Mutates `payload`; returns true when
    * something was actually injected. Items are matched against OUR product's
    * variant ids so another vendor's add (the page's bundle widget, cart-page
-   * upsells) is never rewritten — that would 422 their checkout. An item
-   * that already carries a selling_plan is completed, never rewritten: OUR
-   * plan id gets the missing _cellexia_design attribution stamped on (a
-   * theme that serialized the widget's adopted field without the properties
-   * input), any other plan id is another app's line and is left alone. The
-   * spec'd item[0] fallback applies only when no item carries a usable id at
-   * all.
+   * upsells) is never rewritten — that would 422 their checkout. Every
+   * matched item gets the missing _cellexia_seen stamp; the subscription
+   * pair (selling_plan + _cellexia_design) only while the subscription is
+   * selected. An item that already carries a selling_plan is completed,
+   * never rewritten: OUR plan id (knowable only while the subscription is
+   * selected — with one-time selected a plan the theme kept sending is not
+   * provably ours, so it passes through untouched) gets whichever of
+   * _cellexia_design / _cellexia_seen is missing (a theme that serialized
+   * the widget's adopted field without the properties inputs), any other
+   * plan id is another app's line and is left alone entirely. The spec'd
+   * item[0] fallback applies only when no item carries a usable id at all.
    */
   function injectJson(payload, state) {
     var items;
@@ -682,6 +731,7 @@
       }
     }
 
+    var sub = subscriptionSelected(state);
     var changed = false;
     for (var j = 0; j < targets.length; j++) {
       var target = targets[j];
@@ -689,28 +739,33 @@
         target.properties && typeof target.properties === 'object'
           ? target.properties
           : null;
+      var touched = false;
       if (target.selling_plan) {
         /* Already a subscription line. A foreign plan id is never ours to
-           touch; our own — String-compared, themes carry it numeric or as
-           text — may only be missing its design attribution (an empty
-           value counts as missing: it records no design either way). */
-        if (String(target.selling_plan) !== String(state.sellingPlanId)) {
+           touch — and while one-time is selected NO plan is provably ours;
+           our own (String-compared, themes carry it numeric or as text) may
+           only be missing its properties (an empty value counts as missing:
+           it records nothing either way). */
+        if (!sub || String(target.selling_plan) !== String(state.sellingPlanId)) {
           continue;
         }
-        if (properties && properties._cellexia_design) {
-          continue; /* the attribution already travelled with the line */
-        }
-        properties = properties || {};
+      } else if (sub) {
+        target.selling_plan = planIdValue(state.sellingPlanId);
+        touched = true;
+      }
+      properties = properties || {};
+      if (sub && !hasValue(properties._cellexia_design)) {
         properties._cellexia_design = state.design;
+        touched = true;
+      }
+      if (!hasValue(properties._cellexia_seen)) {
+        properties._cellexia_seen = seenValue(state);
+        touched = true;
+      }
+      if (touched) {
         target.properties = properties;
         changed = true;
-        continue;
       }
-      target.selling_plan = planIdValue(state.sellingPlanId);
-      properties = properties || {};
-      properties._cellexia_design = state.design;
-      target.properties = properties;
-      changed = true;
     }
     return changed;
   }
@@ -736,6 +791,7 @@
   var ITEM_ID_KEY = /^items\[(\d+)\]\[id\]$/;
   var ITEM_PLAN_KEY = /^items\[(\d+)\]\[selling_plan\]$/;
   var ITEM_DESIGN_KEY = /^items\[(\d+)\]\[properties\]\[_cellexia_design\]$/;
+  var ITEM_SEEN_KEY = /^items\[(\d+)\]\[properties\]\[_cellexia_seen\]$/;
 
   /**
    * The `items[i][…]` bracket shape, which is what jQuery produces for
@@ -746,34 +802,47 @@
    *
    * Returns the indexes to touch, applying the same per-item rules as the
    * JSON path — another vendor's variant is never rewritten: `plan` lists
-   * the items that get the full selling_plan + design pair, `designOnly`
-   * the items that already carry OUR plan id but no _cellexia_design (a
-   * theme that serialized the widget's adopted field without the properties
-   * input). An item planned with any other id is left alone. Both empty ⇒
-   * the body passes through byte-identical.
+   * the items that need selling_plan, `design` the ones that need
+   * _cellexia_design (both subscription-only), `seen` the ones that need
+   * _cellexia_seen (every mode). An item that already carries a plan is
+   * completed only when that plan is provably OURS (subscription selected,
+   * same id — a theme that serialized the widget's adopted field without
+   * the properties inputs); planned with any other id it is left alone. All
+   * three empty ⇒ the body passes through byte-identical.
    */
   function itemIndexTargets(pairs, state) {
     var ids = {};
     var planned = {};
     var designed = {};
+    var seen = {};
     for (var i = 0; i < pairs.length; i++) {
       var key = pairs[i][0];
+      var value = pairs[i][1];
       var idMatch = ITEM_ID_KEY.exec(key);
       if (idMatch) {
-        ids[idMatch[1]] = pairs[i][1];
+        ids[idMatch[1]] = value;
         continue;
       }
+      if (!hasValue(value)) {
+        continue; /* an empty plan/property records nothing — "missing" */
+      }
       var planMatch = ITEM_PLAN_KEY.exec(key);
-      if (planMatch && pairs[i][1] !== '' && pairs[i][1] != null) {
-        planned[planMatch[1]] = pairs[i][1];
+      if (planMatch) {
+        planned[planMatch[1]] = value;
         continue;
       }
       var designMatch = ITEM_DESIGN_KEY.exec(key);
-      if (designMatch && pairs[i][1] !== '' && pairs[i][1] != null) {
+      if (designMatch) {
         designed[designMatch[1]] = true;
+        continue;
+      }
+      var seenMatch = ITEM_SEEN_KEY.exec(key);
+      if (seenMatch) {
+        seen[seenMatch[1]] = true;
       }
     }
-    var targets = { plan: [], designOnly: [] };
+    var sub = subscriptionSelected(state);
+    var targets = { plan: [], design: [], seen: [] };
     for (var index in ids) {
       if (!Object.prototype.hasOwnProperty.call(ids, index)) {
         continue;
@@ -781,16 +850,87 @@
       if (!matchesVariant(ids[index], state)) {
         continue;
       }
-      if (planned[index] == null) {
+      if (planned[index] != null) {
+        if (!sub || String(planned[index]) !== String(state.sellingPlanId)) {
+          continue; /* another app's line (or not provably ours) */
+        }
+      } else if (sub) {
         targets.plan.push(index);
-      } else if (
-        String(planned[index]) === String(state.sellingPlanId) &&
-        !designed[index]
-      ) {
-        targets.designOnly.push(index);
+      }
+      if (sub && !designed[index]) {
+        targets.design.push(index);
+      }
+      if (!seen[index]) {
+        targets.seen.push(index);
       }
     }
     return targets;
+  }
+
+  function hasItemTargets(targets) {
+    return !!(targets.plan.length || targets.design.length || targets.seen.length);
+  }
+
+  /** Write itemIndexTargets() into a container with .set() (params/FormData). */
+  function applyItemTargets(container, targets, state) {
+    var i;
+    for (i = 0; i < targets.plan.length; i++) {
+      container.set(
+        'items[' + targets.plan[i] + '][selling_plan]',
+        String(state.sellingPlanId)
+      );
+    }
+    for (i = 0; i < targets.design.length; i++) {
+      container.set(
+        'items[' + targets.design[i] + '][properties][_cellexia_design]',
+        state.design
+      );
+    }
+    for (i = 0; i < targets.seen.length; i++) {
+      container.set(
+        'items[' + targets.seen[i] + '][properties][_cellexia_seen]',
+        seenValue(state)
+      );
+    }
+  }
+
+  /**
+   * The flat shape (id=…&quantity=…): which stamps this body still needs,
+   * given a `get(key)` reader over it, or null for "pass through untouched"
+   * — not our variant, a plan that is not provably ours, or nothing missing.
+   * Shared by the urlencoded and FormData flat paths so the two cannot
+   * drift apart. Same completion rule as the bracket shape.
+   */
+  function flatStamps(get, state) {
+    var id = get('id');
+    if (!id || !matchesVariant(id, state)) {
+      return null;
+    }
+    var sub = subscriptionSelected(state);
+    var stamps = { plan: false, design: false, seen: false };
+    var existingPlan = get('selling_plan');
+    if (hasValue(existingPlan)) {
+      if (!sub || String(existingPlan) !== String(state.sellingPlanId)) {
+        return null;
+      }
+    } else if (sub) {
+      stamps.plan = true;
+    }
+    stamps.design = sub && !hasValue(get('properties[_cellexia_design]'));
+    stamps.seen = !hasValue(get('properties[_cellexia_seen]'));
+    return stamps.plan || stamps.design || stamps.seen ? stamps : null;
+  }
+
+  function applyFlatStamps(container, stamps, state) {
+    if (stamps.plan) {
+      container.set('selling_plan', String(state.sellingPlanId));
+    }
+    if (stamps.design) {
+      container.set('properties[_cellexia_design]', state.design);
+    }
+    if (stamps.seen) {
+      container.set('properties[_cellexia_seen]', seenValue(state));
+    }
   }
 
   /** urlencoded string → new string, or null for "pass through untouched". */
@@ -804,29 +944,15 @@
     } catch (err) {
       return null;
     }
-    var id = params.get('id');
-    if (id) {
+    if (params.get('id')) {
       /* Flat shape: id=…&quantity=… */
-      if (!matchesVariant(id, state)) {
-        return null; /* not our product — pass through untouched */
+      var stamps = flatStamps(function (key) {
+        return params.get(key);
+      }, state);
+      if (!stamps) {
+        return null; /* not our product, or nothing to add — untouched */
       }
-      var existingPlan = params.get('selling_plan');
-      if (existingPlan) {
-        /* Already a subscription line: a foreign plan id is never ours to
-           touch, and our own may only be missing its design attribution —
-           the theme serialized the widget's adopted field without the
-           properties input. An empty design value counts as missing. */
-        if (String(existingPlan) !== String(state.sellingPlanId)) {
-          return null;
-        }
-        if (params.get('properties[_cellexia_design]')) {
-          return null;
-        }
-        params.set('properties[_cellexia_design]', state.design);
-        return params.toString();
-      }
-      params.set('selling_plan', String(state.sellingPlanId));
-      params.set('properties[_cellexia_design]', state.design);
+      applyFlatStamps(params, stamps, state);
       return params.toString();
     }
     var pairs = entryPairs(params);
@@ -834,25 +960,10 @@
       return null;
     }
     var targets = itemIndexTargets(pairs, state);
-    if (!targets.plan.length && !targets.designOnly.length) {
+    if (!hasItemTargets(targets)) {
       return null; /* no id at all, or nothing of ours — untouched */
     }
-    for (var i = 0; i < targets.plan.length; i++) {
-      params.set(
-        'items[' + targets.plan[i] + '][selling_plan]',
-        String(state.sellingPlanId)
-      );
-      params.set(
-        'items[' + targets.plan[i] + '][properties][_cellexia_design]',
-        state.design
-      );
-    }
-    for (var j = 0; j < targets.designOnly.length; j++) {
-      params.set(
-        'items[' + targets.designOnly[j] + '][properties][_cellexia_design]',
-        state.design
-      );
-    }
+    applyItemTargets(params, targets, state);
     return params.toString();
   }
 
@@ -891,31 +1002,23 @@
     if (!pairs) {
       return null;
     }
-    var id = formData.get('id');
+    var stamps = null;
     var targets = null;
-    var designOnly = false;
-    if (id) {
-      if (!matchesVariant(id, state)) {
+    if (formData.get('id')) {
+      /* Flat shape — the same completion rules as the urlencoded flat path
+         (flatStamps): our own plan is completed, anything else passes
+         through untouched. */
+      stamps = flatStamps(function (key) {
+        return formData.get(key);
+      }, state);
+      if (!stamps) {
         return null;
-      }
-      var existingPlan = formData.get('selling_plan');
-      if (existingPlan) {
-        /* Same completion rule as the urlencoded flat shape: our own plan
-           id gets the missing design attribution, anything else passes
-           through untouched. */
-        if (String(existingPlan) !== String(state.sellingPlanId)) {
-          return null;
-        }
-        if (formData.get('properties[_cellexia_design]')) {
-          return null;
-        }
-        designOnly = true;
       }
     } else {
       /* Same items[i][id] shape as the urlencoded path (a FormData built by
          the theme from an items[] payload). */
       targets = itemIndexTargets(pairs, state);
-      if (!targets.plan.length && !targets.designOnly.length) {
+      if (!hasItemTargets(targets)) {
         return null;
       }
     }
@@ -929,27 +1032,9 @@
       return null;
     }
     if (targets) {
-      for (var j = 0; j < targets.plan.length; j++) {
-        copy.set(
-          'items[' + targets.plan[j] + '][selling_plan]',
-          String(state.sellingPlanId)
-        );
-        copy.set(
-          'items[' + targets.plan[j] + '][properties][_cellexia_design]',
-          state.design
-        );
-      }
-      for (var k = 0; k < targets.designOnly.length; k++) {
-        copy.set(
-          'items[' + targets.designOnly[k] + '][properties][_cellexia_design]',
-          state.design
-        );
-      }
-    } else if (designOnly) {
-      copy.set('properties[_cellexia_design]', state.design);
+      applyItemTargets(copy, targets, state);
     } else {
-      copy.set('selling_plan', String(state.sellingPlanId));
-      copy.set('properties[_cellexia_design]', state.design);
+      applyFlatStamps(copy, stamps, state);
     }
     return copy;
   }
@@ -976,6 +1061,79 @@
     return null;
   }
 
+  /**
+   * "Does this cart body target one of OUR variants": the atc beacon's
+   * question, which is NOT injectBody()'s question ("did anything change").
+   * WHY a separate check (v1.27.0 review): on a theme-form install
+   * buy-box.js already wrote selling_plan and both properties into the
+   * product form; a theme whose add-to-cart builds FormData(form) and calls
+   * fetch (no submit event) then sends a body with nothing missing, so
+   * injectBody() answers null and the shopper's add would never be counted,
+   * although the order itself is (it carries _cellexia_seen). Reads only the
+   * id (flat), items[i][id] (bracket) or items[].id / id (JSON), so a foreign
+   * variant is still never counted. Cheap by construction: called only when
+   * injectBody() had nothing to do. Any failure reads as "not ours".
+   */
+  function bodyTargetsOurs(body, state) {
+    try {
+      var pairs = null;
+      if (typeof FormData !== 'undefined' && body instanceof FormData) {
+        if (typeof body.get !== 'function' || typeof body.entries !== 'function') {
+          return false; /* legacy FormData without inspection */
+        }
+        if (body.get('id')) {
+          return matchesVariant(body.get('id'), state);
+        }
+        pairs = entryPairs(body);
+      } else {
+        var text =
+          typeof body === 'string'
+            ? body
+            : typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams
+              ? body.toString()
+              : null;
+        if (text === null) {
+          return false;
+        }
+        var head = text.replace(/^\s+/, '').charAt(0);
+        if (head === '{' || head === '[') {
+          var payload = JSON.parse(text);
+          var items =
+            payload && Object.prototype.toString.call(payload.items) === '[object Array]'
+              ? payload.items
+              : payload && typeof payload === 'object' && payload.id != null
+                ? [payload]
+                : [];
+          for (var i = 0; i < items.length; i++) {
+            if (items[i] && typeof items[i] === 'object' && matchesVariant(items[i].id, state)) {
+              return true;
+            }
+          }
+          return false;
+        }
+        if (typeof window.URLSearchParams !== 'function') {
+          return false;
+        }
+        var params = new URLSearchParams(text);
+        if (params.get('id')) {
+          return matchesVariant(params.get('id'), state);
+        }
+        pairs = entryPairs(params);
+      }
+      if (!pairs) {
+        return false;
+      }
+      for (var j = 0; j < pairs.length; j++) {
+        if (ITEM_ID_KEY.test(pairs[j][0]) && matchesVariant(pairs[j][1], state)) {
+          return true;
+        }
+      }
+      return false;
+    } catch (err) {
+      return false;
+    }
+  }
+
   /* fetch — wrapped once; everything inside try/catch falls through to the
      original, untouched request. */
   var originalFetch = window.fetch;
@@ -994,9 +1152,14 @@
           String(init.method || 'GET').toUpperCase() === 'POST' &&
           isCartAddUrl(url)
         ) {
-          var state = activeSubState();
+          var state = exposureState();
           if (state) {
             var nextBody = injectBody(init.body, state);
+            /* atc is decided on "targets our variant", not on "was changed":
+               a body already carrying every stamp is still an add. */
+            if (nextBody !== null || bodyTargetsOurs(init.body, state)) {
+              noteCartAdd(state);
+            }
             if (nextBody !== null) {
               var nextInit = {};
               for (var key in init) {
@@ -1033,9 +1196,13 @@
     xhrProto.send = function (body) {
       try {
         if (this.__cxCartAdd && body != null) {
-          var state = activeSubState();
+          var state = exposureState();
           if (state) {
             var nextBody = injectBody(body, state);
+            /* Same atc rule as the fetch wrapper: ours-complete counts too. */
+            if (nextBody !== null || bodyTargetsOurs(body, state)) {
+              noteCartAdd(state);
+            }
             if (nextBody !== null) {
               return originalSend.call(this, nextBody);
             }
@@ -1301,4 +1468,461 @@
 
   window.addEventListener('popstate', syncVariantFromUrl);
   window.addEventListener('cx:locationchange', syncVariantFromUrl);
+
+  /* ── 4. Visit beacon (v1.27.0) ──────────────────────────────────────────────
+     WHY: take rate per design (from the _cellexia_seen order stamp) has
+     orders as its denominator, so a design that quietly sells FEWER orders
+     but converts more of them to subscriptions looks like a winner. The
+     honest comparison is per exposed visit: orders per 100 visits and
+     subscriptions per 100 visits, keyed by exactly the same design + preselect
+     stamp as the order facts, so numerator and denominator agree. This module
+     records that denominator: a GET pixel to the app proxy per page view,
+     per event, at most once per event per (design|preselect).
+
+     What it is NOT: it is not an experiment assignment (the visitor id below
+     is a browser-local anonymous id, so the experiment kernel's no-RNG rule
+     does not apply), it carries no personal data (no email, no customer id,
+     no IP is read here; the id is random and never leaves the browser except
+     inside this request), and it needs no consent gate (merchant decision,
+     v1.27.0). Nothing here may ever affect the page: every entry point is
+     wrapped, nothing is awaited, and a beacon that cannot be sent is not sent.
+
+     Skipped entirely in an admin preview (?cx_preview= in this page's URL),
+     in the theme editor (Shopify.designMode, the merchant customising the
+     theme is not a shopper) and, per event, whenever getState() answers null
+     (widget hidden, gated or absent): a visitor who cannot see the widget is
+     not exposed to a design.
+
+     Wire format (see app/routes/proxy.w.tsx): e = view|engage|atc, d = design,
+     p = s|o|u (preselect), v = variant id, c = ISO country (Shopify.country),
+     cur = active currency, dv = m|t|d device, vid = visitor id, pv = page-view
+     id, t = Date.now(), m = s|o (atc only: subscription or one-time line).
+
+     Transport: new Image().src, the one request shape every browser sends
+     without a CORS preflight and without blocking anything; fetch(keepalive,
+     no-cors) only where Image is missing (never awaited). The path is pinned
+     to the app-proxy subpath by tests/proxy-subpath.test.ts. */
+
+  var VISIT_PATH = '/apps/cellexia-subs/w';
+  var VISIT_ID_KEY = 'cellexia_vid';
+  var VISIT_ID_SHAPE = /^[A-Za-z0-9_-]{8,32}$/;
+  var VISIT_ID_ALPHABET =
+    'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+
+  var visitsReady = false; /* module booted (false during the early mount passes) */
+  var visitsOff = false; /* admin preview / theme editor: never measure the merchant */
+  var visitsSent = {}; /* "event:design|p[:m]" → true (once per page load) */
+  var visitorIdValue = null; /* memoised vid */
+  var pageViewId = ''; /* pv: 8 chars per page load */
+  var visitObserver = null; /* IntersectionObserver, when the browser has one */
+  var visitWatch = []; /* [{ el, timer }] roots under observation */
+
+  /**
+   * length random URL-safe characters. crypto.getRandomValues when the
+   * browser has it, Math.random otherwise: this is an anonymous browser-local
+   * id, not an experiment assignment, so the kernel's no-RNG rule does not
+   * apply and a weaker generator only risks a (harmless) collision.
+   */
+  function randomToken(length) {
+    var bytes = null;
+    try {
+      var cryptoApi = window.crypto || window.msCrypto;
+      if (
+        cryptoApi &&
+        typeof cryptoApi.getRandomValues === 'function' &&
+        typeof Uint8Array === 'function'
+      ) {
+        bytes = cryptoApi.getRandomValues(new Uint8Array(length));
+      }
+    } catch (err) {
+      bytes = null;
+    }
+    var out = '';
+    for (var i = 0; i < length; i++) {
+      var n = bytes ? bytes[i] : Math.floor(Math.random() * 256);
+      out += VISIT_ID_ALPHABET.charAt(n % VISIT_ID_ALPHABET.length);
+    }
+    return out;
+  }
+
+  /** window.localStorage / sessionStorage, or null: the ACCESS can throw. */
+  function safeStore(name) {
+    try {
+      var store = window[name];
+      return store &&
+        typeof store.getItem === 'function' &&
+        typeof store.setItem === 'function'
+        ? store
+        : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function storeRead(store, key) {
+    try {
+      return store ? store.getItem(key) : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  /** True only when the value can be read back (quota / private mode). */
+  function storeWrite(store, key, value) {
+    try {
+      if (!store) {
+        return false;
+      }
+      store.setItem(key, value);
+      return store.getItem(key) === value;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  /**
+   * The visitor id: localStorage first (a returning visitor is one visitor
+   * across days, which is what "visits per day" needs), sessionStorage when
+   * that is unavailable, a per-page value as the last resort. Validated on
+   * read so a tampered value never reaches the URL.
+   */
+  function visitorId() {
+    if (visitorIdValue) {
+      return visitorIdValue;
+    }
+    var local = safeStore('localStorage');
+    var session = safeStore('sessionStorage');
+    var found = storeRead(local, VISIT_ID_KEY);
+    if (!VISIT_ID_SHAPE.test(String(found || ''))) {
+      found = storeRead(session, VISIT_ID_KEY);
+    }
+    if (!VISIT_ID_SHAPE.test(String(found || ''))) {
+      found = randomToken(16);
+      if (!storeWrite(local, VISIT_ID_KEY, found)) {
+        storeWrite(session, VISIT_ID_KEY, found);
+      }
+    }
+    visitorIdValue = String(found);
+    return visitorIdValue;
+  }
+
+  function shopifyGlobal() {
+    try {
+      var shopify = window.Shopify;
+      return shopify && typeof shopify === 'object' ? shopify : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  /** Shopify.country as uppercase ISO-2, else '' (the server maps it to a market). */
+  function visitCountry() {
+    var shopify = shopifyGlobal();
+    var code = shopify && shopify.country ? String(shopify.country).toUpperCase() : '';
+    return /^[A-Z]{2}$/.test(code) ? code : '';
+  }
+
+  /** Shopify.currency.active, else ''. */
+  function visitCurrency() {
+    var shopify = shopifyGlobal();
+    var code =
+      shopify && shopify.currency && shopify.currency.active
+        ? String(shopify.currency.active).toUpperCase()
+        : '';
+    return /^[A-Z]{3}$/.test(code) ? code : '';
+  }
+
+  /**
+   * m | t | d from a deliberately simple heuristic: viewport width first
+   * (< 768 mobile, < 1024 tablet), and a coarse primary pointer on a wide
+   * viewport reads as a tablet rather than a desktop. Good enough to split
+   * the Results tab by device; never used for anything else.
+   */
+  function visitDevice() {
+    try {
+      var width = window.innerWidth;
+      var coarse = false;
+      if (typeof window.matchMedia === 'function') {
+        var query = window.matchMedia('(pointer: coarse)');
+        coarse = !!(query && query.matches);
+      }
+      if (typeof width === 'number' && width > 0) {
+        return width < 768 ? 'm' : width < 1024 || coarse ? 't' : 'd';
+      }
+      return coarse ? 'm' : 'd';
+    } catch (err) {
+      return 'd';
+    }
+  }
+
+  function visitQuery(event, state, mode) {
+    var enc = encodeURIComponent;
+    var query =
+      'e=' +
+      enc(event) +
+      '&d=' +
+      enc(String(state.design)) +
+      '&p=' +
+      preselectCode(state) +
+      '&v=' +
+      enc(state.variantId == null ? '' : String(state.variantId)) +
+      '&c=' +
+      enc(visitCountry()) +
+      '&cur=' +
+      enc(visitCurrency()) +
+      '&dv=' +
+      visitDevice() +
+      '&vid=' +
+      enc(visitorId()) +
+      '&pv=' +
+      enc(pageViewId) +
+      '&t=' +
+      Date.now();
+    if (mode) {
+      query += '&m=' + enc(mode);
+    }
+    return query;
+  }
+
+  /** Fire and forget. Never awaited, never thrown from. */
+  function transmitVisit(url) {
+    try {
+      if (typeof window.Image === 'function') {
+        var pixel = new window.Image();
+        pixel.src = url;
+      } else if (typeof originalFetch === 'function') {
+        /* The ORIGINAL fetch, not our own patched wrapper. */
+        var pending = originalFetch.call(window, url, {
+          method: 'GET',
+          keepalive: true,
+          credentials: 'omit',
+          mode: 'no-cors'
+        });
+        if (pending && typeof pending.catch === 'function') {
+          pending.catch(function () {
+            /* a beacon that did not arrive is not worth an unhandled rejection */
+          });
+        }
+      }
+    } catch (err) {
+      /* a beacon that cannot be sent is not sent */
+    }
+  }
+
+  /**
+   * Send one event, once per page load per (design|preselect) and, for atc,
+   * per mode too (a shopper who adds one-time and then switches to the
+   * subscription counts for both flags on the server, never twice for one).
+   * Returns true only when a request actually went out.
+   */
+  function sendVisit(event, mode) {
+    try {
+      if (!visitsReady || visitsOff) {
+        return false;
+      }
+      var state = exposureState();
+      if (!state) {
+        return false;
+      }
+      var once = event + ':' + seenValue(state) + (mode ? ':' + mode : '');
+      if (visitsSent[once]) {
+        return false;
+      }
+      visitsSent[once] = true;
+      transmitVisit(VISIT_PATH + '?' + visitQuery(event, state, mode));
+      return true;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  /**
+   * atc from the cart-request patch: called when the intercepted body
+   * targets OUR variant, whether the patch injected stamps into it or found
+   * them already there (bodyTargetsOurs). m is the widget's branch
+   * (subscription selected ⇒ the line carries our plan, injected or
+   * completed; otherwise a one-time line).
+   */
+  function noteCartAdd(state) {
+    sendVisit('atc', subscriptionSelected(state) ? 's' : 'o');
+  }
+
+  /**
+   * atc from a theme product form (the buy-box.js install shape, where no
+   * cart request is patched): a capture-phase submit of a /cart/add form
+   * that carries our seen input, enabled (releaseForm() disables it while
+   * the widget is hidden). m from the widget's current mode.
+   */
+  function onVisitSubmit(event) {
+    try {
+      var form = event && event.target;
+      if (!form || form.tagName !== 'FORM' || typeof form.querySelector !== 'function') {
+        return;
+      }
+      if (!isCartAddUrl(form.getAttribute('action') || '')) {
+        return;
+      }
+      var seen = form.querySelector('input[name="properties[_cellexia_seen]"]');
+      if (!seen || seen.disabled) {
+        return;
+      }
+      var state = exposureState();
+      if (!state) {
+        return;
+      }
+      sendVisit('atc', state.mode === 'subscription' ? 's' : 'o');
+    } catch (err) {
+      /* measurement only */
+    }
+  }
+
+  /** engage: the first interaction inside a widget root (or its satellite). */
+  function onVisitEngage(event) {
+    try {
+      var target = event && event.target;
+      if (!target || typeof target.closest !== 'function') {
+        return;
+      }
+      if (target.closest(OWN_WIDGET) || target.closest(OWN_SATELLITE)) {
+        sendVisit('engage', null);
+      }
+    } catch (err) {
+      /* measurement only */
+    }
+  }
+
+  function visitWatchFor(el) {
+    for (var i = 0; i < visitWatch.length; i++) {
+      if (visitWatch[i].el === el) {
+        return visitWatch[i];
+      }
+    }
+    return null;
+  }
+
+  function stopVisitObserver() {
+    try {
+      if (visitObserver) {
+        visitObserver.disconnect();
+      }
+    } catch (err) {
+      /* nothing to release */
+    }
+    visitObserver = null;
+  }
+
+  function viewTimerFor(watch) {
+    return function () {
+      watch.timer = null;
+      /* Sent ⇒ this page load's view is recorded; the observer has done its
+         job. Not sent (hidden at that instant) ⇒ keep watching. */
+      if (sendVisit('view', null)) {
+        stopVisitObserver();
+      }
+    };
+  }
+
+  /**
+   * view = a root at least half in the viewport for a full second, so a
+   * scroll-past never counts and a page opened in a background tab (nothing
+   * intersects) never counts. Each entry starts or cancels that root's dwell
+   * timer; isIntersecting is missing on some older engines, so the ratio
+   * decides and isIntersecting only vetoes.
+   */
+  function onVisitIntersect(entries) {
+    try {
+      for (var i = 0; i < entries.length; i++) {
+        var entry = entries[i];
+        var watch = visitWatchFor(entry.target);
+        if (!watch) {
+          continue;
+        }
+        var visible =
+          Number(entry.intersectionRatio) >= 0.5 && entry.isIntersecting !== false;
+        if (visible && watch.timer === null) {
+          watch.timer = window.setTimeout(viewTimerFor(watch), 1000);
+        } else if (!visible && watch.timer !== null) {
+          window.clearTimeout(watch.timer);
+          watch.timer = null;
+        }
+      }
+    } catch (err) {
+      /* measurement only */
+    }
+  }
+
+  /** Observe every widget root not yet under observation (idempotent). */
+  function observeVisitRoots() {
+    if (!visitsReady || visitsOff || !visitObserver) {
+      return;
+    }
+    try {
+      var roots = document.querySelectorAll(OWN_WIDGET);
+      for (var i = 0; i < roots.length; i++) {
+        if (!visitWatchFor(roots[i])) {
+          visitWatch.push({ el: roots[i], timer: null });
+          visitObserver.observe(roots[i]);
+        }
+      }
+    } catch (err) {
+      /* measurement only */
+    }
+  }
+
+  function bootVisits() {
+    try {
+      visitsOff = String(window.location.search || '').indexOf('cx_preview=') !== -1;
+    } catch (err) {
+      visitsOff = false;
+    }
+    /* The theme editor (Online Store > Customize): Shopify sets the
+       documented editor-only global Shopify.designMode = true inside the
+       customiser's preview frame, whose URL carries no cx_preview=. The
+       merchant clicking through designs there is not a shopper; without
+       this gate every editing session would add visits with zero orders to
+       exactly the design being edited and drag its conversion down. The
+       cart stamps stay on (the editor's own add-to-cart still works). */
+    var shopify = shopifyGlobal();
+    if (shopify && shopify.designMode === true) {
+      visitsOff = true;
+    }
+    if (visitsOff) {
+      return;
+    }
+    pageViewId = randomToken(8);
+    visitsReady = true;
+    document.addEventListener('pointerdown', onVisitEngage, true);
+    document.addEventListener('click', onVisitEngage, true);
+    document.addEventListener('keydown', onVisitEngage, true);
+    document.addEventListener('change', onVisitEngage, true);
+    document.addEventListener('submit', onVisitSubmit, true);
+    if (typeof window.IntersectionObserver === 'function') {
+      try {
+        visitObserver = new window.IntersectionObserver(onVisitIntersect, {
+          threshold: [0.5]
+        });
+      } catch (err) {
+        visitObserver = null;
+      }
+    }
+    if (visitObserver) {
+      observeVisitRoots();
+      /* Roots that arrive later: a late DOM, a section re-render (tryMount
+         also calls observeVisitRoots after every successful mount). */
+      document.addEventListener('DOMContentLoaded', observeVisitRoots);
+      document.addEventListener('shopify:section:load', observeVisitRoots);
+    } else {
+      /* No IntersectionObserver: a widget that is visible 1.5 s after boot
+         counts as viewed. Coarser, but still gated on getState(). */
+      window.setTimeout(function () {
+        sendVisit('view', null);
+      }, 1500);
+    }
+  }
+
+  try {
+    bootVisits();
+  } catch (err) {
+    /* the beacon is never worth an exception on a product page */
+  }
 })();

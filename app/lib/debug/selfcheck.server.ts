@@ -2061,6 +2061,116 @@ const CHECKS: CheckDef[] = [
     },
   },
   {
+    key: "design_facts",
+    label: "Design measurement facts",
+    category: "Data integrity",
+    remediation:
+      "The nightly design_facts_backfill job rebuilds the missing SubscribableOrder rows from the checkout.subscribable event feed; a gap of a day is normal. If the gap keeps growing after a night, the ORDERS_CREATE fact write is failing: check the server log for “[webhooks] design fact failed”.",
+    run: async (ctx) => {
+      // The take-rate denominator has two ledgers since v1.26.0: the
+      // checkout.subscribable event feed (the rollup's source) and the
+      // SubscribableOrder fact table (the Results tab's source). Both are
+      // written by ORDERS_CREATE for the same order set (one event per
+      // order id, one row per order id), so over the WHOLE history they
+      // must agree; facts falling behind means the Results tab is
+      // under-reporting orders while the analytics rollup is not. Whole
+      // history on purpose: the two sides do not share a clock (the event
+      // is stamped when the webhook lands, the row carries the order's
+      // processed_at, which an imported or API-created order may backdate
+      // by weeks), so any windowed comparison produces false gaps at the
+      // window edge. Seen coverage is reported for the recent rows only,
+      // where the extension version actually shows.
+      const since = hoursAgo(ctx.now, 30 * 24);
+      const [events, facts, recentFacts, recentSeen] = await Promise.all([
+        prisma.subscriberEvent.count({
+          where: { shopId: ctx.shop.id, type: "checkout.subscribable" },
+        }),
+        prisma.subscribableOrder.count({
+          where: { shopId: ctx.shop.id },
+        }),
+        prisma.subscribableOrder.count({
+          where: { shopId: ctx.shop.id, processedAt: { gte: since } },
+        }),
+        prisma.subscribableOrder.count({
+          where: {
+            shopId: ctx.shop.id,
+            processedAt: { gte: since },
+            designSource: "seen",
+          },
+        }),
+      ]);
+      const coverage =
+        recentFacts > 0
+          ? ` Seen coverage: ${Math.round((recentSeen / recentFacts) * 100)}% of the last 30 days' fact rows carry the widget's seen marker.`
+          : "";
+      if (facts < events) {
+        return {
+          status: "WARN",
+          detail: `${events - facts} subscribable order(s) have no design fact row (${events} event(s), ${facts} fact row(s) since install).${coverage}`,
+        };
+      }
+      return {
+        status: "PASS",
+        detail:
+          events === 0 && facts === 0
+            ? "No subscribable orders yet; nothing to reconcile."
+            : `${facts} design fact row(s) cover the ${events} subscribable order event(s) since install.${coverage}`,
+      };
+    },
+  },
+  {
+    key: "widget_visits",
+    label: "Widget visit beacon",
+    category: "Data integrity",
+    remediation:
+      "Orders carrying the widget's seen marker prove the buy-box renders, so visits should be arriving too. Check that the v1.27.0 extension is deployed (npm run deploy) and that the Cellexia app embed is enabled in the theme editor: theme-block-only installs get no visit tracking. Then open a product page and look for a request to /apps/cellexia-subs/w?e=view in the network tab; a 204 means the beacon works.",
+    run: async (ctx) => {
+      // The Results tab's conversion column divides orders by VISITS
+      // (WidgetVisitorDay, written by the storefront beacon since v1.27.0).
+      // The beacon has two silent failure modes the server cannot see from
+      // its own side: the app embed disabled in the theme (the embed JS is
+      // what sends it) and an old extension still deployed. Both leave the
+      // ledger empty while orders keep landing WITH the seen marker, and
+      // that is the signature checked here: exposure orders in the last 7
+      // days but no visit row in the same window. Not LIVE: nothing to
+      // expect (SETUP renders the widget hidden and the beacon is silent).
+      const live = (await ctx.launch()).mode === "LIVE";
+      if (!live) {
+        return {
+          status: "PASS",
+          detail:
+            "Store is in setup mode; the visit beacon only records on a live store.",
+        };
+      }
+      const since = hoursAgo(ctx.now, 7 * 24);
+      const [visits, exposureOrders] = await Promise.all([
+        prisma.widgetVisitorDay.count({
+          where: { shopId: ctx.shop.id, lastSeenAt: { gte: since } },
+        }),
+        prisma.subscribableOrder.count({
+          where: { shopId: ctx.shop.id, processedAt: { gte: since }, exposure: true },
+        }),
+      ]);
+      if (visits > 0) {
+        return {
+          status: "PASS",
+          detail: `${visits} visit row(s) recorded in the last 7 days.`,
+        };
+      }
+      if (exposureOrders === 0) {
+        return {
+          status: "PASS",
+          detail:
+            "No visits and no widget-exposed orders in the last 7 days; nothing to reconcile yet.",
+        };
+      }
+      return {
+        status: "WARN",
+        detail: `${exposureOrders} order(s) in the last 7 days carry the widget's seen marker but no visit was recorded: the beacon is not deployed, the app embed is disabled, or the request is blocked. Conversion per design cannot be computed until visits arrive.`,
+      };
+    },
+  },
+  {
     key: "open_alerts",
     label: "No unresolved critical alerts",
     category: "Data integrity",

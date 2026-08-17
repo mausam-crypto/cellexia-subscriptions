@@ -457,6 +457,59 @@ export const settingsSchemas = {
     })
     .default({ entries: {} }),
 
+  /**
+   * Design measurement (v1.26.0) — the knobs of the buy-box Results tab
+   * (app/routes/app.buy-box_.results.tsx), edited THERE, never from the
+   * generic Settings page. Consumed by app/lib/design-measurement/*:
+   *
+   * - startedAt: ISO date ("2026-09-01") from which readouts count orders by
+   *   default (null = all time). The merchant's "measurement began here"
+   *   marker; pre-launch test orders live before it.
+   * - excludeEmails: staff / test-buyer emails (lowercased at parse). An
+   *   order whose checkout email is listed is stamped `staff = true` on its
+   *   SubscribableOrder row and left out of every readout; the nightly
+   *   design_facts_backfill recomputes the flag over the last 90 days when
+   *   the list changes. The email itself is never stored on the fact row.
+   * - guardrailMaxOrderDropPct / guardrailMinOrdersPerWeek: the total-orders
+   *   guardrail (a design that lifts take rate by depressing checkouts is a
+   *   loss): a variant's mean weekly orders (weeks with at least
+   *   minOrders) more than maxDropPct below the reference over two or more
+   *   weeks is a breach. Merchant-editable per the v1.26.0 decision.
+   * - weeklySessions: optional product-page sessions per ISO week
+   *   ("2026-W35"), typed in from Shopify Analytics, so the Results tab can
+   *   show a conversion rate (orders ÷ sessions) next to the take rate.
+   *   Record keys stay permissive beyond the shape regex (a typo is a
+   *   harmless extra week, never a corrupted setting).
+   */
+  designMeasurement: z
+    .object({
+      startedAt: z.string().nullable().default(null),
+      excludeEmails: z
+        .array(z.string().trim().toLowerCase().max(254))
+        .max(200)
+        .default([]),
+      guardrailMaxOrderDropPct: z.number().int().min(0).max(90).default(10),
+      guardrailMinOrdersPerWeek: z
+        .number()
+        .int()
+        .min(0)
+        .max(100000)
+        .default(20),
+      weeklySessions: z
+        .record(
+          z.string().regex(/^\d{4}-W\d{2}$/),
+          z.number().int().min(0).max(100000000),
+        )
+        .default({}),
+    })
+    .default({
+      startedAt: null,
+      excludeEmails: [],
+      guardrailMaxOrderDropPct: 10,
+      guardrailMinOrdersPerWeek: 20,
+      weeklySessions: {},
+    }),
+
   /** Win-back for cancelled subscribers, timed to predicted empty date. */
   winback: z
     .object({

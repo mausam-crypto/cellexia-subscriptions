@@ -135,9 +135,9 @@ export const PRESET_META: Record<PresetKey, PresetMeta> = {
       "tap away as a quiet underlined link below the card (a compliance " +
       "guardrail that also protects conversion). Purely presentational: it " +
       "implies no extra perks or discounts. Demoting one-time is a real risk " +
-      "on cold traffic that never meant to subscribe — watch PDP conversion " +
-      "in Design performance against your baseline and restore the previous " +
-      "design from history in one click if it dips.",
+      "on cold traffic that never meant to subscribe — watch orders per week " +
+      "and take rate in the Results tab against your baseline and restore " +
+      "the previous design from history in one click if it dips.",
     conversionRisk: "medium",
     bestFor:
       "Replenishable heroes with warm traffic, where subscribing should " +

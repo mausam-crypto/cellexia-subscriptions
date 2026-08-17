@@ -692,6 +692,11 @@ export interface DesignPerformance {
  * the widget's hidden `_cellexia_design` property (payload {designKey, orderId}).
  * Grouping happens in JS because the key lives inside the JSON payload.
  * Resilient to zero data: empty rows, zero totals.
+ *
+ * Superseded by design-measurement/scoreboard (v1.26.0): the Buy box
+ * designer's Results tab reads take rate, kept rates and guardrails from
+ * SubscribableOrder facts instead, and the designer no longer calls this.
+ * Kept as a public helper (event-fed, dependency-free) for other callers.
  */
 export async function getDesignPerformance(
   shopId: string,

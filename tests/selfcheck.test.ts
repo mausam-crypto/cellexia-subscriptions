@@ -76,6 +76,11 @@ const mocks = vi.hoisted(() => {
     })),
     jobLockFindMany: vi.fn(async (): Promise<unknown[]> => []),
     subscriberEventCount: vi.fn(async (): Promise<number> => 0),
+    // design_facts (v1.26.0): the SubscribableOrder fact table the check
+    // reconciles against the checkout.subscribable event feed.
+    subscribableOrderCount: vi.fn(async (): Promise<number> => 0),
+    // widget_visits (v1.27.0): the WidgetVisitorDay ledger the beacon writes.
+    widgetVisitorDayCount: vi.fn(async (): Promise<number> => 0),
     // gift_promises fixture: a fully-aligned gift setup (cycle-2 + milestone
     // rules, an anniversary rule, a stocked pool) so the healthy run stays
     // healthy; tests that probe the check override these.
@@ -195,6 +200,8 @@ vi.mock("~/db.server", () => ({
     },
     jobLock: { findMany: mocks.jobLockFindMany },
     subscriberEvent: { count: mocks.subscriberEventCount },
+    subscribableOrder: { count: mocks.subscribableOrderCount },
+    widgetVisitorDay: { count: mocks.widgetVisitorDayCount },
     giftRule: { findMany: mocks.giftRuleFindMany },
   },
 }));
@@ -451,6 +458,8 @@ beforeEach(() => {
   mocks.alertUpdateMany.mockResolvedValue({ count: 1 });
   mocks.jobLockFindMany.mockResolvedValue([]);
   mocks.subscriberEventCount.mockResolvedValue(0);
+  mocks.subscribableOrderCount.mockResolvedValue(0);
+  mocks.widgetVisitorDayCount.mockResolvedValue(0);
   mocks.dunningSetting.value = {
     softRetryDays: [0, 3, 7, 14],
     paydayAlign: true,
@@ -509,6 +518,10 @@ describe("self-check registry", () => {
       "event_provenance",
       // v1.25.0: market visibility setting ⇄ storefront metafield.
       "widget_markets",
+      // v1.26.0: design measurement fact table ⇄ checkout.subscribable feed.
+      "design_facts",
+      // v1.27.0: visit beacon ledger vs widget-exposed orders.
+      "widget_visits",
     ]) {
       expect(SELF_CHECK_KEYS).toContain(key);
     }
@@ -1338,6 +1351,132 @@ describe("the comprehensive live-store checks (v1.22.0)", () => {
     const check = report.checks.find((c) => c.key === "event_provenance");
     expect(check?.status).toBe("WARN");
     expect(check?.detail).toContain("4 contract-scoped event(s)");
+  });
+
+  it("design_facts WARNs when fact rows lag the checkout.subscribable feed and PASSes when they cover it (v1.26.0)", async () => {
+    // subscriberEvent.count serves both event_provenance (orphans) and the
+    // design_facts feed count; discriminate on the where clause.
+    mocks.subscriberEventCount.mockImplementation(
+      async (args?: { where?: { type?: unknown } }) =>
+        args?.where?.type === "checkout.subscribable" ? 10 : 0,
+    );
+    // Facts: 6 rows in total, all recent, 3 of them with the seen marker.
+    mocks.subscribableOrderCount.mockImplementation(
+      async (args?: { where?: { designSource?: unknown } }) =>
+        args?.where?.designSource === "seen" ? 3 : 6,
+    );
+
+    let report = await runSelfCheck("cellexia.myshopify.com");
+    let check = report.checks.find((c) => c.key === "design_facts");
+    expect(check?.status).toBe("WARN");
+    expect(check?.category).toBe("Data integrity");
+    expect(check?.detail).toContain("4 subscribable order(s)");
+    expect(check?.detail).toContain("Seen coverage: 50%");
+    expect(check?.remediation).toContain("design_facts_backfill");
+
+    // Caught up: facts cover the feed → PASS with the coverage note.
+    mocks.subscribableOrderCount.mockImplementation(
+      async (args?: { where?: { designSource?: unknown } }) =>
+        args?.where?.designSource === "seen" ? 8 : 10,
+    );
+    report = await runSelfCheck("cellexia.myshopify.com");
+    check = report.checks.find((c) => c.key === "design_facts");
+    expect(check?.status).toBe("PASS");
+    expect(check?.detail).toContain("10 design fact row(s)");
+    expect(check?.detail).toContain("Seen coverage: 80%");
+  });
+
+  it("design_facts compares both ledgers over the whole history, so a backdated processed_at is not a false gap", async () => {
+    // 10 subscribable orders since install; every one has a fact row, but
+    // 5 of those rows carry a processed_at older than 30 days (imported /
+    // API-created orders backdate it) while their events were logged this
+    // month. Same-window counting (events by createdAt vs facts by
+    // processedAt) reported a persistent 5-order gap here.
+    mocks.subscriberEventCount.mockImplementation(
+      async (args?: { where?: { type?: unknown; createdAt?: unknown } }) => {
+        if (args?.where?.type !== "checkout.subscribable") return 0;
+        return args.where.createdAt ? 10 : 10;
+      },
+    );
+    mocks.subscribableOrderCount.mockImplementation(
+      async (args?: { where?: { designSource?: unknown; processedAt?: unknown } }) => {
+        if (args?.where?.designSource === "seen") return 4;
+        return args?.where?.processedAt ? 5 : 10;
+      },
+    );
+
+    const report = await runSelfCheck("cellexia.myshopify.com");
+    const check = report.checks.find((c) => c.key === "design_facts");
+    expect(check?.status).toBe("PASS");
+    expect(check?.detail).toContain("10 design fact row(s) cover the 10");
+    // Coverage is still read over the recent rows: 4 seen of 5 recent.
+    expect(check?.detail).toContain("Seen coverage: 80%");
+    // Same clock on both sides: the reconciled counts carry no time window.
+    const feedCount = (mocks.subscriberEventCount.mock.calls as unknown[][])
+      .map((c) => c[0] as { where: Record<string, unknown> })
+      .find((c) => c.where.type === "checkout.subscribable");
+    expect(feedCount?.where).not.toHaveProperty("createdAt");
+    const factCounts = (mocks.subscribableOrderCount.mock.calls as unknown[][]).map(
+      (c) => c[0] as { where: Record<string, unknown> },
+    );
+    expect(factCounts.some((c) => !("processedAt" in c.where) && !("designSource" in c.where))).toBe(true);
+  });
+
+  it("widget_visits WARNs when LIVE with widget-exposed orders but no visit row in 7 days; PASSes otherwise (v1.27.0)", async () => {
+    // Exposure orders in the last 7 days: subscribableOrder.count with the
+    // exposure filter (design_facts' counts carry no exposure key).
+    mocks.subscribableOrderCount.mockImplementation(
+      async (args?: { where?: { exposure?: unknown; processedAt?: unknown } }) =>
+        args?.where?.exposure === true ? 4 : 0,
+    );
+    mocks.widgetVisitorDayCount.mockResolvedValue(0);
+
+    let report = await runSelfCheck("cellexia.myshopify.com");
+    let check = report.checks.find((c) => c.key === "widget_visits");
+    expect(check?.status).toBe("WARN");
+    expect(check?.category).toBe("Data integrity");
+    expect(check?.detail).toContain("4 order(s) in the last 7 days carry the widget's seen marker");
+    expect(check?.remediation).toContain("app embed");
+    expect(check?.remediation).toContain("/apps/cellexia-subs/w?e=view");
+    // The visit count is windowed on lastSeenAt (7 days), the order count on
+    // processedAt with exposure: true.
+    const visitQuery = (mocks.widgetVisitorDayCount.mock.calls[0] as unknown[])[0] as {
+      where: { shopId: string; lastSeenAt: { gte: Date } };
+    };
+    expect(visitQuery.where.shopId).toBe("shop_1");
+    expect(visitQuery.where.lastSeenAt.gte).toBeInstanceOf(Date);
+    const exposureQuery = (mocks.subscribableOrderCount.mock.calls as unknown[][])
+      .map((c) => c[0] as { where: Record<string, unknown> })
+      .find((c) => c.where.exposure === true);
+    expect(exposureQuery?.where.processedAt).toEqual({ gte: expect.any(Date) });
+
+    // Visits arriving: PASS with the count.
+    mocks.widgetVisitorDayCount.mockResolvedValue(57);
+    report = await runSelfCheck("cellexia.myshopify.com");
+    check = report.checks.find((c) => c.key === "widget_visits");
+    expect(check?.status).toBe("PASS");
+    expect(check?.detail).toContain("57 visit row(s)");
+
+    // No visits but no exposed orders either: nothing to reconcile, PASS.
+    mocks.widgetVisitorDayCount.mockResolvedValue(0);
+    mocks.subscribableOrderCount.mockResolvedValue(0);
+    report = await runSelfCheck("cellexia.myshopify.com");
+    check = report.checks.find((c) => c.key === "widget_visits");
+    expect(check?.status).toBe("PASS");
+    expect(check?.detail).toContain("nothing to reconcile");
+  });
+
+  it("widget_visits PASSes in SETUP mode without reading the ledger (the beacon only records on a live store)", async () => {
+    mocks.launchMode.value = "SETUP";
+    mocks.subscribableOrderCount.mockImplementation(
+      async (args?: { where?: { exposure?: unknown } }) =>
+        args?.where?.exposure === true ? 4 : 0,
+    );
+    const report = await runSelfCheck("cellexia.myshopify.com");
+    const check = report.checks.find((c) => c.key === "widget_visits");
+    expect(check?.status).toBe("PASS");
+    expect(check?.detail).toContain("setup mode");
+    expect(mocks.widgetVisitorDayCount).not.toHaveBeenCalled();
   });
 });
 

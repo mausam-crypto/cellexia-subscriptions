@@ -15,6 +15,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  *  - design attribution — `_cellexia_design` line-property extraction from both
  *    REST property shapes, and the ORDERS_CREATE handler logging
  *    widget.design_attributed
+ *  - design measurement (v1.26.0) — `_cellexia_seen` extraction
+ *    (seenPropertyOf), the SubscribableOrder fact write riding beside the
+ *    attribution feed (call shape, redelivery repair, containment, the
+ *    renewal/test/non-subscribable exclusions) and `seen` in the
+ *    checkout.subscribable payload
  *
  * The v1.2.0 app-embed additions (layout.showFrequency, placement, selector
  * sanitization, v1.1.0 backward-compat, brand-token defaults) are covered in
@@ -47,6 +52,30 @@ const mocks = vi.hoisted(() => ({
   subscriptionContractFindFirst: vi.fn(
     async (_args?: unknown): Promise<unknown> => null,
   ),
+  // v1.26.0 design measurement seam: ORDERS_CREATE writes one
+  // SubscribableOrder fact per subscribable order (lazy import, contained)
+  // and links it to an existing contract mirror. Mocked so the suite stays
+  // DB-free; the call shape is asserted below.
+  recordSubscribableOrder: vi.fn(
+    async (_input: unknown): Promise<unknown> => ({
+      designKey: null,
+      designPreselect: null,
+      designSource: "none",
+      created: true,
+    }),
+  ),
+  linkContractDesign: vi.fn(
+    async (_shopId: string, _contractId: string): Promise<unknown> => ({
+      stamped: false,
+      designKey: null,
+      designSource: null,
+    }),
+  ),
+}));
+
+vi.mock("~/lib/design-measurement/facts.server", () => ({
+  recordSubscribableOrder: mocks.recordSubscribableOrder,
+  linkContractDesign: mocks.linkContractDesign,
 }));
 
 vi.mock("~/db.server", () => ({
@@ -101,7 +130,9 @@ import {
   type WidgetDesignConfig,
 } from "~/lib/widget/presets";
 import {
+  designPropertyOf,
   lineProperty,
+  seenPropertyOf,
   webhookHandlers,
 } from "~/lib/webhooks/handlers.server";
 
@@ -873,6 +904,39 @@ describe("lineProperty (_cellexia_design extraction)", () => {
   });
 });
 
+describe("seenPropertyOf (_cellexia_seen extraction, v1.26.0)", () => {
+  it("reads the array-of-{name,value} REST shape and the flattened shape", () => {
+    expect(
+      seenPropertyOf({
+        properties: [{ name: "_cellexia_seen", value: "subscription_max|s" }],
+      }),
+    ).toBe("subscription_max|s");
+    expect(seenPropertyOf({ properties: { _cellexia_seen: "toggle|o" } })).toBe(
+      "toggle|o",
+    );
+  });
+
+  it("returns the RAW value — parsing/sanitizing is the fact writer's job", () => {
+    expect(seenPropertyOf({ properties: { _cellexia_seen: "Weird Value" } })).toBe(
+      "Weird Value",
+    );
+  });
+
+  it("returns null when absent or empty, and never reads the design property", () => {
+    expect(seenPropertyOf({})).toBeNull();
+    expect(seenPropertyOf({ properties: [] })).toBeNull();
+    expect(seenPropertyOf({ properties: { _cellexia_seen: "" } })).toBeNull();
+    expect(
+      seenPropertyOf({ properties: [{ name: "_cellexia_design", value: "toggle" }] }),
+    ).toBeNull();
+    // …and the design reader never reads the seen marker either: the two
+    // properties keep separate semantics (seen = exposure, design = sub add).
+    expect(
+      designPropertyOf({ properties: [{ name: "_cellexia_seen", value: "toggle|s" }] }),
+    ).toBeNull();
+  });
+});
+
 describe("ORDERS_CREATE design attribution", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -883,6 +947,17 @@ describe("ORDERS_CREATE design attribution", () => {
     mocks.sellingPlanConfigFindMany.mockResolvedValue([]);
     mocks.subscriberEventFindFirst.mockResolvedValue(null);
     mocks.subscriptionContractFindFirst.mockResolvedValue(null);
+    mocks.recordSubscribableOrder.mockResolvedValue({
+      designKey: null,
+      designPreselect: null,
+      designSource: "none",
+      created: true,
+    });
+    mocks.linkContractDesign.mockResolvedValue({
+      stamped: false,
+      designKey: null,
+      designSource: null,
+    });
   });
 
   function orderPayload(lineItems: unknown[]): Record<string, unknown> {
@@ -1101,5 +1176,257 @@ describe("ORDERS_CREATE design attribution", () => {
     const types = mocks.logEvent.mock.calls.map((call) => call[0].type);
     expect(types).toContain("widget.design_attributed");
     expect(types).toContain("checkout.subscribable");
+  });
+
+  // ── v1.26.0: the design fact rides beside the attribution feed ────────────
+
+  function recordedFact(): Record<string, unknown> {
+    expect(mocks.recordSubscribableOrder).toHaveBeenCalledTimes(1);
+    return mocks.recordSubscribableOrder.mock.calls[0][0] as Record<string, unknown>;
+  }
+
+  it("records a SubscribableOrder fact with parsed line props (design + seen), isOurProduct and hasSellingPlanLine", async () => {
+    mocks.sellingPlanConfigFindMany.mockResolvedValue([
+      { productIds: ["gid://shopify/Product/111"] },
+    ]);
+    await run(
+      orderPayload([
+        {
+          product_id: 111,
+          variant_id: 1111,
+          quantity: 1,
+          selling_plan_id: 777,
+          properties: [
+            { name: "_cellexia_design", value: "value_stack" },
+            { name: "_cellexia_seen", value: "value_stack|s" },
+          ],
+        },
+        {
+          product_id: 999,
+          variant_id: 9999,
+          quantity: 3,
+          properties: [],
+        },
+      ]),
+    );
+    const fact = recordedFact();
+    expect(fact).toMatchObject({
+      shopId: "shop_1",
+      orderId: "gid://shopify/Order/999001",
+      orderName: "#1042",
+      orderEmail: "buyer@cellexia.example",
+      hasSellingPlanLine: true,
+      promo: false,
+      units: 4,
+      // No addresses / currency / capture device on this minimal payload:
+      // honest nulls, never guesses.
+      countryCode: null,
+      currencyCode: null,
+      deviceType: null,
+    });
+    const lines = fact.lines as Array<Record<string, unknown>>;
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toMatchObject({
+      variantId: "gid://shopify/ProductVariant/1111",
+      productId: "gid://shopify/Product/111",
+      sellingPlanId: "777",
+      designProp: "value_stack",
+      seenProp: "value_stack|s",
+      isOurProduct: true,
+    });
+    expect(lines[1]).toMatchObject({
+      productId: "gid://shopify/Product/999",
+      sellingPlanId: null,
+      designProp: null,
+      seenProp: null,
+      isOurProduct: false,
+    });
+  });
+
+  /**
+   * The take-rate denominator itself: a one-time-only order of OUR product
+   * (no plan marker on any line, subscribable only through the productIds
+   * fallback) must still write a fact, with hasSellingPlanLine false. Without
+   * this case the handler's design-fact guard could be tightened from
+   * `if (orderGid)` to `if (orderGid && hasSellingPlanLine)` and every case in
+   * this file would stay green while every one-time order vanished from
+   * SubscribableOrder (take rate reading 100% for every design). Here the
+   * writer is never called under that mutation, so the case fails.
+   */
+  it("records a fact for a one-time-only order of our product (no plan marker): hasSellingPlanLine false, seen parsed, isOurProduct true", async () => {
+    mocks.sellingPlanConfigFindMany.mockResolvedValue([
+      { productIds: ["gid://shopify/Product/111"] },
+    ]);
+    await run(
+      orderPayload([
+        {
+          product_id: 111,
+          variant_id: 1111,
+          quantity: 1,
+          properties: [{ name: "_cellexia_seen", value: "classic|o" }],
+        },
+      ]),
+    );
+    const fact = recordedFact();
+    expect(fact).toMatchObject({
+      shopId: "shop_1",
+      orderId: "gid://shopify/Order/999001",
+      hasSellingPlanLine: false,
+      promo: false,
+      units: 1,
+    });
+    const lines = fact.lines as Array<Record<string, unknown>>;
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({
+      variantId: "gid://shopify/ProductVariant/1111",
+      productId: "gid://shopify/Product/111",
+      sellingPlanId: null,
+      designProp: null,
+      seenProp: "classic|o",
+      isOurProduct: true,
+    });
+    // The denominator event agrees (one-time, seen carried), and the
+    // exposure marker alone never enters the design feed.
+    const checkout = mocks.logEvent.mock.calls
+      .map((call) => call[0])
+      .find((e) => e.type === "checkout.subscribable") as
+      | { payload: Record<string, unknown> }
+      | undefined;
+    expect(checkout?.payload).toMatchObject({
+      hasSellingPlanLine: false,
+      designKeys: [],
+      seen: ["classic|o"],
+    });
+    expect(attributedEvents()).toHaveLength(0);
+  });
+
+  it("the seen markers land in the checkout.subscribable payload (distinct, sorted) — one-time lines included", async () => {
+    mocks.sellingPlanConfigFindMany.mockResolvedValue([
+      { productIds: ["gid://shopify/Product/111"] },
+    ]);
+    await run(
+      orderPayload([
+        {
+          product_id: 111,
+          selling_plan_id: 777,
+          properties: [
+            { name: "_cellexia_design", value: "toggle" },
+            { name: "_cellexia_seen", value: "toggle|s" },
+          ],
+        },
+        // One-time add of our product: seen only, no design prop.
+        { product_id: 111, properties: { _cellexia_seen: "toggle|s" } },
+        { product_id: 111, properties: [{ name: "_cellexia_seen", value: "classic|o" }] },
+      ]),
+    );
+    const checkout = mocks.logEvent.mock.calls
+      .map((call) => call[0])
+      .find((e) => e.type === "checkout.subscribable") as
+      | { payload: Record<string, unknown> }
+      | undefined;
+    expect(checkout?.payload.seen).toEqual(["classic|o", "toggle|s"]);
+    // The exposure marker alone never enters the DESIGN feed: seen ≠ sub add.
+    expect(checkout?.payload.designKeys).toEqual(["toggle"]);
+    expect(attributedEvents()).toHaveLength(1);
+  });
+
+  it("still writes the fact on a redelivery where checkout.subscribable already exists (idempotent repair), without re-logging", async () => {
+    mocks.subscriberEventFindFirst.mockResolvedValue({ id: "evt_1" });
+    await run(
+      orderPayload([
+        {
+          product_id: 111,
+          selling_plan_id: 777,
+          properties: [{ name: "_cellexia_design", value: "value_stack" }],
+        },
+      ]),
+    );
+    expect(mocks.logEvent).not.toHaveBeenCalled();
+    expect(mocks.recordSubscribableOrder).toHaveBeenCalledTimes(1);
+  });
+
+  it("a throwing recordSubscribableOrder never fails the webhook", async () => {
+    mocks.recordSubscribableOrder.mockRejectedValue(new Error("facts down"));
+    await expect(
+      run(
+        orderPayload([
+          {
+            product_id: 111,
+            selling_plan_id: 777,
+            properties: [{ name: "_cellexia_design", value: "value_stack" }],
+          },
+        ]),
+      ),
+    ).resolves.toBeUndefined();
+    // The attribution + denominator feeds still landed.
+    const types = mocks.logEvent.mock.calls.map((call) => call[0].type);
+    expect(types).toContain("widget.design_attributed");
+    expect(types).toContain("checkout.subscribable");
+  });
+
+  it("links the fact to an already-mirrored contract; a rejected link is contained", async () => {
+    mocks.subscriptionContractFindFirst.mockResolvedValue({
+      id: "c_42",
+      ownership: "OURS",
+      acqRaw: { existing: true },
+      originOrderId: "gid://shopify/Order/999001",
+    });
+    mocks.linkContractDesign.mockRejectedValue(new Error("link down"));
+    await expect(
+      run(
+        orderPayload([
+          {
+            product_id: 111,
+            selling_plan_id: 777,
+            properties: [{ name: "_cellexia_design", value: "value_stack" }],
+          },
+        ]),
+      ),
+    ).resolves.toBeUndefined();
+    expect(mocks.linkContractDesign).toHaveBeenCalledWith("shop_1", "c_42");
+  });
+
+  it("renewal orders never record a fact", async () => {
+    await run({
+      ...orderPayload([
+        {
+          product_id: 111,
+          selling_plan_id: 777,
+          properties: [{ name: "_cellexia_seen", value: "value_stack|s" }],
+        },
+      ]),
+      source_name: "subscription_contract",
+    });
+    expect(mocks.recordSubscribableOrder).not.toHaveBeenCalled();
+  });
+
+  it("test orders never record a fact", async () => {
+    await run({
+      ...orderPayload([
+        {
+          product_id: 111,
+          selling_plan_id: 777,
+          properties: [{ name: "_cellexia_seen", value: "value_stack|s" }],
+        },
+      ]),
+      test: true,
+    });
+    expect(mocks.recordSubscribableOrder).not.toHaveBeenCalled();
+  });
+
+  it("non-subscribable orders never record a fact, even when a line carries a seen marker", async () => {
+    // No marker, product not in any active SellingPlanConfig: the widget could
+    // not have been the one stamping this (or the config was retired) — the
+    // fact population is subscribable orders only.
+    await run(
+      orderPayload([
+        {
+          product_id: 111,
+          properties: [{ name: "_cellexia_seen", value: "value_stack|s" }],
+        },
+      ]),
+    );
+    expect(mocks.recordSubscribableOrder).not.toHaveBeenCalled();
+    expect(mocks.logEvent).not.toHaveBeenCalled();
   });
 });

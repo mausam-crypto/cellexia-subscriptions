@@ -837,6 +837,8 @@ describe("migration 0003 backfills fail-SAFE and stays additive", () => {
       "0022_billing_attempt_created_at",
       "0023_customer_tag_state",
       "0024_dynamic_gifts_experiments",
+      "0025_design_measurement",
+      "0026_widget_visits",
     ]);
   });
 });
@@ -1704,6 +1706,124 @@ describe("migration 0024 (dynamic gifts + experiments) stays additive and leaves
     expect(sql).not.toMatch(/ownership/i);
     // SET DEFAULT (altering an EXISTING column's default) stays banned; the
     // new columns' own inline DEFAULTs above are not that.
+    expect(sql).not.toMatch(/ALTER\s+COLUMN[^;]*SET DEFAULT/i);
+  });
+});
+
+describe("migration 0025 (design measurement) stays additive and leaves ownership alone", () => {
+  const sql = read("prisma/migrations/0025_design_measurement/migration.sql")
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("is additive only — no destructive verb anywhere in it", () => {
+    for (const verb of [
+      /\bDROP\b/i,
+      /\bTRUNCATE\b/i,
+      /\bDELETE\s+FROM\b/i,
+      /\bUPDATE\s+"/i,
+      /\bRENAME\b/i,
+      /\bALTER\s+TYPE\b/i,
+      /\bALTER\s+COLUMN\s+"\w+"\s+TYPE\b/i,
+    ]) {
+      expect(sql, String(verb)).not.toMatch(verb);
+    }
+  });
+
+  it("adds exactly six NULLABLE columns — null IS the pre-0025 behavior (design unknown / no label)", () => {
+    // Every column is nullable with no default: v1.25 code never reads them,
+    // and a null design on an existing subscriber is the honest "unknown"
+    // bucket the segment dimension exposes, never a fabricated attribution.
+    const adds = sql.match(/ADD COLUMN [^,;]+/g) ?? [];
+    expect(adds).toHaveLength(6);
+    for (const column of [
+      "originDesignKey",
+      "originDesignPreselect",
+      "originDesignRevisionId",
+      "originDesignSource",
+    ]) {
+      expect(sql).toMatch(
+        new RegExp(`ALTER TABLE "SubscriptionContract" ADD COLUMN "${column}" TEXT;`),
+      );
+    }
+    expect(sql).toMatch(
+      /ALTER TABLE "SubscriptionContract" ADD COLUMN "originDesignStampedAt" TIMESTAMP\(3\);/,
+    );
+    expect(sql).toMatch(/ALTER TABLE "WidgetDesignRevision" ADD COLUMN "label" TEXT;/);
+    for (const add of adds) {
+      expect(add, add).not.toMatch(/NOT NULL|DEFAULT/i);
+    }
+  });
+
+  it("creates exactly two brand-new tables (invisible to the previous release)", () => {
+    const creates = sql.match(/CREATE TABLE [^;]+;/g) ?? [];
+    expect(creates).toHaveLength(2);
+    expect(creates[0]).toContain('CREATE TABLE "SubscribableOrder"');
+    expect(creates[1]).toContain('CREATE TABLE "MarketCountryMap"');
+  });
+
+  it("never touches the ownership column or any existing default", () => {
+    // "ownership" IS a column name inside the NEW SubscribableOrder table
+    // (order-level selling-plan ownership bucket) — assert the CONTRACT
+    // ownership column is untouched: no ALTER on it, no UPDATE, and the only
+    // occurrences live inside the CREATE TABLE "SubscribableOrder" body.
+    expect(sql).not.toMatch(/ALTER\s+TABLE\s+"SubscriptionContract"[^;]*ownership/i);
+    const outsideCreate = sql.replace(/CREATE TABLE [^;]+;/g, "");
+    expect(outsideCreate).not.toMatch(/ownership/i);
+    expect(sql).not.toMatch(/ALTER\s+COLUMN[^;]*SET DEFAULT/i);
+  });
+});
+
+describe("migration 0026 (widget visits) stays additive and leaves ownership alone", () => {
+  const sql = read("prisma/migrations/0026_widget_visits/migration.sql")
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("is additive only — no destructive verb anywhere in it", () => {
+    for (const verb of [
+      /\bDROP\b/i,
+      /\bTRUNCATE\b/i,
+      /\bDELETE\s+FROM\b/i,
+      /\bUPDATE\s+"/i,
+      /\bRENAME\b/i,
+      /\bALTER\s+TYPE\b/i,
+      /\bALTER\s+COLUMN\s+"\w+"\s+TYPE\b/i,
+    ]) {
+      expect(sql, String(verb)).not.toMatch(verb);
+    }
+  });
+
+  it("creates exactly ONE brand-new table, WidgetVisitorDay, and alters nothing that exists", () => {
+    // The visit ledger is invisible to v1.26 code: no existing table gains
+    // or loses a column, so a server rollback leaves the rows in place,
+    // unread, and the migration can never touch a contract row.
+    const creates = sql.match(/CREATE TABLE [^;]+;/g) ?? [];
+    expect(creates).toHaveLength(1);
+    expect(creates[0]).toContain('CREATE TABLE "WidgetVisitorDay"');
+    expect(sql).not.toMatch(/\bALTER\s+TABLE\b/i);
+    // The unique key the beacon upserts on, and the read indexes: day range
+    // (summary + presence), design × day, and (shopId, lastSeenAt) so the
+    // scoreboard's "last visit" top-1 and the self-check's "seen since"
+    // count never sort the shop's whole ledger.
+    expect(sql).toMatch(
+      /CREATE UNIQUE INDEX "WidgetVisitorDay_shopId_day_vid_designKey_designPreselect_key"/,
+    );
+    expect(sql).toMatch(/CREATE INDEX "WidgetVisitorDay_shopId_day_idx"/);
+    expect(sql).toMatch(/CREATE INDEX "WidgetVisitorDay_shopId_designKey_day_idx"/);
+    expect(sql).toMatch(
+      /CREATE INDEX "WidgetVisitorDay_shopId_lastSeenAt_idx" ON "WidgetVisitorDay"\("shopId", "lastSeenAt"\)/,
+    );
+    // Every index the migration creates lives on the new table: an index on
+    // an existing table would take a lock on rows v1.26 code is serving.
+    const indexes = sql.match(/CREATE (?:UNIQUE )?INDEX [^;]+;/g) ?? [];
+    expect(indexes).toHaveLength(4);
+    for (const idx of indexes) expect(idx).toMatch(/ ON "WidgetVisitorDay"\(/);
+  });
+
+  it("never mentions ownership at all — visits are anonymous rows with no contract link", () => {
+    expect(sql).not.toMatch(/ownership/i);
+    expect(sql).not.toMatch(/SubscriptionContract/);
     expect(sql).not.toMatch(/ALTER\s+COLUMN[^;]*SET DEFAULT/i);
   });
 });

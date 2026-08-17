@@ -20,7 +20,7 @@ Subscriptions) unless a shell command is shown.
    90-day MRR trend, the 12-week new-vs-churned chart, the forecast teaser
    (with its accuracy grade chip) and the top open failed payments.
 2. **Debug** — the self-check verdict chip should read **Healthy**. The same
-   39 checks re-run automatically every 30 minutes (`selfcheck_run`, also in
+   41 checks re-run automatically every 30 minutes (`selfcheck_run`, also in
    setup mode); a **Broken** verdict raises one CRITICAL `SELF_CHECK_FAILED`
    alert (emailed to Settings → alerts → `emailTo`) and every failing row on
    the page carries a named fix. The alert auto-resolves when a later run
@@ -32,7 +32,12 @@ Subscriptions) unless a shell command is shown.
    break on the deployed store. v1.24.0 adds `gift_promises`, which WARNs
    when your lifecycle/cancel settings promise gifts that no active rule or
    stocked pool backs (see §21) — the engines suppress such sends silently,
-   so this check is where a promise-to-no-one becomes visible.
+   so this check is where a promise-to-no-one becomes visible. v1.26.0 adds
+   `design_facts`, which WARNs when the Results tab's fact table lags the
+   order feed (see §15, "Running a design test", for what to do). v1.27.0
+   adds `widget_visits`, which WARNs when a live store keeps receiving
+   orders that saw the buy box while the storefront visit beacon records
+   nothing (extension not deployed or app embed disabled; see §15).
 3. **Alerts** — unresolved alerts (`BILLING_RUN_FAILED`, `WEBHOOK_FAILURES`,
    `ORIGIN_BACKFILL_FAILURES`, `STUCK_CONTRACTS`, `FAILURE_SPIKE`,
    `CHURN_SPIKE`, `FAST_SHIPPING_SKIPS`, `STOCKOUT_RENEWALS`,
@@ -227,7 +232,14 @@ records receipts:
   v1.5.0 this also erases every acquisition field (`acq*` columns, the
   `acqRaw` bundle and the `acquisition.captured` event payloads — see
   [DATA_FOUNDATION.md](./DATA_FOUNDATION.md)); the origin-order *money*
-  fields are retained (financial records, no personal data).
+  fields are retained (financial records, no personal data). Since v1.26.0
+  the subscriber's buy-box design stamp (`originDesign*`: which design and
+  preselect acquired them) is also retained on purpose: it is a fact about
+  the checkout, not about the person, and the merchant decided the design
+  readouts must stay whole (DATA_FOUNDATION.md Part 4). The
+  `SubscribableOrder` fact table holds no personal data at all, and neither
+  does the v1.27.0 visit ledger `WidgetVisitorDay` (a random browser-local
+  visitor id, no cookie, no IP, no user agent; nothing to redact).
 - `shop/redact` → arrives 48h after uninstall; wipes shop data.
 
 Manual GDPR requests (email/DSAR) about a subscriber: use Shopify admin's
@@ -262,7 +274,7 @@ scheduler liveness (last job tick); it returns non-200 when a subsystem is down.
 
 The admin **Debug** page is the wide companion to this endpoint: where
 `/api/health` answers "is the process alive" for an external monitor, the
-Debug self-check probes 39 feature-level facts on the live store (billing
+Debug self-check probes 40 feature-level facts on the live store (billing
 pipeline shapes, dunning cases, the portal fetched through the real app
 proxy, webhook delivery evidence, granted API scopes, secrets, Klaviyo
 outbox, settings integrity, gift-promise configuration) every 30 minutes and
@@ -477,6 +489,193 @@ history like any other knob). Operational notes:
   running its own preset reports under that preset's key on the performance
   card — that is what makes the one-market rollout discipline in
   [OFFER_PLAYBOOK.md §9](./OFFER_PLAYBOOK.md#subscription-max) measurable.
+  Since v1.26.0 the performance card is gone and the same per-design reading,
+  now with a real denominator, lives on the designer's **Results** tab (next
+  subsection); the widget's `_cellexia_seen` property carries the resolved
+  preset too, on one-time adds as well, and the Results tab has a Market
+  select.
+
+**Running a design test (v1.26.0, Buy box designer → Results; visits and
+conversion since v1.27.0).** The Results tab reads the store's own orders:
+every subscribable order becomes one fact row with the design the shopper
+saw, whether subscription was preselected, the market, and whether the order
+started a subscription. Since v1.27.0 it also reads the store's own
+**visits**: the buy box itself reports, once per visitor per day per design
+and preselected option, that it was really on screen (half visible for a
+full second), that the shopper touched it, and that our product was added
+to the cart. Nothing else is needed, but two things make it more useful and
+both live under the tab's **Guardrails and settings** card: your staff and
+test-buyer emails (their orders are left out of every number) and the
+measurement start date (orders before it are ignored by default). One
+requirement for visits: the **Cellexia buy box app embed must be enabled**
+in the theme editor (Online Store → Themes → Customize → App embeds). The
+visit beacon runs from the embed script; a theme that only uses the app
+block still stamps its orders and gets take rate per design, but records
+no visits and its conversion columns read "no visits yet". How to run a
+test so the numbers mean something:
+
+1. **Change one thing at a time.** A preset switch is one change; switching
+   preselect (Behavior tab → Preselected option) is a second one.
+   The tab tracks preselect as its own variable, so "subscription max with
+   subscription preselected" and "subscription max with one-time preselected"
+   are two rows, not one; do not change both in the same week.
+2. **Run whole weeks**, Monday to Sunday, at least one full week and better
+   two, covering weekends and any scheduled email sends. The tab counts in
+   ISO weeks in the shop timezone; a partial week never counts for
+   guardrails.
+3. **Same design in every market during the test.** Per-market presets are
+   still supported and the tab has a Market select, but a test that runs one
+   design in one market and another elsewhere is a comparison of markets, not
+   of designs. Set the Markets card rows to "Default (use main design)" while
+   testing, or read one market at a time.
+4. **Name the design when you publish** (the optional "Name this design"
+   field in the publish dialog). The name appears in the revision history,
+   in the design calendar and on the Results rows, so a period reads as
+   "Test 2: toggle, sub preselected" instead of a preset key and a date.
+5. **Enter staff emails and the start date** under Guardrails and settings
+   and save; the toast confirms. Adding an email later is fine: the save
+   re-flags the existing orders since the start date right away, and the
+   nightly job repeats it.
+6. **Read the tab in this order.** First the **guardrail** verdict per design
+   against the design with the most orders (the guardrail baseline, fixed:
+   the "Compare against" select does not move it). Since v1.27.0 the
+   guardrail card has a **Basis** column: once both designs have visits in
+   two or more full weeks it judges **weekly conversion** (orders per 100
+   visits), which is fair even when the designs did not get the same
+   traffic; on that basis a full week with visits and zero orders counts as
+   zero conversion rather than being skipped, because that is exactly the
+   collapse the guardrail is for; until then it judges raw weekly orders, as
+   before. A breach means the design is costing orders, so revert or
+   investigate before reading anything else. Then **take rate** (subscribed orders divided by
+   all orders that saw the buy box), with the sample grade next to it: below
+   30 orders it says too early, below 200 direction only, from 200 usable; a
+   10 point take-rate difference needs about 300 orders per design, a 5
+   point difference about 1,100. Then **kept 30 / 60 / 90** (of the
+   subscribers whose order is old enough, the share still active at that
+   age; "not yet" means no order is old enough). Then **LTGP per
+   subscriber** once cohorts are mature (3 and 6 months). A higher take rate
+   that does not keep its subscribers is not a win.
+7. **Visits and conversion (v1.27.0).** Four columns sit next to take rate:
+   - **Visits**: visitors who saw this design, counted once per day each
+     (a person returning the next day counts again), with the share of
+     those visitors who added our product to the cart in brackets. Visits
+     are joined
+     to orders on the same design and preselect stamp, so a design that
+     only ran in one market is compared on its own traffic.
+   - **Conversion (orders per 100 visits)** and **Subscription conversion
+     (per 100 visits)**: orders, and subscription orders, per 100 visits of
+     the same design, shown with two decimals. Conversion moves in fractions
+     of a point, so it needs visits in the thousands per design before a
+     difference means anything. **They only count orders placed on days
+     with recorded visits**: the beacon usually starts after the first
+     order, and dividing a whole range of orders by a few days of visits
+     would read far too high. When that window starts later than the range,
+     the cell carries a second line, "N counted since <date>"; the Orders
+     column still counts the whole range, so do not read the two over the
+     same days. Take rate and kept rates are untouched by this.
+   - **Kept subscribers per 100 visits (30d)**: subscribers still active
+     after 30 days, per 100 visits from days old enough for that horizon
+     (both sides mature by whole days, so the orders of a day enter the
+     numerator on the same day its visits enter the denominator). It
+     multiplies conversion, take rate and the 30-day kept rate into one
+     number (how many lasting subscribers each 100 visitors turned into) and
+     is the number to decide on once it reads a value for both designs;
+     "not yet" means no visit day is 30 days old yet.
+   - What the words mean: "no visits yet" in every row means the store has
+     recorded no visits at all in this range (extension not deployed, or app
+     embed disabled; the banner "Visits are not recorded yet" above the
+     table says so); the banner **"No visits in this selection"** means the
+     store does record visits but none matched the market and range chosen
+     above (a market added after the last visit-to-market refresh: its
+     visits are matched at the next nightly `design_facts_backfill`, or
+     read it without the market filter meanwhile), and its cells read "no
+     visits"; "not available for this view" means visits cannot be attached
+     to that row (visits attach per design and preselected option; switch
+     Group by to "Design and preselected option"); "no visits" on one row
+     while others have numbers means the beacon recorded visits, just none
+     with that stamp.
+   - The **Compare against the reference** card puts each other design
+     against the design picked under **Compare against** above the table
+     (by default the design with the most orders); the same pick drives the
+     "Chance it beats the reference" column, so the two never disagree about
+     a pair. It shows the difference in points for conversion, subscription
+     conversion, take rate, kept 30d and kept subscribers per 100 visits,
+     plus "N% chance better" for conversion, take rate and kept 30d (50% is
+     a coin flip; above 90% is convincing). Both the column and the card
+     stay silent ("too early", "too early to say") while either design has
+     under 30 orders. Read it left to right: conversion must hold first,
+     then take rate, then kept 30d; the last column decides once both sides
+     have matured. Conversion differences use each design's orders from its
+     first day with visits, the same "counted since" window as the
+     scoreboard.
+   - The **weekly table** shows visits and orders per 100 visits per design
+     for every week that has visits. The typed-in Shopify sessions table is
+     now labelled **Optional cross-check: Shopify sessions**: the app's own
+     visits are the conversion denominator, and Shopify's product page
+     sessions (Reports → "Sessions by landing page", one week Monday to
+     Sunday, filtered to your product pages) are only a sanity check.
+     Sessions run a little higher than visits, since a visit is one visitor
+     per day per design. The **Design calendar** card lists which design was
+     live when, per market, so you can line Shopify's own reports up with
+     the same dates.
+8. **Data quality card**: seen coverage (share of orders that carried the
+   widget's own stamp; low coverage means many orders were placed without
+   the widget, or the extension is not deployed), calendar agreement,
+   no-exposure count (orders with no widget stamp that the design calendar
+   could not attribute either; an order placed while the store was still in
+   setup mode, or in a market where the buy box is hidden by "Where the buy
+   box shows", always lands here rather than under a design), staff and
+   foreign-plan exclusions, promo / mixed / transition counts. Since v1.27.0
+   also **Visits recorded** (in the range), **Days with visits** (share of
+   the days in the range with at least one visit; gaps mean the beacon was
+   off or blocked those days) and **Last visit** (an old time on a busy
+   store means the beacon stopped), and a warning banner "Visit beacon:
+   nothing received" when the store is live and orders that saw the buy box
+   arrived in the range with zero visits. Read it before trusting a
+   surprising row.
+
+The tab is cached for up to 10 minutes; **Refresh now** recomputes. New
+orders, a publish and a settings save clear the cache on their own; a visit
+does not (the beacon lands on every page view, so the readout may show
+visits up to 10 minutes late).
+
+*If the `widget_visits` self-check WARNs* ("N order(s) in the last 7 days
+carry the widget's seen marker but no visit was recorded"): orders prove the
+buy box renders, so visits should be arriving too, and their absence has
+three causes. In order: (1) the v1.27.0 extension is not deployed yet: run
+`npm run deploy` from the release tree; (2) the **app embed is disabled** in
+the theme editor (Online Store → Themes → Customize → App embeds → Cellexia
+buy box): a theme-block-only install shows the widget and stamps orders but
+sends no beacon; enable the embed (the block keeps the placement, the embed
+stays dormant, only the beacon runs); (3) the request is blocked: open a
+product page on the live store in a normal browser tab (not the admin
+preview and not the theme editor's preview frame, both of which deliberately
+send nothing), open the browser network tab and look for
+`GET /apps/cellexia-subs/w?e=view…` about a second after the widget is on
+screen; a `204` means the beacon works and the ledger will fill; no request
+at all with the embed enabled and the widget visible points at a content
+blocker in that browser or an old embed script still cached by the theme
+(redeploy and hard-reload). Until visits arrive the tab keeps take rate and
+kept rates as before
+and only the visit-based columns read "no visits yet". The check passes on
+its own while the store is in setup mode (the beacon only records on a live
+store) and whenever no order with widget exposure landed in the last 7 days.
+
+*If the `design_facts` self-check WARNs* ("N subscribable order(s) have no
+design fact row", counted over the whole history since install): a gap of a
+day is normal, the nightly
+`design_facts_backfill` job rebuilds the missing rows from the order feed
+(one `JobRun` row per day in the database, `SUCCESS` with stats such as
+`factsCreated` and `errors`; the Debug page's `jobs_health` check covers job
+staleness). If the gap is still there
+after a night, or keeps growing, the ORDERS_CREATE fact write is failing:
+search the server log for `[webhooks] design fact failed` and read the error
+(a database problem, or a settings read that throws). Nothing else is
+affected: the analytics rollup and the subscriber records are written by
+other paths, so a WARN here only means the Results tab under-reports orders
+until the backfill catches up. The check also prints seen coverage over the
+last 30 days' rows; a coverage near 0% on a live store means the storefront
+extension has not been deployed since v1.26.0 (`npm run deploy`).
 
 **Widget looks wrong after a theme change** (theme update, new theme,
 rebuilt product template):
@@ -516,7 +715,12 @@ first one set wins:
 So a selector typed into the theme editor silently overrides whatever the
 designer publishes — if a placement change from the designer seems to have no
 effect, check the embed's own setting first. If the section app block is also
-present on the page, the embed stays dormant entirely (the block wins).
+present on the page, the embed stays dormant entirely (the block wins). One
+exception since v1.27.0: the **visit beacon** lives in the embed script and
+runs whenever the embed is enabled, block or no block, so keep the embed
+enabled even on a block install if you want visits and conversion on the
+Results tab (§15). Disabling the embed does not hide the widget on a block
+install; it silently stops visit tracking.
 
 **After a theme redesign** (new theme, rebuilt product template, renamed CSS
 classes): re-check the anchor. Open a storefront preview link on a
@@ -815,7 +1019,11 @@ store domain.
 Everything on the Analytics page is derived data, recomputed by jobs
 (`rollup_run` / `cohort_run` / `risk_learning_run` / `churn_risk_run` /
 `retention_90d_run` / `origin_order_backfill` daily, `alerts_run` every 15
-minutes — all keep running in Setup mode). Nothing here
+minutes — all keep running in Setup mode; since v1.26.0 also
+`design_facts_backfill` daily, the repair lane of the Buy box designer's
+Results tab, see §15; since v1.27.0 its steps are markets, facts, link,
+stamp, flags (which now also maps visit rows to markets) and, last,
+`prune_visits`, which drops visit rows older than 400 days). Nothing here
 changes billing; it is reporting only. Another app's subscribers and the demo
 portal contract are excluded from every number.
 

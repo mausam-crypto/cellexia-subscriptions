@@ -1,6 +1,7 @@
 import type { Prisma, WidgetDesignRevision } from "@prisma/client";
 import prisma from "~/db.server";
 import { adminClientForShop } from "~/shopify.server";
+import type { AdminClient } from "~/lib/graphql/client.server";
 import { setShopMetafield } from "~/lib/graphql/metafields.server";
 import { logEvent } from "~/lib/events/log.server";
 import {
@@ -23,12 +24,40 @@ import {
  * Consistency rule: DB and metafield must never diverge silently. When the
  * metafield write fails, publishedAt is rolled back and the error rethrown —
  * the revision stays a draft and the storefront keeps the previous design.
+ *
+ * v1.26.0: revisions carry an optional merchant-given `label` (see
+ * normalizeDesignLabel) and every successful publish nudges the design
+ * measurement engine (market map refresh + scoreboard cache clear, both
+ * contained fire-and-forget; see afterPublishHooks) because a publish is
+ * exactly what changes the design calendar the readouts resolve against.
  */
 
 export const DESIGN_METAFIELD_NAMESPACE = "cellexia";
 export const DESIGN_METAFIELD_KEY = "buybox_design";
 
 const REVISION_LIST_LIMIT = 20;
+
+/**
+ * Merchant-given design name (v1.26.0, WidgetDesignRevision.label): "Test 1:
+ * sub preselected". Shown in the revision history and the Results tab so a
+ * measurement period reads as a named design instead of a cuid. Kept short
+ * so it fits a table cell; whitespace collapsed; empty means "no name".
+ */
+export const DESIGN_LABEL_MAX_LENGTH = 80;
+
+export interface RevisionWriteOptions {
+  /** undefined = leave untouched; null/"" = no name; string = the name. */
+  label?: string | null;
+}
+
+export function normalizeDesignLabel(
+  raw: string | null | undefined,
+): string | null {
+  if (raw == null) return null;
+  const collapsed = String(raw).replace(/\s+/g, " ").trim();
+  if (collapsed === "") return null;
+  return collapsed.slice(0, DESIGN_LABEL_MAX_LENGTH);
+}
 
 // ── Validation ───────────────────────────────────────────────────────────────
 
@@ -102,7 +131,7 @@ export async function getDraftOrPublished(
   };
 }
 
-/** Revision history, newest first. */
+/** Revision history, newest first (rows carry `label` since v1.26.0). */
 export async function listRevisions(
   shopId: string,
   limit = REVISION_LIST_LIMIT,
@@ -140,6 +169,7 @@ export async function saveDraftRevision(
   shopId: string,
   config: unknown,
   createdBy?: string | null,
+  opts?: RevisionWriteOptions,
 ): Promise<WidgetDesignRevision> {
   const validated = validateConfig(config);
   return prisma.widgetDesignRevision.create({
@@ -148,8 +178,38 @@ export async function saveDraftRevision(
       preset: validated.preset,
       config: validated as Prisma.InputJsonObject,
       createdBy: createdBy ?? null,
+      label: normalizeDesignLabel(opts?.label),
     },
   });
+}
+
+/**
+ * Publishing changes what the design calendar (design-measurement/ledger)
+ * resolves from now on, so the readouts must not keep serving a cached
+ * scoreboard, and the market -> country map the order facts rely on is
+ * refreshed while we hold an admin client anyway. Both are fire-and-forget
+ * and fully contained: the sibling modules are loaded dynamically inside a
+ * try/catch so a missing or failing module can never break a publish (the
+ * nightly design_facts_backfill repeats the market refresh; the scoreboard
+ * cache expires on its own after 10 minutes).
+ */
+function afterPublishHooks(shopId: string, admin: AdminClient): void {
+  void (async () => {
+    try {
+      const mod = await import("~/lib/design-measurement/markets.server");
+      await mod.refreshMarketCountryMap(shopId, admin);
+    } catch (err) {
+      console.error("[widget] market map refresh after publish failed", err);
+    }
+  })();
+  void (async () => {
+    try {
+      const mod = await import("~/lib/design-measurement/scoreboard.server");
+      mod.invalidateScoreboardCache(shopId);
+    } catch (err) {
+      console.error("[widget] scoreboard cache invalidation failed", err);
+    }
+  })();
 }
 
 /**
@@ -165,6 +225,7 @@ export async function publishRevision(
   shopId: string,
   revisionId: string,
   actor: string,
+  opts?: RevisionWriteOptions,
 ): Promise<WidgetDesignRevision> {
   const revision = await prisma.widgetDesignRevision.findFirst({
     where: { id: revisionId, shopId },
@@ -179,16 +240,25 @@ export async function publishRevision(
   const validated = validateConfig(revision.config);
   const previousPublishedAt = revision.publishedAt;
 
+  // A label passed here wins over the draft's; undefined leaves it alone
+  // (backward compatible: pre-v1.26.0 callers never mention labels).
+  const labelPatch =
+    opts !== undefined && opts.label !== undefined
+      ? { label: normalizeDesignLabel(opts.label) }
+      : {};
+
   const published = await prisma.widgetDesignRevision.update({
     where: { id: revision.id },
     data: {
       publishedAt: new Date(),
       config: validated as Prisma.InputJsonObject,
+      ...labelPatch,
     },
   });
 
+  let admin: AdminClient;
   try {
-    const admin = await adminClientForShop(shop.domain);
+    admin = await adminClientForShop(shop.domain);
     await setShopMetafield(admin, {
       namespace: DESIGN_METAFIELD_NAMESPACE,
       key: DESIGN_METAFIELD_KEY,
@@ -213,15 +283,20 @@ export async function publishRevision(
       action: "buybox_design_published",
       preset: validated.preset,
       revisionId: revision.id,
+      label: published.label ?? null,
     },
   });
+
+  afterPublishHooks(shopId, admin);
 
   return published;
 }
 
 /**
  * Revert to an older design: copy that revision's config into a NEW revision
- * (history stays append-only) and publish it.
+ * (history stays append-only) and publish it. The source's label travels
+ * with the copy: a restored design is the same named design, so its
+ * measurement periods keep reading under one name.
  */
 export async function restoreRevision(
   shopId: string,
@@ -234,6 +309,8 @@ export async function restoreRevision(
   if (!source) {
     throw new Error(`[widget] design revision not found: ${revisionId}`);
   }
-  const draft = await saveDraftRevision(shopId, source.config, actor);
+  const draft = await saveDraftRevision(shopId, source.config, actor, {
+    label: source.label,
+  });
   return publishRevision(shopId, draft.id, actor);
 }

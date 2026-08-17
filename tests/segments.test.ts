@@ -35,10 +35,12 @@ vi.mock("~/db.server", () => ({
 
 import {
   contractCountryValue,
+  contractDesignValue,
   contractDeviceValue,
   contractHasProduct,
   contractLanguageValue,
   contractMatchesSegment,
+  contractPreselectValue,
   contractSourceValue,
   contractValueBandValue,
   firstOrderDiscountBand,
@@ -49,6 +51,11 @@ import {
   resolveSegmentContractIds,
   type SegmentSourceContract,
 } from "~/lib/analytics/segments.server";
+import {
+  SEGMENT_DIMENSIONS,
+  SEGMENT_PARAM_NAMES,
+  segmentValueLabel,
+} from "~/lib/analytics/segments-shared";
 import {
   getSegmentChurnSeries,
   getSegmentForecast,
@@ -77,6 +84,8 @@ function sourceContract(over: Partial<SegmentSourceContract> = {}): SegmentSourc
     acqOrderValueBand: null,
     originOrderTotalCents: null,
     originOrderDiscountCents: null,
+    originDesignKey: null,
+    originDesignPreselect: null,
     lines: [],
     ...over,
   };
@@ -334,6 +343,90 @@ describe("dimension derivation", () => {
     expect(contractMatchesSegment(contract, { device: "unknown" })).toBe(true);
     expect(contractMatchesSegment(contract, { device: "mobile" })).toBe(false);
   });
+
+  // ── v1.26.0: buy-box design + preselect ────────────────────────────────────
+
+  it("design: the stamped preset key, lowercased; malformed or missing reads unknown", () => {
+    expect(
+      contractDesignValue(sourceContract({ originDesignKey: "subscription_max" })),
+    ).toBe("subscription_max");
+    expect(
+      contractDesignValue(sourceContract({ originDesignKey: " Subscription_Ultra_Max " })),
+    ).toBe("subscription_ultra_max");
+    // Not attributed (pre-tracking / imported / foreign) → unknown bucket.
+    expect(contractDesignValue(sourceContract())).toBe("unknown");
+    // A hostile stored value can never leak into the filter bar.
+    expect(
+      contractDesignValue(sourceContract({ originDesignKey: "<script>alert(1)" })),
+    ).toBe("unknown");
+    expect(
+      contractDesignValue(sourceContract({ originDesignKey: "x".repeat(41) })),
+    ).toBe("unknown");
+    // A fake-db row that never had the column (select is ignored there) is
+    // still safe: undefined behaves like null.
+    expect(
+      contractDesignValue({ originDesignKey: undefined as unknown as null }),
+    ).toBe("unknown");
+  });
+
+  it("preselect: sub / one pass through, anything else (incl. null) is unknown", () => {
+    expect(
+      contractPreselectValue(sourceContract({ originDesignPreselect: "sub" })),
+    ).toBe("sub");
+    expect(
+      contractPreselectValue(sourceContract({ originDesignPreselect: "ONE" })),
+    ).toBe("one");
+    expect(contractPreselectValue(sourceContract())).toBe("unknown");
+    // The storefront's "u" token is stored as null by the facts writer, but a
+    // literal "u" must still bucket as unknown, not as a third value.
+    expect(
+      contractPreselectValue(sourceContract({ originDesignPreselect: "u" })),
+    ).toBe("unknown");
+  });
+
+  it("the predicate ANDs design and preselect like every other dimension", () => {
+    const contract = sourceContract({
+      originDesignKey: "subscription_max",
+      originDesignPreselect: "sub",
+    });
+    expect(contractMatchesSegment(contract, { design: "subscription_max" })).toBe(true);
+    expect(contractMatchesSegment(contract, { design: "value_first" })).toBe(false);
+    expect(contractMatchesSegment(contract, { preselect: "sub" })).toBe(true);
+    expect(contractMatchesSegment(contract, { preselect: "one" })).toBe(false);
+    expect(
+      contractMatchesSegment(contract, {
+        design: "subscription_max",
+        preselect: "one",
+      }),
+    ).toBe(false);
+    // Unknown bucket matches the unattributed contract only.
+    expect(contractMatchesSegment(sourceContract(), { design: "unknown" })).toBe(true);
+    expect(contractMatchesSegment(contract, { design: "unknown" })).toBe(false);
+    expect(
+      contractMatchesSegment(sourceContract(), { preselect: "unknown" }),
+    ).toBe(true);
+  });
+
+  it("segment vocabulary lists both new dimensions with their URL params and labels", () => {
+    expect(SEGMENT_DIMENSIONS).toContain("design");
+    expect(SEGMENT_DIMENSIONS).toContain("preselect");
+    expect(SEGMENT_PARAM_NAMES.design).toBe("design");
+    expect(SEGMENT_PARAM_NAMES.preselect).toBe("preselect");
+    // Every dimension has a distinct param name (a collision would let one
+    // select silently overwrite another).
+    const params = Object.values(SEGMENT_PARAM_NAMES);
+    expect(new Set(params).size).toBe(params.length);
+    expect(SEGMENT_DIMENSIONS.length).toBe(params.length);
+
+    expect(segmentValueLabel("design", "subscription_max")).toBe("Subscription max");
+    expect(segmentValueLabel("design", "subscription_ultra_max")).toBe(
+      "Subscription ultra max",
+    );
+    expect(segmentValueLabel("design", "unknown")).toBe("Unknown");
+    expect(segmentValueLabel("preselect", "sub")).toBe("Subscription preselected");
+    expect(segmentValueLabel("preselect", "one")).toBe("One-time preselected");
+    expect(segmentValueLabel("preselect", "unknown")).toBe("Unknown");
+  });
 });
 
 // ── Pure: URL parsing (fail-safe) ────────────────────────────────────────────
@@ -345,7 +438,7 @@ describe("parseSegmentFromParams", () => {
   it("parses and normalizes every dimension", () => {
     expect(
       parse(
-        "country=ch&lang=FR&source=Instagram&product=gid://shopify/Product/12&discount=10_20&device=Mobile&value=50_75",
+        "country=ch&lang=FR&source=Instagram&product=gid://shopify/Product/12&discount=10_20&device=Mobile&value=50_75&design=Subscription_Max&preselect=SUB",
       ),
     ).toEqual({
       country: "CH",
@@ -355,23 +448,52 @@ describe("parseSegmentFromParams", () => {
       discountBand: "10_20",
       device: "mobile",
       valueBand: "50_75",
+      design: "subscription_max",
+      preselect: "sub",
     });
   });
 
   it("accepts the explicit unknown bucket everywhere it exists", () => {
-    expect(parse("country=unknown&discount=unknown&device=unknown")).toEqual({
+    expect(
+      parse(
+        "country=unknown&discount=unknown&device=unknown&design=unknown&preselect=unknown",
+      ),
+    ).toEqual({
       country: "unknown",
       discountBand: "unknown",
       device: "unknown",
+      design: "unknown",
+      preselect: "unknown",
     });
   });
 
   it("drops malformed values instead of throwing (fail-safe: unfiltered beats broken)", () => {
-    expect(parse("country=Sw!tz&lang=123&discount=99_100&device=bot&product=x")).toEqual(
-      {},
-    );
+    expect(
+      parse(
+        "country=Sw!tz&lang=123&discount=99_100&device=bot&product=x&design=<b>x&preselect=maybe",
+      ),
+    ).toEqual({});
+    // Design keys: snake_case up to 40 chars; preselect: sub | one only.
+    expect(parse(`design=${"a".repeat(41)}`)).toEqual({});
+    expect(parse("design=sub-max")).toEqual({});
+    expect(parse("preselect=u")).toEqual({});
+    expect(parse("preselect=one")).toEqual({ preselect: "one" });
     expect(isEmptySegment(parse(""))).toBe(true);
     expect(isEmptySegment(parse("country=CH"))).toBe(false);
+    expect(isEmptySegment(parse("design=subscription_max"))).toBe(false);
+    expect(isEmptySegment(parse("preselect=one"))).toBe(false);
+  });
+
+  it("round-trips design + preselect through the shared param names", () => {
+    // The filter bar writes params via SEGMENT_PARAM_NAMES; the loader parses
+    // them back — the two must agree or a select would silently no-op.
+    const params = new URLSearchParams();
+    params.set(SEGMENT_PARAM_NAMES.design, "subscription_max");
+    params.set(SEGMENT_PARAM_NAMES.preselect, "one");
+    expect(parseSegmentFromParams(params)).toEqual({
+      design: "subscription_max",
+      preselect: "one",
+    });
   });
 });
 
@@ -425,6 +547,8 @@ function contractRow(id: string, over: Row): Row {
     originOrderRefundedCents: 0,
     originOrderProcessedAt: null,
     originOrderCurrencyCode: null,
+    originDesignKey: null,
+    originDesignPreselect: null,
     ordersCount: 1,
     lines: [],
     ...over,
@@ -445,10 +569,13 @@ const line = (productId: string, title: string): Row => ({
 
 /**
  * Three countable contracts + pollution:
- * - c_ch: CH, French, instagram (utm), product 11, mobile
- * - c_de: DE (acq fallback), German, google (channel), product 22, desktop
+ * - c_ch: CH, French, instagram (utm), product 11, mobile,
+ *         design subscription_max / sub preselected
+ * - c_de: DE (acq fallback), German, google (channel), product 22, desktop,
+ *         design subscription_max / one-time preselected
  * - c_mystery: nothing captured anywhere (all unknown buckets)
- * - c_foreign / c_demo: MUST never appear in ids, options or views.
+ * - c_foreign / c_demo: MUST never appear in ids, options or views (the
+ *   foreign one even carries a design stamp, which must never surface).
  */
 function buildSegmentStore(): AnalyticsStore {
   const store = emptyStore();
@@ -476,6 +603,8 @@ function buildSegmentStore(): AnalyticsStore {
       acqOrderValueBand: "50_75",
       originOrderTotalCents: 9000,
       originOrderDiscountCents: 1000,
+      originDesignKey: "subscription_max",
+      originDesignPreselect: "sub",
       lines: [line("gid://shopify/Product/11", "Serum")],
     }),
     contractRow("c_de", {
@@ -485,12 +614,16 @@ function buildSegmentStore(): AnalyticsStore {
       acqDeviceType: "desktop",
       originOrderTotalCents: 8000,
       originOrderDiscountCents: 0,
+      originDesignKey: "subscription_max",
+      originDesignPreselect: "one",
       lines: [line("gid://shopify/Product/22", "Cream")],
     }),
     contractRow("c_mystery", { lines: [line("gid://shopify/Product/11", "Serum")] }),
     contractRow("c_foreign", {
       ownership: "FOREIGN",
       deliveryAddress: { countryCode: "CH" },
+      originDesignKey: "foreign_design",
+      originDesignPreselect: "sub",
       lines: [line("gid://shopify/Product/11", "Serum")],
     }),
     contractRow("c_demo", {
@@ -523,6 +656,38 @@ describe("resolveSegmentContractIds + getSegmentOptions", () => {
     ).toEqual([]); // a real empty result, not "no filter"
   });
 
+  it("resolves design + preselect segments (v1.26.0), unknown bucket included, countable only", async () => {
+    dbHolder.current = createAnalyticsDb(buildSegmentStore()) as never;
+    expect(
+      await resolveSegmentContractIds(SHOP_ID, { design: "subscription_max" }),
+    ).toEqual(["c_ch", "c_de"]);
+    expect(
+      await resolveSegmentContractIds(SHOP_ID, {
+        design: "subscription_max",
+        preselect: "one",
+      }),
+    ).toEqual(["c_de"]);
+    expect(
+      await resolveSegmentContractIds(SHOP_ID, { preselect: "sub" }),
+    ).toEqual(["c_ch"]); // never c_foreign despite its stamp
+    expect(
+      await resolveSegmentContractIds(SHOP_ID, { design: "unknown" }),
+    ).toEqual(["c_mystery"]);
+    expect(
+      await resolveSegmentContractIds(SHOP_ID, { preselect: "unknown" }),
+    ).toEqual(["c_mystery"]);
+    // AND with an existing dimension.
+    expect(
+      await resolveSegmentContractIds(SHOP_ID, {
+        design: "subscription_max",
+        country: "CH",
+      }),
+    ).toEqual(["c_ch"]);
+    expect(
+      await resolveSegmentContractIds(SHOP_ID, { design: "foreign_design" }),
+    ).toEqual([]);
+  });
+
   it("builds filter options with counts, unknown bucket last, product titles as labels", async () => {
     dbHolder.current = createAnalyticsDb(buildSegmentStore()) as never;
     const options = await getSegmentOptions(SHOP_ID);
@@ -545,6 +710,40 @@ describe("resolveSegmentContractIds + getSegmentOptions", () => {
     expect(options.discountBands.map((o) => o.value)).toEqual([
       "none",
       "10_20",
+      "unknown",
+    ]);
+    // v1.26.0: designs by frequency (unknown last), preselects in the fixed
+    // sub / one / unknown order. The foreign contract's stamp never appears.
+    expect(options.designs).toEqual([
+      { value: "subscription_max", label: "subscription_max", count: 2 },
+      { value: "unknown", label: "unknown", count: 1 },
+    ]);
+    expect(options.preselects).toEqual([
+      { value: "sub", label: "sub", count: 1 },
+      { value: "one", label: "one", count: 1 },
+      { value: "unknown", label: "unknown", count: 1 },
+    ]);
+  });
+
+  it("preselect options keep the fixed order even when one-time leads on count", async () => {
+    const store = buildSegmentStore();
+    for (let i = 0; i < 3; i++) {
+      store.subscriptionContracts.push(
+        contractRow(`c_one_${i}`, {
+          originDesignKey: "value_first",
+          originDesignPreselect: "one",
+          lines: [line("gid://shopify/Product/33", "Filler")],
+        }),
+      );
+    }
+    dbHolder.current = createAnalyticsDb(store) as never;
+    const options = await getSegmentOptions(SHOP_ID);
+    expect(options.preselects.map((o) => o.value)).toEqual(["sub", "one", "unknown"]);
+    expect(options.preselects.find((o) => o.value === "one")?.count).toBe(4);
+    // Designs stay frequency-ranked: value_first (3) leads subscription_max (2).
+    expect(options.designs.map((o) => o.value)).toEqual([
+      "value_first",
+      "subscription_max",
       "unknown",
     ]);
   });

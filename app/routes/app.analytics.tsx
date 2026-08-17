@@ -558,7 +558,9 @@ const SEGMENT_SELECTS: Array<{
     | "products"
     | "discountBands"
     | "devices"
-    | "valueBands";
+    | "valueBands"
+    | "designs"
+    | "preselects";
 }> = [
   { dimension: "country", label: "Country", allLabel: "All countries", optionsKey: "countries" },
   { dimension: "language", label: "Language", allLabel: "All languages", optionsKey: "languages" },
@@ -576,6 +578,22 @@ const SEGMENT_SELECTS: Array<{
     label: "First-order value",
     allLabel: "Any value",
     optionsKey: "valueBands",
+  },
+  // v1.26.0 design measurement: which buy-box design / preselected option
+  // the subscriber's first checkout came through. Segment views compare
+  // subscriber OUTCOMES per design; take rate by design (an orders-based
+  // denominator) lives in Buy box designer → Results, not here.
+  {
+    dimension: "design",
+    label: "Buy-box design",
+    allLabel: "All designs",
+    optionsKey: "designs",
+  },
+  {
+    dimension: "preselect",
+    label: "Preselected option",
+    allLabel: "Any preselect",
+    optionsKey: "preselects",
   },
 ];
 
@@ -624,7 +642,10 @@ function SegmentFilterBar({ data }: { data: ReadyData }) {
             </Button>
           )}
         </InlineStack>
-        <InlineGrid columns={{ xs: 1, sm: 2, md: 4, lg: 7 }} gap="200">
+        {/* Nine selects since v1.26.0: five per row on large screens (two
+            rows) rather than nine hairline-narrow columns whose labels and
+            option text would truncate. */}
+        <InlineGrid columns={{ xs: 1, sm: 2, md: 3, lg: 5 }} gap="200">
           {SEGMENT_SELECTS.map((def) => {
             const options = segmentOptions[def.optionsKey];
             const current = segment[def.dimension] ?? "";
@@ -689,6 +710,9 @@ function SegmentBanner({ data }: { data: ReadyData }) {
         subscriber&rsquo;s current delivery country, language and first-order
         acquisition data; imported or pre-tracking subscribers appear under
         &ldquo;{segmentValueLabel("device", UNKNOWN_SEGMENT_VALUE)}&rdquo;.
+        Buy-box design and preselected option compare subscriber outcomes
+        per design. Take rate by design lives in Buy box designer &rarr;
+        Results.
       </p>
     </Banner>
   );

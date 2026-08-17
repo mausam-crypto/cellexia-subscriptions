@@ -56,8 +56,62 @@ describe("settings registry", () => {
         "alerts",
         // v1.25.0: market-scoped buy-box visibility (Preview & launch owns it).
         "widgetMarkets",
+        // v1.26.0: design measurement knobs (the buy-box Results tab owns it).
+        "designMeasurement",
       ]),
     );
+  });
+
+  it("designMeasurement defaults are the documented ones and its fields normalise (v1.26.0)", () => {
+    expect(defaultFor("designMeasurement")).toEqual({
+      startedAt: null,
+      excludeEmails: [],
+      guardrailMaxOrderDropPct: 10,
+      guardrailMinOrdersPerWeek: 20,
+      weeklySessions: {},
+    });
+    // Field-level defaults: a partial stored row still parses (additive).
+    expect(settingsSchemas.designMeasurement.parse({ startedAt: "2026-09-01" })).toEqual({
+      startedAt: "2026-09-01",
+      excludeEmails: [],
+      guardrailMaxOrderDropPct: 10,
+      guardrailMinOrdersPerWeek: 20,
+      weeklySessions: {},
+    });
+    // Staff emails are trimmed + lowercased at parse (the fact writer compares
+    // lowercased checkout emails against them), capped at 200 entries.
+    expect(
+      settingsSchemas.designMeasurement.parse({ excludeEmails: [" Staff@Cellexia.COM "] })
+        .excludeEmails,
+    ).toEqual(["staff@cellexia.com"]);
+    expect(
+      settingsSchemas.designMeasurement.safeParse({
+        excludeEmails: Array.from({ length: 201 }, (_, i) => `s${i}@x.test`),
+      }).success,
+    ).toBe(false);
+    // Guardrails are bounded integers.
+    expect(
+      settingsSchemas.designMeasurement.safeParse({ guardrailMaxOrderDropPct: 91 }).success,
+    ).toBe(false);
+    expect(
+      settingsSchemas.designMeasurement.safeParse({ guardrailMaxOrderDropPct: 2.5 }).success,
+    ).toBe(false);
+    expect(
+      settingsSchemas.designMeasurement.safeParse({ guardrailMinOrdersPerWeek: -1 }).success,
+    ).toBe(false);
+    // Weekly sessions are keyed by ISO week and hold non-negative integers.
+    expect(
+      settingsSchemas.designMeasurement.parse({ weeklySessions: { "2026-W35": 1200 } })
+        .weeklySessions,
+    ).toEqual({ "2026-W35": 1200 });
+    expect(
+      settingsSchemas.designMeasurement.safeParse({ weeklySessions: { "2026-35": 1200 } })
+        .success,
+    ).toBe(false);
+    expect(
+      settingsSchemas.designMeasurement.safeParse({ weeklySessions: { "2026-W35": -3 } })
+        .success,
+    ).toBe(false);
   });
 
   it("widgetMarkets defaults to every market and is a SEPARATE key from launch (a required launch field would demote LIVE rows to SETUP)", () => {

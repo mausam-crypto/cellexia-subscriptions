@@ -48,16 +48,17 @@ flows, win-back, analytics.
 | Win-back | `app/lib/winback/` | Staged win-back timed to predicted empty date. |
 | Klaviyo | `app/lib/klaviyo/` | Outbox flush (with a 24h age-out — stale moments go DEAD, never fire late), event mapping (`events-map.server.ts`), profile sync. **v1.18.0 — guided flow setup** (`flows.server.ts` + `app.emails_.setup.tsx`): one click creates every delivery flow via Klaviyo's Flows/Templates APIs (metric trigger + `cellexia_send equals "true"` string filter + one send-email rendering `{{ event.content_html }}` with the required unsubscribe footer, smart sending off), seeds unseen metrics with `cellexia_send:"false"` events (can never send), respects the merchant's own live flows (never duplicates), verifies coverage into the machine-written `klaviyoFlowSetup` setting (Emails overview card reads the cache; the daily `KLAVIYO_FLOW_COVERAGE` alert refreshes it at most once/day). `cellexia_send` is a VERDICT when present ("true" from the router's EMAIL enqueues; the provenance verdict — shared `isPersonInitiated` gate + in-app enable toggle + sender — on confirmation events, which also carry rendered `content_*`; "false" on SMS legs and seeds) and deliberately ABSENT on canonical non-confirmation events: several share a metric with a router template, and the outbox dedupe graft supersedes the flag together with the content — the graft protects only confirmation-event verdicts (keyed on the surviving row's `event_type`, never on flag presence, so legacy default-stamped rows heal across upgrades). A stamped default here once froze dual-writer metrics (milestone/rewards/hard-decline payment-failed) silent forever — `tests/outbox-graft-verdict.test.ts` pins the full matrix. **v1.25.0 — fast, reliable setup**: coverage is read with ONE paginated `GET /api/metrics/?include=flow-triggers` (metric → triggering flow ids + the flows' name/status/archived via `included`; 10/s, 150/m; 400 → fallback `GET /api/metrics/` + per-spec-metric `flow-triggers`, paced) — never a per-flow definition GET (the 3/s, 60/m endpoint that 429'd on any store with > ~50 flows, including the ~27 this setup creates, and made the whole index fatal ⇒ an EMPTY checklist); every Klaviyo call goes through a module-private retry wrapper (429 waits Retry-After, capped 30 s, ≤ 4 attempts; GET 5xx/network backs off; a POST 5xx is never re-sent — the post-run re-read resolves the ambiguity); a fatal read keeps the last cached rows (`unchecked` for never-verified specs) so the checklist never blanks. Verify and setup run as ONE-PER-SHOP background tasks (`setup-task.server.ts`: in-process `global.__cellexiaFlowTasks` + the persisted `klaviyoFlowSetup.task` record written on start / throttled ≥ 1 s / 15 s heartbeat / at end; a persisted running record silent for > 90 s = interrupted, restartable; across instances the start is gated by a per-shop `JobLock` lease `klaviyo_flow_task:<shopId>` (owner = task id, 90 s, renewed by the heartbeat, released at the end — the runner's exported `acquireLock`/`renewLock`/`releaseLock`), and a run that lost its map slot to a newer start becomes write-inert; the write chain's read is strict, so a DB blip aborts that write instead of rebuilding the record from an empty cache) started by the setup page's loader (stale cache > 10 min, measured from the last touch — failed attempts included — and never while a task runs) and actions, polled by the DB-only resource route `app.emails_.setup_.status.tsx` (`Cache-Control: no-store` via the route `headers` export, which is what single fetch puts on the wire); no verification or flow creation runs inside a web request — the page's only in-request Klaviyo call is save-key's single 15 s-bounded key probe (validate before storing), and a key saved while a run is in flight is re-verified by one automatic `refresh` when that run finishes; the daily alert sweep skips a tick while a fresh running record exists (never judges coverage mid-setup); the setup has NO per-run cap — every missing flow, one POST per ≥ 4.1 s (Create Flow is 1/s, 15/min, 100/day), 429 waits and continues inside an 8-minute run budget after which the rest report `rate_limited` and the next click continues; `onProgress({step, done, total, message})` drives the page's progress bar. |
 | Notifications | `app/lib/notifications/` | Channel router (Klaviyo event; without a Klaviyo key — `klaviyo` setting or `KLAVIYO_PRIVATE_API_KEY` env fallback — lifecycle email falls back to direct SMTP and SMS is SUPPRESSED — never logged SENT undelivered), templates, `NotificationLog`. Since v1.16.0 the admin **Emails** tab (`app/routes/app.emails.tsx` + `catalog.server.ts`) owns per-template customization: the `emails` setting holds enable/disable (SUPPRESSED reason `template_disabled`; critical templates bypass) and merchant subject/body overrides, which `renderEmail` applies in BOTH delivery shapes — the ready-rendered `content_subject`/`content_html`/`content_text` Klaviyo event properties (flows render `{{ event.content_html }}`) and the direct-SMTP fallback. Rendered content and link URLs are never persisted in `NotificationLog`. **v1.17.0 — the email studio**: body copy renders through a markdown-lite formatter (`format.ts`, isomorphic — escape-before-structure, http/https/mailto href allow-list, `{cta}` semantics preserved; since v1.24.0 also `[image:Alt](url)` on its own line → a centered product image, https-only, degrading to nothing in the plain-text rendering — the enriched gift emails' photo block) inside a brand-kit shell (`emailDesign` setting, Emails → Design tab; defaults = the historical shell). Each template row also carries `sender` — `auto` (pre-1.17.0 behavior exactly), `app` (direct SMTP, delivery metric deliberately NOT enqueued so a flow cannot double-send), `klaviyo` (event only; keyless = SUPPRESSED `klaviyo_unconfigured`, never silently rerouted); SMS ignores `app`, critical templates keep their unconditional SMTP copy. The state-change confirmations (skip/delay/pause/cancel/…) default to their Klaviyo flows but become app-sent via the **confirmation bridge** (`confirmations.server.ts`, invoked by `logEvent()` beside the Klaviyo enqueue, contained, 10-min per-contract+template dedupe) when their sender is `app`. Per-template editor pages (`app.emails_.$template.tsx` — escaped flat-route name since v1.25.0 so the overview's loader is not a layout parent) provide live preview (the REAL `renderEmail` on `preview.server.ts` sample data — every template must render placeholder-free, pinned by tests; all sample links point at example.com) and a test send that never writes `NotificationLog`. The SMTP transport itself resolves settings-first (`mailTransport` setting, admin Settings → Email delivery; env vars as fallback; password encrypted via `app/lib/crypto/secrets.server.ts`), with the transport cache keyed by the resolved config so admin saves apply without a restart. |
-| Analytics | `app/lib/analytics/` | Daily rollups, cohort LTGP (origin payment + renewals), the shared cost model (COGS/shipping/fees/VAT — `costs.server.ts`), censoring-corrected survival curves, churn risk with a self-training learned model (`learning.server.ts` — shadow-until-provably-better, survey features included since v1.21.0), predicted empty dates, per-subscriber predicted LTGP at d90/d180/y1/y3/y5 (`predicted-ltgp.server.ts` — tilted conditional survival × per-cycle margin, per-horizon honesty grades, frozen day-one predictions + the machine-written `ltgpAccuracy` ledger), five-model self-measuring forecasting with accuracy grades, take rate, alert scans, plain-language insights (`insights.server.ts`, imported directly — not via the barrel), and the segment layer (`segments.server.ts` + `segment-views.server.ts` — live filtered views by country/language/source/product/discount/device/value; the isomorphic vocabulary lives in `segments-shared.ts` for route components). See [Analytics](#analytics). |
+| Analytics | `app/lib/analytics/` | Daily rollups, cohort LTGP (origin payment + renewals), the shared cost model (COGS/shipping/fees/VAT — `costs.server.ts`), censoring-corrected survival curves, churn risk with a self-training learned model (`learning.server.ts` — shadow-until-provably-better, survey features included since v1.21.0), predicted empty dates, per-subscriber predicted LTGP at d90/d180/y1/y3/y5 (`predicted-ltgp.server.ts` — tilted conditional survival × per-cycle margin, per-horizon honesty grades, frozen day-one predictions + the machine-written `ltgpAccuracy` ledger), five-model self-measuring forecasting with accuracy grades, take rate, alert scans, plain-language insights (`insights.server.ts`, imported directly — not via the barrel), and the segment layer (`segments.server.ts` + `segment-views.server.ts` — live filtered views by country/language/source/product/discount/device/value and, since v1.26.0, buy-box design/preselect; the isomorphic vocabulary lives in `segments-shared.ts` for route components). See [Analytics](#analytics). |
+| Design measurement | `app/lib/design-measurement/` + `app/routes/app.buy-box_.results.tsx` + `app/components/design-results.tsx` | v1.26.0: the per-design take-rate and retention readout. `SubscribableOrder` fact table (one PII-free row per subscribable order: design seen, preselect, market, outcome, hygiene flags) written from ORDERS_CREATE and the nightly `design_facts_backfill`; the `_cellexia_seen` storefront property and its parser (`shared.ts`); the design calendar from published revisions (`ledger.server.ts`); the country-to-market cache `MarketCountryMap` (`markets.server.ts`); the write-once `originDesign*` subscriber stamp (`facts.server.ts`, retained through CUSTOMERS_REDACT by merchant decision); the scoreboard engine (`scoreboard.server.ts`, order-level metrics, kept rates behind a maturity gate, guardrails, 10-minute cache); the Buy box designer's **Results** tab and the `designMeasurement` settings group. v1.27.0 adds the VISIT side: the storefront beacon (`buy-box-embed.js` section 4, `GET /apps/cellexia-subs/w`) lands in `app/routes/proxy.w.tsx` (signature first, then always 204; LIVE gate, bot filter, token buckets) and writes the `WidgetVisitorDay` ledger through `visits.server.ts` (one row per anonymous visitor per shop-day per design and preselect; `visitSummary`, `pruneVisits`, `recomputeVisitMarkets`); the scoreboard joins visits on the same stamp as the facts and reports conversion per 100 visits, kept subscribers per 100 visits, a conversion-based guardrail basis and a compare-against-the-reference block. See [Design measurement](#design-measurement). |
 | Acquisition capture | `app/lib/acquisition/` + webhook/sync handlers | Sanitized origin-order acquisition signals (`acq*` columns: source, UTM, geo, device, first-order shape) captured once per OURS contract; pure sanitizer (`sanitize.ts`) — never a raw IP or full user-agent; erased on GDPR redact. Contract: [docs/DATA_FOUNDATION.md](DATA_FOUNDATION.md). |
 | Post-purchase survey | `app/lib/survey/` + `app/routes/api.survey.tsx` + `extensions/cellexia-survey/` | v1.21.0: four one-tap questions on the Thank You / Order Status pages (checkout UI extension, subscription orders only), POSTed with a verified session token to `/api/survey`; `SurveyResponse` rows keyed by ORDER (the thank-you page races the contract webhook) and linked to countable OURS contracts by the endpoint, the contract-create webhook tail (+ catch-up) or the daily `survey_link_sweep`. The instrument (question/option keys, `shared.ts`) is FROZEN per `questionSetVersion` — never edited in place; the extension bundles a mirror pinned by `tests/survey-instrument.test.ts`. Answers feed churn-risk features, predicted LTGP and the `survey.answered` → Klaviyo metric with the deterministic intervention holdout (`surveyHoldout`, `survey.holdoutPct`). |
 | Shopify tagging | `app/lib/tagging/` | v1.23.0 (`tagging` settings group, ON by default): mirrors subscription state onto Shopify tags. Customer subscriber tag = membership recompute ("≥1 live ACTIVE/PAUSED billable non-demo contract" — ownership filtered in JS, NOT in the SQL where, so the REMOVAL side keeps working after an OURS→FOREIGN reclassification instead of stranding our tag on another app's customer), hooked at the END of `syncContractFromShopify` (every transition converges there — webhook echoes, backfills and the daily `full_sync_reconcile`, which re-converges every customer) plus `cancelContract` for same-request removal; each recompute runs under a per-(shop,customer) `pg_advisory_xact_lock` so racing webhook echoes with opposite verdicts serialize instead of a stale "remove" stripping a live subscriber. The `CustomerTagState` ledger (migration 0023) records the applied value so no-change recomputes cost zero Shopify calls, renames remove the byte-exact old tag, and removals only ever take back OUR tag. Order tags: first-order at the proven-ours contract-create tail (+ catch-up branch — never ORDERS_CREATE, which races the contract webhook and cannot decide ownership; a contract that mirrored UNKNOWN gets the missed tag healed by the sync that proves it ours), repeat-order in `finishSuccessSettlement` (shared by both claim winners; idempotent across redrives via a `taggedOrderId`-keyed event guard scoped to the contract's own events). Everything is contained (never fails a webhook/settlement/cancel), suppressed in SETUP (install-dark), skips redacted identities + uninstalled shops on BOTH paths, and is forward-only for orders. Settings-save fires `reconcileAllSubscriberTags` WITHOUT awaiting it (capped sweep, one `admin.action` summary in the Audit log). Pinned by `tests/tagging.test.ts`; the module is in the ownership-enforcement static scan. |
 | Experiments | `app/lib/experiments/` + `app/routes/app.experiments.tsx` | v1.24.0: deterministic customer-level test groups. The arm is a pure sha256 hash of (experimentKey, lowercased email) — no RNG, recomputable offline; the unit is the CUSTOMER (email), never the contract (a two-contract customer must not be their own control — the per-contract-cooldown lesson). First exposure at the actual decision point freezes the arm into `ExperimentAssignment` (migration 0024; unique per shop+experiment+unit, `contractId` a convenience pointer with deliberately no FK), and readouts resolve arms exclusively from those rows — "was in the test" always means "the treatment actually diverged for them". Definitions (arms, shares, setting overrides, primary metric) live in code (`index.server.ts`); the `experiments` setting stores only enabled/started/stopped per key. Registry: `gift2_holdout` (**ON by default**, 12.5% `no_gift` arm — skips the cycle-2 surprise grant AND the teaser; it must exist from subscriber #1 or the control group can never be built), `final_offer_depth` (25 vs 20, off) and `winback_discount_depth` (20 vs 15, off) — the depth experiments overlay settings at their decision points via `settingOverride()`, with the stacking clamp applied after. Disabled/stopped experiments — and every failure — resolve to the control arm and record nothing. Every exposure logs `experiment.exposed`. The admin **Experiments** page (in the nav) shows per-arm scoreboards with honest sample-size grades (`too_early` < 30/arm, `direction_only` < 200/arm, `usable` above); the final judgment stays cohort LTGP. Pinned by `tests/experiments-kernel.test.ts`. |
 | Admin UI | `app/routes/app.*` | Polaris pages: dashboard, analytics, subscribers, dunning, emails (catalog + sender model + brand kit + per-template editor with live preview/test send + sent log, v1.17.0), alerts, audit, debug (live self-checks), bulk ops, plans, gifts (rules + gift pool & pairings, v1.24.0), experiments (per-arm scoreboards + sample-size grades, v1.24.0), cancel-flow config, settings, import. |
-| Buy box | `extensions/cellexia-buy-box/` | Theme app extension for the PDP, in two install shapes over one shared core snippet: a `section`-target app block, and (v1.2.0) a `body`-target **app embed** that self-mounts and patches JS cart requests for themes whose product section takes no app blocks. |
-| Widget design | `app/lib/widget/` | Buy-box design system: preset catalog + zod config schema + customCss sanitizer + text resolution (`presets.ts`, isomorphic — the admin designer imports it client-side), revision store / publish-to-metafield / restore (`design.server.ts`). Edited from the admin **Buy box designer** page. Also the storefront projections that ride beside the design: per-variant default frequencies (`variant-defaults.server.ts`, `cellexia.variant_defaults`) and, since v1.25.0, market visibility (`widget-markets.server.ts`, `cellexia.widget_markets` — the `widgetMarkets` setting's mirror, owned by Preview & launch "Where the buy box shows"; see [Launch & preview](#launch--preview)). |
+| Buy box | `extensions/cellexia-buy-box/` | Theme app extension for the PDP, in two install shapes over one shared core snippet: a `section`-target app block, and (v1.2.0) a `body`-target **app embed** that self-mounts and patches JS cart requests for themes whose product section takes no app blocks. Since v1.27.0 the embed script also carries the **visit beacon** (`assets/buy-box-embed.js` section 4): `view` / `engage` / `atc` image requests to `/apps/cellexia-subs/w`, per design and preselect, with a random browser-local visitor id; measurement only, fully contained, never sent in admin preview, in the theme editor (`Shopify.designMode`) or while the widget is hidden. Theme-block-only installs get no visits (the block has no beacon). |
+| Widget design | `app/lib/widget/` | Buy-box design system: preset catalog + zod config schema + customCss sanitizer + text resolution (`presets.ts`, isomorphic — the admin designer imports it client-side), revision store / publish-to-metafield / restore (`design.server.ts`; since v1.26.0 revisions carry an optional merchant-given `label`, and a publish nudges the design-measurement engine: market map refresh + scoreboard cache clear, contained). Edited from the admin **Buy box designer** page. Also the storefront projections that ride beside the design: per-variant default frequencies (`variant-defaults.server.ts`, `cellexia.variant_defaults`) and, since v1.25.0, market visibility (`widget-markets.server.ts`, `cellexia.widget_markets` — the `widgetMarkets` setting's mirror, owned by Preview & launch "Where the buy box shows"; see [Launch & preview](#launch--preview)). |
 | Launch & preview | `app/lib/launch/` | Install-dark launch mode (SETUP/LIVE), storefront PREVIEW tokens, go-live with ownership re-classification + overdue stagger; the gates live in jobs/notifications/Klaviyo/portal/buy box (see below). |
-| Debug / self-check | `app/lib/debug/` | Live self-check engine behind the admin **Debug** page: 39 read-only checks against the deployed store (billing pipeline, dunning, portal-through-proxy, webhooks, jobs, notifications, config, data integrity), each contained doctor-style with detail + named fix. Since v1.22.0 the sweep also proves the live-store shapes local debugging cannot see: the buy box actually on a real plan product's PDP and gated exactly per launch mode (`storefront_widget`, reusing the Preview Doctor's markers), ACTIVE contracts the billing sweep can never select (`renewal_readiness` — null `nextBillingDate`), dunning-ladder steps the exhaust cutoff makes unreachable (`dunning_config`), JobLock leases no code path could have written (`job_locks`, threshold imported from the runner's `LOCK_LEASE_MS`), the Klaviyo key live-probed against Klaviyo (`klaviyo_key_live` — `probeKlaviyoKey`'s `transient` flag keeps network blips WARN), the cached flow-coverage verdict surfaced every tick (`klaviyo_flow_coverage`, reads `klaviyoFlowSetup` — never spends the daily API budget), every email template rendered through the REAL `renderEmail` with the merchant's stored overrides + design (`email_templates` — a throw is a send-time failure, a stray `{placeholder}` reaches the customer), stored credentials still decryptable (`stored_secrets` — the silent APP_SIGNING_SECRET-rotation fallback made visible), and contract-scoped events that lost their contract link (`event_provenance`). v1.24.0 adds `gift_promises` — the configuration drift behind the gift truth gates (the engines gate their sends silently at runtime; a promise quietly suppressed for everyone — surprise setting with no ORDER_INDEX=2 rule, an empty pool that dynamic rules / the day-90 reward / the gift save / the ladder depend on — surfaces here as a WARN instead of nowhere). v1.25.0 adds `widget_markets` — the market-visibility setting ⇄ `cellexia.widget_markets` metafield agreement (`widgetMarketsDiverged`) plus an audit of the saved handles against the live market list (`auditSelectedHandles`: WARN on a deleted/disabled market, FAIL when none is live = hidden everywhere; unreadable list = note) — and teaches `storefront_widget` to read the market-hidden marker before judging the launch gate AND to FAIL the inverse drift (widget rendered on the primary market the setting excludes = extension not deployed / stale metafield). Runs every 30 min (`selfcheck_run`, ungated), persists to the machine-written `selfCheck` setting, keeps the deduped CRITICAL `SELF_CHECK_FAILED` alert in sync (raised while broken, auto-resolved on recovery). |
+| Debug / self-check | `app/lib/debug/` | Live self-check engine behind the admin **Debug** page: 41 read-only checks against the deployed store (billing pipeline, dunning, portal-through-proxy, webhooks, jobs, notifications, config, data integrity), each contained doctor-style with detail + named fix. Since v1.22.0 the sweep also proves the live-store shapes local debugging cannot see: the buy box actually on a real plan product's PDP and gated exactly per launch mode (`storefront_widget`, reusing the Preview Doctor's markers), ACTIVE contracts the billing sweep can never select (`renewal_readiness` — null `nextBillingDate`), dunning-ladder steps the exhaust cutoff makes unreachable (`dunning_config`), JobLock leases no code path could have written (`job_locks`, threshold imported from the runner's `LOCK_LEASE_MS`), the Klaviyo key live-probed against Klaviyo (`klaviyo_key_live` — `probeKlaviyoKey`'s `transient` flag keeps network blips WARN), the cached flow-coverage verdict surfaced every tick (`klaviyo_flow_coverage`, reads `klaviyoFlowSetup` — never spends the daily API budget), every email template rendered through the REAL `renderEmail` with the merchant's stored overrides + design (`email_templates` — a throw is a send-time failure, a stray `{placeholder}` reaches the customer), stored credentials still decryptable (`stored_secrets` — the silent APP_SIGNING_SECRET-rotation fallback made visible), and contract-scoped events that lost their contract link (`event_provenance`). v1.24.0 adds `gift_promises` — the configuration drift behind the gift truth gates (the engines gate their sends silently at runtime; a promise quietly suppressed for everyone — surprise setting with no ORDER_INDEX=2 rule, an empty pool that dynamic rules / the day-90 reward / the gift save / the ladder depend on — surfaces here as a WARN instead of nowhere). v1.25.0 adds `widget_markets` — the market-visibility setting ⇄ `cellexia.widget_markets` metafield agreement (`widgetMarketsDiverged`) plus an audit of the saved handles against the live market list (`auditSelectedHandles`: WARN on a deleted/disabled market, FAIL when none is live = hidden everywhere; unreadable list = note) — and teaches `storefront_widget` to read the market-hidden marker before judging the launch gate AND to FAIL the inverse drift (widget rendered on the primary market the setting excludes = extension not deployed / stale metafield). v1.26.0 adds `design_facts` (Data integrity): the whole-history count of `checkout.subscribable` events against the `SubscribableOrder` fact table (whole history on purpose: the event is stamped when the webhook lands while the row carries the order's `processed_at`, so any windowed comparison produces false gaps at the edge), WARN when facts lag (the nightly `design_facts_backfill` is the fix), with a seen-coverage note over the last 30 days' rows. v1.27.0 adds `widget_visits` (Data integrity): PASS while the store is not LIVE, PASS when any `WidgetVisitorDay` row was touched in the last 7 days or when no order with widget exposure landed in that window, WARN when a LIVE store has exposure orders in the last 7 days and zero visit rows (extension not deployed, app embed disabled, or the beacon blocked; conversion per design cannot be computed until visits arrive). Runs every 30 min (`selfcheck_run`, ungated), persists to the machine-written `selfCheck` setting, keeps the deduped CRITICAL `SELF_CHECK_FAILED` alert in sync (raised while broken, auto-resolved on recovery). |
 | Ownership | `app/lib/ownership/` | Which contracts and selling plan groups are **ours** on a store that runs a second subscription app: contract classification (`OURS`/`FOREIGN`/`UNKNOWN`), the `OURS_ONLY` filter every gating query spreads, the storefront allow-list metafield `cellexia.plan_groups`, claiming and re-classification. |
 | i18n | `app/lib/i18n/` | Framework (done) + locale catalogs. |
 | Scripts | `scripts/` | Import (atomicCreate), seed, healthcheck. |
@@ -115,6 +116,11 @@ resolution fails, everything assumes SETUP and stays dark):
   `{skipped:"setup_mode"}` without touching a contract. Ungated jobs
   (analytics rollups/cohorts/churn risk, `risk_learning_run`,
   `predicted_ltgp_run`, `survey_link_sweep`, `origin_order_backfill`,
+  `design_facts_backfill` (v1.26.0, daily: rebuilds missing
+  `SubscribableOrder` design facts from the event feed, joins them to
+  contracts, stamps `originDesign*`, refreshes the country-to-market map;
+  since v1.27.0 also maps visit rows to markets and prunes the visit ledger
+  past 400 days),
   `cancel_session_gc`, `stale_attempt_sweep`,
   `klaviyo_flush`, `alerts_run`, `selfcheck_run`) keep running — they derive
   state or clean up internal records, and touch no customer.
@@ -153,7 +159,13 @@ inside, and leaving even the wrapper `[hidden]` while that widget is gated
 go-live; a validated preview reveal unhides the mounted wrapper with the
 widget). The same file wraps `fetch`/XHR once so `/cart/add(.js)` POSTs on
 formless AJAX themes get the selected `selling_plan` + `_cellexia_design` injected
-(own-variant matches only; anything else passes through byte-identical). If
+(own-variant matches only; anything else passes through byte-identical). Since
+v1.26.0 the same patch also stamps the exposure property `_cellexia_seen`
+(`<preset>|s|o|u`, see [Design measurement](#design-measurement)) on every
+add of OUR product's variants while the widget is visible: a one-time add
+carries `_cellexia_seen` only, a subscription add carries `selling_plan`,
+`_cellexia_design` and `_cellexia_seen`; foreign variants and foreign-plan
+lines stay byte-identical, and a hidden or gated widget stamps nothing. If
 the section block is present the embed stays dormant, and state is shared
 solely via the guarded `window.CellexiaSubs` global.
 
@@ -226,7 +238,9 @@ real asset files over it and asserts our wrapper mounts before `.pdp__grey`,
 the foreign element is byte-for-byte untouched, every `data-cellexia-*`
 attribute in the document is inside our wrapper, and the theme's jQuery XHR
 cart add carries `selling_plan` + `_cellexia_design` (and is byte-identical
-on one-time). Its vacuity guards put the defect back — the bare pre-rename
+on one-time). Since v1.26.0 that last clause reads: a one-time add of our
+product carries `_cellexia_seen` and nothing else, a subscription add carries
+all three, and foreign lines stay byte-identical in both modes. Its vacuity guards put the defect back — the bare pre-rename
 lookup, then the same lookup with `isOwnWrapper()` neutered — and assert the
 live failure modes, so the layers cannot quietly stop being load-bearing.
 
@@ -629,9 +643,404 @@ property `_cellexia_design` = the active preset key (`_cx_design` before
 v1.2.3 — the ORDERS_CREATE handler reads both names, preferring the current
 one, so attribution is continuous across the upgrade); the webhook logs
 one `widget.design_attributed` event (`{designKey, orderId}`) per distinct
-design on the order, and `getDesignPerformance`
-(`app/lib/analytics/queries.server.ts`) aggregates those into take-rate by
-design for the designer's performance card.
+design on the order. `getDesignPerformance`
+(`app/lib/analytics/queries.server.ts`) still aggregates those into a share
+of attributed subscription orders per design, but since v1.26.0 the designer
+no longer shows it: the bottom "Design performance" card is gone and the
+**Results** tab (next section) reads take rate, kept rates and LTGP per
+design from the `SubscribableOrder` fact table instead. **Design names**
+(v1.26.0): the publish dialog takes an optional name, stored as
+`WidgetDesignRevision.label` (`normalizeDesignLabel`, 80 chars, whitespace
+collapsed); `restoreRevision` carries the source's label onto the copy so a
+restored design keeps reading under one name in the history and the Results
+tab. A successful publish also fires two contained, fire-and-forget hooks
+(`afterPublishHooks` in `design.server.ts`): `refreshMarketCountryMap` and
+`invalidateScoreboardCache`, because a publish is exactly what changes the
+design calendar the readouts resolve against.
+
+## Design measurement (v1.26.0, visits v1.27.0)
+
+<a name="design-measurement"></a>
+
+`app/lib/design-measurement/` answers one merchant question the event feed
+never could: **per buy-box design, and per "was subscription preselected",
+what share of subscribable orders subscribed, and did those subscribers
+stay?** Before v1.26.0 the only per-design signal was `_cellexia_design`,
+stamped on subscription adds alone, so a design had a numerator and no
+denominator. v1.27.0 adds the second denominator: **exposed visits**, so the
+same rows also answer "how many orders and subscriptions per 100 visitors
+who saw this design". The module is read-side derivation plus two fact
+tables (orders and visits); every entry point is contained by its caller
+(Golden rule 9), nothing here touches billing, and every write is
+idempotent.
+
+**The `_cellexia_seen` carrier.** Both storefront writers (`buy-box.js` for
+theme forms, `buy-box-embed.js` for formless AJAX themes) stamp a second
+hidden line property `properties[_cellexia_seen]` = `<preset>|<p>` with `p`
+in `s` (subscription preselected on the rendered widget), `o` (one-time
+preselected) or `u` (unknown), on EVERY add-to-cart of our product's variants
+while the widget is visible, one-time and subscription alike; `_cellexia_design`
+keeps its exact old meaning (subscription adds only). Foreign variants and
+foreign-plan lines are never touched, an existing non-empty seen value is
+never overwritten, and the launch/market write gate applies unchanged (a
+hidden widget stamps nothing). `getState()` exposes `preselect` and the
+`cx:buybox:change` detail carries it. `shared.ts` (isomorphic, no server
+imports) owns the property name (`SEEN_PROPERTY`), the parser
+(`parseSeenValue`, sanitizing the key to `/^[a-z0-9_]{1,40}$/` because a
+line property is buyer-writable input) and the display formatters. The
+ORDERS_CREATE handler lifts the raw value off every line (`seenPropertyOf`)
+and adds the distinct values as `seen: [...]` to the `checkout.subscribable`
+payload (additive; it is what lets the nightly backfill rebuild a fact from
+the event alone).
+
+**`SubscribableOrder`, the fact table** (migration 0025; column contract in
+[DATA_FOUNDATION.md Part 4](DATA_FOUNDATION.md#part-4)). One PII-free row per
+subscribable storefront order, keyed `(shopId, orderId)`, written by
+`recordSubscribableOrder` (`facts.server.ts`) from ORDERS_CREATE for every
+`containsSubscribable` order (the dedupe of the `checkout.subscribable`
+event is a decision now, not an early return, so a redelivery repairs a
+missing fact) and by the nightly backfill from the event feed. The row
+carries what the shopper saw (`designKey`, `designPreselect`,
+`designRevisionId`, `designSource`, `calendarDesignKey`), the outcome
+(`subscribed`, `contractId`, `subscribedAt`, `hasSellingPlanLine`), the
+context the readouts split on (`marketHandle`, `countryCode`,
+`currencyCode`, `deviceType`, `sourceName`, `orderTotalCents`, `units`) and
+the hygiene flags a per-design readout must disclose: `promo` (any discount
+code or discount application), `mixed` (several designs stamped, or our
+product bought both as subscription and one-time in one order), `transition`
+(a publish within 24h before the order, `isTransition`), `staff` (checkout
+email in `designMeasurement.excludeEmails`, computed at write time,
+re-stamped right away when the Results tab saves the email list
+(`recomputeStaffFlags`) and again nightly; the email itself is never
+stored), `ownership` of the
+plan lines (`ours` / `foreign` / `mixed` / `none`, from `getOwnPlanIdEvidence`;
+when our own plan-id set is known to be incomplete an unmatched plan is not
+declared foreign) and `exposure` (any widget-stamped property on any line).
+**Resolution ladder** (`chooseDesign`, best evidence first, recorded in
+`designSource`): `seen` (`_cellexia_seen` on any of our lines; the
+subscription line of OUR plan wins when lines disagree) → `design_prop`
+(`_cellexia_design` only: pre-v1.26.0 extension or a lost seen value;
+preselect borrowed from the calendar when it names the same design) →
+`calendar` (no widget property at all: the design the ledger says was live
+for the order's market at `processedAt`) → `none`. The calendar rung is
+withheld when exposure was structurally impossible (`calendarRungAllowed`):
+the store was in SETUP, or the order's market is excluded by `widgetMarkets`
+(an unknown market fails open); such rows stay `none` and land in the
+scoreboard's no-exposure bucket, while `calendarDesignKey` still records
+what the ledger would have said, for the agreement audit. On UPDATE the
+writer never touches `subscribed` / `contractId` / `subscribedAt`: those
+belong to `linkContractDesign`.
+
+**The write-once subscriber stamp.** `linkContractDesign(shopId, contractId)`
+joins fact and contract for a COUNTABLE contract (`isDemo:false`, ownership
+OURS) that has an `originOrderId`: it marks the fact `subscribed=true` /
+`contractId` / `subscribedAt` (`firstChargeAt ?? createdAt`) and stamps the
+contract's `originDesignKey` / `originDesignPreselect` /
+`originDesignRevisionId` / `originDesignSource` / `originDesignStampedAt`
+exactly once (an `updateMany ... where originDesignStampedAt: null`, so two
+racing callers cannot both win). It is called from the contract-create tail,
+the UPDATE catch-up branch, ORDERS_CREATE when the contract mirror already
+exists (the webhook race), and the nightly backfill; all four contained.
+When no fact row exists the stamp falls back to `widget.design_attributed`
+events, then the calendar, then `none`, but only once the contract is older
+than `LINK_NO_FACT_GRACE_MS` (48h), so a contract webhook that lands seconds
+before its order webhook does not burn the write-once slot on a guess.
+`originDesign*` are **deliberately outside the `acq*` family and retained
+through `CUSTOMERS_REDACT`** (merchant decision v1.26.0: a design label is a
+property of the checkout, not of the person, and LTGP by design must survive
+a redact); the anonymizer carries a comment saying so, and
+[DATA_FOUNDATION.md](DATA_FOUNDATION.md) records the exception.
+
+**The design calendar** (`ledger.server.ts`) is derived, never stored: from
+the published `WidgetDesignRevision` rows (`publishedAt` not null, oldest
+first) it answers "which design was live at instant T for market M" with the
+storefront's own rule, `config.markets[handle]?.preset ?? config.preset`,
+and reads the preselect from `config.behavior.preselect` (`subscription` →
+`sub`, `one_time` → `one`, `inherit` → `sub` for `subscription_ultra_max`
+whose frame forces the subscription first, else unknown). `getDesignCalendar`
+renders one period per market (or default) per contiguous stretch, newest
+first, capped at 200; consecutive publishes that leave a market's preset,
+preselect and label unchanged merge into one period, and a relabelled
+republish opens a new one on purpose (naming a design is how the merchant
+marks a new test). `isTransition` flags orders within 24h after a publish.
+Orders carry a country, not a market, so **`MarketCountryMap`**
+(`markets.server.ts`) caches Shopify's Market regions (Admin API 2025-01
+`markets { handle enabled primary regions { ... on MarketRegionCountry { code } } }`;
+enabled markets only, primary first, a country in two markets keeps the
+first); refreshed after every publish and by the nightly job, contained, and
+an empty answer never wipes a working map. A missing entry degrades to
+`marketHandle = null` (the default design), never to an error.
+
+**The visit ledger (v1.27.0).** `WidgetVisitorDay` (migration 0026, column
+contract in [DATA_FOUNDATION.md Part 4](DATA_FOUNDATION.md#part-4)) holds
+one row per anonymous visitor per shop-timezone day per (design key,
+preselect), unique on `(shopId, day, vid, designKey, designPreselect)`, with
+a `views` count and three booleans (`engaged`, `addedToCart`,
+`addedSubscription`) plus the context the scoreboard splits on
+(`countryCode`, `marketHandle`, `deviceType`). It is written by the
+**storefront beacon** in `buy-box-embed.js` (section 4 of the file; the
+theme block has no beacon, so a theme-block-only install records no
+visits): a `GET /apps/cellexia-subs/w?…` image request (`new Image().src`;
+the original `fetch(keepalive, no-cors)` only when `Image` is missing; never
+awaited, every entry point wrapped) fired at most once per page load per
+(design|preselect) for each of three events: `e=view` once a widget root
+(`.cx-buybox[data-cellexia-buybox]`) has been at least half in the viewport
+for a full second (IntersectionObserver at threshold 0.5 with a 1,000 ms
+dwell timer; without IO, 1,500 ms after boot if `getState()` is non-null),
+`e=engage` on the first pointerdown / click / keydown / change inside a root
+or the ultra-max satellite (document-level capture listeners), and `e=atc`
+from the fetch / XHR cart-request patch whenever the intercepted `/cart/add`
+body targets one of our variants, whether the patch injected the stamps or
+found them already there (`bodyTargetsOurs`: a theme that serialises an
+already-stamped product form and sends it without a submit event; a foreign
+variant never counts; `m=s` when the subscription option is selected, else
+`m=o`) and from a capture-phase `submit` on a `/cart/add` form carrying an
+enabled `properties[_cellexia_seen]` input (theme-form installs; `m` from
+the widget's mode). Common params: `d` (design), `p` (`s|o|u`), `v`
+(variant id), `c` (`Shopify.country`, ISO-2 or empty), `cur`
+(`Shopify.currency.active` or empty), `dv` (`m|t|d`: width < 768 mobile,
+< 1024 or coarse pointer tablet, else desktop), `vid` (visitor id), `pv`
+(8-char page-view id), `t` (`Date.now()`). The visitor id is 16 URL-safe
+characters from `crypto.getRandomValues` (else `Math.random`; a browser-local
+anonymous id, not an experiment assignment, so the kernel's no-RNG rule does
+not apply), kept in `localStorage["cellexia_vid"]`, then `sessionStorage`,
+then per page, validated on read against `/^[A-Za-z0-9_-]{8,32}$/`. The
+beacon is skipped entirely (no observer, no listeners) when the page URL
+carries `cx_preview=` (admin preview) or when `Shopify.designMode === true`
+(the theme editor's preview frame: the merchant clicking through designs is
+not a shopper, and without this gate every editing session would add
+zero-order visits to exactly the design being edited), and per event
+whenever `getState()` is null (widget hidden, gated, absent); the cart
+stamps keep working in all three cases. It carries no personal data, sets no
+cookie and needs no consent gate (merchant decision, v1.27.0). Byte budget:
+the beacon added about 20 KB to the embed (73,998 bytes at v1.27.0 against
+the 114,688 ceiling enforced by `tests/liquid/size-limits.test.ts`).
+
+The route `app/routes/proxy.w.tsx` (`/apps/cellexia-subs/w` through the app
+proxy, i.e. `/proxy/w`) runs `authenticate.public.appProxy` FIRST and
+outside the containment (an unsigned request gets the library's rejection
+like every proxy route); everything after that is in a try/catch and the
+only answer is **204 No Content, `Cache-Control: no-store`**, never a 4xx
+or 5xx to a shopper's browser. Gates in order: `parseVisitBeacon`
+(`e` in view|engage|atc, `d` through `sanitizeDesignKey`, `p` in s|o|u
+mapped to `sub|one|u`, `vid` against the id grammar; `c` must be
+`/^[A-Z]{2}$/` else null, `dv` mapped to mobile|tablet|desktop else null,
+`m` read on atc only; `v`, `cur`, `pv`, `t` are transport-only and ignored);
+a bot filter on the forwarded User-Agent (`VISIT_BOT_UA_RE`, three groups:
+generic crawler words `bot|robot|crawler|crawl|spider|slurp|preview` only as
+whole tokens, so "Robot Framework" is a bot but the phone "CUBOT" and
+"Robotics" are not; tool prefixes `headless|lighthouse|pingdom|facebookexternalhit`
+where a product name continues; and a named-crawler list, googlebot,
+bingbot, yandexbot, baiduspider, duckduckbot, applebot, semrush, ahrefs,
+petalbot, slackbot, twitterbot, discordbot, linkedinbot, telegrambot,
+whatsapp, bytespider, gptbot, claudebot, ccbot, amazonbot, mj12bot, dotbot,
+seznambot, ia_archiver; a bare `yandex` is deliberately NOT listed because
+YandexSearch is a shopper's mobile browser); two in-module token buckets, per `shop:vid` (60 per minute) and per shop
+(3,000 per minute), continuous refill, idle keys swept each minute,
+per-instance state (N instances multiply the effective limit; a defence
+against a runaway tab, not a security boundary); then the shop
+(`requireShop(session.shop)` when the proxy names one, else
+`getPrimaryShop()`) and the launch mode, which must be LIVE (verdict cached
+in-module for 60 s per shop); then `marketHandleForCountry` and
+`recordVisit`. `recordVisit` (`visits.server.ts`) upserts on the unique
+key with `day = visitDayKey(now, shop.ianaTimezone)`: `view` increments
+`views` (created with 1), `engage` sets `engaged`, `atc` sets `addedToCart`
+and, for `m=s`, `addedSubscription`; `engage` and `atc` create the row with
+`views 0` when no view landed first (beacon order is not guaranteed), every
+event refreshes `lastSeenAt`, and the identity columns (country, market,
+device) are written on create only. Readers: `visitSummary(shopId, {since,
+until, marketHandle, tz})` groups by (designKey, designPreselect, day) into
+`visits` (row count = distinct visitors), `views` (sum), `engaged`,
+`addedToCart`, `addedSubscription` (rows where true); `lastVisitAt` (top-1
+by `lastSeenAt`); and two unscoped presence readers over the same shop-tz
+day range, `hasVisits(shopId, {since, until, tz})` (one indexed probe on
+`(shopId, day)`, any market, any design: the scoreboard's "recorded" fact)
+and `firstVisitDay(...)` (earliest day key with a row). Indexes: the unique
+key, `(shopId, day)`, `(shopId, designKey, day)` and `(shopId, lastSeenAt)`
+(the last one carries `lastVisitAt` and the self-check's since-count without
+sorting the ledger). Maintenance from `design_facts_backfill`: `recomputeVisitMarkets` (rows
+with a country and a null market, oldest first, capped 5,000 per run,
+skipped when the market map is empty; run inside the flags step, contained
+on its own) and `pruneVisits` (rows whose day key is older than
+`VISIT_RETENTION_DAYS` = 400, computed in the shop timezone; its own last
+step, `prune_visits`). Nothing on the visit path invalidates the scoreboard
+cache: a beacon per page view would defeat it, and the readout may be up to
+10 minutes stale by contract.
+
+**The scoreboard engine** (`scoreboard.server.ts`, pure types and the one
+statistic in `types.ts`) is what the Results tab reads. Population: the
+shop's fact rows in range (a trailing 30/90/365-day window that never
+reaches behind `designMeasurement.startedAt`, or everything since that date)
+with `staff = false`; foreign-only rows (`ownership: "foreign"`) are excluded
+and counted in `excludedForeignOnly`; rows with no exposure and
+`designSource: "none"` form one synthetic **no_exposure** row so bypass volume
+stays visible; rows with exposure but no resolvable design (or a design key
+colliding with a reserved synthetic key) form the synthetic **unknown** row.
+Grouping is by variant (`design|preselect`), by design or by revision.
+Per row, order-level metrics: `takeRatePct` = subscribed ÷ orders; kept
+30/60/90 behind a **maturity gate** (only orders with `processedAt + N days
+≤ now` enter horizon N; a subscriber is kept when its contract's churn end,
+`churnEndOf` shared with the cohort engine, is null or after that instant;
+the rate's denominator is the mature subscribed orders); quick cancels at
+14 days; one-time share; LTGP per subscriber at M3/M6/M12 through the
+IDENTICAL cohort engine (`computeCohortRows` + `summarizeLtgp` over the row's
+contract ids); AOV; a sample grade (`too_early` < 30 orders,
+`direction_only` < 200, else `usable`); ISO weeks in the shop timezone; and
+the hygiene counts. **Guardrail rule** (`computeGuardrailVerdicts`): the
+reference is the real row with the most orders; only whole weeks with orders
+qualify (the current week and a leading partial week never do); the
+reference must have two qualifying weeks averaging at least
+`guardrailMinOrdersPerWeek`, else every verdict is `insufficient`; a row is
+`breach` when its mean weekly orders sit more than `guardrailMaxOrderDropPct`
+below the reference AND at least two of its weeks each breach, `watch` above
+half the tolerance, else `ok`. `probabilityBetterThan` (Beta(1,1) priors,
+numeric integration) is the "chance it beats the reference" the client
+computes. Cache: a module Map keyed by `(shopId, rangeDays, marketHandle,
+groupBy)`, TTL 10 minutes, `fresh` bypasses; `invalidateScoreboardCache(shopId)`
+is called after fact writes, after a publish and after a settings save
+(never by the visit path).
+
+**Visits, conversion, comparison and the guardrail basis (v1.27.0).** The
+engine reads `visitSummary` through a lazy, contained import (`loadVisits`:
+a missing module, a thrown read or a shape surprise all yield null and can
+never blank the order-side readout) over the same range and market as the
+facts, and joins each summary row onto a scoreboard row **by the same stamp
+the facts carry**: `designKey|preselect` for variant grouping (a stored
+`u` joins the `unknown` preselect), `designKey` for design grouping, and
+for revision grouping the ledger revision live on that day for the queried
+market (`revisionForVisitDay`: candidates are the revision live at day start
+plus every revision published during the day; the last one whose design for
+the market equals the visit's design key wins, else the one live at day
+end; when the ledger cannot be loaded, revision rows read visits null).
+Reserved design keys join nothing; synthetic rows (no_exposure, unknown)
+always have `visits: null`. "Recorded" is an UNSCOPED presence fact: the
+shop has at least one visit row in the day range, in any market and for any
+design (`hasVisits`; falls back to the unscoped summary when that reader is
+unavailable), so a market filter whose visits are still unmapped (country
+not in the market map yet) reads zeros with `totals.visitsRecorded: true`,
+never "not recorded". `VariantRow.visits` is `null` for every row when the
+shop is not recorded (beacon not deployed, app embed disabled) or the scoped
+read failed, and the UI says "visits not recorded yet"; once recorded, a
+real row with no matching visits reads zeros. A design with visits but no
+order yet still gets a row (0 orders, N visits) so a freshly published
+design shows as live and seen. Rows sort by orders, then visits, then key;
+the weekly axis starts at `since`, else at the earliest fact OR visit.
+**Time alignment**: the beacon usually goes live after the first order, so
+the conversion numerators are NOT the row's whole-range orders. Facts are
+tallied per shop-tz day inside each bucket, and only the days in the
+shop-wide covered-day set (days with at least one visit row for the shop,
+any design, any market: the same set behind `visitCoverageDays`, from the
+unscoped summary on market-scoped queries) are summed into
+`ordersCounted`, `subscribedCounted` and `keptCounted`; take rate and the
+kept rates keep counting every order. Per row `conversion`
+(`ConversionBlock`; the per-100 rates keep 2 decimals because 0.26 vs 0.34
+kept subscribers per 100 visits is a 31% difference one decimal would erase,
+the two share percentages keep 1; null when the denominator is 0 or visits
+are null): `ordersPer100Visits` = ordersCounted ÷ visits,
+`subscriptionsPer100Visits` = subscribedCounted ÷ visits, `addToCartPct`
+(visitor-days that added ÷ visits), `subscriptionPickPct` (addedSubscription
+÷ addedToCart) and `keptSubscribersPer100VisitsD30` = keptCounted ÷
+`maturedVisits`, where BOTH sides mature on the same day rule (the whole
+shop-tz day is at least 30 days old: day end + 30 days ≤ now; `keptCounted`
+is the subscribed orders of covered, matured days whose contract was still
+live 30 days after the order, which differs from `held.d30.heldSubscribed`,
+matured by the order instant, and `maturedVisits` is the row's visits on
+matured days), the one number that combines conversion and net take rate.
+The counted numerators, `maturedVisits` and `firstVisitDay` (first covered
+day in range) ride along so the UI can print "N counted since <day>" and
+recompute the digits from raw counts. Weekly buckets gain `visits`
+(visitor-days whose day key falls in the ISO week). Totals gain `visits`
+(market-scoped like the rows), `visitsRecorded` (the unscoped presence
+fact), `visitsUnscoped` (visitor-days across every market; null when that
+read was unavailable), `visitCoverageDays` (shop-wide days with at least one
+visit row ÷ days in range, plus the two counts `visitDaysCovered` /
+`visitDaysInRange`) and `lastVisitAt`. **Guardrail basis**:
+`computeGuardrailVerdicts` runs the identical rule twice; the `orders` basis
+(weekly raw orders, the v1.26.0 rule; a week qualifies with orders > 0) is
+always present per real row, and the `conversion` basis (weekly orders per
+100 visits, 2 decimals in the wording) is present, listed first and read by
+the UI as the primary verdict, only when the reference is judgeable on
+orders AND both the reference and the row have at least two whole weeks
+with visits > 0. On the conversion basis a week qualifies on VISITS, not
+orders: a whole week with traffic and zero orders contributes 0 per 100 (it
+is the collapse the guardrail exists to catch); the floor stays on the
+reference's weekly ORDERS for both bases. `GuardrailVerdict.basis` says
+which. **Comparison** (`computeComparison`, pure, still shipped as
+`scoreboard.comparison` although the v1.27.0 Results tab computes its own
+card client-side, see below): every real non-reference row against the
+reference (the real row with most orders): deltas row minus reference in
+points from the UNROUNDED ratios of the raw counts, rounded once to 2
+decimals (`conversionPts` and `subscriptionConversionPts` from the
+time-aligned `ordersCounted` / `subscribedCounted` over visits,
+`takeRatePts`, `kept30Pts`, `keptPer100VisitsD30` from keptCounted over
+maturedVisits) and `chance` from `probabilityBetterThan` over the same raw
+counts, null when either side lacks a denominator; `[]` with fewer than two
+real rows.
+
+**Admin surface.** The Buy box designer's fifth tab, **Results**
+(`app/components/design-results.tsx`, client-only, mounts lazily and fetches
+through `useFetcher`), talks to the resource route
+`app/routes/app.buy-box_.results.tsx` (escaped flat name: URL
+`/app/buy-box/results`, NOT nested under the designer, so neither loader
+re-runs for the other; `Cache-Control: no-store`). GET takes `range`
+(30|90|365|all), `market`, `group` (variant|design|revision) and `fresh`;
+POST intents `save-measurement-settings` and `save-sessions` write the
+**`designMeasurement` settings group** (`startedAt`, `excludeEmails`,
+`guardrailMaxOrderDropPct` default 10, `guardrailMinOrdersPerWeek` default
+20, `weeklySessions` keyed by ISO week; edited only from this tab, never from
+the generic Settings page), log `admin.action`
+`design_measurement_settings_saved` and clear the cache. The tab shows the
+scoreboard with a reference chooser, guardrail verdicts and the editable
+thresholds, a weekly table with optional typed-in product-page sessions
+(conversion per week), a data-quality card (seen coverage, calendar
+agreement, exclusions), the design calendar and a "how to read this" guide
+with sample-size guidance. v1.27.0 (payload shape unchanged; everything
+rides inside `scoreboard`): the table gains **Visits**, **Conversion (orders
+per 100 visits)**, **Subscription conversion (per 100 visits)** and **Kept
+subscribers per 100 visits (30d)** columns whose cells degrade to words, not
+blanks ("no visits yet" when the shop has recorded no visits in range, "no
+visits" on a row when the shop records visits but none carried that stamp,
+"not available for this view" for a row visits cannot attach to, "not yet"
+until a visit day has matured), with the per-100 rates recomputed
+client-side from the raw counts (`ordersCounted` over visits) to two real
+decimals and a second line "N counted since <day>" under Conversion when
+the row's first visit day is later than the range start; two banners above
+the table, "Visits are not recorded yet" (info) turning into "No visits
+recorded although orders arrived" (warning) when the store is LIVE and
+exposure orders exist in range while `totals.visitsRecorded` is false, and
+"No visits in this selection" (info) when the shop records visits but none
+matched the chosen market and range; ONE reference on the screen: the
+"Compare against" Select (default: the real row with most orders) drives
+both the "Chance it beats the reference" column and the **Compare against
+the reference** card, both computed in the browser from the raw counts on
+the rows (`compareAgainstReference`: deltas in points plus "N% chance
+better" for conversion, take rate and kept 30d) behind ONE gate, "too
+early" while either design has under 30 orders (the server's
+`scoreboard.comparison`, always against the most-orders row, is not read by
+the tab: an earlier draft that used it left two references on one screen);
+the guardrail keeps its fixed baseline (the row with most orders) and is
+worded "the guardrail baseline", never "the reference", with a Basis column
+(conversion where present, weekly orders otherwise); visits and orders per
+100 visits per design on the weekly table; the sessions table relabelled
+"Optional cross-check: Shopify sessions"; and data-quality tiles for visits
+recorded, days with visits and last visit. The **`design_facts` self-check** (Data
+integrity) compares the whole-history count of `checkout.subscribable`
+events with the fact-row count (no window: the two sides do not share a
+clock, the event is stamped at webhook time and the row at the order's
+`processed_at`): PASS when facts cover the events (or both are 0), WARN when
+facts lag (remediation: the nightly `design_facts_backfill`), plus a
+seen-coverage note over the last 30 days' rows. The **`widget_visits`
+self-check** (v1.27.0, Data integrity) is the server-side signature of a
+silent beacon: PASS while the store is not LIVE, PASS when any visit row
+was touched in the last 7 days or no exposure order landed in that window,
+WARN when a LIVE store has exposure orders in the last 7 days and zero visit
+rows (remediation: deploy the v1.27.0 extension, enable the app embed, look
+for `/apps/cellexia-subs/w?e=view` in the network tab).
+
+**Segments** gained the `design` and `preselect` dimensions from the
+subscriber stamp (see [Analytics](#analytics)); take rate by design is
+deliberately NOT a segment view (its denominator is orders, not contracts)
+and lives only here.
 
 ## Analytics
 
@@ -650,7 +1059,14 @@ enter any metric, numerator or denominator. Event-based counters (skips,
 saves, add-ons, refunds) are counted **through the contract relation** with the
 same filter; the one deliberate exception is `checkout.subscribable` (the
 take-rate denominator), which precedes any contract and is counted without a
-join. Money is only summed within the shop currency — attempts/contracts in
+join. A second, written exception since v1.26.0: the design scorecard
+(Buy box designer → Results) is an ORDER-level readout over the
+`SubscribableOrder` fact table with its own denominator (subscribable orders,
+staff and foreign-only rows excluded), disclosed as such on the tab; its
+subscriber-side figures (kept rates, LTGP) still spread `COUNTABLE_CONTRACT`
+through the contract lookup, and the contract-based `takeRatePct` of the
+analytics page stays null under filters rather than borrowing that
+denominator. Money is only summed within the shop currency — attempts/contracts in
 another presentment currency are excluded, never converted at 1:1, and the
 excluded amount is accumulated into
 `DailyRollup.excludedForeignCurrencyCents` so the exclusion is a visible,
@@ -859,7 +1275,14 @@ Other load-bearing details:
 - **Segments** (v1.15.0, `segments.server.ts` + `segment-views.server.ts`):
   the analytics page's filter bar — country / language / traffic source /
   product / first-order discount band / device / first-order value, AND-
-  combinable, each with an explicit Unknown bucket. ONE pure predicate
+  combinable, each with an explicit Unknown bucket. Since v1.26.0 two more
+  dimensions make nine: **buy-box design** (`design`, URL param `design`,
+  from `SubscriptionContract.originDesignKey`, validated against the
+  preset-key shape) and **preselected option** (`preselect`, values `sub` /
+  `one` / `unknown`, from `originDesignPreselect`); both read the write-once
+  stamp described under [Design measurement](#design-measurement) and never
+  resolve the ladder themselves. The filter bar renders five selects per row
+  on large screens. ONE pure predicate
   derives every dimension (country via `contractTaxCountry` — shared with
   VAT; language from the checkout locale (`acqRaw.checkoutLocale`, v1.16.0 —
   the contract locale is catalog-normalized with an "en" default) falling
@@ -882,8 +1305,10 @@ Other load-bearing details:
   over a weekly history reconstructed from contracts + orders (no MRR — not
   reconstructable; grade hard-capped at B with the reconstruction caveats
   as reasons; never writes `forecastModelHistory`). Take rate stays
-  store-wide under a filter (its checkout denominator precedes contracts)
-  and insight cards hide. Route components import the vocabulary from
+  store-wide under a filter (its checkout denominator precedes contracts;
+  `takeRatePct` reads null while any filter is active) and insight cards
+  hide; take rate BY design lives in Buy box designer → Results, whose
+  denominator is orders. Route components import the vocabulary from
   `segments-shared.ts` only (the ownership `shared.ts` pattern — a
   `.server` import in a component breaks the client build).
 - **Jobs**: `rollup_run`, `cohort_run` (full triangle recompute — delete +
@@ -901,7 +1326,24 @@ Other load-bearing details:
   oldest first; permanently unfetchable orders are retired via the
   `originCaptureExhaustedAt` / `acqPickupExhaustedAt` terminal markers so the
   capped window always drains, and contained per-contract failures surface as
-  the `ORIGIN_BACKFILL_FAILURES` alert), `refund_reconcile` (re-attempts the
+  the `ORIGIN_BACKFILL_FAILURES` alert), `design_facts_backfill` (v1.26.0,
+  six contained steps since v1.27.0: refresh `MarketCountryMap` FIRST (every later step
+  resolves the calendar per market), rebuild missing `SubscribableOrder`
+  rows from `checkout.subscribable` events plus the order's
+  `acquisition.captured` stash and `widget.design_attributed` events (the
+  feed is walked newest to oldest by cursor, 500 per page, at most 40 pages,
+  until 2,000 missing rows are found, so an old backlog drains over
+  consecutive nights), link unlinked facts to countable contracts (walked
+  from the contract side), stamp unstamped contracts, then recompute
+  `staff` / `transition` / `marketHandle` over the rows since
+  `designMeasurement.startedAt` (all rows when unset, capped 5,000; a row
+  whose calendar-sourced design was resolved against an empty market map is
+  re-resolved for its real market; the same step maps `WidgetVisitorDay`
+  rows that carry a country but no market yet, `recomputeVisitMarkets`,
+  capped 5,000, contained on its own), then `prune_visits` LAST (drop visit
+  rows older than 400 days in the shop timezone; its own step so retention
+  housekeeping never costs a repair step; stats `visitMarketsRecomputed`,
+  `visitsPruned`)), `refund_reconcile` (re-attempts the
   unmatched-refund guard events once the attempt/origin mirror exists) and
   `full_sync_reconcile` (full contract re-sync — recovers from webhooks that
   outlived Shopify's retry horizon) daily; `alerts_run` every 15 min (which
@@ -924,7 +1366,9 @@ Other load-bearing details:
 Two contract-less types complete the vocabulary: `checkout.subscribable`
 (the take-rate denominator — logged per checkout that *could* have chosen a
 subscription, before any contract exists, and therefore counted without the
-contract join every other counter spreads) and `system.plan_group_drift_check`
+contract join every other counter spreads; since v1.26.0 its payload also
+carries `seen: [...]`, the distinct `_cellexia_seen` values on the order, and
+the same order set is mirrored as a `SubscribableOrder` fact row) and `system.plan_group_drift_check`
 (an internal marker, not a subscriber event: its existence within 24h is the
 budget gate for the daily Admin-API plan-drift sweep in
 `alerts.server.ts`). Neither is Klaviyo-mapped.
@@ -943,11 +1387,13 @@ caller.
 - `/app`, `/app/*` — embedded admin (Polaris), authenticated via `authenticate.admin`
 - `/webhooks` — all webhook topics (configured in `shopify.app.toml`)
 - `/proxy/*` — customer portal via app proxy (verify signature with `authenticate.public.appProxy`)
+- `/apps/cellexia-subs/w` (storefront URL; lands as `/proxy/w`, `proxy.w.tsx`): the buy-box visit beacon (v1.27.0). GET only, `authenticate.public.appProxy` first, then always `204 No Content` with `Cache-Control: no-store`; invalid params, bots, rate-limited visitors or shops and a store that is not LIVE are dropped silently. Writes `WidgetVisitorDay`; see [Design measurement](#design-measurement)
 - `/magic/:token` — magic link executor (public, self-authenticating)
 - `/api/jobs/run` — external cron trigger (`x-cron-secret` header)
 - `/api/survey` — post-purchase survey writes from the checkout UI extension (Shopify session token, CORS-handled)
 - `/api/health` — health/monitoring endpoint
 - `/app/emails`, `/app/emails/setup`, `/app/emails/:template` — Emails overview (`app.emails.tsx`, a LEAF route since v1.25.0), Klaviyo delivery setup (`app.emails_.setup.tsx`) and per-template editor (`app.emails_.$template.tsx`) — escaped flat-route names: same URLs, no nesting under the overview's loader; `/app/emails/setup/status` (`app.emails_.setup_.status.tsx`) is the DB-only polling endpoint for the background verify/setup task
+- `/app/buy-box/results`: resource route (`app.buy-box_.results.tsx`, escaped: not nested under the designer's loader) feeding the Buy box designer's Results tab (v1.26.0): GET the design scoreboard (`range`, `market`, `group`, `fresh`), POST the `designMeasurement` settings intents; `Cache-Control: no-store`
 
 ## Key Shopify API notes (Admin GraphQL 2025-01)
 
