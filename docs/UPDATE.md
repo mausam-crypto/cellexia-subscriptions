@@ -84,15 +84,24 @@ the next scheduler tick, so there is no need to "pause billing".
    pg_dump "$DATABASE_URL" -Fc -f backup-pre-vX.Y.Z-$(date +%F).dump
    ```
 
-3. **Unzip over the previous directory, keeping `.env`** (and your `fly.toml`):
+3. **Unzip over the previous directory, keeping `.env`, your `fly.toml`, YOUR
+   `shopify.app.toml` and YOUR `extensions/*/shopify.extension.toml`**:
 
    ```bash
    unzip -o cellexia-subscriptions-vX.Y.Z.zip -d cellexia-subscriptions/
    ```
 
    `.env`, `fly.toml` and `prisma/migrations/` from earlier versions are never
-   removed by an update — migrations are cumulative. If you keep a git repo (§3),
-   commit now and review `git diff` against the previous release.
+   removed by an update — migrations are cumulative. **The ZIP ships
+   `shopify.app.toml` and the extension tomls as TEMPLATES** (placeholder
+   `client_id` and `application_url`, no extension `uid`s): unzipping
+   overwrites your linked copies, so restore them from git (§3) — or unzip to
+   a scratch directory and copy everything except those files. Then apply
+   the release's toml deltas by hand: every release that adds webhook
+   topics, scopes or extension settings lists the exact lines in its
+   CHANGELOG entry / release notes (e.g. 1.28.0: three `fulfillments/*`
+   webhook subscriptions). If you keep a git repo (§3), commit now and review
+   `git diff` against the previous release.
 4. **Install exact dependencies**: `npm ci`
 5. **Apply migrations**: `npx prisma migrate deploy`
    (safe to run before deploying code — migrations are additive, so old code

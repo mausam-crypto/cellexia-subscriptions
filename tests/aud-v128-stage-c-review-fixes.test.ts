@@ -294,7 +294,9 @@ describe("settings.support — save-time format checks match the resolver", () =
     whatsapp: "",
     chatUrl: "",
     hoursNote: "",
-    slaBusinessDays: 1,
+    replyWithinValue: 30,
+    replyWithinUnit: "minutes",
+    alwaysOn: true,
     requestsPerHour: 3,
   };
   const parse = (over: Record<string, unknown>) =>

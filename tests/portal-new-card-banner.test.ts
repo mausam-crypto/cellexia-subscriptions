@@ -219,12 +219,19 @@ describe("home banner (proxy._index.tsx pins)", () => {
     expect(block).toContain('["ACTIVE", "PAUSED", "FAILED"].includes(contract.status)');
     expect(block).toContain('api("payment_select")');
     expect(block).toContain('{ name: "paymentMethodId", value: params.newCard.paymentMethodId }');
-    expect(block).toContain("portal.index.new_card_banner_labelled");
-    expect(block).toContain("portal.index.new_card_banner");
+    // v1.29.0: the banner text + markup live in the shared new-card-banner
+    // module (the single-mode subscription page renders the same banner).
+    const shared = readSource("app/lib/portal/new-card-banner.server.ts");
+    expect(block).toContain("newCardBannerHtml({");
+    expect(block).toContain("newCardBannerText(locale, params.newCard)");
+    expect(shared).toContain("portal.index.new_card_banner_labelled");
+    expect(shared).toContain("portal.index.new_card_banner");
     expect(block).toContain("portal.index.new_card_cta");
-    expect(block).toContain('#cxs-payment"');
-    expect(block).toContain("cxs-banner cxs-newcard");
+    expect(block).toContain("#cxs-payment`");
+    expect(shared).toContain("cxs-banner cxs-newcard");
+    expect(shared).toContain("portal.index.new_card_more");
     expect(block).not.toMatch(/class="[^"]*\bcx-/);
+    expect(shared).not.toMatch(/class="[^"]*\bcx-/);
     // The banner sits above the value grid and the run-out prompt.
     expect(src).toMatch(/\$\{newCardHtml\}\s*\$\{valueHtml\}\s*\$\{promptHtml\}/);
   });

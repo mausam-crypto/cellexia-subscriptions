@@ -4,7 +4,7 @@ import { getSetting } from "~/lib/settings/settings.server";
 import { escapeHtml } from "~/lib/portal/layout.server";
 import { formatShopDate } from "~/lib/dates.server";
 import { formatMoney } from "~/lib/money";
-import { getSupportChannels, type SupportChannels } from "./channels.server";
+import { getSupportChannels, type ReplyPromise, type SupportChannels } from "./channels.server";
 
 /**
  * Support requests (v1.28.0, P5.1) — the ONE submit path behind the portal
@@ -103,7 +103,8 @@ export interface SubmitSupportRequestResult {
   pushBackFailed: boolean;
   alertRaised: boolean;
   emailSent: boolean;
-  slaBusinessDays: number;
+  /** The reply promise as resolved at submit time (supportReplyPromise phrases it). */
+  replyWithin: ReplyPromise;
   channels: SupportChannels;
 }
 
@@ -287,7 +288,12 @@ async function applyPushBack(
 async function raiseSupportAlert(
   input: SubmitSupportRequestInput,
   now: Date,
-  extra: { orderLabel: string | null; pushBackApplied: boolean },
+  extra: {
+    orderLabel: string | null;
+    pushBackApplied: boolean;
+    /** The reply promise the customer READ (v1.29.0) — the SLA job judges against it. */
+    replyWithin?: ReplyPromise;
+  },
 ): Promise<boolean> {
   try {
     const { raiseAlert } = await import("~/lib/analytics/alerts.server");
@@ -327,6 +333,10 @@ async function raiseSupportAlert(
           : {}),
         ...(input.cancelSessionId ? { cancelSessionId: input.cancelSessionId } : {}),
         ...(input.saveRequest ? { saveRequest: true } : {}),
+        // The promise as it stood when the customer read it: the breach job
+        // measures THIS, not the setting at tick time (a merchant editing the
+        // promise must not silence or invent breaches for open requests).
+        ...(extra.replyWithin ? { replyWithin: extra.replyWithin } : {}),
       },
       // A concierge save request (P3.7) dedupes on its cancel session, never
       // on the day: an earlier plain Get-help submit the same day must not
@@ -448,7 +458,11 @@ export async function submitSupportRequest(
   });
 
   const channels = await getSupportChannels(input.shopId);
-  const extra = { orderLabel: input.orderLabel ?? null, pushBackApplied: push.applied };
+  const extra = {
+    orderLabel: input.orderLabel ?? null,
+    pushBackApplied: push.applied,
+    replyWithin: channels.replyWithin,
+  };
 
   // 3 + 4: demo fixtures never page the merchant.
   let alertRaised = false;
@@ -464,7 +478,7 @@ export async function submitSupportRequest(
     pushBackFailed: wantsPushBack && !push.applied,
     alertRaised,
     emailSent,
-    slaBusinessDays: channels.slaBusinessDays,
+    replyWithin: channels.replyWithin,
     channels,
   };
 }

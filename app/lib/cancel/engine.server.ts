@@ -69,6 +69,7 @@ import {
 } from "./config.server";
 import { pickGiftForContract } from "~/lib/gifts/picker.server";
 import { settingOverride } from "~/lib/experiments/index.server";
+import type { ReplyPromise } from "~/lib/support/channels.server";
 
 /**
  * Cancel-flow engine: CancelSession lifecycle, reason-matched save offers,
@@ -258,13 +259,14 @@ export interface SaveConfirmation {
   };
   /**
    * SUPPORT concierge save (v1.28.0, P3.7): whether the next order was held
-   * (moved by cancelFlow.conciergeHoldDays) and the reply promise in
-   * business days — the saved page states exactly what happened.
+   * (moved by cancelFlow.conciergeHoldDays) and the reply promise
+   * (support.replyWithin*, phrased by supportReplyPromise) — the saved page
+   * states exactly what happened.
    */
   concierge?: {
     holdApplied: boolean;
     holdDays: number;
-    slaBusinessDays: number;
+    replyWithin: ReplyPromise;
   };
 }
 
@@ -2134,7 +2136,7 @@ export async function acceptSave(
         concierge = {
           holdApplied: hold.applied,
           holdDays: hold.days,
-          slaBusinessDays: result.slaBusinessDays,
+          replyWithin: result.replyWithin,
         };
       }
       break;
@@ -2190,7 +2192,7 @@ export async function acceptSave(
               pending: true,
               holdApplied: concierge.holdApplied,
               holdDays: concierge.holdDays,
-              slaBusinessDays: concierge.slaBusinessDays,
+              replyWithin: concierge.replyWithin,
             }
           : {}),
       },

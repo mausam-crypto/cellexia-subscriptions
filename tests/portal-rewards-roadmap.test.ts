@@ -359,7 +359,11 @@ describe("cycle-2 surprise row — only what the teaser already promised", () =>
     expect(row.orderNumber).toBe(2);
     expect(row.gift).toEqual({ kind: "generic" });
     expect(row.aroundDate?.toISOString()).toBe("2026-09-01T00:00:00.000Z");
-    expect(r.rows[0].kind).toBe("surprise"); // listed first, before the rungs
+    // v1.29.0: rows are chronological — the surprise (Sep 1) sits right after
+    // the day-N reward (Aug 30) and before every milestone rung.
+    const kinds = r.rows.map((x) => x.kind);
+    expect(kinds.indexOf("surprise")).toBe(kinds.indexOf("rewards") + 1);
+    expect(kinds.indexOf("surprise")).toBeLessThan(kinds.indexOf("milestone"));
   });
   it("teaserPromisedFor reads the SENT gift_teaser for cycle 2 — the holdout never has one", async () => {
     expect(await teaserPromisedFor("c_1")).toBe(false);
@@ -385,14 +389,18 @@ describe("cycle-2 surprise row — only what the teaser already promised", () =>
 
 describe("wiring pins", () => {
   it("home route: roadmap behind growth.rewardsRoadmap, teaser-gated surprise, classic strip fallback", () => {
-    const src = readSource("app/routes/proxy._index.tsx");
+    // v1.29.0: the rewards card lives in the shared rewards-card module (the
+    // home and the single-mode subscription page both call rewardsSectionHtml).
+    const home = readSource("app/routes/proxy._index.tsx");
+    expect(home).toContain("body += await rewardsSectionHtml({");
+    const src = readSource("app/lib/portal/rewards-card.server.ts");
     expect(src).toContain("if (growth.rewardsRoadmap)");
     expect(src).toContain("teaserPromised: await teaserPromisedFor(primary.id)");
     // The upcoming Shopify cycle index is passed, so a rung whose gift is
     // already SCHEDULED/ADDED on the next order is named from its grant.
     expect(src).toContain("upcomingCycleIndex = await nextCycleIndex(primary)");
     expect(src).toMatch(/rewardsUnlockedEvent: rewardsEvent !== null,\s+upcomingCycleIndex,/);
-    expect(src).toContain("body += roadmapHtml || rewardsStripHtml({");
+    expect(src).toContain("return roadmapHtml || rewardsStripHtml({");
     expect(src).toContain("portal.roadmap.deliveries_so_far");
     expect(src).toContain("portal.roadmap.gifts_received");
     // Named gifts only through the builder's label; the surprise row never

@@ -12,7 +12,6 @@ import {
   addDaysTz,
   cardExpiryMoment,
   formatShopDate,
-  formatShopTime,
 } from "~/lib/dates.server";
 import { contractFrequency, formatFrequency } from "~/lib/frequency";
 import { t } from "~/lib/i18n/i18n.server";
@@ -25,6 +24,7 @@ import { hasFurtherOrders } from "~/lib/cancel/further-orders";
 import { estimateNextCharge, type EstimateLine } from "./estimate.server";
 import {
   editCutoffSync,
+  formatEditCutoff,
   resolveChargeTiming,
   type ChargeTiming,
 } from "./timing.server";
@@ -275,7 +275,9 @@ export function reminderCutoffVars(
 ): { edit_cutoff: string; edit_cutoff_iso: string; edit_cutoff_line: string } {
   try {
     const cutoff = editCutoffSync(nextBillingDate, timing);
-    const label = `${formatShopDate(cutoff, timing.tz, locale ?? undefined)}, ${formatShopTime(cutoff, timing.tz, locale ?? undefined)}`;
+    // The shared rendering (timing.server.ts): hour-0 cut-offs read as the
+    // end of the previous day, exactly as the portal home card and hero.
+    const label = formatEditCutoff(cutoff, timing.tz, locale);
     return {
       edit_cutoff: label,
       edit_cutoff_iso: cutoff.toISOString(),

@@ -255,8 +255,9 @@ describe("growth copy hygiene", () => {
         key === "portal.add.popular",
     );
     // 30 (v1.20.0–v1.27.0) + 3 (v1.28.0 P2.7 "already out" branch:
-    // portal.nudge.already_out / _cta / _hint).
-    expect(growthKeys.length).toBe(33);
+    // portal.nudge.already_out / _cta / _hint) + 1 (v1.29.0: the milestone
+    // tile label split into _one / _other for real pluralisation).
+    expect(growthKeys.length).toBe(34);
     for (const key of growthKeys) {
       expect(catalog[key], key).not.toMatch(/cancel/i);
       expect(catalog[key], key).not.toMatch(/hurry|last chance|only \d/i);

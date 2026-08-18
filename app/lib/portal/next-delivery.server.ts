@@ -1,7 +1,7 @@
 import prisma from "~/db.server";
 import { t } from "~/lib/i18n/i18n.server";
 import { formatMoney } from "~/lib/money";
-import { formatShopDate, formatShopTime, shopDayStartUtc } from "~/lib/dates.server";
+import { formatShopDate, shopDayStartUtc } from "~/lib/dates.server";
 import { escapeHtml } from "~/lib/portal/layout.server";
 import {
   estimateNextCharge,
@@ -12,6 +12,7 @@ import {
 import { nextChargeEstimateCents } from "~/lib/portal/payment.server";
 import {
   editCutoffSync,
+  formatEditCutoff,
   preparingOrderDate,
   type AttemptLike,
   type ChargeTiming,
@@ -131,9 +132,14 @@ export async function safeEstimateNextCharge(
   }
 }
 
-/** "17 August 2026, 00:00" — the same rendering the reminder email uses. */
+/**
+ * "August 19, 2026, 11:59 PM" — THE cut-off rendering (timing.server.ts
+ * formatEditCutoff): the home card, the hero and the reminder's
+ * `{edit_cutoff}` share it, so an hour-0 charge moment reads as the end of
+ * the previous day everywhere.
+ */
 export function cutoffLabel(locale: string, cutoff: Date, tz: string): string {
-  return `${formatShopDate(cutoff, tz, locale)}, ${formatShopTime(cutoff, tz, locale)}`;
+  return formatEditCutoff(cutoff, tz, locale);
 }
 
 /** Sync convenience: cut-off for a contract's next date, or null. */

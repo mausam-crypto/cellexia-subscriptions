@@ -30,13 +30,12 @@ import type { LocalContractWithLines } from "~/lib/contracts/shared.server";
 import { contractFrequency, formatFrequency } from "~/lib/frequency";
 import { OURS_ONLY } from "~/lib/ownership/ownership.server";
 import { getLockRules, lockStateFor } from "~/lib/contracts/lock.server";
+import { memberSavingsCents, milestoneRemaining } from "~/lib/portal/growth.server";
+import { rewardsSectionHtml } from "~/lib/portal/rewards-card.server";
 import {
-  buildRewardsRoadmap,
-  memberSavingsCents,
-  milestoneRemaining,
-  teaserPromisedFor,
-  type RewardsRoadmap,
-} from "~/lib/portal/growth.server";
+  homeReturnTo,
+  singleSubscriptionRedirectPath,
+} from "~/lib/portal/single-subscription.server";
 import {
   resolveTimeline,
   resolveTimelineArm,
@@ -57,15 +56,14 @@ import {
 } from "~/lib/portal/dunning.server";
 import {
   derivePortalPaymentState,
-  nextChargeLine,
   paymentChipKey,
-  paymentMethodShortLabel,
   type PortalPaymentView,
 } from "~/lib/portal/payment.server";
+import { newCardBannerHtml, newCardBannerText } from "~/lib/portal/new-card-banner.server";
 import { newCardBannerHits, type NewCardBannerHit } from "~/lib/dunning/new-method.server";
 import { listLivePaymentMethodsCached } from "~/lib/portal/payment-methods.server";
 import { getActiveDiscountForCycle } from "~/lib/billing/discounts.server";
-import { nextCycleIndex, type NextChargeEstimate } from "~/lib/billing/estimate.server";
+import type { NextChargeEstimate } from "~/lib/billing/estimate.server";
 import { resolveChargeTiming } from "~/lib/billing/timing.server";
 import {
   contractCutoff,
@@ -235,8 +233,15 @@ function contractCardHtml(params: {
    * tap posts payment_select (the service re-validates the id). Null = none.
    */
   newCard?: NewCardBannerHit | null;
+  /**
+   * `return_to` for this page (v1.29.0): "/" or "/?list=1" when the page is
+   * the explicit list — a single-subscription customer stays on the list
+   * after a card action instead of bouncing to the detail page.
+   */
+  returnTo?: string;
 }): string {
   const { contract, locale, tz, csrf, preview, dunning } = params;
+  const returnTo = params.returnTo ?? "/";
   const api = (action: string) => apiPath(locale, action, preview);
   // Server-side double-submit dedupe: one-tap forms carry the cycle date they
   // target, so a duplicate POST for an already-advanced cycle is a no-op.
@@ -249,7 +254,7 @@ function contractCardHtml(params: {
   const baseFields: FormField[] = [
     { name: "contractId", value: contract.id },
     { name: "_csrf", value: csrf },
-    { name: "return_to", value: "/" },
+    { name: "return_to", value: returnTo },
   ];
 
   const statusLabel = t(
@@ -329,18 +334,21 @@ function contractCardHtml(params: {
         ? params.preparingOrderDate
         : contract.nextBillingDate;
     const nextDate = formatShopDate(shownDate, tz, locale);
-    const chargeLine = nextChargeLine(locale, {
-      amount: total,
-      date: nextDate,
-      cardLabel: params.estimate.cardLabel || null,
-    });
+    // v1.29.0: the heading already IS the date, so the subline is
+    // "{amount} · Visa ····4242" (card label only when known) — the date is
+    // never repeated. Same estimate + card label as before.
+    const chargeLine = [total, params.estimate.cardLabel || null]
+      .filter(Boolean)
+      .join(" · ");
     // Cut-off (P2.1): "Changes until {date, time}" — the charge moment the
-    // sweep reads; while preparing, the chip carries the state instead.
+    // sweep reads, rendered by the shared formatter (an hour-0 moment reads
+    // as the end of the previous day); while preparing, the chip carries the
+    // state instead.
     const cutoffLine =
       params.cutoff && !preparing
         ? `<p class="cxs-muted cxs-small cxs-next__cutoff" style="margin:2px 0 0">${escapeHtml(t(locale, "portal.next.cutoff_short", { cutoff: cutoffLabel(locale, params.cutoff, tz) }))}</p>`
         : "";
-    scheduleHtml = `<div><span class="cxs-label">${escapeHtml(t(locale, "portal.index.next_order"))}</span><strong>${escapeHtml(nextDate)}</strong><p class="cxs-muted cxs-small cxs-next-charge" style="margin:4px 0 0">${escapeHtml(chargeLine)}</p>${cutoffLine}</div>`;
+    scheduleHtml = `<div class="cxs-next__block"><span class="cxs-label">${escapeHtml(t(locale, "portal.index.next_order"))}</span><strong>${escapeHtml(nextDate)}</strong><p class="cxs-muted cxs-small cxs-next-charge" style="margin:4px 0 0">${escapeHtml(chargeLine)}</p>${cutoffLine}</div>`;
   } else if (contract.status === "PAUSED" && contract.resumeAt) {
     scheduleHtml = `<div><span class="cxs-label">${escapeHtml(t(locale, "portal.index.resumes"))}</span><strong>${escapeHtml(formatShopDate(contract.resumeAt, tz, locale))}</strong></div>`;
   } else {
@@ -384,20 +392,21 @@ function contractCardHtml(params: {
   // detail page's list uses, the quiet link opens the payment section.
   let newCardHtml = "";
   if (params.newCard && ["ACTIVE", "PAUSED", "FAILED"].includes(contract.status)) {
-    const cardLabel = paymentMethodShortLabel(locale, {
-      paymentInstrumentType: params.newCard.instrumentType,
-      cardBrand: params.newCard.cardBrand,
-      cardLast4: params.newCard.cardLast4,
+    // Shared markup (new-card-banner.server.ts) — the subscription page
+    // renders the same banner in single mode (v1.29.0). Keys:
+    // portal.index.new_card_banner_labelled / portal.index.new_card_banner.
+    newCardHtml = newCardBannerHtml({
+      locale,
+      hit: params.newCard,
+      text: newCardBannerText(locale, params.newCard),
+      formHtml: postForm(
+        api("payment_select"),
+        [...baseFields, { name: "paymentMethodId", value: params.newCard.paymentMethodId }],
+        t(locale, "portal.index.new_card_cta"),
+        "cxs-btn cxs-btn--small",
+      ),
+      moreHref: `${manageHref}#cxs-payment`,
     });
-    const text = cardLabel
-      ? t(locale, "portal.index.new_card_banner_labelled", { card: cardLabel })
-      : t(locale, "portal.index.new_card_banner");
-    newCardHtml = `<div class="cxs-banner cxs-newcard" data-payment-method="${escapeHtml(params.newCard.paymentMethodId)}"><p>${escapeHtml(text)}</p>${postForm(
-      api("payment_select"),
-      [...baseFields, { name: "paymentMethodId", value: params.newCard.paymentMethodId }],
-      t(locale, "portal.index.new_card_cta"),
-      "cxs-btn cxs-btn--small",
-    )}<a class="cxs-link cxs-small cxs-newcard__more" href="${manageHref}#cxs-payment">${escapeHtml(t(locale, "portal.index.new_card_more"))}</a></div>`;
   }
 
   // Value-first card (portalGrowth.homeValueCard, v1.20.0): the list card
@@ -410,21 +419,41 @@ function contractCardHtml(params: {
   const valueCard = params.valueCard && contract.status === "ACTIVE";
   let valueHtml = "";
   if (valueCard) {
+    // v1.29.0: uniform tiles (.cxs-value__*) — one number style, one label
+    // style; the member-since date is a compact value, not a display date.
+    const tile = (num: string, label: string, numClass = "") =>
+      `<div class="cxs-value__cell"><div class="cxs-value__num${numClass}">${num}</div><div class="cxs-muted cxs-small cxs-value__label">${escapeHtml(label)}</div></div>`;
     const cells: string[] = [];
     if (params.savedCents > 0) {
       cells.push(
-        `<div class="cxs-rewards__cell"><div class="cxs-rewards__num">${escapeHtml(formatMoney(params.savedCents, contract.currencyCode, locale))}</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.value.saved"))}</div></div>`,
+        tile(
+          escapeHtml(formatMoney(params.savedCents, contract.currencyCode, locale)),
+          t(locale, "portal.value.saved"),
+        ),
       );
     }
     cells.push(
-      `<div class="cxs-rewards__cell"><div class="cxs-rewards__num">${escapeHtml(formatShopDate(contract.firstChargeAt ?? contract.createdAt, tz, locale))}</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.value.member_since"))}</div></div>`,
+      tile(
+        escapeHtml(formatShopDate(contract.firstChargeAt ?? contract.createdAt, tz, locale)),
+        t(locale, "portal.value.member_since"),
+        " cxs-value__num--date",
+      ),
     );
     if (params.milestoneAway != null) {
+      // Proper pluralisation: one key per form, selected by the count.
       cells.push(
-        `<div class="cxs-rewards__cell"><div class="cxs-rewards__num">${params.milestoneAway}</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.value.milestone_away"))}</div></div>`,
+        tile(
+          String(params.milestoneAway),
+          t(
+            locale,
+            params.milestoneAway === 1
+              ? "portal.value.milestone_away_one"
+              : "portal.value.milestone_away_other",
+          ),
+        ),
       );
     }
-    valueHtml = `<div class="cxs-rewards__grid" style="margin-top:12px">${cells.join("")}</div>`;
+    valueHtml = `<div class="cxs-value" style="margin-top:12px">${cells.join("")}</div>`;
   }
   // "Week N of your routine" line rides under the value grid on ACTIVE cards
   // only — the timeline is about a routine that is running.
@@ -522,112 +551,6 @@ function contractCardHtml(params: {
 </section>`;
 }
 
-function rewardsStripHtml(params: {
-  locale: string;
-  daysSubscribed: number;
-  maxOrders: number;
-  milestoneCycle: number;
-  rewardsUnlockDay: number;
-  rewardsUnlocked: boolean;
-  milestoneReached: boolean;
-}): string {
-  const {
-    locale,
-    daysSubscribed,
-    maxOrders,
-    milestoneCycle,
-    rewardsUnlockDay,
-    rewardsUnlocked,
-    milestoneReached,
-  } = params;
-
-  const milestonePct = Math.min(
-    100,
-    Math.round((maxOrders / milestoneCycle) * 100),
-  );
-  // Concrete next-perk copy: "N more order(s) until your milestone gift".
-  // Guards: milestoneReached uses >= so the cell flips to "earned" exactly AT
-  // the milestone order (and remaining is only rendered when >= 1).
-  const ordersRemaining = Math.max(1, milestoneCycle - maxOrders);
-  const milestoneCell = milestoneReached
-    ? `<div class="cxs-rewards__num">&#10003;</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.rewards.milestone_reached", { orders: milestoneCycle }))}</div>`
-    : `<div class="cxs-rewards__num">${maxOrders}&thinsp;/&thinsp;${milestoneCycle}</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.rewards.milestone_next", { count: ordersRemaining }))}</div><div class="cxs-progress" role="progressbar" aria-label="${escapeHtml(t(locale, "portal.a11y.progress_milestone"))}" aria-valuemin="0" aria-valuemax="${milestoneCycle}" aria-valuenow="${Math.min(maxOrders, milestoneCycle)}"><span style="width:${milestonePct}%"></span></div>`;
-
-  const unlockPct = Math.min(
-    100,
-    Math.round((daysSubscribed / rewardsUnlockDay) * 100),
-  );
-  // rewardsUnlocked uses >= so day 90 exactly reads as unlocked, never "0 more days".
-  const daysRemaining = Math.max(1, rewardsUnlockDay - daysSubscribed);
-  const rewardsCell = rewardsUnlocked
-    ? `<div class="cxs-rewards__num">&#10003;</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.rewards.unlocked"))}</div>`
-    : `<div class="cxs-rewards__num">${daysSubscribed}&thinsp;/&thinsp;${rewardsUnlockDay}</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.rewards.unlock_next", { days: daysRemaining }))}</div><div class="cxs-progress" role="progressbar" aria-label="${escapeHtml(t(locale, "portal.a11y.progress_rewards"))}" aria-valuemin="0" aria-valuemax="${rewardsUnlockDay}" aria-valuenow="${Math.min(daysSubscribed, rewardsUnlockDay)}"><span style="width:${unlockPct}%"></span></div>`;
-
-  return `<section class="cxs-rewards">
-  <h2>${escapeHtml(t(locale, "portal.rewards.title"))}</h2>
-  <div class="cxs-rewards__grid">
-    <div class="cxs-rewards__cell"><div class="cxs-rewards__num">${daysSubscribed}</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.rewards.days_subscribed"))}</div></div>
-    <div class="cxs-rewards__cell">${milestoneCell}</div>
-    <div class="cxs-rewards__cell">${rewardsCell}</div>
-  </div>
-</section>`;
-}
-
-/**
- * Rewards roadmap (v1.28.0, P4.3 — portalGrowth.rewardsRoadmap): every
- * milestone rung + the day-N reward as a list with a projected "around
- * {date}" each, and two tiles (deliveries so far / gifts received) from
- * local data. Gift NAMES only when the roadmap builder proved the pick is
- * committed; "a free product" when a gift will ship but the pick is dynamic;
- * nothing at all when no gift is behind a rung. Holdout-safe by
- * construction: the "surprise" row exists only when the teaser was sent.
- */
-function rewardsRoadmapHtml(params: {
-  locale: string;
-  tz: string;
-  roadmap: RewardsRoadmap;
-  daysSubscribed: number;
-}): string {
-  const { locale, tz, roadmap } = params;
-  const giftText = (row: RewardsRoadmap["rows"][number]): string => {
-    if (row.gift.kind === "named") {
-      return t(locale, "portal.roadmap.gift_named", { title: row.gift.title });
-    }
-    if (row.gift.kind === "generic") return t(locale, "portal.roadmap.gift_generic");
-    return "";
-  };
-  const items = roadmap.rows
-    .map((row) => {
-      const label =
-        row.kind === "surprise"
-          ? t(locale, "portal.roadmap.surprise", { order: row.orderNumber ?? 2 })
-          : row.kind === "milestone"
-            ? t(locale, "portal.roadmap.milestone", { order: row.orderNumber ?? 0 })
-            : t(locale, "portal.roadmap.rewards");
-      const when = row.reached
-        ? t(locale, "portal.roadmap.reached")
-        : row.aroundDate
-          ? t(locale, "portal.roadmap.around", {
-              date: formatShopDate(row.aroundDate, tz, locale),
-            })
-          : "";
-      const gift = row.kind === "surprise" ? "" : giftText(row);
-      const meta = [when, gift].filter(Boolean).join(" · ");
-      const mark = row.reached ? "&#10003;" : "&#9675;";
-      return `<li class="cxs-roadmap__row${row.reached ? " cxs-roadmap__row--done" : ""}"><span class="cxs-roadmap__mark" aria-hidden="true">${mark}</span><span class="cxs-roadmap__label">${escapeHtml(label)}</span>${meta ? `<span class="cxs-muted cxs-small cxs-roadmap__meta">${escapeHtml(meta)}</span>` : ""}</li>`;
-    })
-    .join("");
-  return `<section class="cxs-rewards cxs-roadmap">
-  <h2>${escapeHtml(t(locale, "portal.rewards.title"))}</h2>
-  <div class="cxs-rewards__grid">
-    <div class="cxs-rewards__cell"><div class="cxs-rewards__num">${params.daysSubscribed}</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.rewards.days_subscribed"))}</div></div>
-    <div class="cxs-rewards__cell"><div class="cxs-rewards__num">${roadmap.deliveriesSoFar}</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.roadmap.deliveries_so_far"))}</div></div>
-    <div class="cxs-rewards__cell"><div class="cxs-rewards__num">${roadmap.giftsReceived}</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.roadmap.gifts_received"))}</div></div>
-  </div>
-  <ul class="cxs-roadmap__list" style="list-style:none;margin:14px 0 0;padding:0;display:grid;gap:6px" aria-label="${escapeHtml(t(locale, "portal.roadmap.list_label"))}">${items}</ul>
-</section>`;
-}
-
 async function buildToast(
   request: Request,
   locale: string,
@@ -648,7 +571,7 @@ async function buildToast(
   if (resolved.key === "skipped") {
     const cid = new URL(request.url).searchParams.get("cid");
     if (cid && contractIds.has(cid)) {
-      resolved.toast.html = `<form method="post" action="${apiPath(locale, "unskip", session.previewToken)}"><input type="hidden" name="contractId" value="${escapeHtml(cid)}"><input type="hidden" name="_csrf" value="${escapeHtml(session.csrfToken)}"><input type="hidden" name="return_to" value="/"><button type="submit">${escapeHtml(t(locale, "portal.toast.undo"))}</button></form>`;
+      resolved.toast.html = `<form method="post" action="${apiPath(locale, "unskip", session.previewToken)}"><input type="hidden" name="contractId" value="${escapeHtml(cid)}"><input type="hidden" name="_csrf" value="${escapeHtml(session.csrfToken)}"><input type="hidden" name="return_to" value="${escapeHtml(homeReturnTo(new URL(request.url)))}"><button type="submit">${escapeHtml(t(locale, "portal.toast.undo"))}</button></form>`;
     }
   }
   return resolved.toast;
@@ -768,6 +691,22 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     // dunning.preExpiryNoticeDays drives the "Card expiring" chip.
     getSetting(shop.id, "dunning"),
   ]);
+
+  // Single-subscription view (v1.29.0, portal.singleSubscriptionOpensDetail):
+  // exactly one contract (any status) ⇒ open it directly, forwarding the
+  // query (toasts / undo / cid / locale / cx_pp) — `?list=1` keeps the list.
+  // Same guard chain as the list (auth, shop, setup gate, visit event) —
+  // preview sessions follow it too: the preview shows what the customer sees,
+  // and the list stays one tap away through the nav tab.
+  {
+    const singlePath = singleSubscriptionRedirectPath({
+      requestUrl: requestUrl,
+      enabled: portalSettings.singleSubscriptionOpensDetail,
+      contractIds: contracts.map((c) => c.id),
+    });
+    if (singlePath) throw redirect(singlePath);
+  }
+
   // Payment issues (v1.28.0): open case on an ACTIVE/PAUSED contract, or the
   // exhausted case of a FAILED one — read once for the page. Contained: a
   // failed read renders the classic cards.
@@ -794,91 +733,16 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   if (contracts.length === 0) {
     body = `<div class="cxs-card"><p style="margin:0 0 8px">${escapeHtml(t(locale, "portal.index.empty_title"))}</p><p class="cxs-muted cxs-small" style="margin:0">${escapeHtml(t(locale, "portal.index.empty_body"))}</p></div>`;
   } else {
-    // ── Rewards strip: days subscribed, milestone + rewards unlock ─────────
-    const startTimes = contracts.map((c) =>
-      (c.firstChargeAt ?? c.createdAt).getTime(),
-    );
-    const daysSubscribed = Math.max(
-      0,
-      Math.floor((Date.now() - Math.min(...startTimes)) / 86_400_000),
-    );
-    const maxOrders = Math.max(...contracts.map((c) => c.ordersCount), 0);
-
-    const [rewardsEvent, milestoneGrant] = await Promise.all([
-      prisma.subscriberEvent.findFirst({
-        where: {
-          shopId: shop.id,
-          customerId: portalSession.customerId,
-          type: "lifecycle.rewards_unlocked",
-        },
-        select: { id: true },
-      }),
-      prisma.giftGrant.findFirst({
-        where: {
-          contractId: { in: contracts.map((c) => c.id) },
-          status: { in: ["ADDED", "SHIPPED"] },
-          rule: {
-            is: {
-              trigger: "ORDER_INDEX",
-              orderIndex: lifecycle.milestoneGiftCycle,
-            },
-          },
-        },
-        select: { id: true },
-      }),
-    ]);
-
-    // Rewards roadmap (v1.28.0, P4.3, portalGrowth.rewardsRoadmap): the
-    // strip becomes the full ladder with projected dates, anchored on the
-    // customer's primary contract (the ACTIVE one furthest along — rung
-    // dates are per contract). Off, or the roadmap failing: the classic
-    // three-tile strip.
-    let roadmapHtml = "";
-    if (growth.rewardsRoadmap) {
-      const primary =
-        [...contracts]
-          .filter((c) => c.status === "ACTIVE" || c.status === "PAUSED")
-          .sort((a, b) => b.ordersCount - a.ordersCount)[0] ?? contracts[0];
-      try {
-        // The upcoming Shopify cycle index (THE hint every per-cycle read
-        // uses) lets the builder name a rung whose gift is already
-        // SCHEDULED/ADDED on the next order; contained — null keeps the
-        // config-based label.
-        let upcomingCycleIndex: number | null = null;
-        try {
-          upcomingCycleIndex = await nextCycleIndex(primary);
-        } catch (err) {
-          console.error("[portal] roadmap: upcoming cycle index failed", primary.id, err);
-        }
-        const roadmap = await buildRewardsRoadmap({
-          shopId: shop.id,
-          tz: shop.ianaTimezone,
-          contract: primary,
-          lifecycle,
-          teaserPromised: await teaserPromisedFor(primary.id),
-          rewardsUnlockedEvent: rewardsEvent !== null,
-          upcomingCycleIndex,
-        });
-        roadmapHtml = rewardsRoadmapHtml({
-          locale,
-          tz: shop.ianaTimezone,
-          roadmap,
-          daysSubscribed,
-        });
-      } catch (err) {
-        console.error("[portal] rewards roadmap failed", err);
-      }
-    }
-    body += roadmapHtml || rewardsStripHtml({
+    // The rewards card (strip / roadmap) — the shared builder the
+    // subscription page renders in single mode too (v1.29.0).
+    body += await rewardsSectionHtml({
+      shopId: shop.id,
+      tz: shop.ianaTimezone,
       locale,
-      daysSubscribed,
-      maxOrders,
-      milestoneCycle: lifecycle.milestoneGiftCycle,
-      rewardsUnlockDay: lifecycle.rewardsUnlockDay,
-      rewardsUnlocked:
-        rewardsEvent !== null || daysSubscribed >= lifecycle.rewardsUnlockDay,
-      milestoneReached:
-        milestoneGrant !== null || maxOrders >= lifecycle.milestoneGiftCycle,
+      customerId: portalSession.customerId,
+      contracts,
+      lifecycle,
+      growth,
     });
 
     // Results timeline compact line (v1.28.0, P4.1): per ACTIVE contract,
@@ -1075,6 +939,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         timelineLine: timelineLines.get(contract.id) ?? "",
         inTransitLine: inTransitLines.get(contract.id) ?? "",
         newCard: newCardHits.get(contract.id) ?? null,
+        returnTo: homeReturnTo(requestUrl),
       });
     }
 

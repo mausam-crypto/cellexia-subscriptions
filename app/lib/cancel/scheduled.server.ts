@@ -3,7 +3,13 @@ import prisma from "~/db.server";
 import { logEvent } from "~/lib/events/log.server";
 import { getSetting } from "~/lib/settings/settings.server";
 import { OURS_ONLY } from "~/lib/ownership/ownership.server";
-import { formatShopDate } from "~/lib/dates.server";
+import { addDaysTz, formatShopDate, shopDayStartUtc } from "~/lib/dates.server";
+import {
+  DEFAULT_REPLY_PROMISE,
+  resolveReplyPromise,
+  type ReplyPromise,
+} from "~/lib/support/channels.server";
+import { readReplyPromise, supportReplyPromise } from "~/lib/support/reply-promise.server";
 import { getPrimaryShop } from "~/lib/shop/install.server";
 import { CANCEL_SCHEDULED, SAVED_PENDING } from "./config.server";
 
@@ -29,11 +35,15 @@ import { CANCEL_SCHEDULED, SAVED_PENDING } from "./config.server";
  *    pause leaves it standing (the decision was to end, not to move).
  *
  * ── Concierge SLA (P3.7) ─────────────────────────────────────────────────────
- * `runConciergeSla` (hourly, `concierge_sla_run`): a SUPPORT_REQUEST alert
- * carrying `saveRequest: true` that is still unresolved after
- * `support.slaBusinessDays` business days raises ONE SUPPORT_SLA_BREACH
- * alert (CRITICAL — the customer was told "we reply within N business
- * days" and is one broken promise from cancelling). Once the merchant
+ * `runConciergeSla` (every 10 minutes, `concierge_sla_run`): a SUPPORT_REQUEST
+ * alert carrying `saveRequest: true` that is still unresolved past the reply
+ * promise (`support.replyWithinValue/Unit/alwaysOn`, v1.29.0 — minutes and
+ * hours on the wall clock, weekends skipped unless alwaysOn; business days
+ * Mon–Fri) raises ONE SUPPORT_SLA_BREACH alert per request (CRITICAL — the
+ * customer was told "a human replies within 30 minutes, 24/7" and is one
+ * broken promise from cancelling; dedupe on requestAlertId). The 10-minute
+ * cadence exists for that default: an hourly tick would notice a 30-minute
+ * breach up to an hour late. Once the merchant
  * resolves the request alert while the contract still lives, the session's
  * SAVED_PENDING is promoted to SAVED (a soft save becomes a save when the
  * human actually answered) — `cancel.save_confirmed` is logged.
@@ -352,7 +362,86 @@ export function businessDaysBetween(from: Date, to: Date, tz: string): number {
   return count;
 }
 
-/** Hourly job body (`concierge_sla_run`). Exported for tests. */
+const MINUTE_MS = 60_000;
+const HOUR_MS = 3_600_000;
+
+/**
+ * Wall-clock milliseconds between two instants that fall on Mon–Fri in the
+ * shop timezone (weekend time does not count against a promise that is not
+ * 24/7). Walks shop-day segments — bounded by the 60-day alert window.
+ */
+export function weekdayMsBetween(from: Date, to: Date, tz: string): number {
+  if (to.getTime() <= from.getTime()) return 0;
+  const weekdayOf = (d: Date) =>
+    new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short" }).format(d);
+  let total = 0;
+  let cursor = from;
+  for (let i = 0; i < 400 && cursor.getTime() < to.getTime(); i += 1) {
+    const nextDayStart = addDaysTz(shopDayStartUtc(cursor, tz), 1, tz);
+    const segEnd = nextDayStart.getTime() < to.getTime() ? nextDayStart : to;
+    const wd = weekdayOf(cursor);
+    if (wd !== "Sat" && wd !== "Sun") total += segEnd.getTime() - cursor.getTime();
+    cursor = segEnd;
+  }
+  return total;
+}
+
+export interface ReplyPromiseElapsed {
+  /** The promise is exceeded. */
+  breached: boolean;
+  /** Honest, human "unanswered for …" label (admin alert copy). */
+  label: string;
+  /** Wall-clock (or weekday-only when not 24/7) ms — minutes/hours units. */
+  elapsedMs: number;
+  /** Whole business days — business_days unit (0 otherwise). */
+  elapsedBusinessDays: number;
+}
+
+/** "45 min" / "2 h 15 min" / "3 d 4 h" — admin-facing elapsed label. */
+export function formatElapsed(ms: number): string {
+  const totalMin = Math.floor(ms / MINUTE_MS);
+  const days = Math.floor(totalMin / 1440);
+  const hours = Math.floor((totalMin % 1440) / 60);
+  const min = totalMin % 60;
+  if (days > 0) return `${days} d ${hours} h`;
+  if (hours > 0) return `${hours} h ${min} min`;
+  return `${min} min`;
+}
+
+/**
+ * Pure: has the reply promise been broken for a request made at `from`?
+ * minutes/hours = wall clock (weekends skipped unless alwaysOn);
+ * business_days = whole Mon–Fri days in the shop timezone (existing logic).
+ * Exported for tests.
+ */
+export function replyPromiseElapsed(
+  from: Date,
+  now: Date,
+  tz: string,
+  promise: ReplyPromise,
+): ReplyPromiseElapsed {
+  if (promise.unit === "business_days") {
+    const elapsedBusinessDays = businessDaysBetween(from, now, tz);
+    return {
+      breached: elapsedBusinessDays > promise.value,
+      label: `${elapsedBusinessDays} business day(s)`,
+      elapsedMs: Math.max(0, now.getTime() - from.getTime()),
+      elapsedBusinessDays,
+    };
+  }
+  const elapsedMs = promise.alwaysOn
+    ? Math.max(0, now.getTime() - from.getTime())
+    : weekdayMsBetween(from, now, tz);
+  const limitMs = promise.value * (promise.unit === "minutes" ? MINUTE_MS : HOUR_MS);
+  return {
+    breached: elapsedMs > limitMs,
+    label: formatElapsed(elapsedMs),
+    elapsedMs,
+    elapsedBusinessDays: 0,
+  };
+}
+
+/** Job body (`concierge_sla_run`, every 10 minutes). Exported for tests. */
 export async function runConciergeSla(now: Date = new Date()): Promise<ConciergeSlaStats> {
   const stats: ConciergeSlaStats = { checked: 0, breaches: 0, promoted: 0, errors: 0 };
   const shop = await getPrimaryShop();
@@ -360,9 +449,11 @@ export async function runConciergeSla(now: Date = new Date()): Promise<Concierge
     stats.skipped = "no_shop";
     return stats;
   }
-  let sla = 1;
+  // The CURRENT promise — the fallback for requests recorded before the
+  // alert context carried `replyWithin` (pre-1.29.0 rows).
+  let currentPromise: ReplyPromise = DEFAULT_REPLY_PROMISE;
   try {
-    sla = (await getSetting(shop.id, "support")).slaBusinessDays;
+    currentPromise = resolveReplyPromise(await getSetting(shop.id, "support"));
   } catch (err) {
     console.error("[cancel] concierge: support settings read failed", err);
   }
@@ -385,6 +476,7 @@ export async function runConciergeSla(now: Date = new Date()): Promise<Concierge
         contractId?: unknown;
         cancelSessionId?: unknown;
         cancelReason?: unknown;
+        replyWithin?: unknown;
       };
       const contractId = typeof ctx.contractId === "string" ? ctx.contractId : null;
       const sessionId = typeof ctx.cancelSessionId === "string" ? ctx.cancelSessionId : null;
@@ -392,22 +484,32 @@ export async function runConciergeSla(now: Date = new Date()): Promise<Concierge
 
       if (alert.resolvedAt == null) {
         // ── SLA breach ────────────────────────────────────────────────────
-        const elapsed = businessDaysBetween(alert.createdAt, now, shop.ianaTimezone);
-        if (elapsed <= sla) continue;
+        // Judge against the promise the customer READ (recorded on the
+        // request alert by submitSupportRequest); a merchant editing the
+        // setting afterwards neither silences nor invents breaches.
+        const promise = readReplyPromise(ctx.replyWithin) ?? currentPromise;
+        const elapsed = replyPromiseElapsed(alert.createdAt, now, shop.ianaTimezone, promise);
+        if (!elapsed.breached) continue;
         const { raiseAlert } = await import("~/lib/analytics/alerts.server");
+        // dedupe on requestAlertId ⇒ at most ONE breach alert per request,
+        // however many ticks see it unanswered.
         const raised = await raiseAlert({
           shopId: shop.id,
           type: "SUPPORT_SLA_BREACH",
           severity: "CRITICAL",
-          message: `A cancel-flow save request is unanswered after ${elapsed} business day(s) (promise: ${sla}). The customer stayed on the promise of a reply — answer it now: /app/subscribers/${contractId}`,
+          message: `A cancel-flow save request is unanswered for ${elapsed.label} (promise: ${supportReplyPromise("en", promise)}). The customer stayed on the promise of a reply — answer it now: /app/subscribers/${contractId}`,
           context: {
             contractId,
             subscriberUrl: `/app/subscribers/${contractId}`,
             requestAlertId: alert.id,
             ...(sessionId ? { cancelSessionId: sessionId } : {}),
             ...(typeof ctx.cancelReason === "string" ? { cancelReason: ctx.cancelReason } : {}),
-            slaBusinessDays: sla,
-            elapsedBusinessDays: elapsed,
+            replyWithin: promise,
+            elapsedMs: elapsed.elapsedMs,
+            elapsedLabel: elapsed.label,
+            ...(promise.unit === "business_days"
+              ? { elapsedBusinessDays: elapsed.elapsedBusinessDays }
+              : {}),
           },
           dedupe: { key: "requestAlertId", value: alert.id, since: alert.createdAt },
         });

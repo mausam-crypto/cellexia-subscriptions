@@ -188,7 +188,9 @@ describe("1. card label parity — revoked card never named on a next-charge lin
     expect(live.cardLabel).toBe("Visa ····4242");
 
     const src = readSource("app/routes/proxy._index.tsx");
-    expect(src).toContain("cardLabel: params.estimate.cardLabel || null");
+    // v1.29.0: the home subline is "{amount} · {card}" (no repeated date) —
+    // still the estimate's revoke-aware label, never the raw contract mirror.
+    expect(src).toContain("const chargeLine = [total, params.estimate.cardLabel || null]");
     expect(src).not.toContain("cardLabel: paymentMethodShortLabel(locale, contract)");
   });
 });

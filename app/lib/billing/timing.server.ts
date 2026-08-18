@@ -1,6 +1,11 @@
 import prisma from "~/db.server";
 import { getSetting } from "~/lib/settings/settings.server";
-import { addDaysTz, shopDayStartUtc } from "~/lib/dates.server";
+import {
+  addDaysTz,
+  formatShopDate,
+  formatShopTime,
+  shopDayStartUtc,
+} from "~/lib/dates.server";
 
 /**
  * Charge timing — the ONE place "when does this renewal actually charge" is
@@ -136,6 +141,26 @@ export async function editCutoff(
   nextBillingDate: Date,
 ): Promise<Date> {
   return chargeMomentUtc(shopIdOrTiming, nextBillingDate);
+}
+
+/**
+ * The ONE customer-facing rendering of a cut-off instant (v1.29.0) — the
+ * portal home card, the detail hero and the upcoming-order reminder's
+ * `{edit_cutoff}` all print this string, so they can never disagree.
+ *
+ * "{date}, {time}" in the shop timezone + locale. When the instant falls
+ * EXACTLY on shop-day midnight (the default hour-0 charge moment) it is
+ * rendered as the END of the previous day — "August 19, 2026, 11:59 PM"
+ * rather than "August 20, 2026, 12:00 AM", which read as if the customer had
+ * the whole billing day. Any other moment prints its actual local time.
+ * The instant itself is untouched (the sweep still bills at the same
+ * moment); only the wording of the last editable minute changes.
+ */
+export function formatEditCutoff(cutoff: Date, tz: string, locale?: string | null): string {
+  const loc = locale ?? undefined;
+  const isShopMidnight = shopDayStartUtc(cutoff, tz).getTime() === cutoff.getTime();
+  const shown = isShopMidnight ? new Date(cutoff.getTime() - 60_000) : cutoff;
+  return `${formatShopDate(shown, tz, loc)}, ${formatShopTime(shown, tz, loc)}`;
 }
 
 /**

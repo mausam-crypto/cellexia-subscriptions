@@ -20,8 +20,31 @@ entry lists every setting, event, template, verb and job by name).
 
 1. Back up the database (UPDATE.md section 4, step 2).
 2. Unzip `cellexia-subscriptions-v1.28.0.zip` over the previous directory,
-   keeping `.env` and `fly.toml`. Commit to your own git repo and review the
-   diff.
+   keeping `.env`, `fly.toml`, **your `shopify.app.toml` and your
+   `extensions/*/shopify.extension.toml`** (the ZIP ships templates with a
+   placeholder `client_id`/URL and no extension `uid`s — restore yours from
+   git if they were overwritten). Then add the three new webhook
+   subscriptions to YOUR `shopify.app.toml` by hand, next to the existing
+   `[[webhooks.subscriptions]]` entries (same `uri`/format as the
+   neighbours):
+
+   ```toml
+   [[webhooks.subscriptions]]
+   topics = [ "fulfillments/create", "fulfillments/update", "fulfillment_events/create" ]
+   uri = "/webhooks"
+   ```
+
+   (Copy the exact `uri` your other subscriptions use; the template in the
+   ZIP shows the intended block.) No scope change: `read_fulfillments` is
+   already held. If your toml still carries `include_config_on_deploy = true`
+   under `[build]` and your CLI rejects it, delete the line — current CLIs
+   always include app config on deploy. Commit to your own git repo and
+   review the diff.
+
+   **1.28.1 hotfix:** the 1.28.0 ZIP's `prisma/schema.prisma` was corrupted
+   (`EXHAUSTED` missing from `enum DunningState`, `prisma generate` failed).
+   Apply 1.28.1 (same steps, no migration) or restore the value by hand;
+   see the CHANGELOG 1.28.1 entry.
 3. `npm ci`
 4. `npm run setup` (applies 0027 and 0028; safe before the new code runs —
    v1.27 code ignores every new column).
@@ -55,7 +78,12 @@ existed; the items below are the ones that need a merchant decision.
   **chat URL** (https), **hours note**, **SLA in business days** (default 1
   — this number is promised to the customer by the concierge save; only
   promise what a human can meet), **requests per hour** (default 3, per
-  customer).
+  customer). **Superseded in v1.29.0:** the single SLA integer became the
+  **reply promise** — `support.replyWithinValue` + `replyWithinUnit`
+  (minutes / hours / business days) + `alwaysOn` (24/7), default "A human
+  replies within 30 minutes, 24/7."; a value you saved here on 1.28.x is
+  read as "{N} business days, not 24/7" until you save the section again.
+  See [RELEASE_NOTES_v1.29.0.md](./RELEASE_NOTES_v1.29.0.md).
 - **Settings → Billing timing** (`billing.chargeHourLocal`, default 0) — the
   local hour at which renewals charge. 0 keeps today's behaviour (the first
   5-minute sweep after shop midnight). Every "you can make changes until

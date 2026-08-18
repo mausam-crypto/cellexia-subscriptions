@@ -63,9 +63,11 @@ const SAMPLE_BY_TEMPLATE: Partial<Record<TemplateKey, TemplateVars>> = {
     card_label: "Visa ····4242",
     payment_line: "Payment method: Visa ····4242",
     card_expiry_warning: "",
-    edit_cutoff: "12 September 2026, 00:00",
+    // v1.29.0: hour-0 cut-offs render as the previous day, 11:59 PM
+    // (formatEditCutoff) — the sample mirrors the real send path's wording.
+    edit_cutoff: "11 September 2026, 11:59 PM",
     edit_cutoff_iso: "2026-09-11T22:00:00.000Z",
-    edit_cutoff_line: "You can make changes until 12 September 2026, 00:00.",
+    edit_cutoff_line: "You can make changes until 11 September 2026, 11:59 PM.",
     following_date: "7 November 2026",
     following_date_iso: "2026-11-07",
   },
@@ -223,9 +225,9 @@ const SAMPLE_BY_TEMPLATE: Partial<Record<TemplateKey, TemplateVars>> = {
     next_line:
       "Your next order of about CHF 132.00 is scheduled for 12 September 2026 (every 8 weeks).",
     amount: "CHF 132.00",
-    edit_cutoff: "12 September 2026, 00:00",
+    edit_cutoff: "11 September 2026, 11:59 PM",
     edit_cutoff_iso: "2026-09-11T22:00:00.000Z",
-    changes_line: "You can change, skip or delay it until 12 September 2026, 00:00.",
+    changes_line: "You can change, skip or delay it until 11 September 2026, 11:59 PM.",
     support_email: "hello@example.com",
     support_line: "Questions? Write to us at hello@example.com — we're happy to help.",
     cta_url: "https://example.com/account",

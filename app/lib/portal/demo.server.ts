@@ -32,7 +32,7 @@ const DEMO_NEXT_BILLING_DAYS = 12;
 const DEMO_FIRST_CHARGE_DAYS_AGO = 10 * 7;
 // > nextBillingDate + 10 days, so the "not running low?" prompt renders.
 const DEMO_PREDICTED_EMPTY_DAYS = 25;
-const DEMO_GIFT_TITLE = "Surprise gift — thank you";
+const DEMO_GIFT_TITLE = "Free gift — thank you";
 
 function demoGid(kind: string): string {
   return `gid://cellexia/demo/${kind}/${crypto.randomBytes(9).toString("base64url")}`;

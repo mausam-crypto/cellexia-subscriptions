@@ -13,12 +13,51 @@ import { getSetting } from "~/lib/settings/settings.server";
  *  - replyTo:  setting → resolved email → null (no Reply-To header).
  *  - whatsapp: setting normalized to E.164 digits → wa.me link; malformed → null.
  *  - chatUrl:  setting, https:// only → null.
- *  - hoursNote / slaBusinessDays: verbatim.
+ *  - hoursNote: verbatim.
+ *  - replyWithin (v1.29.0): { value, unit, alwaysOn } — the reply promise
+ *    every surface phrases through supportReplyPromise() (reply-promise.ts).
+ *    A stored settings object that still carries the Stage C
+ *    `slaBusinessDays` and no replyWithin* keys is read as
+ *    { value: slaBusinessDays, unit: "business_days", alwaysOn: false } —
+ *    no migration, the old key stays tolerated by the schema.
  *
  * Contained: any read failure (settings, DB) resolves to the empty channel
  * set — the surfaces render without a contact line rather than 500 (golden
  * rule 9). Never throws.
  */
+
+export type ReplyWithinUnit = "minutes" | "hours" | "business_days";
+
+/** The reply promise as every surface consumes it (see supportReplyPromise). */
+export interface ReplyPromise {
+  value: number;
+  unit: ReplyWithinUnit;
+  /** True = the team answers 24/7 (weekends included). */
+  alwaysOn: boolean;
+}
+
+export const REPLY_WITHIN_UNITS: readonly ReplyWithinUnit[] = Object.freeze([
+  "minutes",
+  "hours",
+  "business_days",
+]);
+
+/** Upper bound per unit (a week in minutes / a month in hours / 30 business days). */
+export const REPLY_WITHIN_MAX: Readonly<Record<ReplyWithinUnit, number>> = Object.freeze({
+  minutes: 10_080,
+  hours: 720,
+  business_days: 30,
+});
+
+export const DEFAULT_REPLY_PROMISE: ReplyPromise = Object.freeze({
+  value: 30,
+  unit: "minutes",
+  alwaysOn: true,
+});
+
+export function isReplyWithinUnit(value: unknown): value is ReplyWithinUnit {
+  return typeof value === "string" && (REPLY_WITHIN_UNITS as readonly string[]).includes(value);
+}
 
 export interface SupportChannels {
   email: string | null;
@@ -29,7 +68,7 @@ export interface SupportChannels {
   whatsappHref: string | null;
   chatUrl: string | null;
   hoursNote: string | null;
-  slaBusinessDays: number;
+  replyWithin: ReplyPromise;
   /** True when at least one of email / whatsapp / chatUrl resolved. */
   hasAny: boolean;
 }
@@ -41,7 +80,7 @@ export const EMPTY_SUPPORT_CHANNELS: SupportChannels = Object.freeze({
   whatsappHref: null,
   chatUrl: null,
   hoursNote: null,
-  slaBusinessDays: 1,
+  replyWithin: DEFAULT_REPLY_PROMISE,
   hasAny: false,
 });
 
@@ -110,7 +149,50 @@ interface SupportSettingShape {
   whatsapp?: unknown;
   chatUrl?: unknown;
   hoursNote?: unknown;
+  replyWithinValue?: unknown;
+  replyWithinUnit?: unknown;
+  alwaysOn?: unknown;
+  /** Stage C (v1.28.0) key — read only when no replyWithin* key is stored. */
   slaBusinessDays?: unknown;
+}
+
+function isIntInRange(v: unknown, min: number, max: number): v is number {
+  return typeof v === "number" && Number.isInteger(v) && v >= min && v <= max;
+}
+
+/**
+ * Pure: the reply promise out of a stored/parsed support settings object.
+ * Legacy `slaBusinessDays` (and NO replyWithin* key) ⇒ business days, not
+ * 24/7 — exactly what Stage C promised. Anything malformed ⇒ the default
+ * (30 minutes, 24/7). `business_days` is never 24/7 (the unit already says
+ * "not weekends"), so alwaysOn is normalised to false for it.
+ */
+export function resolveReplyPromise(
+  setting: SupportSettingShape | null | undefined,
+): ReplyPromise {
+  const s = setting && typeof setting === "object" ? setting : {};
+  const hasNew =
+    s.replyWithinValue !== undefined ||
+    s.replyWithinUnit !== undefined ||
+    s.alwaysOn !== undefined;
+  if (!hasNew && isIntInRange(s.slaBusinessDays, 1, REPLY_WITHIN_MAX.business_days)) {
+    return { value: s.slaBusinessDays, unit: "business_days", alwaysOn: false };
+  }
+  const unit = isReplyWithinUnit(s.replyWithinUnit)
+    ? s.replyWithinUnit
+    : DEFAULT_REPLY_PROMISE.unit;
+  const value = isIntInRange(s.replyWithinValue, 1, REPLY_WITHIN_MAX[unit])
+    ? s.replyWithinValue
+    : unit === DEFAULT_REPLY_PROMISE.unit
+      ? DEFAULT_REPLY_PROMISE.value
+      : 1;
+  const alwaysOn =
+    unit === "business_days"
+      ? false
+      : typeof s.alwaysOn === "boolean"
+        ? s.alwaysOn
+        : DEFAULT_REPLY_PROMISE.alwaysOn;
+  return { value, unit, alwaysOn };
 }
 
 /**
@@ -131,13 +213,6 @@ export function resolveSupportChannels(
     typeof s.hoursNote === "string" && s.hoursNote.trim()
       ? s.hoursNote.trim().slice(0, 300)
       : null;
-  const sla =
-    typeof s.slaBusinessDays === "number" &&
-    Number.isInteger(s.slaBusinessDays) &&
-    s.slaBusinessDays >= 1 &&
-    s.slaBusinessDays <= 30
-      ? s.slaBusinessDays
-      : 1;
   return {
     email,
     replyTo,
@@ -145,7 +220,7 @@ export function resolveSupportChannels(
     whatsappHref: whatsapp ? whatsappHrefFor(whatsapp) : null,
     chatUrl,
     hoursNote,
-    slaBusinessDays: sla,
+    replyWithin: resolveReplyPromise(s),
     hasAny: !!(email || whatsapp || chatUrl),
   };
 }

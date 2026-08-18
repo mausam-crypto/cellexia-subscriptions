@@ -484,7 +484,31 @@ export async function buildRewardsRoadmap(input: {
         : { kind: "none" },
   });
 
-  return { rows, deliveriesSoFar: Math.max(0, contract.ordersCount), giftsReceived };
+  return {
+    rows: sortRoadmapRows(rows),
+    deliveriesSoFar: Math.max(0, contract.ordersCount),
+    giftsReceived,
+  };
+}
+
+/**
+ * Chronological order (v1.29.0): reached rows first (their build order kept —
+ * they no longer carry a date), then every upcoming row by its projected
+ * `aroundDate` ascending, undated rows last. Stable, so the day-N reward
+ * lands between the milestone rungs it actually falls between instead of
+ * always trailing the 2029 rungs. Pure — exported for the pinning test.
+ */
+export function sortRoadmapRows(rows: RoadmapRow[]): RoadmapRow[] {
+  return rows
+    .map((row, index) => ({ row, index }))
+    .sort((a, b) => {
+      if (a.row.reached !== b.row.reached) return a.row.reached ? -1 : 1;
+      const at = a.row.aroundDate?.getTime() ?? Number.POSITIVE_INFINITY;
+      const bt = b.row.aroundDate?.getTime() ?? Number.POSITIVE_INFINITY;
+      if (at !== bt) return at < bt ? -1 : 1;
+      return a.index - b.index;
+    })
+    .map(({ row }) => row);
 }
 
 /**

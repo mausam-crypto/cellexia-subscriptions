@@ -524,6 +524,13 @@ const SECTION_DEFS: SectionDef[] = [
           "On: the subscription page lists the other cards saved on the customer's Shopify account with “Use for this subscription” and “Set as backup”, and the second/third payment-failed emails offer “Use my card ····1234 instead” links when at least two methods exist. Off: only the single-card update path is offered.",
         type: "toggle",
       },
+      {
+        path: "singleSubscriptionOpensDetail",
+        label: "Open the subscription directly when there is only one",
+        helpText:
+          "When a customer has exactly one subscription, the portal opens it directly instead of the list. The list stays one tap away (Subscriptions tab).",
+        type: "toggle",
+      },
     ],
   },
   // No "buyBox" card: buy-box presentation (savings format, preselect,
@@ -1219,7 +1226,7 @@ const SECTION_DEFS: SectionDef[] = [
     key: "support",
     title: "Support channels",
     description:
-      "Where customers reach a human — the portal's Get-help card (Account, every subscription page, the payment-issue banner), the cancel-flow support cards and the Reply-To of every email the app sends. Empty channels are hidden, never shown as dead links. Requests submitted through the form land as a SUPPORT_REQUEST alert, a Klaviyo “Cellexia Support Requested” event and (when an email is set) a message to that inbox.",
+      "Where customers reach a human — the portal's Get-help card (Account, every subscription page, the payment-issue banner), the cancel-flow support cards and the Reply-To of every email the app sends. Empty channels are hidden, never shown as dead links. Requests submitted through the form land as a SUPPORT_REQUEST alert, a Klaviyo “Cellexia Support Requested” event and (when an email is set) a message to that inbox. The reply promise (default “A human replies within 30 minutes, 24/7.”) is one sentence shown everywhere the app promises an answer.",
     fields: [
       {
         path: "email",
@@ -1257,13 +1264,32 @@ const SECTION_DEFS: SectionDef[] = [
         type: "text",
       },
       {
-        path: "slaBusinessDays",
-        label: "Reply promise (business days)",
+        path: "replyWithinValue",
+        label: "Reply promise — within",
         helpText:
-          "The confirmation says “we'll get back to you within N business day(s)”. Set only what the team keeps.",
+          "The number in “A human replies within N …”. Shown on the Get-help card, the sent confirmation, the cancel-flow support card and its saved page. Set only what the team keeps — an unanswered cancel-flow request past this raises a critical alert (checked every 10 minutes).",
         type: "int",
         min: 1,
-        max: 30,
+        max: 10_080,
+      },
+      {
+        path: "replyWithinUnit",
+        label: "Reply promise — unit",
+        helpText:
+          "Minutes (max 10 080) or hours (max 720) count on the clock; business days (max 30) count Mon–Fri in the shop timezone and are never 24/7.",
+        type: "select",
+        options: [
+          { label: "minutes", value: "minutes" },
+          { label: "hours", value: "hours" },
+          { label: "business days", value: "business_days" },
+        ],
+      },
+      {
+        path: "alwaysOn",
+        label: "24/7",
+        helpText:
+          "On = the promise reads “…, 24/7” and weekends count against it. Off = the sentence reads “… on business days” and time on Saturdays/Sundays (shop timezone) does not count — say when you answer in the hours note. Ignored for business days.",
+        type: "toggle",
       },
       {
         path: "requestsPerHour",

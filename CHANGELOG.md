@@ -4,6 +4,275 @@ All notable changes to Cellexia Subscriptions. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [SemVer](https://semver.org) as contracted in [docs/UPDATE.md](docs/UPDATE.md).
 
+## [1.29.0] — 2026-08-18
+
+**Portal polish after the churn pack, and an honest support promise.** Three
+things a subscriber (or the merchant previewing the portal) noticed first
+after v1.28.0: the home page had rendering rough edges (the rewards roadmap
+listed rungs out of date order with unstyled rows, the next-order block
+repeated the date on two lines and printed the cut-off as "00:00" the day
+of the charge, the value tiles borrowed the rewards-strip styles and said
+"1 deliveries"); a customer with ONE subscription — the normal case — landed
+on a list of one and had to tap through; and the support surfaces promised
+"a reply within 1 business day" from a single integer that no longer matched
+how the merchant actually answers (within minutes, around the clock). Now:
+**home rendering** — the roadmap has its own `.cxs-roadmap__*` styles and is
+sorted chronologically (`sortRoadmapRows`: reached first, then by date,
+undated last), the next-order block is heading date + ONE subline
+("€54.15 · Visa ····4242") + "Changes until {date, 11:59 PM}" through one
+shared `formatEditCutoff` that the reminder email uses too, uniform
+`.cxs-value` tiles with pluralised milestone copy, and the demo persona's
+gift line renamed. **Single-subscription view** — `portal.singleSubscriptionOpensDetail`
+(default ON): the home loader 302s a customer whose only subscription (any
+status) exists straight to its detail page, forwarding the toast / undo /
+locale query and dropping the proxy signature params; the detail page in
+single mode carries the home-only surfaces (rewards card, cancel-intent
+banner, newer-card banner) and every "Subscriptions" link targets the
+explicit list `/?list=1`, which never redirects. **Reply promise** —
+`support.slaBusinessDays` is replaced by `support.replyWithinValue` +
+`replyWithinUnit` (minutes | hours | business_days) + `alwaysOn`, default
+"A human replies within 30 minutes, 24/7."; ONE helper `supportReplyPromise()`
+renders the sentence on the Get-help card, the support toast, the concierge
+save card and the saved page; a stored `slaBusinessDays` is read quietly as
+`{value, unit: business_days, alwaysOn: false}` (no DB migration); the
+concierge SLA job judges each request against the promise the customer
+actually read (stored on the alert), on the wall clock or weekday time, and
+runs every 10 minutes. **No migration, no new env vars, no scope, webhook,
+theme or extension change — `npm run deploy` is not required.**
+
+> Update notes: unzip (keep `.env`, `fly.toml`, your `shopify.app.toml` and
+> extension tomls) → `npm ci` → `npm run setup` (regenerates the client;
+> migrations are a no-op) → deploy / restart the server → **Settings →
+> Support: confirm the reply promise.** A store that never saved the Support
+> section moves silently from "1 business day" to "30 minutes, 24/7" and arms
+> 30-minute CRITICAL `SUPPORT_SLA_BREACH` alerts — set the value/unit/24-7 you
+> can honour. Then review `portal.singleSubscriptionOpensDetail` (Settings →
+> Customer portal). Full checklist in
+> [docs/RELEASE_NOTES_v1.29.0.md](docs/RELEASE_NOTES_v1.29.0.md).
+
+### Added
+
+**Portal**
+
+- **Single-subscription direct view** (`app/lib/portal/single-subscription.server.ts`,
+  pure: `wantsList`, `isSingleSubscriptionMode`, `singleSubscriptionRedirectPath`,
+  `forwardedSearch`, `listHref`, `homeReturnTo`, `HOME_LIST_RETURN_TO`).
+  Setting `portal.singleSubscriptionOpensDetail` (boolean, default true;
+  Settings → Customer portal "Open the subscription directly when there is
+  only one"). The home loader — after auth, shop, setup gate and the
+  `portal.visit` event — counts the customer's OURS contracts of ANY status
+  and `302`s to `/subscription/<id>` when there is exactly one, forwarding
+  the request's query verbatim (`toast`, `cid`, `undo`, `locale`, `cx_pp`,
+  `sla*` …) EXCEPT the proxy / hand-off params (`shop`, `path_prefix`,
+  `timestamp`, `signature`, `logged_in_customer_id`, `handoff`, `next`,
+  `list`). `?list=1` (exact) is the escape hatch that always renders the
+  list. Applies to admin PREVIEW sessions too (the preview shows what the
+  customer sees; the demo persona has one contract; the list stays one tap
+  away via the nav tab which carries `cx_pp`). The `?handoff=` exchange is
+  untouched (it lands on the clean home URL; the redirect fires on the next
+  request).
+- **Detail page single mode** (`proxy.subscription.$id.tsx`): when the
+  setting is on and the customer has one contract, the page prepends the
+  cancel-intent banner (`renderIntentBanner`, same gates as home) and the
+  newer-card banner (`newCardBannerHits`, gated by `portal.paymentMethodsList`
+  && !preview && live status, one-tap `payment_select` form) ABOVE the hero
+  (after the whole body is built, so the check-in "unsure" timeline-first
+  landing keeps them on top), renders the shared rewards card after the
+  schedule / pause cards, and points both "← All subscriptions" and the nav
+  "Subscriptions" tab (`PortalPageInput.subscriptionsHref`, new optional
+  override in `layout.server.ts`) at `/?list=1`. Multi mode is unchanged.
+- **Shared portal modules** (moved, not duplicated): `rewards-card.server.ts`
+  (`rewardsStripHtml`, `rewardsRoadmapHtml`, `rewardsSectionHtml` — days
+  subscribed, `rewards_unlocked` event, milestone grants, roadmap build with
+  strip fallback) and `new-card-banner.server.ts` (`NEW_CARD_BANNER_STATUSES`,
+  `newCardBannerText`, `newCardBannerHtml`) — the home card and the detail
+  page render identical markup.
+- **Explicit list round-trip**: home cards (`contractCardHtml` `returnTo`)
+  and the skipped-toast Undo form emit `return_to=/?list=1` when the page was
+  rendered with `?list=1`; `sanitizeReturnTo` accepts exactly `/?list=1`;
+  `backRedirect` keeps a `return_to`'s own query ahead of the toast params.
+- **Roadmap styles + order**: `.cxs-roadmap__list/__row/__mark/__label/__meta/__row--done`
+  in the portal shell (row = flex, baseline aligned, tabular-numeral meta;
+  ≤ 479 px the meta drops to its own indented line, RTL-safe via logical
+  properties); `sortRoadmapRows()` in `growth.server.ts` (reached first in
+  build order, then `aroundDate` ascending, undated last) applied at the end
+  of `buildRewardsRoadmap`; roadmap tiles `flex: 1 1 80px` so the three
+  counts sit three-across at 375 px.
+- **Value tiles**: `.cxs-value/.cxs-value__cell/__num/__num--date/__label`
+  (Georgia 22 px tabular numerals, 17 px date variant); "Member since" shows
+  the compact date in the tile style; new keys `portal.value.milestone_away_one`
+  / `_other` selected by count replace "delivery(ies)".
+- **One cut-off formatter** `formatEditCutoff(cutoff, tz, locale)` in
+  `billing/timing.server.ts`: an instant equal to `shopDayStartUtc` (shop
+  midnight, the `chargeHourLocal` 0 default) renders as the previous minute
+  (previous day, 11:59 PM); any other hour renders the actual local time.
+  Portal `cutoffLabel()` (home card + detail hero) and `reminderCutoffVars()`
+  (`{edit_cutoff}` / `edit_cutoff_line` in `upcoming_order`) both delegate to
+  it — the instant (`edit_cutoff_iso`) is unchanged.
+
+**Support**
+
+- **Reply promise model** (`support.replyWithinValue` int ≥ 1 default 30,
+  per-unit ceiling 10 080 min / 720 h / 30 business days enforced by
+  `superRefine` at save; `support.replyWithinUnit` `minutes | hours |
+  business_days` default `minutes`; `support.alwaysOn` boolean default true).
+  `SupportChannels.replyWithin: ReplyPromise` replaces `slaBusinessDays`;
+  `channels.server.ts` exports `ReplyWithinUnit`, `ReplyPromise`,
+  `REPLY_WITHIN_UNITS`, `REPLY_WITHIN_MAX`, `DEFAULT_REPLY_PROMISE`,
+  `isReplyWithinUnit`, `resolveReplyPromise`. `business_days` is normalised
+  to `alwaysOn: false`; a malformed object resolves to the default.
+- **ONE helper** `app/lib/support/reply-promise.server.ts`:
+  `supportReplyPromise(locale, channels | promise)` → the localized sentence
+  via `portal.support.reply_promise.<unit>_<one|other>[_always]`;
+  `replyPromiseKey`, `replyPromiseParams` / `parseReplyPromiseParams` (URL
+  codec `sla` / `slau=m|h|d` / `sla247=1` for the redirect toast — tampered ⇒
+  plain copy), `readReplyPromise` (event / alert payload read-back).
+  Consumers: Get-help card SLA line, `support_sent` / `support_pushback_failed`
+  toast (`portal.toast.support_sent_promise {promise}`), cancel-flow concierge
+  card (`ConciergeCardInfo.replyWithin`), saved page (`cancel.saved.support_pending`
+  / `support_hold {promise}` reading `replyWithin` back off the
+  `cancel.save_accepted` payload, else the current setting), cancel engine
+  (`CancelConfirmation.concierge.replyWithin`; the `cancel.save_accepted`
+  payload carries `replyWithin {value, unit, alwaysOn}`),
+  `SubmitSupportRequestResult.replyWithin`. No email template named a time
+  — none changed.
+- **Promise stored with the request**: `submitSupportRequest` passes
+  `channels.replyWithin` into `raiseSupportAlert`, which stores it in the
+  `SUPPORT_REQUEST` alert context; `runConciergeSla` reads
+  `readReplyPromise(ctx.replyWithin) ?? currentPromise` per alert — the
+  setting is only the fallback for pre-1.29.0 rows.
+- **Concierge SLA on minutes / hours** (`scheduled.server.ts`): pure
+  `replyPromiseElapsed(from, now, tz, promise)` — wall clock when `alwaysOn`,
+  weekday-only time via `weekdayMsBetween` (Sat/Sun in shop tz do not count)
+  otherwise, `businessDaysBetween` for `business_days`; `formatElapsed`
+  ("31 min" / "2 h 15 min" / "2 d 15 h"). The alert message reads "A
+  cancel-flow save request is unanswered for {elapsed} (promise: …)"; context
+  carries `replyWithin`, `elapsedMs`, `elapsedLabel` (+ `elapsedBusinessDays`
+  for business days). At most one alert per request (existing
+  `requestAlertId` dedupe kept).
+- **Admin Settings → Support**: "Reply promise — within" (1..10080), "Reply
+  promise — unit" (minutes / hours / business days), "24/7" toggle with
+  honest help text; the section description names the default sentence.
+  Cancel-flow page `conciergeHoldDays` help now points at Settings → Support
+  → Reply promise (default 30 minutes 24/7, checked every 10 minutes).
+- Tests: `tests/portal-single-subscription.test.ts` (20), `tests/support-reply-promise.test.ts`,
+  `tests/cancel-concierge-sla-minutes.test.ts`, `tests/portal-home-render-fixes.test.ts`;
+  existing pins re-pointed (`portal-a11y`, `portal-rewards-roadmap`,
+  `portal-new-card-banner`, `portal-next-delivery-hero`, `billing-timing`,
+  `portal-growth` key count 33 → 34, `aud-v128-cross-stage-truth`,
+  `support-channels`, `cancel-concierge-save`, `portal-support-request`,
+  `cancel-support-save-truth`, `aud-v128-stage-c-review-fixes`).
+
+### Changed
+
+- `concierge_sla_run` cadence 60 → 10 minutes (`jobs/runner.server.ts`): an
+  hourly tick would notice a 30-minute breach up to an hour late; the
+  per-request dedupe means the faster tick never re-alerts.
+- `settingsSchemas.support` is wrapped in `z.preprocess`: a stored object
+  carrying `slaBusinessDays` and no `replyWithin*` key is read as
+  `{replyWithinValue: slaBusinessDays, replyWithinUnit: "business_days",
+  alwaysOn: false}` BEFORE field defaults could mask it (`getSetting` and the
+  `settings_integrity` self-check both go through it — a legacy row keeps
+  PASSing). `slaBusinessDays` stays an optional tolerated key so Stage C JSON
+  parses; the UI never writes it, so a merchant save drops it naturally.
+- Home NEXT ORDER block: `nextChargeLine` no longer used on the home route
+  (date never repeated); wrapper `<div class="cxs-next__block">`; ORDER TOTAL
+  stays at right.
+- Every "not found" redirect targets the explicit list `/?list=1&toast=not_found`
+  (`proxy.subscription.$id.tsx`, `proxy.subscription.$id.restart.tsx`, the
+  API's `not_found` `backRedirect`) so single mode never renders a real
+  subscription page headed by a "not found" toast.
+- Demo persona gift line (`demo.server.ts` `DEMO_GIFT_TITLE`): "Surprise gift
+  — thank you" → "Free gift — thank you".
+- Cancel-flow help text for `conciergeHoldDays` and the Support settings
+  section description reworded for the new model.
+- i18n — added: `portal.support.reply_promise.{minutes,hours}_{one,other}[_always]`,
+  `portal.support.reply_promise.business_days_{one,other}`,
+  `portal.toast.support_sent_promise`, `cancel.saved.support_pending`,
+  `cancel.saved.support_hold`, `portal.value.milestone_away_{one,other}` (the
+  four non-`_always` minutes/hours keys NAME business days — "A human replies
+  within {n} minutes on business days." — translated in all 22 catalogs).
+  Removed from all 22 catalogs: `portal.support.sla_one/other`,
+  `portal.toast.support_sent_one/other`, `cancel.saves.support.sla_one/other`,
+  `cancel.saved.support_pending_one/other`, `cancel.saved.support_hold_one/other`.
+
+### Fixed
+
+- Rewards roadmap rows rendered with inline list styles, out of chronological
+  order ("Order 6 milestone · February 2027" before "Rewards unlock · August
+  2026"); the base milestone rung correctly shows no gift when no active
+  ORDER_INDEX `GiftRule` targets it (the base `milestoneGiftCycle` is
+  rule-driven; ladder rungs come from the pool) — pinned for the four
+  rule/pool combinations rather than changed.
+- Home next-order block repeated the date on two lines and printed the
+  cut-off as "{charge day}, 00:00"; now one subline and "Changes until
+  {previous day}, 11:59 PM" (or the real local hour when `chargeHourLocal`
+  ≠ 0) — the reminder email's `{edit_cutoff}` says the same.
+- Value tiles said "1 deliveries" and borrowed `.cxs-rewards__num`; "Gift
+  from us" is confirmed to render only for `gift`-kind estimate lines (the
+  contract's committed `isGift` mirror rows) — `scheduled_gift` rows never
+  reach the home card, so holdout / uncommitted grants never show.
+- 375 px / 1024 px pass on the home card + journey card: no overlap, no
+  horizontal overflow, tiles 3-across at 1024 / 2+1 at 375, roadmap meta on
+  its own indented line at 375.
+- `singleSubscriptionRedirectPath` re-emitted the raw `url.search` — the
+  proxy signature params and `handoff` / `next` / `list` are now stripped
+  (`REDIRECT_DROPPED_PARAMS`), order and repeats of the rest preserved.
+- Concierge SLA was judged against the CURRENT setting rather than the
+  promise the customer read at submit time (see Added).
+- Copy truth: a not-24/7 minutes / hours promise previously read as if
+  around the clock; the four non-`_always` keys now say "on business days".
+
+## [1.28.1] — 2026-08-18
+
+**Hotfix for the v1.28.0 ZIP: `prisma/schema.prisma` shipped corrupted** —
+a `resolution String? // …` comment line had been pasted INSIDE
+`enum DunningState`, replacing the `EXHAUSTED` value. `prisma generate`
+(and therefore `npm run setup`) failed with a hard error on a fresh
+machine; the release machine's generated client predated the edit, so
+typecheck, the full test suite and the build all stayed green. Had
+generate succeeded, the dunning engine, the portal payment-issue banner and
+the admin dunning queue would have referenced an enum value that no longer
+existed. Restored `EXHAUSTED` in place (diffed against the pre-update
+schema; the model comment lives on `DunningCase.resolution` where it
+belongs). Reported and worked around at deploy by the merchant's developer;
+this is the source fix. **No migration** (the SQL chain never carried the
+corruption — the enum values in the database were always right), no new
+env vars, no scope, webhook, theme or extension change. `npm run deploy` is
+**not** required for 1.28.1 itself (do run it once for 1.28.0 if you have
+not yet: three fulfillment webhook topics + the Thank-you page card).
+
+### Fixed
+- `prisma/schema.prisma`: `DunningState` enum reads `OPEN | RETRYING |
+  AWAITING_CUSTOMER | AWAITING_3DS | RECOVERED | EXHAUSTED | CANCELLED`
+  again; the stray line inside the enum body removed.
+- New guard `tests/schema-integrity.test.ts`: (a) every `enum … { }` body
+  line must be a bare value (the exact shape of this corruption fails it),
+  (b) the enums the code keys on by string (`DunningState`) must still
+  carry every referenced value, (c) `prisma validate` runs on the file
+  (with a dummy `DATABASE_URL`; validate never connects) — the very command
+  that failed at deploy — skipped only when the Prisma CLI is not
+  resolvable. `tests/migration-parity.test.ts` replays SQL against MODELS
+  and never looked inside enum bodies, which is how this slipped through.
+- `shopify.app.toml` template: dropped `include_config_on_deploy = true`
+  under `[build]` — current Shopify CLI versions always include the app
+  configuration in `deploy` and reject/deprecate the flag (a sibling
+  Cellexia app had to remove it). `docs/INSTALL.md` §7 wording updated.
+- Update procedure (`docs/UPDATE.md` §4 step 3, `docs/RELEASE_NOTES_v1.28.0.md`
+  step 2): the ZIP ships `shopify.app.toml` and `extensions/*/shopify.extension.toml`
+  as TEMPLATES (placeholder `client_id`/URLs, no extension `uid`s). Keep
+  YOUR copies when unzipping — restore them from git if overwritten — and
+  apply the per-release toml deltas by hand from the release notes (for
+  1.28.0: the three `fulfillments/create`, `fulfillments/update`,
+  `fulfillment_events/create` subscriptions). The notes now carry the exact
+  snippet.
+
+> Update notes: unzip over 1.28.0 (keep `.env`, `fly.toml`, your
+> `shopify.app.toml` and extension tomls), `npm ci`, `npm run setup`
+> (regenerates the client; migrations are a no-op), deploy/restart. If you
+> already patched the schema by hand as the merchant's developer did, the
+> 1.28.1 file is byte-for-byte the same fix.
+
 ## [1.28.0] — 2026-08-17
 
 **The portal churn pack: a subscriber can now fix a failed payment, see and

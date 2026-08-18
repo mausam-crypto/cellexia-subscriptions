@@ -180,8 +180,9 @@ describe("nextDeliveryHeroHtml — money-true", () => {
     expect(html).toContain("Charged to");
     expect(html).toContain("4242");
     expect(html).toContain("After that: September 17, 2026");
-    // Cut-off line in shop tz (00:00 BST on the billing day).
-    expect(html).toContain("You can make changes until August 20, 2026, 12:00 AM.");
+    // Cut-off line in shop tz (00:00 BST on the billing day — rendered as the
+    // end of the previous day, v1.29.0 shared formatter).
+    expect(html).toContain("You can make changes until August 19, 2026, 11:59 PM.");
     // Title + date.
     expect(html).toContain(en["portal.next.title"]);
     expect(html).toContain('cxs-next__date">August 20, 2026<');
@@ -405,8 +406,13 @@ describe("safeEstimateNextCharge / cutoffLabel", () => {
   });
 
   it("formats the cut-off as date + time in the shop timezone", () => {
+    // Shop midnight (00:00 BST Aug 20) reads as the end of the previous day.
     expect(cutoffLabel("en", new Date("2026-08-19T23:00:00.000Z"), TZ)).toBe(
-      "August 20, 2026, 12:00 AM",
+      "August 19, 2026, 11:59 PM",
+    );
+    // Any other moment prints its actual local time.
+    expect(cutoffLabel("en", new Date("2026-08-20T05:00:00.000Z"), TZ)).toBe(
+      "August 20, 2026, 6:00 AM",
     );
   });
 });

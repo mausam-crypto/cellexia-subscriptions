@@ -413,6 +413,16 @@ export const settingsSchemas = {
        * payment_select / payment_backup verbs are refused.
        */
       paymentMethodsList: z.boolean().default(true),
+      /**
+       * Single-subscription view (v1.29.0): when the signed-in customer has
+       * exactly ONE subscription (any status), the portal home 302s straight
+       * to that subscription's page — no "Manage" click — forwarding the
+       * query string (toasts, undo tokens) and honouring `?list=1` as the
+       * escape hatch back to the list. The subscription page then also
+       * carries the home-only surfaces (rewards roadmap, cancel-intent and
+       * newer-card banners). Off: the home list always renders.
+       */
+      singleSubscriptionOpensDetail: z.boolean().default(true),
     })
     .default({
       contextualPrompts: true,
@@ -439,6 +449,7 @@ export const settingsSchemas = {
       deliveriesProcessingMaxDays: 30,
       deliveriesInTransitMaxDays: 14,
       paymentMethodsList: true,
+      singleSubscriptionOpensDetail: true,
     }),
 
   // NOTE deliberately NO "buyBox" group here: buy-box presentation (savings
@@ -1556,10 +1567,33 @@ export const settingsSchemas = {
    * resolved email; empty channels are HIDDEN, never shown as dead links —
    * the pre-v1.28.0 hard-coded `mailto:support@cellexia.com` (a domain the
    * store does not own) is exactly the failure this group exists to remove.
-   * `slaBusinessDays` is the reply promise the confirmation toast makes; the
-   * merchant owns keeping it true.
+   * The reply promise (v1.29.0) is `replyWithinValue` + `replyWithinUnit`
+   * (minutes | hours | business_days) + `alwaysOn` (24/7) — default "a human
+   * replies within 30 minutes, 24/7"; phrased everywhere by
+   * supportReplyPromise() (app/lib/support/reply-promise.ts) and enforced by
+   * the concierge SLA job. The Stage C `slaBusinessDays` key stays tolerated:
+   * a stored object that carries it and no replyWithin* key is read as
+   * { value: slaBusinessDays, unit: "business_days", alwaysOn: false } — the
+   * preprocess below performs that read BEFORE the field defaults could mask
+   * it (no migration; the merchant owns keeping the promise true).
    */
-  support: z
+  support: z.preprocess(
+    (raw) => {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+      const o = raw as Record<string, unknown>;
+      const hasNew =
+        o.replyWithinValue !== undefined ||
+        o.replyWithinUnit !== undefined ||
+        o.alwaysOn !== undefined;
+      if (hasNew || typeof o.slaBusinessDays !== "number") return raw;
+      return {
+        ...o,
+        replyWithinValue: o.slaBusinessDays,
+        replyWithinUnit: "business_days",
+        alwaysOn: false,
+      };
+    },
+    z
     .object({
       // Format-checked at SAVE time with the same rules the resolver applies
       // (channels.server.ts normalizeSupportEmail / normalizeWhatsapp /
@@ -1604,9 +1638,27 @@ export const settingsSchemas = {
         })
         .default(""),
       hoursNote: z.string().trim().max(300).default(""),
-      slaBusinessDays: z.number().int().min(1).max(30).default(1),
+      /** Reply promise: "a human replies within {value} {unit}[, 24/7]". */
+      replyWithinValue: z.number().int().min(1).max(10_080).default(30),
+      replyWithinUnit: z.enum(["minutes", "hours", "business_days"]).default("minutes"),
+      /** 24/7 — weekends included (ignored for business_days, which never is). */
+      alwaysOn: z.boolean().default(true),
+      /** Stage C (≤ v1.28.x) key — tolerated so stored JSON still parses; never written by the UI. */
+      slaBusinessDays: z.number().int().min(1).max(30).optional(),
       /** Get-help submits per rolling hour per customer (stricter than portal.mutationsPerHour). */
       requestsPerHour: z.number().int().min(1).max(50).default(3),
+    })
+    .superRefine((v, ctx) => {
+      // Per-unit ceiling: a week in minutes, a month in hours, 30 business
+      // days — a promise past that is not a promise, it is a disclaimer.
+      const max = { minutes: 10_080, hours: 720, business_days: 30 }[v.replyWithinUnit];
+      if (v.replyWithinValue > max) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["replyWithinValue"],
+          message: `Reply promise must be at most ${max} ${v.replyWithinUnit.replace("_", " ")}`,
+        });
+      }
     })
     .default({
       email: "",
@@ -1614,9 +1666,12 @@ export const settingsSchemas = {
       whatsapp: "",
       chatUrl: "",
       hoursNote: "",
-      slaBusinessDays: 1,
+      replyWithinValue: 30,
+      replyWithinUnit: "minutes",
+      alwaysOn: true,
       requestsPerHour: 3,
     }),
+  ),
 
   /** Monitoring & alerting. */
   alerts: z

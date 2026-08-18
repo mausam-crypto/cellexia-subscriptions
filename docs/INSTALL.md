@@ -387,7 +387,9 @@ npx prisma migrate dev
    npm run deploy          # = shopify app deploy
    ```
 
-   Because `include_config_on_deploy = true`, this registers the app URL,
+   Current Shopify CLI versions always include the app configuration in a
+   deploy (the old `include_config_on_deploy` flag is deprecated and no
+   longer set in the template), so this registers the app URL,
    redirect URLs, **all webhook subscriptions**, and the app proxy — and uploads
    the `cellexia-buy-box` theme extension. Re-run it after any `shopify.app.toml`
    change.

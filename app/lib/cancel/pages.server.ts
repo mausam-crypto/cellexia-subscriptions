@@ -19,9 +19,11 @@ import { retentionLossLines, type RetentionSummary } from "./summary.server";
 import type { PageContent } from "./portal.server";
 import {
   EMPTY_SUPPORT_CHANNELS,
+  type ReplyPromise,
   type SupportChannels,
 } from "~/lib/support/channels.server";
 import { supportChannelsHtml } from "~/lib/support/portal-card.server";
+import { supportReplyPromise } from "~/lib/support/reply-promise.server";
 import {
   EMPTY_EDUCATION_LINKS,
   educationGuideUrl,
@@ -313,7 +315,7 @@ export function pageSaves(args: {
   /**
    * Concierge save (v1.28.0, P3.7): what the SUPPORT card promises and
    * prefills — the Get-help topic matched to the cancel reason, the survey
-   * free text as the message draft, the reply promise (support.slaBusinessDays)
+   * free text as the message draft, the reply promise (support.replyWithin*)
    * and, when the hold WOULD apply right now (conciergeHoldPlan), the day the
    * next order moves to. Omitted ⇒ Stage C's plain form.
    */
@@ -379,7 +381,7 @@ export interface ConciergeCardInfo {
   topic: "DELIVERY" | "PAYMENT" | "PLAN" | "OTHER";
   /** Message draft (the survey's free text), "" when none. */
   prefill: string;
-  slaBusinessDays: number;
+  replyWithin: ReplyPromise;
   /** The day the next order moves to when the hold applies; null = no hold. */
   holdUntil: Date | null;
   holdDays: number;
@@ -700,13 +702,7 @@ ${supportSaveForm(savesAction, csrf, locale, "EDUCATION")}`,
       // (conciergeHoldPlan decided; the accept path applies the same rule).
       const promise = concierge
         ? `<p class="cxs-muted cxs-small cxc-concierge-promise" style="margin:0 0 6px">${esc(
-            t(
-              locale,
-              concierge.slaBusinessDays === 1
-                ? "cancel.saves.support.sla_one"
-                : "cancel.saves.support.sla_other",
-              { days: concierge.slaBusinessDays },
-            ),
+            supportReplyPromise(locale, concierge),
           )}${
             concierge.holdUntil
               ? ` ${esc(

@@ -42,7 +42,7 @@ const mocks = vi.hoisted(() => ({
     pushBackFailed: false,
     alertRaised: true,
     emailSent: true,
-    slaBusinessDays: 1,
+    replyWithin: { value: 30, unit: "minutes", alwaysOn: true },
   })),
   contractUpdate: vi.fn(async (): Promise<unknown> => ({})),
 }));

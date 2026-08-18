@@ -10,7 +10,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  * Pins:
  *  - settings.support.email → Shop.contactEmail → null (no dead mailto:);
  *  - replyTo → email; whatsapp normalized to E.164 → wa.me; chatUrl https only;
- *  - slaBusinessDays defaults to 1 and is bounded;
+ *  - the reply promise (v1.29.0) resolves: legacy slaBusinessDays ⇒ business
+ *    days, malformed ⇒ 30 minutes 24/7 (tests/support-reply-promise.test.ts
+ *    owns the phrasing);
  *  - the Shop record is only read when the setting leaves the email blank;
  *  - every failure (settings, DB) degrades to the empty channel set — never
  *    throws (golden rule 9);
@@ -94,19 +96,21 @@ describe("resolveSupportChannels (pure)", () => {
     );
   });
 
-  it("chatUrl must be https; hoursNote trimmed; SLA bounded with default 1", () => {
+  it("chatUrl must be https; hoursNote trimmed; reply promise resolved (legacy slaBusinessDays → business days, malformed → default 30 min 24/7)", () => {
     const c = resolveSupportChannels(
       { chatUrl: "https://chat.example.com/x", hoursNote: "  Mon–Fri 9–17 CET ", slaBusinessDays: 2 },
       null,
     );
     expect(c.chatUrl).toBe("https://chat.example.com/x");
     expect(c.hoursNote).toBe("Mon–Fri 9–17 CET");
-    expect(c.slaBusinessDays).toBe(2);
+    expect(c.replyWithin).toEqual({ value: 2, unit: "business_days", alwaysOn: false });
     expect(normalizeChatUrl("http://insecure.example")).toBeNull();
     expect(normalizeChatUrl("javascript:alert(1)")).toBeNull();
-    expect(resolveSupportChannels({ slaBusinessDays: 0 }, null).slaBusinessDays).toBe(1);
-    expect(resolveSupportChannels({ slaBusinessDays: 99 }, null).slaBusinessDays).toBe(1);
-    expect(resolveSupportChannels({ slaBusinessDays: "3" }, null).slaBusinessDays).toBe(1);
+    const dflt = { value: 30, unit: "minutes", alwaysOn: true };
+    expect(resolveSupportChannels({ slaBusinessDays: 0 }, null).replyWithin).toEqual(dflt);
+    expect(resolveSupportChannels({ slaBusinessDays: 99 }, null).replyWithin).toEqual(dflt);
+    expect(resolveSupportChannels({ slaBusinessDays: "3" }, null).replyWithin).toEqual(dflt);
+    expect(resolveSupportChannels({}, null).replyWithin).toEqual(dflt);
   });
 
   it("email validation refuses header-injection shapes", () => {
@@ -148,18 +152,23 @@ describe("getSupportChannels (fallback chain + containment)", () => {
 });
 
 describe("registry: the support settings group", () => {
-  it("ships with empty channels, SLA 1 business day and 3 requests/hour", () => {
+  it("ships with empty channels, a 30-minute 24/7 reply promise and 3 requests/hour", () => {
     expect(defaultFor("support")).toEqual({
       email: "",
       replyTo: "",
       whatsapp: "",
       chatUrl: "",
       hoursNote: "",
-      slaBusinessDays: 1,
+      replyWithinValue: 30,
+      replyWithinUnit: "minutes",
+      alwaysOn: true,
       requestsPerHour: 3,
     });
     // Field-level defaults keep a partially stored row valid.
-    expect(settingsSchemas.support.parse({ email: "care@cellexialabs.com" }).slaBusinessDays).toBe(1);
+    const partial = settingsSchemas.support.parse({ email: "care@cellexialabs.com" });
+    expect(partial.replyWithinValue).toBe(30);
+    expect(partial.replyWithinUnit).toBe("minutes");
+    expect(partial.alwaysOn).toBe(true);
   });
 });
 

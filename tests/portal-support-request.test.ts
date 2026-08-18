@@ -133,7 +133,9 @@ vi.mock("~/lib/settings/settings.server", () => ({
         whatsapp: "",
         chatUrl: "",
         hoursNote: "",
-        slaBusinessDays: 1,
+        replyWithinValue: 30,
+        replyWithinUnit: "minutes",
+        alwaysOn: true,
         requestsPerHour: 3,
         ...mocks.settings.support,
       };
@@ -337,12 +339,19 @@ describe("POST /api/support — guards", () => {
 // ── Happy path: event, alert, email, toast ───────────────────────────────────
 
 describe("POST /api/support — record, alert, email, toast", () => {
-  it("logs support.requested with the documented payload and redirects with support_sent + sla", async () => {
-    mocks.settings.support = { email: "care@cellexialabs.com", slaBusinessDays: 2 };
+  it("logs support.requested with the documented payload and redirects with support_sent + the reply promise params", async () => {
+    mocks.settings.support = {
+      email: "care@cellexialabs.com",
+      replyWithinValue: 2,
+      replyWithinUnit: "hours",
+      alwaysOn: true,
+    };
     const res = await postSupport({ topic: "PLAN", message: "Can I go monthly?" });
     const params = locationParams(res);
     expect(params.get("toast")).toBe("support_sent");
     expect(params.get("sla")).toBe("2");
+    expect(params.get("slau")).toBe("h");
+    expect(params.get("sla247")).toBe("1");
 
     const ev = requestEvent();
     expect(ev).toEqual(
@@ -560,7 +569,12 @@ describe("push my next order back 1 week", () => {
 
 describe("submitSupportRequest (direct)", () => {
   it("tags cancel-flow requests with reason + session and never pushes back", async () => {
-    mocks.settings.support = { email: "care@cellexialabs.com", slaBusinessDays: 3 };
+    mocks.settings.support = {
+      email: "care@cellexialabs.com",
+      replyWithinValue: 3,
+      replyWithinUnit: "business_days",
+      alwaysOn: false,
+    };
     const result = await submitSupportRequest({
       shopId: "shop_1",
       shopDomain: SHOP_DOMAIN,
@@ -572,7 +586,7 @@ describe("submitSupportRequest (direct)", () => {
       cancelReason: "SHIPPING_ISSUES",
       cancelSessionId: "cs_1",
     });
-    expect(result.slaBusinessDays).toBe(3);
+    expect(result.replyWithin).toEqual({ value: 3, unit: "business_days", alwaysOn: false });
     expect(result.emailSent).toBe(true);
     expect(result.alertRaised).toBe(true);
     expect(requestEvent()?.payload).toEqual(
@@ -600,24 +614,32 @@ describe("wiring", () => {
     });
   });
 
-  it("resolveToast renders the SLA-aware confirmation; malformed sla → the plain copy", () => {
+  it("resolveToast renders the reply-promise confirmation; malformed params → the plain copy", () => {
     const one = resolveToast(
-      new Request("https://x/apps/cellexia-subs/?toast=support_sent&sla=1"),
+      new Request("https://x/apps/cellexia-subs/?toast=support_sent&sla=1&slau=d"),
       "en",
     );
-    expect(one?.toast.text).toContain("within 1 business day.");
-    const two = resolveToast(
+    expect(one?.toast.text).toContain("A human replies within 1 business day.");
+    const thirty = resolveToast(
+      new Request("https://x/apps/cellexia-subs/?toast=support_sent&sla=30&slau=m&sla247=1"),
+      "en",
+    );
+    expect(thirty?.toast.text).toBe(
+      "Thanks — we've got your message. A human replies within 30 minutes, 24/7.",
+    );
+    // A bare legacy `sla` (no unit) is no longer a promise.
+    const legacy = resolveToast(
       new Request("https://x/apps/cellexia-subs/?toast=support_sent&sla=2"),
       "en",
     );
-    expect(two?.toast.text).toContain("within 2 business days.");
+    expect(legacy?.toast.text).toBe("Thanks — we've got your message and will get back to you.");
     const bad = resolveToast(
-      new Request("https://x/apps/cellexia-subs/?toast=support_sent&sla=999"),
+      new Request("https://x/apps/cellexia-subs/?toast=support_sent&sla=999&slau=d"),
       "en",
     );
     expect(bad?.toast.text).not.toContain("999");
     const failed = resolveToast(
-      new Request("https://x/apps/cellexia-subs/?toast=support_pushback_failed&sla=1"),
+      new Request("https://x/apps/cellexia-subs/?toast=support_pushback_failed&sla=1&slau=d"),
       "en",
     );
     expect(failed?.toast.text).toContain("couldn't move your next order");
@@ -663,7 +685,7 @@ describe("wiring", () => {
     expect(layout.indexOf(".cxs-check[hidden]{display:none}")).toBeGreaterThan(
       layout.indexOf(".cxs-check{display:flex"),
     );
-    expect(html).toContain("We reply within 1 business day.");
+    expect(html).toContain("A human replies within 30 minutes, 24/7.");
     expect(html).toContain("We keep it with your subscription history.");
     expect(html).not.toContain("cellexia.com");
     expect(html).toContain('id="cxs-support"');

@@ -54,6 +54,7 @@ function isContractEditBlocked(err: unknown): boolean {
   return err instanceof Error && err.name === "ContractEditBlockedError";
 }
 import { pauseExtendChoices } from "~/lib/portal/flex.server";
+import { HOME_LIST_RETURN_TO } from "~/lib/portal/single-subscription.server";
 import { isKnownCountry, normalizeProvinceCode } from "~/lib/portal/countries";
 import type { DeliveryAddressInput } from "~/lib/graphql/index.server";
 import { reactivateWithCurrentOffer } from "~/lib/winback/restart.server";
@@ -104,6 +105,7 @@ import {
   resolveOrderRef,
   submitSupportRequest,
 } from "~/lib/support/request.server";
+import { replyPromiseParams } from "~/lib/support/reply-promise.server";
 
 /**
  * Single POST dispatcher for every portal mutation:
@@ -168,6 +170,9 @@ const addressFormSchema = z.object({
 function sanitizeReturnTo(value: unknown): string {
   const raw = typeof value === "string" ? value : "/";
   // "/account" (v1.28.0): the Account page hosts the Get-help form.
+  // "/?list=1" (v1.29.0): the explicit list — a single-subscription customer
+  // who opened the escape hatch stays on it after a card action.
+  if (raw === HOME_LIST_RETURN_TO) return raw;
   return /^\/(subscription\/[A-Za-z0-9_-]+|account)?$/.test(raw) ? raw : "/";
 }
 
@@ -178,8 +183,13 @@ function backRedirect(
   preview: string | null,
   extra?: Record<string, string>,
 ) {
-  const path = returnTo === "/" ? `${PORTAL_BASE_PATH}/` : `${PORTAL_BASE_PATH}${returnTo}`;
-  const params = new URLSearchParams({ toast, ...(extra ?? {}) });
+  // return_to may carry its own query (`/?list=1`): keep it ahead of the toast.
+  const q = returnTo.indexOf("?");
+  const pathPart = q === -1 ? returnTo : returnTo.slice(0, q);
+  const path = pathPart === "/" ? `${PORTAL_BASE_PATH}/` : `${PORTAL_BASE_PATH}${pathPart}`;
+  const params = new URLSearchParams(q === -1 ? "" : returnTo.slice(q + 1));
+  params.set("toast", toast);
+  for (const [k, v] of Object.entries(extra ?? {})) params.set(k, v);
   return redirect(withLocale(`${path}?${params.toString()}`, locale, preview));
 }
 
@@ -301,7 +311,9 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     include: { lines: true },
   });
   if (!contract) {
-    return backRedirect(locale, "/", "not_found", portalSession.previewToken);
+    // The explicit list (never the single-subscription redirect): a "not
+    // found" toast must not head the customer's one real subscription page.
+    return backRedirect(locale, HOME_LIST_RETURN_TO, "not_found", portalSession.previewToken);
   }
 
   const actionName = params.action ?? "";
@@ -1527,7 +1539,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
           result.pushBackFailed || pushBackRefused
             ? "support_pushback_failed"
             : "support_sent",
-          { sla: String(result.slaBusinessDays) },
+          replyPromiseParams(result),
         );
       }
 

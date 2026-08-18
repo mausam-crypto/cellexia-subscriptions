@@ -335,7 +335,9 @@ describe("reminder edit cut-off vars", () => {
     const due = new Date("2026-08-19T09:00:00.000Z");
     const vars = reminderCutoffVars("en", due, { tz: LONDON, chargeHourLocal: 0 });
     expect(vars.edit_cutoff_iso).toBe("2026-08-18T23:00:00.000Z");
-    expect(vars.edit_cutoff).toBe("August 19, 2026, 12:00 AM");
+    // v1.29.0: shop midnight is worded as the end of the previous day (the
+    // instant is unchanged) — the same string the portal card and hero print.
+    expect(vars.edit_cutoff).toBe("August 18, 2026, 11:59 PM");
   });
 
   it("never throws — a bad timezone collapses the line to empty strings", () => {

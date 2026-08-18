@@ -9,7 +9,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  * Pins:
  *  - the card prefills the Get-help topic from the cancel reason and the
  *    survey free text as the message draft, states the reply promise
- *    (support.slaBusinessDays) and the next-order hold ONLY when it applies;
+ *    (support.replyWithin*, v1.29.0) and the next-order hold ONLY when it applies;
  *  - accepting SUPPORT routes the request with saveRequest + reasonDetail
  *    (alert flag + admin visibility), closes the session as SAVED_PENDING
  *    (distinct from SAVED — a request is not yet a save), and HOLDS the next
@@ -18,7 +18,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  *    locked; a failed hold never reverts the save (the request is the save);
  *  - conciergeHoldPlan is the single rule (card promise = accept behaviour);
  *  - the SLA job raises ONE CRITICAL SUPPORT_SLA_BREACH per unanswered save
- *    request after slaBusinessDays business days, and promotes SAVED_PENDING
+ *    request past the reply promise (legacy slaBusinessDays ⇒ business days), and promotes SAVED_PENDING
  *    → SAVED once the request alert is resolved while the contract lives;
  *  - businessDaysBetween skips weekends in the shop timezone;
  *  - the support request module carries the new fields to the event, alert
@@ -46,7 +46,7 @@ const mocks = vi.hoisted(() => ({
     pushBackFailed: false,
     alertRaised: true,
     emailSent: true,
-    slaBusinessDays: 2,
+    replyWithin: { value: 2, unit: "business_days", alwaysOn: false },
   })),
   delaySchedule: vi.fn(async (): Promise<unknown> => ({ ...store.contract, nextBillingDate: new Date("2026-09-08T00:00:00Z") })),
   delayNextCycle: vi.fn(async (): Promise<unknown> => ({ ...store.contract, nextBillingDate: new Date("2026-09-08T00:00:00Z") })),
@@ -283,14 +283,14 @@ describe("the SUPPORT card (in-flow request form)", () => {
       concierge: {
         topic: "PLAN",
         prefill: "Two parcels arrived crushed",
-        slaBusinessDays: 2,
+        replyWithin: { value: 2, unit: "business_days", alwaysOn: false },
         holdUntil: new Date("2026-09-08T00:00:00Z"),
         holdDays: 7,
       },
     });
     expect(page.body).toContain('name="support_topic" value="PLAN"');
     expect(page.body).toContain(">Two parcels arrived crushed</textarea>");
-    expect(page.body).toContain("A real person replies within 2 business days.");
+    expect(page.body).toContain("A human replies within 2 business days.");
     expect(page.body).toContain("hold your next order until September 8, 2026");
     expect(page.body).not.toContain("mailto:");
   });
@@ -304,9 +304,15 @@ describe("the SUPPORT card (in-flow request form)", () => {
       tz: "Europe/Zurich",
       currencyCode: "CHF",
       showError: false,
-      concierge: { topic: "DELIVERY", prefill: "", slaBusinessDays: 1, holdUntil: null, holdDays: 7 },
+      concierge: {
+        topic: "DELIVERY",
+        prefill: "",
+        replyWithin: { value: 1, unit: "business_days", alwaysOn: false },
+        holdUntil: null,
+        holdDays: 7,
+      },
     });
-    expect(noHold.body).toContain("A real person replies within 1 business day.");
+    expect(noHold.body).toContain("A human replies within 1 business day.");
     expect(noHold.body).not.toContain("hold your next order");
     const plain = pageSaves({
       locale: "en",
@@ -352,7 +358,11 @@ describe("accepting SUPPORT (concierge)", () => {
       expect.objectContaining({ outcome: SAVED_PENDING, saveAccepted: "SUPPORT" }),
     );
     expect(store.reverts).toHaveLength(0);
-    expect(result.concierge).toEqual({ holdApplied: true, holdDays: 7, slaBusinessDays: 2 });
+    expect(result.concierge).toEqual({
+      holdApplied: true,
+      holdDays: 7,
+      replyWithin: { value: 2, unit: "business_days", alwaysOn: false },
+    });
     expect(result.nextBillingDate).toBe("2026-09-08T00:00:00.000Z");
     expect(mocks.logEvent).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -362,7 +372,7 @@ describe("accepting SUPPORT (concierge)", () => {
           pending: true,
           holdApplied: true,
           holdDays: 7,
-          slaBusinessDays: 2,
+          replyWithin: { value: 2, unit: "business_days", alwaysOn: false },
         }),
       }),
     );
@@ -480,7 +490,7 @@ describe("concierge SLA job", () => {
           contractId: "c_1",
           requestAlertId: "al_1",
           cancelSessionId: "cs_1",
-          slaBusinessDays: 2,
+          replyWithin: { value: 2, unit: "business_days", alwaysOn: false },
           elapsedBusinessDays: 3,
         }),
         dedupe: expect.objectContaining({ key: "requestAlertId", value: "al_1" }),
@@ -553,9 +563,9 @@ describe("support request module + admin surfaces (source pins)", () => {
     expect(page).toContain('label="Pending (concierge)"');
   });
 
-  it("the concierge_sla_run and cancel_scheduled_run jobs are registered hourly", () => {
+  it("the concierge_sla_run job ticks every 10 minutes (30-minute promise) and cancel_scheduled_run hourly", () => {
     const runner = src("app/lib/jobs/runner.server.ts");
-    expect(runner).toMatch(/name: "concierge_sla_run",\s*everyMinutes: 60/);
+    expect(runner).toMatch(/name: "concierge_sla_run",\s*everyMinutes: 10/);
     expect(runner).toMatch(/name: "cancel_scheduled_run",\s*gatedInSetup: true,\s*everyMinutes: 60/);
   });
 });

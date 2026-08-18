@@ -14,6 +14,7 @@ import {
   withLocale,
 } from "~/lib/portal/layout.server";
 import { PORTAL_BASE_PATH, requireCustomer } from "~/lib/portal/session.server";
+import { HOME_LIST_RETURN_TO } from "~/lib/portal/single-subscription.server";
 import { buildRetentionSummary } from "~/lib/cancel/summary.server";
 import { deriveCurrentWinbackOffer } from "~/lib/winback/restart.server";
 import { addDaysTz } from "~/lib/dates.server";
@@ -62,7 +63,8 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   });
   if (!contract) {
     throw redirect(
-      withLocale(`${PORTAL_BASE_PATH}/?toast=not_found`, locale, portalSession.previewToken),
+      // Explicit list (v1.29.0): never a "not found" toast on the single detail page.
+      withLocale(`${PORTAL_BASE_PATH}${HOME_LIST_RETURN_TO}&toast=not_found`, locale, portalSession.previewToken),
     );
   }
   const detailPath = withLocale(

@@ -1,6 +1,7 @@
 import { t } from "~/lib/i18n/i18n.server";
 import { escapeHtml } from "~/lib/portal/layout.server";
 import { mailtoHref, type SupportChannels } from "./channels.server";
+import { supportReplyPromise } from "./reply-promise.server";
 import { SUPPORT_MESSAGE_MAX, SUPPORT_TOPICS, type SupportTopic } from "./request.server";
 
 /**
@@ -10,8 +11,8 @@ import { SUPPORT_MESSAGE_MAX, SUPPORT_TOPICS, type SupportTopic } from "./reques
  * the cancel-flow SUPPORT/EDUCATION cards. Pure: the route hands in the
  * resolved channels, the form target and its hidden fields.
  *
- * Honesty: only channels that resolved render (no dead mailto:); the SLA
- * line names settings.support.slaBusinessDays; the privacy line says exactly
+ * Honesty: only channels that resolved render (no dead mailto:); the reply
+ * line is supportReplyPromise() (settings.support.replyWithin*); the privacy line says exactly
  * what happens to the message (team + Klaviyo profile — see the copy).
  */
 
@@ -106,13 +107,7 @@ export function supportCardHtml(input: SupportCardInput): string {
     ? `<label class="cxs-check"${selected === "DELIVERY" ? "" : " hidden"} data-cellexia-support-delivery><input type="checkbox" name="push_back" value="1"><span>${escapeHtml(t(locale, "portal.support.push_back"))}<br><span class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.support.push_back_hint"))}</span></span></label><noscript><style>.cxs-check[data-cellexia-support-delivery][hidden]{display:flex}</style></noscript>`
     : "";
 
-  const sla = t(
-    locale,
-    channels.slaBusinessDays === 1
-      ? "portal.support.sla_one"
-      : "portal.support.sla_other",
-    { days: channels.slaBusinessDays },
-  );
+  const sla = supportReplyPromise(locale, channels);
 
   const form = `<form method="post" action="${escapeHtml(input.formAction)}" class="cxs-support__form">
     ${input.hiddenFields}

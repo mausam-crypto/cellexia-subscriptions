@@ -148,6 +148,19 @@ import {
 } from "~/lib/portal/growth.server";
 import { PROVINCES, countryOptions, provincesFor } from "~/lib/portal/countries";
 import { hasFurtherOrders } from "~/lib/cancel/further-orders";
+import { rewardsSectionHtml } from "~/lib/portal/rewards-card.server";
+import {
+  HOME_LIST_RETURN_TO,
+  isSingleSubscriptionMode,
+  listHref,
+} from "~/lib/portal/single-subscription.server";
+import { renderIntentBanner } from "~/lib/cancel/intent-banner.server";
+import { newCardBannerHits } from "~/lib/dunning/new-method.server";
+import {
+  NEW_CARD_BANNER_STATUSES,
+  newCardBannerHtml,
+  newCardBannerText,
+} from "~/lib/portal/new-card-banner.server";
 
 /**
  * Full subscription management: items (swap / quantity / remove), add a
@@ -1385,9 +1398,12 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     portalSession,
   );
   if (!contract) {
+    // The explicit list (`/?list=1`, v1.29.0): in single-subscription mode
+    // a plain "/" would forward the toast onto the customer's one real
+    // subscription page — "not found" heading a page that clearly found one.
     throw redirect(
       withLocale(
-        `${PORTAL_BASE_PATH}/?toast=not_found`,
+        `${PORTAL_BASE_PATH}${HOME_LIST_RETURN_TO}&toast=not_found`,
         locale,
         portalSession.previewToken,
       ),
@@ -1420,6 +1436,28 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const scheduledCancelEnabled =
     (cancelFlowSettings as { scheduledCancelEnabled?: boolean })
       .scheduledCancelEnabled !== false;
+
+  // Single-subscription view (v1.29.0, portal.singleSubscriptionOpensDetail):
+  // this is the customer's ONLY subscription (any status, OURS_ONLY — the
+  // same count the home redirect used), so this page IS the portal home:
+  // the back link / nav tab carry `?list=1` (no bounce through the redirect)
+  // and the home-only surfaces (rewards card, cancel-intent and newer-card
+  // banners) render here. Contained: a failed count renders the multi view.
+  let singleMode = false;
+  if (portalSettings.singleSubscriptionOpensDetail) {
+    try {
+      const contractCount = await prisma.subscriptionContract.count({
+        where: {
+          shopId: shop.id,
+          customerId: portalSession.customerId,
+          ...OURS_ONLY,
+        },
+      });
+      singleMode = isSingleSubscriptionMode({ enabled: true, contractCount });
+    } catch (err) {
+      console.error("[portal] single-subscription count failed", contract.id, err);
+    }
+  }
 
   // Catalog + discount map (cached, degrade-to-empty) for swap/add sections.
   let catalog: CatalogProduct[] = [];
@@ -2363,6 +2401,24 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     }
     body += pauseHtml(ctx, pauseSettings.maxMonths);
   }
+  // Single mode (v1.29.0): the rewards card the home renders (roadmap behind
+  // portalGrowth.rewardsRoadmap, else the classic strip) — THE shared
+  // builder, anchored on this one contract — after the schedule cards.
+  if (singleMode) {
+    try {
+      body += await rewardsSectionHtml({
+        shopId: shop.id,
+        tz: ctx.tz,
+        locale,
+        customerId: portalSession.customerId,
+        contracts: [contract],
+        lifecycle,
+        growth,
+      });
+    } catch (err) {
+      console.error("[portal] single-mode rewards card failed", contract.id, err);
+    }
+  }
   if (editable) {
     body += addressHtml(ctx);
     // Delivery instructions (v1.28.0, P2.8): same editability as the
@@ -2436,6 +2492,76 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     body += `<p style="text-align:center;margin:24px 0 0"><a href="${withLocale(`${PORTAL_BASE_PATH}/cancel/${contract.id}`, locale, ctx.preview)}" class="cxs-muted cxs-small" style="color:var(--cxs-muted)">${escapeHtml(t(locale, "portal.detail.cancel_link"))}</a></p>`;
   }
 
+  // Single mode (v1.29.0): the home banners the customer would otherwise
+  // never see — cancel-intent (Stage F) and "newer card on file" (Stage G) —
+  // ABOVE everything else on the page (a payment fix / a walked-away cancel
+  // outranks the hero). Same gates as the home: cancelFlow.enabled +
+  // intentBannerDays; portal.paymentMethodsList + real customers only.
+  // Both contained: nothing renders on any failure.
+  if (singleMode) {
+    let banners = "";
+    try {
+      const cancelFlow = cancelFlowSettings;
+      if (cancelFlow.enabled && cancelFlow.intentBannerDays > 0) {
+        let supportAvailable = false;
+        try {
+          supportAvailable = (await getSupportChannels(shop.id)).hasAny;
+        } catch {
+          supportAvailable = false;
+        }
+        banners += await renderIntentBanner([contract], {
+          shopId: shop.id,
+          tz: ctx.tz,
+          locale,
+          csrf: ctx.csrf,
+          preview: ctx.preview,
+          isPreview: portalSession.isPreview,
+          bannerDays: cancelFlow.intentBannerDays,
+          downsizeEnabled: cancelFlow.downsizeSaveEnabled,
+          preparingByContract: new Map([[contract.id, preparing]]),
+          supportAvailable,
+        });
+      }
+    } catch (err) {
+      console.error("[portal] single-mode cancel-intent banner failed", contract.id, err);
+    }
+    try {
+      if (
+        ctx.paymentMethodsList &&
+        !portalSession.isPreview &&
+        NEW_CARD_BANNER_STATUSES.includes(contract.status)
+      ) {
+        const hits = await newCardBannerHits([contract], {
+          preExpiryNoticeDays: dunningSettings.preExpiryNoticeDays,
+          tz: ctx.tz,
+          liveMethodIds: async (customerGid) => {
+            try {
+              const admin = await adminClientForShop(session.shop);
+              const live = await listLivePaymentMethodsCached(admin, customerGid);
+              return new Set(live.map((m) => m.id));
+            } catch (err) {
+              console.error("[portal] new-card banner method read failed", err);
+              return null;
+            }
+          },
+        });
+        const hit = hits.get(contract.id);
+        if (hit) {
+          banners += newCardBannerHtml({
+            locale,
+            hit,
+            text: newCardBannerText(locale, hit),
+            formHtml: `<form method="post" action="${api(ctx, "payment_select")}">${hiddenFields([...baseFields(ctx), ["paymentMethodId", hit.paymentMethodId]])}<button type="submit" class="cxs-btn cxs-btn--small">${escapeHtml(t(locale, "portal.index.new_card_cta"))}</button></form>`,
+            moreHref: "#cxs-payment",
+          });
+        }
+      }
+    } catch (err) {
+      console.error("[portal] single-mode new-card banner failed", contract.id, err);
+    }
+    body = banners + body;
+  }
+
   const toast = resolvedToast?.toast ?? null;
   const toastWithUndo: PortalToast | null = toast;
   if (
@@ -2452,8 +2578,13 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       body,
       activeNav: "subscriptions",
       toast: toastWithUndo,
-      backHref: withLocale(`${PORTAL_BASE_PATH}/`, locale, ctx.preview),
+      // Single mode (v1.29.0): the list is reached through `?list=1` — the
+      // plain "/" would 302 straight back to this page.
+      backHref: singleMode
+        ? listHref(locale, ctx.preview)
+        : withLocale(`${PORTAL_BASE_PATH}/`, locale, ctx.preview),
       backLabel: t(locale, "portal.detail.back"),
+      subscriptionsHref: singleMode ? listHref(locale, ctx.preview) : undefined,
       isPreview: portalSession.isPreview,
       previewToken: portalSession.previewToken,
     }),

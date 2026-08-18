@@ -812,7 +812,7 @@ export default function CancelFlowPage() {
                       value={conciergeHoldDays}
                       onChange={setConciergeHoldDays}
                       error={errors.conciergeHoldDays}
-                      helpText='When a customer sends the "talk to a human" request from the cancel flow, their next order is pushed back this many days so nothing charges while you answer (only when the charge is further away than the lead time on the right). 0 = never hold. The card promises the reply within Support → SLA business days; an unanswered request raises a critical alert after that. The session counts as "pending" until you resolve the request alert.'
+                      helpText='When a customer sends the "talk to a human" request from the cancel flow, their next order is pushed back this many days so nothing charges while you answer (only when the charge is further away than the lead time on the right). 0 = never hold. The card promises the reply within Settings → Support → Reply promise (default 30 minutes, 24/7); an unanswered request raises a critical alert after that (checked every 10 minutes). The session counts as "pending" until you resolve the request alert.'
                     />
                   </Box>
                   <Box minWidth="200px">

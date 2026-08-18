@@ -66,7 +66,12 @@ import {
   buildRetentionSummary,
   type RetentionSummary,
 } from "~/lib/cancel/summary.server";
-import { getSupportChannels } from "~/lib/support/channels.server";
+import {
+  DEFAULT_REPLY_PROMISE,
+  getSupportChannels,
+  type ReplyPromise,
+} from "~/lib/support/channels.server";
+import { readReplyPromise, supportReplyPromise } from "~/lib/support/reply-promise.server";
 import { resumeReminderPromised } from "~/lib/notifications/promise.server";
 import { getEducationLinks } from "~/lib/portal/education.server";
 import { educationTimelineTextFor } from "~/lib/portal/timeline.server";
@@ -185,7 +190,7 @@ async function conciergeInfoFor(
     return {
       topic: conciergeTopicForReason(reason),
       prefill: reasonDetail ?? "",
-      slaBusinessDays: channels.slaBusinessDays,
+      replyWithin: channels.replyWithin,
       holdUntil: hold.applies ? hold.newNextDate : null,
       holdDays: hold.days,
     };
@@ -604,12 +609,14 @@ async function loadSaved(ctx: CancelRouteContext) {
       break;
     case "SUPPORT": {
       // Concierge save (P3.7): the honest state is PENDING — the request is
-      // in, a human answers within the promised business days, and when the
-      // hold applied the next order's new day is stated (read back off the
-      // contract; the accept event says whether the hold happened).
+      // in, a human answers within the promised time (the promise the accept
+      // event recorded, else the current setting — supportReplyPromise phrases
+      // it), and when the hold applied the next order's new day is stated
+      // (read back off the contract; the accept event says whether the hold
+      // happened).
       showSupportLink = true;
       let holdApplied = false;
-      let sla = 1;
+      let promise: ReplyPromise = DEFAULT_REPLY_PROMISE;
       try {
         const [ev, channels] = await Promise.all([
           prisma.subscriberEvent.findFirst({
@@ -619,19 +626,19 @@ async function loadSaved(ctx: CancelRouteContext) {
           }),
           getSupportChannels(shop.id),
         ]);
-        const p = ev?.payload as { holdApplied?: unknown; slaBusinessDays?: unknown } | null;
+        const p = ev?.payload as { holdApplied?: unknown; replyWithin?: unknown } | null;
         holdApplied = p?.holdApplied === true;
-        sla =
-          typeof p?.slaBusinessDays === "number" ? p.slaBusinessDays : channels.slaBusinessDays;
+        promise = readReplyPromise(p?.replyWithin) ?? channels.replyWithin;
       } catch (err) {
         console.error("[cancel] saved page: concierge read failed", contract.id, err);
       }
+      const promiseText = supportReplyPromise(locale, promise);
       if (holdApplied && contract.nextBillingDate) {
-        messageKey = sla === 1 ? "cancel.saved.support_hold_one" : "cancel.saved.support_hold_other";
-        messageVars = { days: sla, date: fmt(contract.nextBillingDate) };
+        messageKey = "cancel.saved.support_hold";
+        messageVars = { promise: promiseText, date: fmt(contract.nextBillingDate) };
       } else {
-        messageKey = sla === 1 ? "cancel.saved.support_pending_one" : "cancel.saved.support_pending_other";
-        messageVars = { days: sla };
+        messageKey = "cancel.saved.support_pending";
+        messageVars = { promise: promiseText };
       }
       break;
     }

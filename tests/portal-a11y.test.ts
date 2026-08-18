@@ -168,8 +168,11 @@ describe("route markup contracts", () => {
   });
 
   it("progress bars carry role=progressbar with aria-value* and a label", () => {
-    // Milestone + rewards-unlock bars on the home page.
-    const bars = index.match(/role="progressbar"[^>]*/g) ?? [];
+    // Milestone + rewards-unlock bars of the rewards strip (shared module
+    // since v1.29.0 — the home page and the single-mode detail render it).
+    const rewards = src("app/lib/portal/rewards-card.server.ts");
+    expect(index).toContain('from "~/lib/portal/rewards-card.server"');
+    const bars = rewards.match(/role="progressbar"[^>]*/g) ?? [];
     expect(bars).toHaveLength(2);
     for (const bar of bars) {
       expect(bar).toMatch(/aria-label="/);

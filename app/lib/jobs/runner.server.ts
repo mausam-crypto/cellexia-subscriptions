@@ -522,9 +522,12 @@ const registry: JobDef[] = [
   {
     // Concierge save follow-through (v1.28.0, P3.7): SLA-breach alert for
     // unanswered save requests; SAVED_PENDING → SAVED once the merchant
-    // resolved the request while the customer still subscribes.
+    // resolved the request while the customer still subscribes. Every 10
+    // minutes since v1.29.0: the default promise is "a human replies within
+    // 30 minutes" — an hourly tick would notice a breach up to an hour late.
+    // The alert dedupes on the request, so the cadence never re-alerts.
     name: "concierge_sla_run",
-    everyMinutes: 60,
+    everyMinutes: 10,
     fn: async (now) => {
       const { runConciergeSla } = await import("~/lib/cancel/scheduled.server");
       return runConciergeSla(now);

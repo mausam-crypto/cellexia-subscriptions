@@ -1,5 +1,9 @@
 import { normalizeLocale, t } from "~/lib/i18n/i18n.server";
 import { PORTAL_PROXY_BASE } from "~/lib/portal/proxy-path";
+import {
+  parseReplyPromiseParams,
+  supportReplyPromise,
+} from "~/lib/support/reply-promise.server";
 
 /**
  * Shared HTML layout for every portal page served through the app proxy.
@@ -135,8 +139,9 @@ export const TOAST_KEYS = new Set([
   "undone",
   "undo_stale",
   "undo_expired",
-  // Support request (v1.28.0, P5.1) — POST /api/support; `sla` param carries
-  // the reply promise in business days (settings.support.slaBusinessDays).
+  // Support request (v1.28.0, P5.1) — POST /api/support; `sla`/`slau`/`sla247`
+  // carry the reply promise (settings.support.replyWithin*, v1.29.0 —
+  // reply-promise.server.ts codec).
   "support_sent",
   "support_pushback_failed",
   // Per-line cycle edits (v1.28.0, P2.5) — line_skip / line_unskip /
@@ -284,7 +289,11 @@ function returnToOf(url: URL): string {
     ? url.pathname.slice(PORTAL_PROXY_BASE.length)
     : url.pathname;
   const match = /^\/subscription\/([A-Za-z0-9_-]+)\/?$/.exec(rest);
-  return match ? `/subscription/${match[1]}` : "/";
+  if (match) return `/subscription/${match[1]}`;
+  // The explicit list (`?list=1`, v1.29.0 single-subscription escape hatch)
+  // returns to itself — mirrors homeReturnTo() in single-subscription.server
+  // (not imported: that module depends on this one).
+  return url.searchParams.get("list") === "1" ? "/?list=1" : "/";
 }
 
 /** The Undo form rendered inside a toast (undo.server.ts consumes it). */
@@ -444,18 +453,16 @@ function resolveToastText(
   // or any tampered value — falls back to the classic factual toast. The
   // label is the shop-tz calendar day, formatted here as a UTC-midnight
   // date so no second timezone conversion can shift the promised day.
-  // Support toast (v1.28.0, P5.1): "within {days} business day(s)" — the
-  // writer appends `sla` from settings; malformed/missing ⇒ the copy without
-  // a number (never a promise the settings did not make).
+  // Support toast (v1.28.0, P5.1 / v1.29.0): the reply promise sentence
+  // (supportReplyPromise) — the writer appends the promise params from
+  // settings; malformed/missing ⇒ the copy without a promise (never a
+  // promise the settings did not make).
   if (key === "support_sent" || key === "support_pushback_failed") {
-    const sla = Number(url.searchParams.get("sla") ?? "");
-    const days = Number.isInteger(sla) && sla >= 1 && sla <= 30 ? sla : null;
-    const sent = days
-      ? t(
-          locale,
-          days === 1 ? "portal.toast.support_sent_one" : "portal.toast.support_sent_other",
-          { days },
-        )
+    const promise = parseReplyPromiseParams(url.searchParams);
+    const sent = promise
+      ? t(locale, "portal.toast.support_sent_promise", {
+          promise: supportReplyPromise(locale, promise),
+        })
       : t(locale, "portal.toast.support_sent");
     return {
       key,
@@ -516,6 +523,13 @@ export interface PortalPageInput {
   /** Optional back link above the heading. */
   backHref?: string;
   backLabel?: string;
+  /**
+   * Override for the nav "Subscriptions" tab href (v1.29.0 single-
+   * subscription view: the detail page points it at `/?list=1` so the tab
+   * opens the list instead of bouncing back through the home redirect).
+   * Already a safe portal-relative URL from withLocale; escaped here.
+   */
+  subscriptionsHref?: string;
   /** Admin preview session — renders the persistent "Preview mode" banner. */
   isPreview?: boolean;
   /**
@@ -685,9 +699,27 @@ details.cxs-acc--attention{border-color:var(--cxs-amber)}
 .cxs-rewards .cxs-muted{color:${T.rewardsMuted}}
 .cxs-rewards__grid{display:flex;gap:20px;flex-wrap:wrap}
 .cxs-rewards__cell{flex:1;min-width:150px}
+.cxs-roadmap .cxs-rewards__cell{flex:1 1 80px;min-width:0}
 .cxs-rewards__num{font-family:Georgia,serif;font-size:24px;line-height:1.1}
 .cxs-progress{height:6px;border-radius:3px;background:rgba(255,255,255,.25);overflow:hidden;margin-top:8px}
 .cxs-progress>span{display:block;height:100%;background:#fdfcf9;border-radius:3px}
+.cxs-roadmap__list{list-style:none;margin:14px 0 0;padding:0;display:grid;gap:8px}
+.cxs-roadmap__row{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 10px;line-height:1.4}
+.cxs-roadmap__mark{flex:none;width:18px;text-align:center;font-size:14px}
+.cxs-roadmap__label{flex:1 1 auto;min-width:0;font-weight:500}
+.cxs-roadmap__meta{flex:0 1 auto;font-variant-numeric:tabular-nums}
+.cxs-roadmap__row--done .cxs-roadmap__label{opacity:.85}
+@media (max-width:479px){
+  .cxs-roadmap__label{flex-basis:calc(100% - 28px)}
+  .cxs-roadmap__meta{flex-basis:100%;padding-inline-start:28px}
+}
+.cxs-value{display:flex;gap:16px 20px;flex-wrap:wrap}
+.cxs-value__cell{flex:1 1 120px;min-width:0}
+.cxs-value__num{font-family:Georgia,"Times New Roman",serif;font-size:22px;line-height:1.15;font-variant-numeric:tabular-nums;color:var(--cxs-ink)}
+.cxs-value__num--date{font-size:17px;padding-top:3px}
+.cxs-value__label{margin-top:2px}
+.cxs-next__block{min-width:0}
+.cxs-next__block>strong{font-variant-numeric:tabular-nums}
 .cxs-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
 .cxs-grid .cxs-card{margin:0;padding:14px;display:flex;flex-direction:column;gap:8px}
 .cxs-grid .cxs-thumb{width:100%;height:120px}
@@ -920,7 +952,7 @@ export function portalPage(input: PortalPageInput): string {
   const nav = input.hideNav
     ? ""
     : `<nav class="cxs-nav" aria-label="${escapeHtml(t(locale, "portal.nav.label"))}">
-        <a href="${withLocale(`${base}/`, locale, preview)}"${input.activeNav === "subscriptions" ? ' class="cxs-nav--on" aria-current="page"' : ""}>${NAV_ICON_SUBSCRIPTIONS}<span>${escapeHtml(t(locale, "portal.nav.subscriptions"))}</span></a>
+        <a href="${input.subscriptionsHref ? escapeHtml(input.subscriptionsHref) : withLocale(`${base}/`, locale, preview)}"${input.activeNav === "subscriptions" ? ' class="cxs-nav--on" aria-current="page"' : ""}>${NAV_ICON_SUBSCRIPTIONS}<span>${escapeHtml(t(locale, "portal.nav.subscriptions"))}</span></a>
         <a href="${withLocale(`${base}/account`, locale, preview)}"${input.activeNav === "account" ? ' class="cxs-nav--on" aria-current="page"' : ""}>${NAV_ICON_ACCOUNT}<span>${escapeHtml(t(locale, "portal.nav.account"))}</span></a>
       </nav>`;
 
