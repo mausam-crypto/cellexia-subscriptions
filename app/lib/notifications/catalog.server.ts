@@ -76,10 +76,40 @@ const BUNDLE_LINKS = [
   "delay_3w_url",
   "pause_url",
   "update_card_url",
+  "retry_payment_url",
   "portal_url",
 ] as const;
 const BUNDLE_WITH_ADDON = [...BUNDLE_LINKS, "addon_url"] as const;
+/** resume_reminder (v1.28.0, P2.6): + one-tap resume + "need longer?" page. */
+const RESUME_REMINDER_LINKS = [
+  ...BUNDLE_WITH_ADDON,
+  "resume_url",
+  "extend_pause_url",
+] as const;
 const PORTAL_ONLY = ["portal_url"] as const;
+/** new_card_detected (v1.28.0, P1.8): one-tap use-it + set-as-backup links. */
+const NEW_CARD_LINKS = ["portal_url", "use_url", "backup_url"] as const;
+/** cancel_confirmed / winback_soft (v1.28.0, P3.2): + the signed one-tap restart link. */
+const RESTART_LINKS = ["portal_url", "restart_url"] as const;
+/** cancel_scheduled / cancel_upcoming (v1.28.0, P3.8): + the one-tap KEEP link. */
+const KEEP_LINKS = ["portal_url", "keep_url"] as const;
+/** routine_checkin (v1.28.0, P4.1): the two one-tap answers. */
+const CHECKIN_LINKS = ["portal_url", "checkin_great_url", "checkin_unsure_url"] as const;
+/**
+ * cancel_intent_followup (v1.28.0, P3.6): the reason-matched one-tap saves
+ * (each empty when not applicable — the body reads them through the
+ * pre-composed `options_block`), the support line and the plain cancel link.
+ */
+const INTENT_FOLLOWUP_LINKS = [
+  "portal_url",
+  "skip_url",
+  "delay_3w_url",
+  "set_frequency_url",
+  "pause_url",
+  "manage_url",
+  "support_url",
+  "cancel_url",
+] as const;
 
 export const EMAIL_CATALOG: Record<TemplateKey, Omit<EmailCatalogEntry, "template">> = {
   upcoming_order: {
@@ -104,7 +134,7 @@ export const EMAIL_CATALOG: Record<TemplateKey, Omit<EmailCatalogEntry, "templat
   resume_reminder: {
     title: "Pause ending reminder",
     trigger:
-      "Before a paused subscription auto-resumes, with one-click delay and add-a-product actions.",
+      "Before a paused subscription auto-resumes, with one-click resume-now, need-longer (pick a new date), delay and add-a-product actions.",
     sentBy: "pause auto-resume job (hourly), once per pause",
     timing: {
       settingsKey: "pause",
@@ -115,7 +145,7 @@ export const EMAIL_CATALOG: Record<TemplateKey, Omit<EmailCatalogEntry, "templat
       max: 14,
       suffix: "days before the resume",
     },
-    links: BUNDLE_WITH_ADDON,
+    links: RESUME_REMINDER_LINKS,
     customizable: true,
     disableable: true,
     group: "reminders",
@@ -250,19 +280,61 @@ export const EMAIL_CATALOG: Record<TemplateKey, Omit<EmailCatalogEntry, "templat
     trigger: "The subscription was cancelled.",
     sentBy: "confirmation bridge on contract.cancelled (or your Klaviyo flow)",
     timing: null,
-    links: PORTAL_ONLY,
+    links: RESTART_LINKS,
     customizable: true,
     disableable: true,
     confirmationEvent: "contract.cancelled",
     group: "orders",
   },
+  cancel_scheduled: {
+    title: "Cancellation scheduled",
+    trigger:
+      "A subscriber inside a plan's commitment period scheduled their cancellation for the day the period ends (Cancel flow → scheduled cancel). States the exact end date — deliveries and charges continue as agreed until then — with a one-tap \"keep my subscription\" link.",
+    sentBy: "cancel flow, the moment the customer schedules it",
+    timing: null,
+    links: KEEP_LINKS,
+    customizable: true,
+    disableable: true,
+    group: "orders",
+  },
+  cancel_upcoming: {
+    title: "Cancellation upcoming",
+    trigger:
+      "A scheduled cancellation is a few days away (Cancel flow → notice days before the scheduled cancel). The last reminder with the one-tap \"keep my subscription\" link; the hourly job then cancels exactly at the scheduled moment. Sent once per scheduling.",
+    sentBy: "scheduled-cancel job (hourly)",
+    timing: {
+      settingsKey: "cancelFlow",
+      path: "scheduledCancelNoticeDays",
+      label: "Send",
+      kind: "int",
+      min: 1,
+      max: 14,
+      suffix: "days before the scheduled cancellation",
+    },
+    links: KEEP_LINKS,
+    customizable: true,
+    disableable: true,
+    group: "orders",
+  },
   payment_method_updated: {
     title: "Payment method updated",
     trigger:
-      "Renewals switched to the backup card after repeated failures on the primary.",
-    sentBy: "dunning engine",
+      "The card behind the subscription changed — the customer updated or switched it, a removed card's backup took over, or renewals moved to the backup card after failures on the primary. One notice per card per 24 hours.",
+    sentBy:
+      "payment-method webhooks, portal/admin card changes and the dunning engine",
     timing: null,
     links: PORTAL_ONLY,
+    customizable: true,
+    disableable: true,
+    group: "payments",
+  },
+  new_card_detected: {
+    title: "New card on the account",
+    trigger:
+      "A subscriber in payment trouble (held payment, or a card about to expire) saved a NEW payment method on their account while the subscription's own card is still live — the moment to offer it: “use it for this subscription” in one tap, or set it as the backup. When the subscription's card had been removed or had expired, the app switches to the new method instead and confirms through “Payment method updated”. Once per new method.",
+    sentBy: "payment-method webhooks, immediately",
+    timing: null,
+    links: NEW_CARD_LINKS,
     customizable: true,
     disableable: true,
     group: "payments",
@@ -316,6 +388,23 @@ export const EMAIL_CATALOG: Record<TemplateKey, Omit<EmailCatalogEntry, "templat
     disableable: true,
     group: "payments",
   },
+  payment_failed_parked: {
+    title: "Subscription on hold — ways to continue",
+    trigger:
+      "The retry ladder gave up and the subscription is on hold (FAILED); sent at each offset while it stays on hold and no newer payment issue opened.",
+    sentBy: "dunning sweep (10 min), once per offset",
+    timing: {
+      settingsKey: "dunning",
+      path: "postExhaustionTouchDays",
+      label: "Send",
+      kind: "intList",
+      suffix: "days after the ladder gave up (each offset = one email)",
+    },
+    links: [...BUNDLE_LINKS, "skip_resume_url"],
+    customizable: true,
+    disableable: true,
+    group: "payments",
+  },
   payment_failed_sms: {
     title: "Payment failed — SMS",
     trigger: "One SMS late in the dunning ladder (Klaviyo SMS consent applies).",
@@ -364,6 +453,17 @@ export const EMAIL_CATALOG: Record<TemplateKey, Omit<EmailCatalogEntry, "templat
     disableable: false,
     group: "payments",
   },
+  threeds_action_sms: {
+    title: "Bank verification required — SMS",
+    trigger:
+      "The same 3-D Secure moment as the email, as a short text with the secure confirmation link (Klaviyo SMS consent applies; only when the subscriber has a phone number).",
+    sentBy: "billing challenge webhook, immediately, once per challenged attempt",
+    timing: null,
+    links: PORTAL_ONLY,
+    customizable: false,
+    disableable: true,
+    group: "payments",
+  },
   gift_announcement: {
     title: "Gift announcement",
     trigger: "A configured gift will be added to the customer's upcoming order.",
@@ -384,6 +484,47 @@ export const EMAIL_CATALOG: Record<TemplateKey, Omit<EmailCatalogEntry, "templat
     customizable: true,
     disableable: true,
     group: "lifecycle",
+  },
+  subscription_started: {
+    title: "Welcome — subscription started",
+    trigger:
+      "A new subscription was created at checkout: what happens next (first order, next charge date, the change/skip cut-off) and where to manage it. Never sent for imported or backfilled subscriptions.",
+    sentBy: "subscription-created webhook, once per subscription",
+    timing: null,
+    links: PORTAL_ONLY,
+    customizable: true,
+    disableable: true,
+    group: "lifecycle",
+  },
+  routine_checkin: {
+    title: "Routine check-in (week N)",
+    trigger:
+      "The customer reaches the configured routine week (Lifecycle → results timeline → check-in week, default 4): where they are in the routine, what many people notice in this phase, one sentence resetting a fast survey expectation when known, and two one-tap answers (Great / Not sure yet). Not sent to the results-timeline holdout group, nor when Portal growth → results timeline is off.",
+    sentBy: "lifecycle sweep (daily), once per subscription",
+    timing: null,
+    links: CHECKIN_LINKS,
+    customizable: true,
+    disableable: true,
+    group: "lifecycle",
+  },
+  cancel_intent_followup: {
+    title: "Cancel intent — follow-up",
+    trigger:
+      "The customer opened the cancel flow and left without deciding (the session closed as walked-away). Sent once, 12–24 hours later (Cancel flow → intent follow-up hours), with the saves that match the reason they gave — skip / delay / a slower cadence as one-tap links, a smaller order via the portal — plus \"talk to us\" and a plain link back to the cancel page. Never inside the pre-charge buffer, never more than once per customer per cooldown, never after a save, a pause or a cancellation.",
+    sentBy: "cancel-intent job (hourly), once per walked-away session",
+    timing: {
+      settingsKey: "cancelFlow",
+      path: "intentFollowupHours",
+      label: "Send",
+      kind: "int",
+      min: 1,
+      max: 72,
+      suffix: "hours after the session closes",
+    },
+    links: INTENT_FOLLOWUP_LINKS,
+    customizable: true,
+    disableable: true,
+    group: "winback",
   },
   milestone_gift: {
     title: "Milestone reached",
@@ -434,7 +575,7 @@ export const EMAIL_CATALOG: Record<TemplateKey, Omit<EmailCatalogEntry, "templat
       max: 365,
       suffix: "days after the predicted empty date (negative = before)",
     },
-    links: BUNDLE_LINKS,
+    links: RESTART_LINKS,
     customizable: true,
     disableable: true,
     group: "winback",
@@ -452,7 +593,7 @@ export const EMAIL_CATALOG: Record<TemplateKey, Omit<EmailCatalogEntry, "templat
       max: 365,
       suffix: "days after the predicted empty date",
     },
-    links: BUNDLE_LINKS,
+    links: PORTAL_ONLY,
     customizable: true,
     disableable: true,
     group: "winback",
@@ -470,7 +611,7 @@ export const EMAIL_CATALOG: Record<TemplateKey, Omit<EmailCatalogEntry, "templat
       max: 365,
       suffix: "days after the predicted empty date",
     },
-    links: BUNDLE_LINKS,
+    links: PORTAL_ONLY,
     customizable: true,
     disableable: true,
     group: "winback",

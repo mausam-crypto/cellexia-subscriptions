@@ -1,5 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import { json, type ActionFunctionArgs } from "@remix-run/node";
+import type { ContractStatus } from "@prisma/client";
 import { z } from "zod";
 import prisma from "~/db.server";
 import { t } from "~/lib/i18n/i18n.server";
@@ -8,9 +9,26 @@ import { getSetting } from "~/lib/settings/settings.server";
 import { logEvent } from "~/lib/events/log.server";
 import { sha256 } from "~/lib/crypto/tokens.server";
 import { getPrimaryShop } from "~/lib/shop/install.server";
-import { delayNextCycle, skipNextCycle } from "~/lib/contracts/service.server";
+import { isSetupMode } from "~/lib/launch/launch.server";
+import {
+  delayNextCycle,
+  delaySchedule,
+  skipNextCycle,
+} from "~/lib/contracts/service.server";
 import { resolveLockState } from "~/lib/contracts/lock.server";
 import { OURS_ONLY } from "~/lib/ownership/ownership.server";
+import { findPortalDunningCase } from "~/lib/portal/dunning.server";
+import { delayModeFor } from "~/lib/portal/schedule.server";
+import {
+  isPreparingOrder,
+  resolveChargeTiming,
+} from "~/lib/billing/timing.server";
+import {
+  UNDOABLE_EVENT_TYPES,
+  performUndo,
+  undoSpecFromEvent,
+  undoWindowSeconds,
+} from "~/lib/portal/undo.server";
 
 /**
  * POST /api/sms/inbound — Klaviyo SMS keyword webhook ("text-to-skip").
@@ -19,11 +37,17 @@ import { OURS_ONLY } from "~/lib/ownership/ownership.server";
  * a keyword; the JSON `message` in the response can be sent back as the SMS
  * reply. Auth: `x-cellexia-secret` must equal env CRON_SECRET (fail closed).
  *
- * Keywords: SKIP → skip next cycle; DELAY → push next cycle 2 weeks. All
- * mutations go through the contract services with source MAGIC_LINK / actor
- * "sms" (one-tap-verb semantics, no login), which log the canonical events.
+ * Keywords: SKIP → skip next cycle; DELAY → push the next order 2 weeks
+ * (portal.delayReanchors decides whether the whole schedule moves or only
+ * this order — the same setting the portal follows, see delayModeFor);
+ * UNDO (v1.28.0) → reverse the customer's most recent delay / next-date /
+ * frequency change inside the undo window (see handleUndo). All mutations
+ * go through the contract services with source MAGIC_LINK / actor "sms"
+ * (one-tap-verb semantics, no login), which log the canonical events.
  * STOP → win-back opt-out, handled here directly (see handleStop) — the only
- * writer of WinbackState.OPTED_OUT.
+ * writer of WinbackState.OPTED_OUT. RETRY (v1.28.0) → customer "Retry now"
+ * on the held payment through the dunning engine's requestCustomerRetry
+ * (open case or FAILED contract; per-case cooldown; see handleRetry).
  *
  * Audit: every inbound intent logs a portal.sms_inbound event before its
  * response goes out — the magic-link rule ("every tapped link leaves a
@@ -80,6 +104,8 @@ interface MatchedContract {
   customerId: string;
   email: string;
   locale: string;
+  status: ContractStatus;
+  nextBillingDate: Date | null;
   shopDomain: string;
   ianaTimezone: string;
 }
@@ -125,6 +151,8 @@ async function contractsMatchingPhone(
       customerId: true,
       email: true,
       locale: true,
+      status: true,
+      nextBillingDate: true,
       shop: { select: { domain: true, ianaTimezone: true } },
     },
   });
@@ -139,6 +167,8 @@ async function contractsMatchingPhone(
         customerId: candidate.customerId,
         email: candidate.email,
         locale: candidate.locale,
+        status: candidate.status,
+        nextBillingDate: candidate.nextBillingDate ?? null,
         shopDomain: candidate.shop.domain,
         ianaTimezone: candidate.shop.ianaTimezone,
       });
@@ -165,7 +195,14 @@ async function auditInboundSms(entry: {
   contract: MatchedContract | null;
   phone: string;
   keyword: string;
-  outcome: "ok" | "unknown_phone" | "unknown_keyword" | "locked" | "error";
+  outcome:
+    | "ok"
+    | "unknown_phone"
+    | "unknown_keyword"
+    | "locked"
+    | "refused"
+    | "setup_mode"
+    | "error";
 }): Promise<void> {
   try {
     const shopId =
@@ -285,6 +322,200 @@ async function handleStop(phone: string, keyword: string) {
   }
 }
 
+/**
+ * RETRY — customer "Retry now" by text (v1.28.0). Target: the newest
+ * ACTIVE / PAUSED / FAILED contract on the phone that has a case to retry
+ * (open, or newest EXHAUSTED while FAILED); without one, the newest such
+ * contract (the engine answers "nothing to retry"). Same engine guards as
+ * the portal button and the RETRY_PAYMENT magic link — per-case cooldown,
+ * paused / challenge-pending refusals — so a repeated text can never fire
+ * a second charge attempt.
+ */
+async function handleRetry(phone: string, keyword: string) {
+  const matches = (
+    await contractsMatchingPhone(phone, { activeOnly: false })
+  ).filter(
+    (m) => m.status === "ACTIVE" || m.status === "PAUSED" || m.status === "FAILED",
+  );
+  if (matches.length === 0) {
+    await auditInboundSms({
+      contract: null,
+      phone,
+      keyword,
+      outcome: "unknown_phone",
+    });
+    return json(
+      { ok: false, message: t("en", "magic.sms.unknown_phone") },
+      { status: 200 },
+    );
+  }
+
+  let target = matches[0];
+  for (const candidate of matches) {
+    if (await findPortalDunningCase(candidate)) {
+      target = candidate;
+      break;
+    }
+  }
+  const { locale } = target;
+  try {
+    const { requestCustomerRetry } = await import("~/lib/dunning/engine.server");
+    const outcome = await requestCustomerRetry(target.id, {
+      source: "MAGIC_LINK",
+      actor: "sms",
+    });
+    let key: string;
+    let ok = false;
+    switch (outcome.kind) {
+      case "started":
+        key = "magic.sms.retry_done";
+        ok = true;
+        break;
+      case "too_soon":
+        key = "magic.sms.retry_too_soon";
+        break;
+      case "unavailable":
+        if (outcome.reason === "claim_lost") {
+          // A concurrent request won the claim — the retry is running.
+          key = "magic.sms.retry_done";
+          ok = true;
+          break;
+        }
+        key =
+          outcome.reason === "challenge_pending"
+            ? "magic.sms.retry_needs_bank"
+            : outcome.reason === "contract_paused"
+              ? "magic.sms.retry_paused"
+              : "magic.sms.retry_none";
+        break;
+      default:
+        key = "magic.sms.retry_none";
+    }
+    await auditInboundSms({
+      contract: target,
+      phone,
+      keyword,
+      outcome: ok ? "ok" : "refused",
+    });
+    return json({ ok, message: t(locale, key) });
+  } catch (err) {
+    console.error("[sms-inbound] keyword action failed", "RETRY", target.id, err);
+    await auditInboundSms({ contract: target, phone, keyword, outcome: "error" });
+    return json(
+      { ok: false, message: t(locale, "magic.sms.error") },
+      { status: 500 },
+    );
+  }
+}
+
+/**
+ * UNDO — reverse the customer's most recent undoable schedule change
+ * (v1.28.0, P2.2): the newest cycle.delayed / contract.next_date_changed /
+ * contract.frequency_changed the CUSTOMER made (portal, magic link or SMS —
+ * never an admin edit) inside the undo window, restored from the previous
+ * values its own payload stores (undoSpecFromEvent). A portal.undo that is
+ * newer than any candidate means the last thing that happened WAS an undo —
+ * texting UNDO again does not redo it. performUndo re-checks the contract
+ * against the event's after-state, so a schedule that moved on since
+ * (another change, a charge) answers "can't be undone" instead of
+ * restoring a date the customer no longer expects.
+ */
+async function handleUndo(
+  contract: MatchedContract,
+  phone: string,
+  keyword: string,
+) {
+  const { locale } = contract;
+  try {
+    let windowSeconds = 14 * 24 * 3600;
+    try {
+      windowSeconds = undoWindowSeconds(
+        await getSetting(contract.shopId, "portal"),
+      );
+    } catch {
+      /* default window */
+    }
+    const since = new Date(Date.now() - windowSeconds * 1000);
+    const latest = await prisma.subscriberEvent.findFirst({
+      where: {
+        contractId: contract.id,
+        type: { in: [...UNDOABLE_EVENT_TYPES, "portal.undo"] },
+        source: { in: ["CUSTOMER_PORTAL", "MAGIC_LINK"] },
+        createdAt: { gte: since },
+      },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      select: { type: true, payload: true },
+    });
+    const spec =
+      latest && latest.type !== "portal.undo"
+        ? undoSpecFromEvent({ type: latest.type, payload: latest.payload })
+        : null;
+    if (!spec) {
+      await auditInboundSms({ contract, phone, keyword, outcome: "refused" });
+      return json({ ok: false, message: t(locale, "magic.sms.undo_none") });
+    }
+    const full = await prisma.subscriptionContract.findUnique({
+      where: { id: contract.id },
+      select: {
+        id: true,
+        shopId: true,
+        customerId: true,
+        email: true,
+        status: true,
+        nextBillingDate: true,
+        intervalWeeks: true,
+        billingIntervalUnit: true,
+        billingIntervalCount: true,
+      },
+    });
+    if (!full) {
+      await auditInboundSms({ contract, phone, keyword, outcome: "refused" });
+      return json({ ok: false, message: t(locale, "magic.sms.undo_none") });
+    }
+    // Preparing-your-order window (v1.28.0): an undo moves the schedule
+    // like the verb it reverses — never while an attempt is in flight.
+    const timing = await resolveChargeTiming(contract.shopId, contract.ianaTimezone);
+    if (await isPreparingOrder(full, timing)) {
+      await auditInboundSms({ contract, phone, keyword, outcome: "refused" });
+      return json({ ok: false, message: t(locale, "magic.sms.preparing") });
+    }
+    const outcome = await performUndo(contract.shopDomain, full, spec, {
+      source: "MAGIC_LINK",
+      actor: "sms",
+      via: "sms",
+      timing,
+    });
+    if (outcome.kind === "restored") {
+      await auditInboundSms({ contract, phone, keyword, outcome: "ok" });
+      // Per-line edits (P2.5) never move the order date — the dated copy
+      // ("back on {date}") would claim a move that did not happen.
+      const lineEdit = spec.kind === "line_skip" || spec.kind === "line_qty_once";
+      const message =
+        outcome.nextBillingDate && !lineEdit
+        ? t(locale, "magic.sms.undo_done", {
+            date: formatShopDate(
+              outcome.nextBillingDate,
+              contract.ianaTimezone,
+              locale,
+            ),
+          })
+        : t(locale, "magic.sms.undo_done_nodate");
+      return json({ ok: true, message });
+    }
+    await auditInboundSms({ contract, phone, keyword, outcome: "refused" });
+    // stale / past / inactive: the schedule has moved on — nothing truthful
+    // to restore.
+    return json({ ok: false, message: t(locale, "magic.sms.undo_stale") });
+  } catch (err) {
+    console.error("[sms-inbound] keyword action failed", "UNDO", contract.id, err);
+    await auditInboundSms({ contract, phone, keyword, outcome: "error" });
+    return json(
+      { ok: false, message: t(locale, "magic.sms.error") },
+      { status: 500 },
+    );
+  }
+}
+
 export const action = async ({ request }: ActionFunctionArgs) => {
   if (request.method !== "POST") {
     return json({ error: "method_not_allowed" }, { status: 405 });
@@ -312,6 +543,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   if (verb === "STOP") {
     return handleStop(phone, keyword);
   }
+  // RETRY also dispatches before the ACTIVE-only match: FAILED contracts
+  // (the exhausted-ladder cohort) are exactly who needs it.
+  if (verb === "RETRY") {
+    return handleRetry(phone, keyword);
+  }
 
   const contract = await findContractByPhone(phone);
   if (!contract) {
@@ -329,6 +565,21 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   const { locale } = contract;
   const opts = { source: "MAGIC_LINK" as const, actor: "sms" };
+
+  // ── Launch gate: a store in SETUP takes no zero-login mutations ────────────
+  // Same rule as the portal dispatcher, the magic-link executor and the
+  // jobs runner: after an emergency revertToSetup() everything is frozen and
+  // goLive() re-staggers the overdue cycles — a texted SKIP / DELAY / UNDO
+  // must not edit the live Shopify schedule meanwhile. RETRY gates itself in
+  // requestCustomerRetry; STOP is an opt-out (no schedule mutation). The
+  // inbound is audited with its own outcome; the reply is the portal's
+  // setup copy (same read as the portal dispatcher's gate).
+  if (verb === "SKIP" || verb === "DELAY" || verb === "UNDO") {
+    if (await isSetupMode(contract.shopId)) {
+      await auditInboundSms({ contract, phone, keyword, outcome: "setup_mode" });
+      return json({ ok: false, message: t(locale, "portal.setup.body") });
+    }
+  }
 
   // ── Plan lock window: SKIP and DELAY are reducing verbs ────────────────────
   // Same blocked set as the portal dispatcher and magic links. The phone
@@ -372,6 +623,21 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
   }
 
+  // ── Preparing-your-order window (v1.28.0) — same gate as the portal ──────
+  // SKIP / DELAY edit the cycle being billed once the charge moment has
+  // passed or an attempt is in flight; refuse with the preparing copy (the
+  // read is contained — false on any failure).
+  if (verb === "SKIP" || verb === "DELAY") {
+    const preparing = await isPreparingOrder(
+      { id: contract.id, status: contract.status, nextBillingDate: contract.nextBillingDate },
+      await resolveChargeTiming(contract.shopId, contract.ianaTimezone),
+    );
+    if (preparing) {
+      await auditInboundSms({ contract, phone, keyword, outcome: "refused" });
+      return json({ ok: false, message: t(locale, "magic.sms.preparing") });
+    }
+  }
+
   try {
     switch (verb) {
       case "SKIP": {
@@ -390,12 +656,29 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       }
 
       case "DELAY": {
-        const updated = await delayNextCycle(
-          contract.shopDomain,
-          contract.id,
-          { weeks: DELAY_WEEKS },
-          opts,
-        );
+        // Same semantics setting as the portal's delay buttons; a broken
+        // settings read falls back to the one-cycle delay (never breaks the
+        // verb).
+        let portalSettings: { delayReanchors?: boolean } | null = null;
+        try {
+          portalSettings = await getSetting(contract.shopId, "portal");
+        } catch {
+          portalSettings = null;
+        }
+        const updated =
+          delayModeFor(portalSettings, null) === "reanchor"
+            ? await delaySchedule(
+                contract.shopDomain,
+                contract.id,
+                { weeks: DELAY_WEEKS },
+                opts,
+              )
+            : await delayNextCycle(
+                contract.shopDomain,
+                contract.id,
+                { weeks: DELAY_WEEKS },
+                opts,
+              );
         const message = updated.nextBillingDate
           ? t(locale, "magic.sms.delay_done", {
               date: formatShopDate(
@@ -408,6 +691,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         await auditInboundSms({ contract, phone, keyword, outcome: "ok" });
         return json({ ok: true, message });
       }
+
+      case "UNDO":
+        return handleUndo(contract, phone, keyword);
 
       default:
         await auditInboundSms({

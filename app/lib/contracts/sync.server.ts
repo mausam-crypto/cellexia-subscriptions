@@ -124,6 +124,7 @@ interface CardData {
   cardLast4: string | null;
   cardExpiryMonth: number | null;
   cardExpiryYear: number | null;
+  paymentInstrumentType: string | null;
 }
 
 function cardDataFromContract(sc: ShopifyContract): CardData | null {
@@ -134,6 +135,9 @@ function cardDataFromContract(sc: ShopifyContract): CardData | null {
     cardLast4: instrument.lastDigits,
     cardExpiryMonth: instrument.expiryMonth,
     cardExpiryYear: instrument.expiryYear,
+    // Migration 0027: the normalized instrument kind travels with the card
+    // columns (decides hosted-URL vs Shopify-email card update).
+    paymentInstrumentType: instrument.type,
   };
 }
 
@@ -432,8 +436,15 @@ export async function syncContractFromShopify(
           cardLast4: null,
           cardExpiryMonth: null,
           cardExpiryYear: null,
+          paymentInstrumentType: null,
         }
       : (card ?? {})),
+    // Revoked-state mirror (migration 0027): a live method clears the stamp;
+    // Shopify reporting the method as revoked keeps/sets it. Absent method
+    // → leave whatever the revoke webhook stamped.
+    ...(sc.customerPaymentMethod != null
+      ? { paymentMethodRevokedAt: sc.customerPaymentMethod.revokedAt ?? null }
+      : {}),
     ...(deliveryAddressJson !== undefined
       ? { deliveryAddress: deliveryAddressJson }
       : {}),
@@ -480,6 +491,9 @@ export async function syncContractFromShopify(
       // indistinguishable from internal bookkeeping cancels — permanently,
       // since the conflation happened at collection time.
       if (!prior?.cancelSource) transitions.cancelSource = "EXTERNAL";
+      // A scheduled cancel (v1.28.0, P3.8) is settled by any cancel — the
+      // column is LIVE-STATE and must not survive into a later reactivation.
+      transitions.cancelScheduledAt = null;
     }
     if (status === "FAILED" && !prior?.failedAt) {
       transitions.failedAt = now;
@@ -521,6 +535,13 @@ export async function syncContractFromShopify(
       transitions.cancelReason = null;
       transitions.cancelSource = null;
       transitions.failedAt = null;
+      // Reactivation after a CANCEL clears a scheduled cancel too (v1.28.0,
+      // P3.8) — the hourly job must never re-cancel a subscriber who came
+      // back. FAILED → ACTIVE is a payment RECOVERY, not a change of mind:
+      // the customer's scheduled end stands (dunning recovery in
+      // dunning/engine.server.ts leaves it too — one truth either way the
+      // webhook races the local write).
+      if (prior.status === "CANCELLED") transitions.cancelScheduledAt = null;
     }
     return transitions;
   };
@@ -983,6 +1004,40 @@ export async function syncContractFromShopify(
   } catch (err) {
     console.error(
       "[contracts] sync: first-order tag heal failed",
+      shopifyContractGid,
+      err,
+    );
+  }
+
+  // Welcome-email heal (v1.28.0): the same UNKNOWN→billable moment. The
+  // create tail's subscription_started went through the router's ownership
+  // gate and was SUPPRESSED(foreign_contract); that reason is the one row
+  // the welcome dedupe ignores (subscription-started.server.ts), so this
+  // re-invocation sends it now — bounded by
+  // settings.notifications.welcomeHealMaxDays from the contract's mirror
+  // birth so a long-standing subscriber is never "welcomed" (0 = off), and
+  // still refused for imports/backfills (no origin order) inside the helper.
+  // Contained: a notification failure never fails a sync.
+  try {
+    if (
+      existingRow &&
+      contractRow.originOrderId &&
+      !isBillableOwnership(existingRow.ownership) &&
+      isBillableOwnership(persistedOwnership)
+    ) {
+      const { getSetting } = await import("~/lib/settings/settings.server");
+      const { welcomeHealMaxDays } = await getSetting(shop.id, "notifications");
+      const ageMs = Date.now() - new Date(contractRow.createdAt).getTime();
+      if (welcomeHealMaxDays > 0 && ageMs <= welcomeHealMaxDays * 86_400_000) {
+        const { maybeSendSubscriptionStarted } = await import(
+          "~/lib/notifications/subscription-started.server"
+        );
+        await maybeSendSubscriptionStarted(shop.id, contractRow.id);
+      }
+    }
+  } catch (err) {
+    console.error(
+      "[contracts] sync: welcome email heal failed",
       shopifyContractGid,
       err,
     );

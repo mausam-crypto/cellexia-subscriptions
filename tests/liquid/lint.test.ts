@@ -1363,6 +1363,9 @@ describe("portal script namespace", () => {
     ...readdirSync(join(REPO_ROOT, "app", "routes"))
       .filter((name) => name.startsWith("proxy.") && name.endsWith(".tsx"))
       .map((name) => read(join(REPO_ROOT, "app", "routes", name))),
+    // Portal HTML builders outside the routes (v1.28.0): the Get-help card
+    // emits the data-cellexia-support-* hooks the layout script binds to.
+    read(join(REPO_ROOT, "app", "lib", "support", "portal-card.server.ts")),
   ].join("\n");
 
   const queries = () => documentQueriesIn(portalSource, PORTAL_LABEL);

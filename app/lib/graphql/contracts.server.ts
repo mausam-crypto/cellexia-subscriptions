@@ -285,6 +285,12 @@ const CONTRACT_GIDS_QUERY = `#graphql
   }
 `;
 
+// The three draft mutations (contractUpdate → draftUpdate → draftCommit) all
+// return SubscriptionDraftUserError, which exposes `code`
+// (SubscriptionDraftErrorCode: CUSTOMER_MISMATCH, MISSING_CUSTOMER_PAYMENT_METHOD,
+// STALE_CONTRACT, HAS_FUTURE_EDITS, …). It is selected so the portal's
+// paymentMethodErrorToast mapping (v1.28.0) matches on the structured code
+// instead of message text.
 const CONTRACT_UPDATE_MUTATION = `#graphql
   mutation CellexiaSubscriptionContractUpdate($contractId: ID!) {
     subscriptionContractUpdate(contractId: $contractId) {
@@ -294,6 +300,7 @@ const CONTRACT_UPDATE_MUTATION = `#graphql
       userErrors {
         field
         message
+        code
       }
     }
   }
@@ -310,6 +317,7 @@ const DRAFT_COMMIT_MUTATION = `#graphql
       userErrors {
         field
         message
+        code
       }
     }
   }
@@ -324,6 +332,7 @@ const DRAFT_UPDATE_MUTATION = `#graphql
       userErrors {
         field
         message
+        code
       }
     }
   }
@@ -366,6 +375,34 @@ const DRAFT_LINE_REMOVE_MUTATION = `#graphql
       userErrors {
         field
         message
+      }
+    }
+  }
+`;
+
+const DRAFT_LINES_QUERY = `#graphql
+  query CellexiaSubscriptionDraftLines($draftId: ID!) {
+    subscriptionDraft(id: $draftId) {
+      id
+      lines(first: 100) {
+        nodes {
+          id
+          variantId
+          quantity
+        }
+      }
+    }
+  }
+`;
+
+const CONTRACT_NOTE_QUERY = `#graphql
+  query CellexiaSubscriptionContractNote($id: ID!) {
+    subscriptionContract(id: $id) {
+      id
+      note
+      customAttributes {
+        key
+        value
       }
     }
   }
@@ -559,6 +596,27 @@ interface DraftLineRemoveResponse {
   subscriptionDraftLineRemove?: {
     lineRemoved?: { id: string } | null;
     userErrors?: UserError[];
+  } | null;
+}
+
+interface ContractNoteResponse {
+  subscriptionContract?: {
+    id: string;
+    note?: string | null;
+    customAttributes?: Array<{ key: string; value?: string | null }> | null;
+  } | null;
+}
+
+interface DraftLinesResponse {
+  subscriptionDraft?: {
+    id: string;
+    lines?: {
+      nodes?: Array<{
+        id: string;
+        variantId?: string | null;
+        quantity?: number | null;
+      }>;
+    } | null;
   } | null;
 }
 
@@ -897,6 +955,24 @@ export async function draftUpdatePaymentMethod(
   await runDraftUpdate(run, draftId, { paymentMethodId: paymentMethodGid });
 }
 
+/**
+ * Contract note + custom attributes (v1.28.0, P2.8 delivery instructions).
+ * `SubscriptionDraftInput.note` is "the note field that will be applied to
+ * the generated orders" and `customAttributes` (AttributeInput[]) are stored
+ * on the contract itself — both verified present on the pinned Admin API
+ * version (2025-01). `note: null` / `[]` clear them.
+ */
+export async function draftUpdateNote(
+  run: DraftRunner,
+  draftId: string,
+  note: string | null,
+  customAttributes?: Array<{ key: string; value: string }>,
+): Promise<void> {
+  const input: Record<string, unknown> = { note };
+  if (customAttributes) input.customAttributes = customAttributes;
+  await runDraftUpdate(run, draftId, input);
+}
+
 // ── Draft line ops ───────────────────────────────────────────────────────────
 
 export interface LineCycleDiscountInput {
@@ -1013,6 +1089,58 @@ export async function draftLineRemove(
     data.subscriptionDraftLineRemove,
   );
   return data.subscriptionDraftLineRemove?.lineRemoved?.id ?? null;
+}
+
+export interface DraftLine {
+  id: string;
+  variantId: string | null;
+  quantity: number;
+}
+
+/**
+ * The lines currently on an open draft (contract-update OR billing-cycle
+ * contract-edit). Per-cycle line edits (v1.28.0, P2.5) read this before
+ * removing / updating a line on a cycle draft: a line the cycle edit itself
+ * re-added (an unskip after a skip) carries a cycle-scoped id, not the
+ * contract line's, so the caller resolves the target by id-then-variant.
+ */
+export async function draftLines(
+  run: DraftRunner,
+  draftId: string,
+): Promise<DraftLine[]> {
+  const data = await run<DraftLinesResponse>(DRAFT_LINES_QUERY, { draftId });
+  const nodes = data.subscriptionDraft?.lines?.nodes ?? [];
+  return nodes.map((n) => ({
+    id: n.id,
+    variantId: n.variantId ?? null,
+    quantity: n.quantity ?? 0,
+  }));
+}
+
+/**
+ * The contract's current Shopify `note` and `customAttributes` (v1.28.0
+ * review fix): the delivery-instructions writer merges into these instead of
+ * replacing the whole list — checkout notes / attributes copied onto the
+ * contract by Shopify (or written by another app) survive our save and clear.
+ */
+export async function getContractNoteAndAttributes(
+  admin: AdminClient,
+  contractGid: string,
+): Promise<{
+  note: string | null;
+  customAttributes: Array<{ key: string; value: string }>;
+}> {
+  const data = await gql<ContractNoteResponse>(admin, CONTRACT_NOTE_QUERY, {
+    id: contractGid,
+  });
+  const c = data.subscriptionContract;
+  return {
+    note: c?.note ?? null,
+    customAttributes: (c?.customAttributes ?? []).map((a) => ({
+      key: a.key,
+      value: a.value ?? "",
+    })),
+  };
 }
 
 // ── Status mutations ─────────────────────────────────────────────────────────

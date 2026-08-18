@@ -611,6 +611,8 @@ export async function runRewardsUnlock(now: Date): Promise<RewardsUnlockStats> {
 
 export interface LifecycleSweepStats {
   rewards: RewardsUnlockStats;
+  /** Week-N routine check-in (v1.28.0, P4.1); absent when its module failed. */
+  checkin?: import("./checkin.server").RoutineCheckinStats;
 }
 
 /**
@@ -620,5 +622,14 @@ export interface LifecycleSweepStats {
  */
 export async function runLifecycleSweep(now: Date): Promise<LifecycleSweepStats> {
   const rewards = await runRewardsUnlock(now);
-  return { rewards };
+  const stats: LifecycleSweepStats = { rewards };
+  // Routine check-in (v1.28.0, P4.1) — lazy + contained: a failure here must
+  // never fail the rewards sweep's job run.
+  try {
+    const { runRoutineCheckin } = await import("./checkin.server");
+    stats.checkin = await runRoutineCheckin(now);
+  } catch (err) {
+    console.error("[lifecycle] routine check-in sweep failed", err);
+  }
+  return stats;
 }

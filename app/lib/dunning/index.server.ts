@@ -24,8 +24,12 @@ export {
   onBillingAttemptFailed,
   onBillingAttemptSucceeded,
   onPaymentMethodUpdated,
+  requestCustomerRetry,
   runDunningSweep,
   runPreExpiryNotices,
   transitionOpenCase,
+  type CustomerRetryOptions,
+  type CustomerRetryOutcome,
   type DunningSweepStats,
+  type PaymentMethodUpdatedOptions,
 } from "./engine.server";

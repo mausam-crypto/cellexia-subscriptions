@@ -43,14 +43,21 @@
 
 import { PORTAL_PROXY_BASE } from "~/lib/portal/proxy-path";
 
-/** The 8 save mechanics the flow can offer. */
+/** The 11 save mechanics the flow can offer. EXTEND_PAUSE (v1.28.0) is the
+ * pause exit ramp — offered only on already-PAUSED contracts, in PAUSE's
+ * slot; it never appears in a reason's savesOrder. DELAY (v1.28.0, P3.3) is
+ * "push my next order to {predicted empty date}" — the fitted answer to
+ * "too much product" when the churn model knows the run-out day. */
 export const SAVE_KINDS = [
+  "DELAY",
   "SKIP",
   "FREQUENCY",
   "PAUSE",
+  "EXTEND_PAUSE",
   "DISCOUNT",
   "GIFT",
   "SWAP",
+  "DOWNSIZE",
   "EDUCATION",
   "SUPPORT",
 ] as const;
@@ -87,12 +94,28 @@ export const REASONS: CancelReasonConfig[] = [
   {
     key: "TOO_MUCH_PRODUCT",
     i18nKey: "cancel.reason.too_much_product",
-    savesOrder: ["SKIP", "FREQUENCY", "PAUSE"],
+    // DOWNSIZE (v1.28.0) right after SKIP: fewer units / a smaller size is a
+    // structural fix for surplus that keeps every delivery, at a lower ARPU
+    // instead of zero. It only renders when a genuinely cheaper option
+    // exists, so FREQUENCY/PAUSE still fill the cap otherwise.
+    // DELAY (v1.28.0, P3.3) FIRST: when the churn model predicts the run-out
+    // day and it lies after the next charge, "push my next order to {that
+    // day}" fits the objection exactly — one delivery arrives when the
+    // product actually runs out, nothing is skipped. It only renders when
+    // that prediction exists and is within cancelFlow.delaySaveMaxDays, so
+    // SKIP keeps its slot otherwise.
+    savesOrder: ["DELAY", "SKIP", "DOWNSIZE", "FREQUENCY", "PAUSE"],
   },
   {
     key: "TOO_EXPENSIVE",
     i18nKey: "cancel.reason.too_expensive",
-    savesOrder: ["PAUSE", "DISCOUNT"],
+    // DOWNSIZE (v1.28.0) leads: a cheaper configuration (fewer units /
+    // smaller size / cheaper product, each with its concrete new total)
+    // answers the price objection directly and keeps every delivery at a
+    // lower ARPU instead of zero — and it is not a discount, so it never
+    // trains the customer. The pause reframes the spend next; the discount
+    // stays the fallback (it fills the cap when no cheaper option exists).
+    savesOrder: ["DOWNSIZE", "PAUSE", "DISCOUNT"],
   },
   {
     key: "NOT_SEEING_RESULTS",
@@ -124,6 +147,64 @@ export const REASONS: CancelReasonConfig[] = [
     savesOrder: ["PAUSE", "GIFT"],
   },
 ];
+
+/**
+ * Saves a PAUSED canceller is offered FIRST, whatever the reason (v1.28.0):
+ * a subscriber already on hold who still walks into the flow used to see
+ * zero applicable saves (SKIP / DOWNSIZE / FREQUENCY were ACTIVE-only, PAUSE
+ * a no-op). The honest, non-discount fixes for that moment are the pause
+ * exit ramp — PAUSE's slot resolves to EXTEND_PAUSE on a paused contract —
+ * and "resume later, at a slower cadence" (FREQUENCY applied to the paused
+ * contract: nothing is charged before the hold ends; the slower cadence
+ * applies from the first order after it). The reason's own order follows,
+ * so a reason that already leads with them keeps its intent; the cap
+ * (settings.cancelFlow.maxSavesShown) still applies.
+ */
+export const PAUSED_SAVES_LEAD: SaveKind[] = ["PAUSE", "FREQUENCY"];
+
+/**
+ * The SaveKind order to walk for a contract in `status` — the reason's own
+ * order for ACTIVE contracts; PAUSED_SAVES_LEAD first (deduped) for PAUSED.
+ * Pure — pinned in tests/cancel-paused-saves.test.ts.
+ */
+export function savesOrderFor(cfg: CancelReasonConfig, status: string): SaveKind[] {
+  if (status !== "PAUSED") return cfg.savesOrder;
+  const out: SaveKind[] = [];
+  for (const kind of [...PAUSED_SAVES_LEAD, ...cfg.savesOrder]) {
+    if (!out.includes(kind)) out.push(kind);
+  }
+  return out;
+}
+
+/**
+ * Saves the plan lock window refuses (v1.28.0, P3.8): every schedule
+ * reduction the portal dispatcher blocks — a locked contract that walks the
+ * flow (to schedule its cancellation) is offered only the additive saves
+ * (DISCOUNT / GIFT / EDUCATION / SUPPORT). Same set as the dispatcher's
+ * blocked verbs; the engine enforces it at offer AND accept time.
+ */
+export const LOCK_BLOCKED_SAVES: ReadonlySet<SaveKind> = new Set<SaveKind>([
+  "DELAY",
+  "SKIP",
+  "FREQUENCY",
+  "PAUSE",
+  "EXTEND_PAUSE",
+  "SWAP",
+  "DOWNSIZE",
+]);
+
+/**
+ * CancelSession outcome for the concierge save (v1.28.0, P3.7): the SUPPORT
+ * request went out and the subscription stands, but a human still has to
+ * answer — analytics keep it DISTINCT from SAVED (a request is not yet a
+ * save); the hourly concierge job promotes it to SAVED once the merchant
+ * resolves the SUPPORT_REQUEST alert while the contract still lives.
+ */
+export const SAVED_PENDING = "SAVED_PENDING";
+
+/** CancelSession outcome when a locked contract scheduled its cancellation
+ * for the unlock moment (v1.28.0, P3.8) — the hourly job completes it. */
+export const CANCEL_SCHEDULED = "CANCEL_SCHEDULED";
 
 /** Look up a reason config; null for unknown/tampered form values. */
 export function reasonConfig(key: string | null | undefined): CancelReasonConfig | null {
@@ -176,6 +257,10 @@ export const PAUSE_SUGGEST_MONTHS = 2;
 /** How many swap alternatives a SWAP card lists at most. */
 export const MAX_SWAP_OPTIONS = 3;
 
+/** How many cheaper configurations a DOWNSIZE card lists at most
+ * (fewer units → smaller size → cheaper product, in that order). */
+export const MAX_DOWNSIZE_OPTIONS = 3;
+
 /**
  * An un-completed session older than this is treated as stale: the flow
  * starts fresh (and startCancelSession marks stale ones ABANDONED). Default
@@ -208,6 +293,9 @@ export const CANCEL_STEPS = [
   "confirm",
   "done",
   "saved",
+  // Scheduled-cancel confirmation (v1.28.0, P3.8): "cancels on {date} ·
+  // keep my subscription"; also the landing after a keep.
+  "scheduled",
 ] as const;
 
 export type CancelStep = (typeof CANCEL_STEPS)[number];

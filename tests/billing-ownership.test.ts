@@ -273,6 +273,9 @@ function contractRow(overrides: Row = {}): Row {
     status: "ACTIVE",
     isDemo: false,
     nextBillingDate: YESTERDAY,
+    // v1.28.0 (P3.8): no scheduled cancel — the sweep's due query excludes
+    // contracts whose scheduled moment has passed.
+    cancelScheduledAt: null,
     billingAttempts: [],
     ...overrides,
   };
@@ -297,6 +300,11 @@ const BOOK: Row[] = [
     billingAttempts: [{ status: "PENDING" }],
   }),
   contractRow({ id: "c_other_shop", shopId: "shop_2" }),
+  // v1.28.0 (P3.8): a scheduled cancel whose moment has PASSED is never
+  // billed (the customer was told "no charge after {date}", even if the
+  // hourly cancel job is late); one still in the future bills as usual.
+  contractRow({ id: "c_ours_cancel_passed", cancelScheduledAt: YESTERDAY }),
+  contractRow({ id: "c_ours_cancel_future", cancelScheduledAt: NEXT_MONTH }),
 ];
 
 beforeEach(() => {
@@ -361,7 +369,7 @@ describe("OURS_ONLY", () => {
 describe("the billing sweep's due-contract query", () => {
   it("selects ONLY the OURS contract out of a mixed book", async () => {
     await runBillingSweep(NOW);
-    expect(select(BOOK, dueWhere())).toEqual(["c_ours_due"]);
+    expect(select(BOOK, dueWhere()).sort()).toEqual(["c_ours_cancel_future", "c_ours_due"]);
   });
 
   it("excludes each non-billable row for its own reason", async () => {
@@ -382,9 +390,11 @@ describe("the billing sweep's due-contract query", () => {
       "c_ours_no_date",
       "c_ours_pending",
       "c_other_shop",
+      "c_ours_cancel_passed",
     ]) {
       expect(selected.has(id), id).toBe(false);
     }
+    expect(selected.has("c_ours_cancel_future")).toBe(true);
   });
 
   it("REGRESSION (v1.22.0): the batch refetch re-applies the FULL due conditions", async () => {
@@ -439,6 +449,7 @@ describe("the billing sweep's due-contract query", () => {
     expect(ownership).toBe(OWNERSHIP_OURS);
     expect(select(BOOK, withoutOwnership).sort()).toEqual([
       "c_joy_due",
+      "c_ours_cancel_future",
       "c_ours_due",
       "c_unknown_due",
     ]);
@@ -482,7 +493,7 @@ describe("the billing sweep's due-contract query", () => {
     mocks.contractFindMany.mockImplementation(async (args: unknown) => {
       captured.contractFindMany.push(args);
       return select(BOOK, (args as { where: Record<string, unknown> }).where)
-        .filter((id) => id !== "c_ours_due")
+        .filter((id) => id !== "c_ours_due" && id !== "c_ours_cancel_future")
         .map((id) => ({ id }));
     });
 

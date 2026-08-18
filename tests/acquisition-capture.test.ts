@@ -35,6 +35,8 @@ const mocks = vi.hoisted(() => ({
   ),
   sellingPlanConfigFindMany: vi.fn(async (): Promise<unknown[]> => []),
   subscriberEventFindFirst: vi.fn(async (_a?: unknown): Promise<unknown> => null),
+  subscriberEventFindMany: vi.fn(async (_a?: unknown): Promise<unknown[]> => []),
+  subscriberEventUpdate: vi.fn(async (args: unknown): Promise<unknown> => args),
   subscriberEventUpdateMany: vi.fn(async (_a?: unknown) => ({ count: 0 })),
   contractFindFirst: vi.fn(async (_a?: unknown): Promise<unknown> => null),
   contractFindMany: vi.fn(async (_a?: unknown): Promise<unknown[]> => []),
@@ -62,6 +64,8 @@ vi.mock("~/db.server", () => ({
     sellingPlanConfig: { findMany: mocks.sellingPlanConfigFindMany },
     subscriberEvent: {
       findFirst: mocks.subscriberEventFindFirst,
+      findMany: mocks.subscriberEventFindMany,
+      update: mocks.subscriberEventUpdate,
       updateMany: mocks.subscriberEventUpdateMany,
     },
     subscriptionContract: {
@@ -145,6 +149,7 @@ beforeEach(() => {
   });
   mocks.sellingPlanConfigFindMany.mockResolvedValue([]);
   mocks.subscriberEventFindFirst.mockResolvedValue(null);
+  mocks.subscriberEventFindMany.mockResolvedValue([]);
   mocks.contractFindFirst.mockResolvedValue(null);
   mocks.contractFindMany.mockResolvedValue([]);
   mocks.contractUpdateMany.mockResolvedValue({ count: 1 });
@@ -1067,17 +1072,24 @@ describe("CUSTOMERS_REDACT scrubs every acq* column", () => {
   it("rewrites GDPR_DATA_REQUEST alert context/message for the redacted identity", async () => {
     // handleCustomersDataRequest stores the customer's email + order list in
     // Alert.context as operator guidance; the redact supersedes it.
-    mocks.alertFindMany.mockResolvedValue([
-      {
-        id: "alert_1",
-        context: {
-          customerId: "gid://shopify/Customer/42",
-          email: "jane@example.com",
-          ordersRequested: [999001],
-          dataRequestId: "req_9",
+    // Since v1.28.0 the handler also queries SUPPORT_REQUEST alerts; answer
+    // only the GDPR_DATA_REQUEST query here (the support pass is pinned in
+    // tests/aud-v128-redact-pii.test.ts).
+    mocks.alertFindMany.mockImplementation(async (args?: unknown) => {
+      const where = (args as { where?: { type?: unknown } })?.where;
+      if (where?.type !== "GDPR_DATA_REQUEST") return [];
+      return [
+        {
+          id: "alert_1",
+          context: {
+            customerId: "gid://shopify/Customer/42",
+            email: "jane@example.com",
+            ordersRequested: [999001],
+            dataRequestId: "req_9",
+          },
         },
-      },
-    ]);
+      ];
+    });
     await runRedact();
 
     const query = mocks.alertFindMany.mock.calls[0][0] as {

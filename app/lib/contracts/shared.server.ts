@@ -208,6 +208,57 @@ export async function ongoingDiscountedPriceCents(
   return proportionalPriceCents(variant.priceCents, referenceLine);
 }
 
+/**
+ * THE swap-pricing rule (v1.28.0), pure form — `swapPriceCentsFor` in the
+ * contracts service resolves `ongoingPct` (SellingPlanConfig.ongoingDiscountPct
+ * covering the variant's product, null when none) and delegates here; the
+ * portal's items-card swap dropdown prices its options through the same
+ * function so what the customer sees is exactly what the executed swap bills:
+ *
+ *   repriced                     = covering config → ongoingPct off the
+ *                                  catalog price; otherwise the line's
+ *                                  proportional discount ratio;
+ *   grandfathered + same product → the lock is keyed to the SIZE, not the
+ *                                  product (review fix): a variant whose
+ *                                  catalog price is at or below the line's
+ *                                  original catalog price (compareAt, else
+ *                                  the current price) — same size / a
+ *                                  downsize — pays min(locked, repriced),
+ *                                  so the locked price still shields against
+ *                                  catalog rises and a cheaper smaller size
+ *                                  is never dearer than it; a BIGGER (dearer)
+ *                                  size is repriced — a locked 30 ml price
+ *                                  never buys the 100 ml;
+ *   otherwise                    → repriced.
+ */
+export function swapPriceCentsSync(
+  contract: { grandfatheredPricing: boolean },
+  line: Pick<
+    LocalContractLine,
+    "productId" | "currentPriceCents" | "compareAtPriceCents"
+  >,
+  variant: Pick<ShopifyVariant, "productId" | "priceCents">,
+  ongoingPct: number | null,
+): number {
+  const repriced =
+    ongoingPct != null
+      ? applyDiscountPct(variant.priceCents, ongoingPct)
+      : proportionalPriceCents(variant.priceCents, line);
+  const sameProduct =
+    variant.productId != null && variant.productId === line.productId;
+  if (contract.grandfatheredPricing && sameProduct) {
+    const originalCatalog =
+      line.compareAtPriceCents != null && line.compareAtPriceCents > 0
+        ? line.compareAtPriceCents
+        : line.currentPriceCents;
+    if (variant.priceCents <= originalCatalog) {
+      return Math.min(line.currentPriceCents, repriced);
+    }
+    return repriced;
+  }
+  return repriced;
+}
+
 // ── Shopify contract refresh ─────────────────────────────────────────────────
 
 /**

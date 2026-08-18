@@ -39,6 +39,8 @@ const mocks = vi.hoisted(() => ({
     skipped: false,
   })),
   skipBillingCycle: vi.fn(async (): Promise<unknown> => ({})),
+  onCycleSkipped: vi.fn(async (): Promise<boolean> => false),
+  onCycleDelayed: vi.fn(async (): Promise<boolean> => false),
   contractPause: vi.fn(async (): Promise<unknown> => ({})),
   contractCancel: vi.fn(async (): Promise<unknown> => ({})),
   contractActivate: vi.fn(async (): Promise<unknown> => ({})),
@@ -114,6 +116,13 @@ vi.mock("~/lib/billing/release.server", () => ({
 vi.mock("~/lib/winback/engine.server", () => ({
   scheduleWinback: mocks.scheduleWinback,
 }));
+// v1.28.0 audit: skip / delay reconcile an open dunning case anchored on the
+// cycle they touch (see tests below) — the engine seam is pinned here.
+vi.mock("~/lib/dunning/engine.server", () => ({
+  onCycleSkipped: mocks.onCycleSkipped,
+  onCycleDelayed: mocks.onCycleDelayed,
+  onPaymentMethodUpdated: vi.fn(async (): Promise<void> => {}),
+}));
 vi.mock("~/lib/graphql/index.server", () => {
   class ShopifyUserError extends Error {}
   return {
@@ -182,6 +191,15 @@ beforeEach(() => {
 });
 
 describe("skipNextCycle initiators", () => {
+  it("hands the skipped cycle to the dunning engine (onCycleSkipped) after the skip commits, and a failing hook never breaks the skip", async () => {
+    await skipNextCycle("cellexia.myshopify.com", "c_1");
+    expect(mocks.onCycleSkipped).toHaveBeenCalledWith("c_1", 5, "SYSTEM");
+    // Contained.
+    mocks.onCycleSkipped.mockRejectedValueOnce(new Error("engine down"));
+    store.contract = baseContract();
+    await expect(skipNextCycle("cellexia.myshopify.com", "c_1")).resolves.toBeTruthy();
+  });
+
   it("default (CUSTOMER) increments skipCount and stamps lastSkippedAt", async () => {
     await skipNextCycle("cellexia.myshopify.com", "c_1");
 

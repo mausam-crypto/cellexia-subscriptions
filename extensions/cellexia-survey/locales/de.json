@@ -3,6 +3,11 @@
   "progress": "Frage {{current}} von {{total}} — je ein Tipp",
   "doneTitle": "Vielen Dank!",
   "doneBody": "Ihre Antworten helfen, alles auf Sie abzustimmen.",
+  "manage": {
+    "title": "Ihr Abo verwalten",
+    "body": "Produkte ändern, eine Lieferung überspringen oder verschieben, Adresse oder Karte aktualisieren — jederzeit in Ihrem Abo-Konto.",
+    "cta": "Mein Abo verwalten"
+  },
   "q": {
     "plannedDuration": {
       "title": "Wie möchten Sie das Produkt nutzen?",

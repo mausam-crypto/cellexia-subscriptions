@@ -41,6 +41,14 @@ export interface SendEmailInput {
    * the pre-v1.12.0 contract (tests and any shop-less caller rely on this).
    */
   shopId?: string;
+  /**
+   * Explicit Reply-To for THIS message (v1.28.0) — e.g. the merchant-bound
+   * support-request email sets the customer's address so "Reply" answers
+   * them. When omitted and a shopId is given, the shop's resolved support
+   * channel (settings.support.replyTo → support.email → Shop.contactEmail)
+   * is used; nothing resolvable ⇒ no header, exactly as before.
+   */
+  replyTo?: string | null;
 }
 
 interface CachedTransport {
@@ -67,6 +75,13 @@ export interface ResolvedMailConfig {
   /** Which layer decided the provider. */
   source: "settings" | "env";
   from: string;
+  /**
+   * Set ONLY when `from` is the shop's support email standing in for a
+   * missing Settings/MAIL_FROM From (v1.28.0) — a relay that verifies
+   * senders may refuse it; verifyMailer surfaces this so the Settings page
+   * can say so instead of the operator reading FAILED sends.
+   */
+  fromFallback?: "support_email";
   host: string | null;
   port: number;
   secure: boolean;
@@ -74,7 +89,25 @@ export interface ResolvedMailConfig {
   pass: string | null;
 }
 
+/**
+ * From address of LAST resort — only when neither the Settings page nor
+ * MAIL_FROM names one. Shop-aware resolution (resolveMailConfig with a
+ * shopId) first tries the shop's support email (settings.support →
+ * Shop.contactEmail, v1.28.0) so mail never claims a domain the store does
+ * not own; this literal is what a shop-less caller falls back to.
+ */
 const DEFAULT_FROM = "Cellexia <no-reply@cellexia.com>";
+
+/** `Cellexia <support@…>` from the shop's support channel, or null. */
+async function supportFallbackFrom(shopId: string): Promise<string | null> {
+  try {
+    const { getSupportChannels } = await import("~/lib/support/channels.server");
+    const channels = await getSupportChannels(shopId);
+    return channels.email ? `Cellexia <${channels.email}>` : null;
+  } catch {
+    return null;
+  }
+}
 
 function isProduction(): boolean {
   return process.env.NODE_ENV === "production";
@@ -199,7 +232,14 @@ export async function resolveMailConfig(
   shopId?: string,
 ): Promise<ResolvedMailConfig> {
   const stored = shopId ? await readMailSettings(shopId) : null;
-  if (!stored || stored.provider === "") return resolveFromEnv();
+  if (!stored || stored.provider === "") {
+    const env = resolveFromEnv();
+    if (shopId && !process.env.MAIL_FROM && !stored?.from) {
+      const fallback = await supportFallbackFrom(shopId);
+      if (fallback) return { ...env, from: fallback, fromFallback: "support_email" };
+    }
+    return env;
+  }
 
   let pass: string | null = null;
   if (stored.provider === "smtp") {
@@ -227,10 +267,15 @@ export async function resolveMailConfig(
       : stored.smtpSecure === "never"
         ? false
         : process.env.SMTP_SECURE === "true" || port === 465;
+  const explicitFrom = stored.from || process.env.MAIL_FROM || null;
+  const supportFrom =
+    !explicitFrom && shopId ? await supportFallbackFrom(shopId) : null;
+  const from = explicitFrom || supportFrom || DEFAULT_FROM;
   return {
     provider: stored.provider,
     source: "settings",
-    from: stored.from || process.env.MAIL_FROM || DEFAULT_FROM,
+    from,
+    ...(supportFrom ? { fromFallback: "support_email" as const } : {}),
     host: stored.smtpHost || process.env.SMTP_HOST || null,
     port,
     secure,
@@ -281,9 +326,33 @@ function smtpTransport(config: ResolvedMailConfig): Transporter {
   return transport;
 }
 
+/**
+ * Reply-To resolution (v1.28.0, P5.1): explicit input wins; otherwise the
+ * shop's support channel (settings.support.replyTo → support.email →
+ * Shop.contactEmail). Contained — a failed read means no header, and sending
+ * is never blocked by it. Exported for the console log line + tests.
+ */
+export async function resolveReplyTo(
+  input: Pick<SendEmailInput, "shopId" | "replyTo">,
+): Promise<string | null> {
+  if (typeof input.replyTo === "string" && input.replyTo.trim()) {
+    return input.replyTo.trim();
+  }
+  if (!input.shopId) return null;
+  try {
+    const { getSupportChannels } = await import("~/lib/support/channels.server");
+    const channels = await getSupportChannels(input.shopId);
+    return channels.replyTo;
+  } catch (err) {
+    console.error("[mailer] reply-to resolution failed — sending without", err);
+    return null;
+  }
+}
+
 /** Sends one email. Throws on delivery failure — callers decide containment. */
 export async function sendEmail(input: SendEmailInput): Promise<void> {
   const config = await resolveMailConfig(input.shopId);
+  const replyTo = await resolveReplyTo(input);
   if (config.provider === "console") {
     // Fail LOUD on an implicit fallback in production: a deploy that forgot
     // (or typo'd) MAIL_PROVIDER must produce FAILED NotificationLog rows and
@@ -292,7 +361,7 @@ export async function sendEmail(input: SendEmailInput): Promise<void> {
       throw new Error(`[mailer] ${fallbackError(config)}`);
     }
     console.log(
-      `[mailer:console] to=${input.to} subject="${input.subject}" html=${input.html.length} chars`,
+      `[mailer:console] to=${input.to} subject="${input.subject}" html=${input.html.length} chars${replyTo ? ` replyTo=${replyTo}` : ""}`,
     );
     return;
   }
@@ -302,6 +371,7 @@ export async function sendEmail(input: SendEmailInput): Promise<void> {
     to: input.to,
     subject: input.subject,
     html: input.html,
+    ...(replyTo ? { replyTo } : {}),
   });
 }
 
@@ -312,6 +382,10 @@ export interface MailerStatus {
   source: "settings" | "env";
   /** True only when console engaged implicitly (MAIL_PROVIDER unset/unknown). */
   implicitFallback?: boolean;
+  /** The effective From header (absent only on a crashed verification). */
+  from?: string;
+  /** Set when `from` is the support email standing in for a missing From. */
+  fromFallback?: "support_email";
   error?: string;
 }
 
@@ -328,6 +402,10 @@ export interface MailerStatus {
  */
 export async function verifyMailer(shopId?: string): Promise<MailerStatus> {
   const config = await resolveMailConfig(shopId);
+  const fromFacts = {
+    from: config.from,
+    ...(config.fromFallback ? { fromFallback: config.fromFallback } : {}),
+  };
   if (config.provider === "console") {
     if (config.fallback && isProduction()) {
       return {
@@ -335,6 +413,7 @@ export async function verifyMailer(shopId?: string): Promise<MailerStatus> {
         provider: "console",
         source: config.source,
         implicitFallback: true,
+        ...fromFacts,
         error: fallbackError(config),
       };
     }
@@ -343,16 +422,18 @@ export async function verifyMailer(shopId?: string): Promise<MailerStatus> {
       provider: "console",
       source: config.source,
       ...(config.fallback ? { implicitFallback: true } : {}),
+      ...fromFacts,
     };
   }
   try {
     await smtpTransport(config).verify();
-    return { ok: true, provider: "smtp", source: config.source };
+    return { ok: true, provider: "smtp", source: config.source, ...fromFacts };
   } catch (err) {
     return {
       ok: false,
       provider: "smtp",
       source: config.source,
+      ...fromFacts,
       error: err instanceof Error ? err.message : String(err),
     };
   }

@@ -40,6 +40,15 @@ const mocks = vi.hoisted(() => ({
   draftLineUpdate: vi.fn(
     async (..._args: unknown[]): Promise<string | null> => "line_gid",
   ),
+  // The cycle draft's lines: by default every mirrored line with a GID sits
+  // on the draft under its own id (a fresh cycle) — tests override this to
+  // simulate a re-added (cycle-scoped id) or absent line.
+  draftLines: vi.fn(
+    async (..._args: unknown[]): Promise<Array<{ id: string; variantId: string | null; quantity: number }>> => [
+      { id: "gid://shopify/SubscriptionLine/1", variantId: "gid://shopify/ProductVariant/1", quantity: 1 },
+      { id: "gid://shopify/SubscriptionLine/2", variantId: "gid://shopify/ProductVariant/2", quantity: 1 },
+    ],
+  ),
 }));
 
 vi.mock("~/db.server", () => ({
@@ -63,6 +72,7 @@ vi.mock("~/lib/graphql/billingCycles.server", () => ({
 
 vi.mock("~/lib/graphql/contracts.server", () => ({
   draftLineUpdate: mocks.draftLineUpdate,
+  draftLines: mocks.draftLines,
 }));
 
 import type { AdminClient } from "~/lib/graphql/client.server";

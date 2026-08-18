@@ -3,6 +3,11 @@
   "progress": "Pergunta {{current}} de {{total}} — um toque só",
   "doneTitle": "Obrigado!",
   "doneBody": "Suas respostas ajudam a personalizar tudo para você.",
+  "manage": {
+    "title": "Gerencie sua assinatura",
+    "body": "Troque produtos, pule ou adie uma entrega, atualize seu endereço ou cartão — a qualquer momento, pela sua conta de assinatura.",
+    "cta": "Gerenciar minha assinatura"
+  },
   "q": {
     "plannedDuration": {
       "title": "Como você pensa em usar este produto?",

@@ -133,6 +133,7 @@ describe("settings-configured SMTP delivers", () => {
       ok: true,
       provider: "smtp",
       source: "settings",
+      from: "Cellexia Care <care@cellexia.com>",
     });
     expect(transport.verify).toHaveBeenCalledTimes(1);
   });
@@ -224,6 +225,7 @@ describe("settings-configured SMTP delivers", () => {
       ok: true,
       provider: "console",
       source: "settings",
+      from: "Cellexia Care <care@cellexia.com>",
     });
   });
 });

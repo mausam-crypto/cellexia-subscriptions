@@ -8,19 +8,32 @@ import {
   getPortalCatalog,
   ongoingDiscountPctByProduct,
 } from "~/lib/portal/catalog.server";
-import { addDaysTz, formatShopDate } from "~/lib/dates.server";
+import {
+  addDaysTz,
+  cardExpiryMoment,
+  formatShopDate,
+  formatShopTime,
+} from "~/lib/dates.server";
 import { contractFrequency, formatFrequency } from "~/lib/frequency";
 import { t } from "~/lib/i18n/i18n.server";
-import { applyDiscountPct, formatMoney } from "~/lib/money";
+import { formatMoney } from "~/lib/money";
 import { sendNotification } from "~/lib/notifications/send.server";
-import { getActiveDiscountForCycle } from "./discounts.server";
+import { emailCardLabel } from "~/lib/notifications/payment-method.server";
 import { OURS_ONLY } from "~/lib/ownership/ownership.server";
+import { OPEN_CASE_STATES } from "~/lib/dunning/states";
+import { hasFurtherOrders } from "~/lib/cancel/further-orders";
+import { estimateNextCharge, type EstimateLine } from "./estimate.server";
+import {
+  editCutoffSync,
+  resolveChargeTiming,
+  type ChargeTiming,
+} from "./timing.server";
 
 /**
  * Pre-billing customer touches:
  *
- * - `runUpcomingOrderReminders`: "your order ships soon" N days before each
- *   renewal (N = settings.notifications.upcomingOrderDaysBefore), exactly once
+ * - `runUpcomingOrderReminders`: "your next order is on {date}" N days before
+ *   each renewal (N = settings.notifications.upcomingOrderDaysBefore), exactly once
  *   per billing occasion (NotificationLog dedupe keyed on the shop-tz day the
  *   charge is due — a skipped/delayed cycle never suppresses the reminder for
  *   the charge that actually happens). The notifications
@@ -167,6 +180,136 @@ function shopDayKey(date: Date, tz: string): string {
   }).format(date);
 }
 
+// ── Card line + expiry warning (v1.28.0, P1.5) ──────────────────────────────
+
+/**
+ * The reminder's payment vars: `card_label` ("Visa ····4242" / "Shop Pay
+ * ····4242" / "PayPal" / ""), `payment_line` (the localized "Payment method:
+ * …" line, or "" when nothing is mirrored — the body's line then collapses),
+ * and `card_expiry_warning` — "" or ONE localized sentence: the card expires
+ * before this order (expiry moment ≤ the charge date), or within
+ * `dunning.preExpiryNoticeDays` of now. Cards work through the last day of
+ * their expiry month, so the expiry moment is the first instant of the
+ * following month (same convention as the pre-expiry job). PayPal carries
+ * no expiry. Never throws — a broken card mirror must not block the reminder.
+ */
+export function reminderCardVars(
+  contract: {
+    locale: string | null;
+    paymentInstrumentType?: string | null;
+    cardBrand: string | null;
+    cardLast4: string | null;
+    cardExpiryMonth: number | null;
+    cardExpiryYear: number | null;
+    /** Revoked on Shopify (v1.28.0 audit): the mirrored card no longer exists. */
+    paymentMethodRevokedAt?: Date | null;
+  },
+  nextBillingDate: Date,
+  now: Date,
+  preExpiryNoticeDays: number,
+  tz: string,
+): { card_label: string; payment_line: string; card_expiry_warning: string } {
+  const locale = contract.locale;
+  // A revoked method: last4 stays mirrored for copy elsewhere ("Card ····4242
+  // was removed"), but a reminder that names it as THE payment method for
+  // this order — with "nothing to do" — would be false: the charge will fail.
+  if (contract.paymentMethodRevokedAt != null) {
+    return {
+      card_label: "",
+      payment_line: t(locale, "email.upcoming_order.payment_line_missing"),
+      card_expiry_warning: "",
+    };
+  }
+  let cardLabel = "";
+  try {
+    cardLabel = emailCardLabel(locale, contract);
+  } catch (err) {
+    console.error("[reminders] card label failed", err);
+  }
+  const paymentLine = cardLabel
+    ? t(locale, "email.upcoming_order.payment_line", { card_label: cardLabel })
+    : "";
+
+  let warning = "";
+  const month = contract.cardExpiryMonth;
+  const year = contract.cardExpiryYear;
+  const expiresAt = cardExpiryMoment(month, year, tz);
+  if (
+    month != null &&
+    year != null &&
+    expiresAt != null &&
+    contract.paymentInstrumentType !== "PAYPAL"
+  ) {
+    const expiry = `${String(month).padStart(2, "0")}/${year}`;
+    const vars = { card_last4: contract.cardLast4 ?? "", card_expiry: expiry };
+    if (expiresAt <= nextBillingDate) {
+      warning = t(locale, "email.upcoming_order.card_expiry_warning", vars);
+    } else if (
+      Number.isFinite(preExpiryNoticeDays) &&
+      preExpiryNoticeDays > 0 &&
+      addDaysTz(now, preExpiryNoticeDays, tz) >= expiresAt
+    ) {
+      warning = t(locale, "email.upcoming_order.card_expiry_warning_soon", vars);
+    }
+  }
+  return {
+    card_label: cardLabel,
+    payment_line: paymentLine,
+    card_expiry_warning: warning,
+  };
+}
+
+// ── Edit cut-off line (v1.28.0, P2.1) ────────────────────────────────────────
+
+/**
+ * `edit_cutoff` ("18 August 2026, 06:00" in the shop tz + locale),
+ * `edit_cutoff_iso` and the composed `edit_cutoff_line` ("You can make changes
+ * until …") — from the SAME charge-moment helper the sweep bills on
+ * (timing.server.ts), so the reminder can never promise a window the sweep
+ * does not honour. Never throws: a formatting failure collapses the line.
+ */
+export function reminderCutoffVars(
+  locale: string | null,
+  nextBillingDate: Date,
+  timing: ChargeTiming,
+): { edit_cutoff: string; edit_cutoff_iso: string; edit_cutoff_line: string } {
+  try {
+    const cutoff = editCutoffSync(nextBillingDate, timing);
+    const label = `${formatShopDate(cutoff, timing.tz, locale ?? undefined)}, ${formatShopTime(cutoff, timing.tz, locale ?? undefined)}`;
+    return {
+      edit_cutoff: label,
+      edit_cutoff_iso: cutoff.toISOString(),
+      edit_cutoff_line: t(locale, "email.upcoming_order.edit_cutoff_line", {
+        edit_cutoff: label,
+      }),
+    };
+  } catch (err) {
+    console.error("[reminders] edit cut-off vars failed", err);
+    return { edit_cutoff: "", edit_cutoff_iso: "", edit_cutoff_line: "" };
+  }
+}
+
+/**
+ * "Serum (30 ml) × 1, Night Cream × 2, Travel Kit (free)" — one line per
+ * estimate row, in the estimate's order; free rows (attached or committed
+ * gifts) carry the localized "(free)" marker so the email never lists a gift
+ * as if it were billed. Lines the customer skipped for this cycle
+ * (`skippedThisCycle`, v1.28.0 Stage D) are omitted — the email lists what
+ * WILL ship; a one-cycle quantity tweak shows the billed quantity.
+ */
+export function itemsSummaryOf(
+  locale: string | null,
+  lines: EstimateLine[],
+): string {
+  return lines
+    .filter((l) => !l.skippedThisCycle)
+    .map((l) => {
+      const item = `${l.title}${l.variantTitle ? ` (${l.variantTitle})` : ""} × ${l.quantity}`;
+      return l.free ? t(locale, "email.upcoming_order.item_free", { item }) : item;
+    })
+    .join(", ");
+}
+
 // ── Upcoming order reminders ─────────────────────────────────────────────────
 
 export interface UpcomingReminderStats {
@@ -203,7 +346,7 @@ export async function runUpcomingOrderReminders(
   // noise, so the window starts at `now`.
   const horizon = addDaysTz(now, daysBefore, tz);
 
-  const contracts = await prisma.subscriptionContract.findMany({
+  const candidates = await prisma.subscriptionContract.findMany({
     where: {
       shopId: shop.id,
       // Another subscription app's subscribers are not ours to email.
@@ -211,10 +354,24 @@ export async function runUpcomingOrderReminders(
       status: "ACTIVE",
       isDemo: false, // portal-preview fixtures never get customer touches
       nextBillingDate: { gte: now, lte: horizon },
+      // An open dunning case owns the customer's next-order story: the
+      // portal says "Payment issue · Order held since {date}" and the ladder
+      // emails carry the retry date. The mirror's nextBillingDate is
+      // advanced optimistically at attempt creation and is NOT resynced by
+      // the failure webhook, so a short-interval plan inside the case's life
+      // would otherwise be told "your order is on {held+interval}, changes
+      // until …" — a promise nothing keeps if the retry exhausts. The held
+      // order's own reminder is the dunning ladder.
+      dunningCases: { none: { state: { in: OPEN_CASE_STATES } } },
     },
     include: { lines: true },
     orderBy: { nextBillingDate: "asc" },
   });
+  // Scheduled cancel (v1.28.0, P3.8): a pointer at or past cancelScheduledAt
+  // is an order the sweep will never bill (the hourly job ends the contract
+  // first) — no reminder, no one-tap skip/delay links to a phantom order.
+  // JS filter: Prisma cannot compare two columns of the same row.
+  const contracts = candidates.filter((c) => hasFurtherOrders(c));
 
   // One-tap add-on leg: candidates resolved once per run, matched per contract
   // below. Gated on the reminder's own toggle AND the portal add-products
@@ -230,6 +387,30 @@ export async function runUpcomingOrderReminders(
           notifications.addonSuggestionVariantId.trim(),
         )
       : [];
+
+  // Expiring-card window for the reminder's warning line — the same knob the
+  // pre-expiry job uses (settings own every schedule). Failure-contained: a
+  // broken read just drops the "expires soon" sentence (the "before this
+  // order" sentence needs no setting).
+  let preExpiryNoticeDays = 0;
+  if (contracts.length > 0) {
+    try {
+      const dunning = await getSetting(shop.id, "dunning");
+      preExpiryNoticeDays =
+        typeof dunning?.preExpiryNoticeDays === "number"
+          ? dunning.preExpiryNoticeDays
+          : 0;
+    } catch (err) {
+      console.error("[reminders] dunning settings read failed", err);
+    }
+  }
+
+  // Charge timing for the "you can make changes until …" line — the sweep's
+  // own helper (contained: a broken read means hour 0, the default).
+  const timing: ChargeTiming =
+    contracts.length > 0
+      ? await resolveChargeTiming(shop.id, tz)
+      : { tz, chargeHourLocal: 0 };
 
   for (const contract of contracts) {
     stats.scanned += 1;
@@ -279,23 +460,17 @@ export async function runUpcomingOrderReminders(
         continue;
       }
 
-      const chargeableLines = contract.lines.filter((l) => !l.isGift);
-      const itemsSummary = contract.lines
-        .map(
-          (l) =>
-            `${l.title}${l.variantTitle ? ` (${l.variantTitle})` : ""} × ${l.quantity}`,
-        )
-        .join(", ");
-
-      // Estimate = plan pricing minus any live per-cycle grant, plus delivery.
-      // Taxes are Shopify's at charge time, so this stays an estimate.
-      let subtotalCents = chargeableLines.reduce(
-        (sum, l) => sum + l.currentPriceCents * l.quantity,
-        0,
+      // Estimate = plan pricing minus any live per-cycle grant, plus delivery
+      // — the shared next-order estimate (estimate.server.ts, v1.28.0), the
+      // same numbers the portal shows. Taxes are Shopify's at charge time,
+      // so this stays an estimate.
+      const est = await estimateNextCharge(
+        { id: shop.id, ianaTimezone: tz },
+        contract,
       );
-      const grant = await getActiveDiscountForCycle(contract.id);
-      if (grant) subtotalCents = applyDiscountPct(subtotalCents, grant.percent);
-      const totalCents = subtotalCents + contract.deliveryPriceCents;
+      const itemsSummary = itemsSummaryOf(contract.locale, est.lines);
+      const totalCents = est.totalCents;
+      const grantPercent = est.discountPercent;
 
       // `addon_variant_id` makes the notifications layer build the one-tap
       // `addon_url` magic link (ADD_TO_NEXT) into the Klaviyo link bundle.
@@ -306,6 +481,17 @@ export async function runUpcomingOrderReminders(
       // template placeholders render, in the same locale the send resolves.
       const freq = contractFrequency(contract);
 
+      // Payment line + expiring-card warning (v1.28.0, P1.5).
+      const cardVars = reminderCardVars(
+        contract,
+        nextBillingDate,
+        now,
+        preExpiryNoticeDays,
+        tz,
+      );
+      // Edit cut-off (v1.28.0, P2.1) — the sweep's charge moment.
+      const cutoffVars = reminderCutoffVars(contract.locale, nextBillingDate, timing);
+
       const result = await sendNotification({
         shopId: shop.id,
         contractId: contract.id,
@@ -313,11 +499,13 @@ export async function runUpcomingOrderReminders(
         locale: contract.locale,
         vars: {
           cycleIndex,
+          ...cardVars,
+          ...cutoffVars,
           // Persistent occasion dedupe (see the alreadySent check above) —
           // lands in the SENT row's payload.vars like dunning_dedupe does.
           reminder_dedupe: reminderDedupe,
           items_summary: itemsSummary,
-          item_count: contract.lines.length,
+          item_count: est.lines.filter((l) => !l.skippedThisCycle).length,
           total_estimate: formatMoney(
             totalCents,
             contract.currencyCode,
@@ -326,6 +514,17 @@ export async function runUpcomingOrderReminders(
           total_estimate_cents: totalCents,
           next_date: formatShopDate(nextBillingDate, tz, contract.locale),
           next_date_iso: nextBillingDate.toISOString(),
+          // "After that" date (v1.28.0) — one interval on, from the estimate.
+          ...(est.followingBillingDate
+            ? {
+                following_date: formatShopDate(
+                  est.followingBillingDate,
+                  tz,
+                  contract.locale,
+                ),
+                following_date_iso: est.followingBillingDate.toISOString(),
+              }
+            : {}),
           frequency_weeks: contract.intervalWeeks,
           frequency_unit: freq.unit,
           frequency_count: freq.count,
@@ -334,7 +533,7 @@ export async function runUpcomingOrderReminders(
             "every",
             freq,
           ),
-          ...(grant ? { discount_percent: grant.percent } : {}),
+          ...(grantPercent != null ? { discount_percent: grantPercent } : {}),
           ...(addon
             ? {
                 addon_variant_id: addon.variantId,
@@ -403,19 +602,23 @@ export async function runPauseAutoResume(
       isDemo: false,
       resumeAt: { not: null, lte: now },
     },
-    select: { id: true },
+    select: { id: true, resumeAt: true },
   });
 
-  for (const { id } of dueForResume) {
+  for (const { id, resumeAt } of dueForResume) {
     try {
       const svc = await import("~/lib/contracts/service.server");
+      // `billOn: resumeAt` (v1.28.0, P2.6): the first post-hold charge lands
+      // at the charge moment of the promised resume day — the reminder said
+      // "resumes on {resume_date}", so no +3-day drift, and never earlier
+      // (a late run bills at the next sweep, not retroactively).
       await (
         svc.resumeContract as unknown as (
           shopDomain: string,
           contractId: string,
-          opts?: { source?: string },
+          opts?: { source?: string; billOn?: Date | null },
         ) => Promise<unknown>
-      )(shop.domain, id, { source: "SYSTEM" });
+      )(shop.domain, id, { source: "SYSTEM", billOn: resumeAt });
       stats.resumed += 1;
     } catch (err) {
       stats.resumeErrors += 1;
@@ -458,10 +661,37 @@ export async function runPauseAutoResume(
       const resumeAt = contract.resumeAt;
       if (!resumeAt) continue;
 
-      // One reminder per pause period: any SENT resume_reminder since this
-      // pause began means we already reminded.
-      const dedupeSince =
+      // One reminder per RESUME DAY, not per pause episode: any SENT
+      // resume_reminder since the hold was last (re)set means we already
+      // reminded for the day it currently ends on. `extendPause` (portal
+      // "need a little longer" or the reminder's own EXTEND_PAUSE link)
+      // moves resumeAt later without touching pausedAt, so the dedupe floor
+      // is max(pausedAt, latest contract.pause_extended) — the new resume
+      // day gets its own heads-up instead of a silent auto-resume charge
+      // (v1.28.0 review fix). Contained: an event-log read failure keeps
+      // the per-episode floor.
+      let dedupeSince =
         contract.pausedAt ?? new Date(now.getTime() - 180 * 86_400_000);
+      try {
+        const lastExtended = await prisma.subscriberEvent.findFirst({
+          where: {
+            contractId: contract.id,
+            type: "contract.pause_extended",
+            createdAt: { gte: dedupeSince },
+          },
+          orderBy: { createdAt: "desc" },
+          select: { createdAt: true },
+        });
+        if (lastExtended && lastExtended.createdAt.getTime() > dedupeSince.getTime()) {
+          dedupeSince = lastExtended.createdAt;
+        }
+      } catch (err) {
+        console.error(
+          "[reminders] resume reminder: pause_extended lookup failed, using pausedAt",
+          contract.id,
+          err,
+        );
+      }
       const alreadySent = await prisma.notificationLog.findFirst({
         where: {
           contractId: contract.id,

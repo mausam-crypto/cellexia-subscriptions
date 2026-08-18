@@ -1213,6 +1213,16 @@ export interface RaiseAlertInput {
   severity: AlertSeverity;
   message: string;
   context?: Record<string, unknown>;
+  /**
+   * Per-entity dedupe (v1.28.0, P5.1) for alert types that legitimately
+   * repeat across entities — e.g. SUPPORT_REQUEST is one alert PER CONTRACT
+   * PER DAY, not one open alert shop-wide. When set, the dedupe rule becomes
+   * "an alert of this type whose context[`key`] equals `value`, created at or
+   * after `since` (resolved or not), already exists" instead of the default
+   * "an unresolved alert of this type exists". The advisory lock still
+   * serializes per (shop, type), so concurrent raises cannot both pass.
+   */
+  dedupe?: { key: string; value: string; since: Date };
 }
 
 /**
@@ -1243,7 +1253,14 @@ export async function raiseAlert(input: RaiseAlertInput): Promise<boolean> {
   const alert = await prisma.$transaction(async (tx) => {
     await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${input.shopId}), hashtext(${input.type}))`;
     const existing = await tx.alert.findFirst({
-      where: { shopId: input.shopId, type: input.type, resolvedAt: null },
+      where: input.dedupe
+        ? {
+            shopId: input.shopId,
+            type: input.type,
+            createdAt: { gte: input.dedupe.since },
+            context: { path: [input.dedupe.key], equals: input.dedupe.value },
+          }
+        : { shopId: input.shopId, type: input.type, resolvedAt: null },
       select: { id: true },
     });
     if (existing) return null;

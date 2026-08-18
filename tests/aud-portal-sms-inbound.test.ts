@@ -29,6 +29,7 @@ const store = vi.hoisted(() => ({
 }));
 
 const mocks = vi.hoisted(() => ({
+  isSetupMode: vi.fn(async (_shopId: string): Promise<boolean> => false),
   logEvent: vi.fn(async (_e: unknown): Promise<void> => {}),
   skipNextCycle: vi.fn(async (): Promise<unknown> => ({
     nextBillingDate: null,
@@ -106,6 +107,7 @@ vi.mock("~/db.server", () => ({
 }));
 
 vi.mock("~/lib/events/log.server", () => ({ logEvent: mocks.logEvent }));
+vi.mock("~/lib/launch/launch.server", () => ({ isSetupMode: mocks.isSetupMode }));
 vi.mock("~/lib/shop/install.server", () => ({
   getPrimaryShop: mocks.getPrimaryShop,
 }));

@@ -17,6 +17,7 @@ import {
   hasSentForCycle,
   sendNotification,
 } from "~/lib/notifications/send.server";
+import { sendPaymentMethodUpdatedOnce } from "~/lib/notifications/payment-method.server";
 import {
   type AdminClient,
   draftUpdatePaymentMethod,
@@ -33,6 +34,10 @@ import {
   timeToPurchaseSeconds,
   type AcquisitionCapture,
 } from "~/lib/acquisition/sanitize";
+import {
+  applyDeliveryTrackingContained,
+  parseWebhookDate,
+} from "~/lib/webhooks/fulfillment-tracking.server";
 // Type-only: the runtime seam into design measurement is a lazy import inside
 // contained blocks (see linkContractDesignContained / the ORDERS_CREATE fact
 // write), so this module never statically loads the measurement module.
@@ -539,6 +544,37 @@ async function handleSubscriptionContractsCreate({
   // write-once. Same create-moment rule as acquisition/survey/tags, same
   // containment (the helper swallows and logs).
   await linkContractDesignContained(shop.id, contract.id);
+
+  // Welcome email (v1.28.0, P4.5/P5.2): once per genuinely new contract —
+  // the helper refuses imports/backfills (no origin order) and dedupes by
+  // contract, so a replay of this webhook never sends twice. Runs LAST so a
+  // send failure can never shadow the enrichment steps above; the helper is
+  // contained (never throws) — the guard here is belt-and-braces.
+  await sendSubscriptionStartedContained(shop.id, contract.id);
+}
+
+/**
+ * The welcome-email hook shared by the CREATE handler and the UPDATE
+ * catch-up branch (a lost create webhook's catch-up IS the create moment —
+ * the acquisition rule). Notifications never fail a webhook.
+ */
+async function sendSubscriptionStartedContained(
+  shopId: string,
+  contractId: string,
+  label = "",
+): Promise<void> {
+  try {
+    const { maybeSendSubscriptionStarted } = await import(
+      "~/lib/notifications/subscription-started.server"
+    );
+    await maybeSendSubscriptionStarted(shopId, contractId);
+  } catch (err) {
+    console.error(
+      `[webhooks] ${label}subscription_started send failed`,
+      contractId,
+      err,
+    );
+  }
 }
 
 /**
@@ -669,6 +705,8 @@ async function handleSubscriptionContractsUpdate({
     }
     // And for the design measurement join (see linkContractDesignContained).
     await linkContractDesignContained(shop.id, after.id, "catch-up ");
+    // And the welcome email (see sendSubscriptionStartedContained).
+    await sendSubscriptionStartedContained(shop.id, after.id, "catch-up ");
     return;
   }
 
@@ -812,6 +850,18 @@ export async function finishSuccessSettlement(
     "consumeGrantCycle",
     [contract.id, updated.cycleIndex],
     "billing.consumeGrantCycle",
+  );
+
+  // Per-line cycle edits (v1.28.0, P2.5): a "not this time" / "just this
+  // order" flag targets ONE cycle — the settled one (and anything earlier)
+  // is done, so its flags are nulled (cycle-scoped like the add-on mirrors;
+  // flags staged for a LATER cycle during the in-flight window survive).
+  // Contained + idempotent, so the redrive tail may re-run it.
+  await callOptionalHook(
+    () => import("~/lib/billing/estimate.server"),
+    "clearStaleCycleOverrides",
+    [contract.id, updated.cycleIndex + 1],
+    "billing.clearStaleCycleOverrides",
   );
 
   // Dunning recovery bookkeeping — a failure here must surface (receipt
@@ -1218,6 +1268,12 @@ async function handleBillingAttemptSuccess({
                 orderSummary.processedAt ?? orderSummary.createdAt,
             }
           : {}),
+        // Shopify order-status page (v1.28.0, P4.2): the portal's receipt /
+        // "view order" link, captured here so a not-yet-fulfilled renewal
+        // already has one; ORDERS_FULFILLED refreshes it later.
+        ...(orderSummary?.statusPageUrl
+          ? { orderStatusUrl: orderSummary.statusPageUrl }
+          : {}),
         ...(costSnapshot !== undefined ? { costSnapshot } : {}),
       },
     });
@@ -1282,6 +1338,34 @@ async function handleBillingAttemptSuccess({
   contract = settled.contract;
 
   await resyncNextBillingDate();
+
+  // Delivery mirror backfill (v1.28.0, P4.2): an order ALREADY fulfilled at
+  // settlement (auto-fulfilment app, digital line, redriven settlement) had
+  // its fulfillments/* webhooks land before BillingAttempt.orderId existed
+  // — they matched nothing. The summary's fulfillment list is the fallback:
+  // first SUCCESS fulfillment → tracking + ship instant, same idempotent
+  // rules as the webhook path. Contained; nothing else depends on it.
+  // (`?? []`: summaries from before the field existed / test doubles.)
+  const summaryFulfillments = orderSummary?.fulfillments ?? [];
+  if (orderGid && orderSummary && summaryFulfillments.length > 0) {
+    const live = summaryFulfillments.find(
+      (f) => (f.status ?? "").toUpperCase() === "SUCCESS",
+    );
+    if (live) {
+      await applyDeliveryTrackingContained({
+        shopId: shop.id,
+        orderGid,
+        source: "settlement/order_summary",
+        orderName: orderSummary.name || null,
+        tracking: {
+          url: live.trackingUrl,
+          company: live.trackingCompany,
+          number: live.trackingNumber,
+        },
+        shippedAt: live.createdAt,
+      });
+    }
+  }
 
   if (settled.addonTitles.length > 0) {
     await logEvent({
@@ -1534,11 +1618,27 @@ function makeBillingCycleEditHandler(
  * metadata actually changed, and pokes the dunning engine for contracts with
  * an open case (an updated card is the recovery moment).
  */
-async function handlePaymentMethodUpsert({
-  shopDomain,
-  payload,
-  webhookId,
-}: WebhookHandlerContext): Promise<void> {
+/**
+ * Drop the portal's in-process payment-methods memo for a customer (v1.28.0
+ * review fix): CREATE / UPDATE / REVOKE are exactly the events that change
+ * the list. Lazy import keeps the webhook → portal edge out of the module
+ * graph; contained — a failure here never touches the mirror refresh.
+ */
+async function invalidatePortalPaymentMethodsMemo(customerGid: string): Promise<void> {
+  try {
+    const { invalidatePaymentMethodsCache } = await import(
+      "~/lib/portal/payment-methods.server"
+    );
+    invalidatePaymentMethodsCache(customerGid);
+  } catch (err) {
+    console.error("[webhooks] payment-methods memo invalidation failed", customerGid, err);
+  }
+}
+
+async function handlePaymentMethodUpsert(
+  { shopDomain, payload, webhookId }: WebhookHandlerContext,
+  topic: "CREATE" | "UPDATE" = "CREATE",
+): Promise<void> {
   const shop = await requireShop(shopDomain);
   const customerGid = toGid(
     "Customer",
@@ -1551,6 +1651,9 @@ async function handlePaymentMethodUpsert({
     );
     return;
   }
+  // The portal's payment-methods memo (60 s) is keyed on exactly this event:
+  // drop it so a render right after the webhook sees the new / changed card.
+  await invalidatePortalPaymentMethodsMemo(customerGid);
   const methodGid = toGid(
     "CustomerPaymentMethod",
     pick(payload, "admin_graphql_api_id", "id"),
@@ -1577,21 +1680,34 @@ async function handlePaymentMethodUpsert({
       cardExpiryMonth: instrument?.expiryMonth ?? null,
       cardExpiryYear: instrument?.expiryYear ?? null,
     };
+    // Migration 0027 mirror riders: instrument type travels with the card
+    // columns; a live (non-revoked) method clears the revoked stamp.
+    const instrumentType = instrument?.type ?? null;
+    const revokedAt = method.revoked ? (method.revokedAt ?? new Date()) : null;
     const changed =
       card.cardBrand !== contract.cardBrand ||
       card.cardLast4 !== contract.cardLast4 ||
       card.cardExpiryMonth !== contract.cardExpiryMonth ||
       card.cardExpiryYear !== contract.cardExpiryYear;
+    const mirrorRidersChanged =
+      instrumentType !== contract.paymentInstrumentType ||
+      (revokedAt?.getTime() ?? null) !==
+        (contract.paymentMethodRevokedAt?.getTime() ?? null);
     const directHit =
       methodGid != null && methodGid === contract.paymentMethodId;
-    if (!changed && !directHit) continue;
+    if (!changed && !mirrorRidersChanged && !directHit) continue;
 
-    if (changed) {
+    if (changed || mirrorRidersChanged) {
       await prisma.subscriptionContract.update({
         where: { id: contract.id },
-        data: card,
+        data: {
+          ...card,
+          paymentInstrumentType: instrumentType,
+          paymentMethodRevokedAt: revokedAt,
+        },
       });
     }
+    if (!changed && !directHit) continue;
 
     await logEvent({
       ...contractEventBase(shop.id, contract),
@@ -1603,6 +1719,11 @@ async function handlePaymentMethodUpsert({
         last4: card.cardLast4,
         expiryMonth: card.cardExpiryMonth,
         expiryYear: card.cardExpiryYear,
+        // Klaviyo segmentation prop (the canonical event maps to "Cellexia
+        // Payment Method Updated" since v1.28.0): a payment-method webhook
+        // is always the customer's own doing (Shopify's hosted replace flow
+        // or the account page).
+        card_updated_by: "customer",
       },
     });
 
@@ -1616,12 +1737,107 @@ async function handlePaymentMethodUpsert({
       where: { contractId: contract.id, resolvedAt: null },
       select: { id: true },
     });
-    if (openCase || contract.status === "FAILED") {
+    const inRecovery = openCase != null || contract.status === "FAILED";
+
+    // Closed loop (v1.28.0, P1.4): a DIRECT hit whose mirrored card actually
+    // changed is the customer's own card update landing — tell them it
+    // worked (today they heard nothing). Type-only backfills and untouched
+    // cards stay silent, and so do contracts that no longer bill (a
+    // cancelled/expired subscription has no "next order" to reassure
+    // about); the helper dedupes once per {contract,last4}/24h and never
+    // throws. An EXPIRY-ONLY refresh (same brand/last4 — what a card
+    // network's account updater produces without any customer action) is
+    // only announced while the contract is in payment recovery, where a
+    // renewed expiry IS the fix the customer was asked for; otherwise the
+    // "thank you for updating / if you didn't, reply" framing would be false.
+    const identityChanged =
+      card.cardBrand !== contract.cardBrand ||
+      card.cardLast4 !== contract.cardLast4;
+    if (
+      directHit &&
+      changed &&
+      (identityChanged || inRecovery) &&
+      ["ACTIVE", "PAUSED", "FAILED"].includes(contract.status)
+    ) {
+      await sendPaymentMethodUpdatedOnce({
+        locale: contract.locale,
+        tz: shop.ianaTimezone,
+        contract: {
+          ...contract,
+          ...card,
+          paymentInstrumentType: instrumentType,
+        },
+        reason: "updated",
+        previousCard: contract,
+        cardUpdatedBy: "customer",
+        hasOpenCase: openCase != null,
+      });
+    }
+
+    if (inRecovery) {
       await callOptionalHook(
         () => import("~/lib/dunning/engine.server"),
         "onPaymentMethodUpdated",
-        [contract.id],
+        // `contract` is the pre-update row: its last4 is the "before" the
+        // engine compares against so a RETRYING case retries at once only
+        // when the card really changed (v1.28.0).
+        [
+          contract.id,
+          {
+            previous: {
+              paymentMethodId: contract.paymentMethodId,
+              cardLast4: contract.cardLast4,
+              cardExpiryMonth: contract.cardExpiryMonth,
+              cardExpiryYear: contract.cardExpiryYear,
+              cardBrand: contract.cardBrand,
+            },
+          },
+        ],
         "dunning.onPaymentMethodUpdated",
+      );
+    }
+  }
+
+  // New-method detection (v1.28.0, P1.8): the webhook is about a live method
+  // that is NOT some contract's primary — a customer in payment trouble who
+  // just saved a new card has handed us the recovery. Per contract: dead
+  // primary → auto-switch (closed loop rides payment_method_updated, reason
+  // new_method); otherwise → new_card_detected with one-tap USE_METHOD /
+  // SET_BACKUP links + the home banner. Gated by settings.dunning.
+  // newMethodDetection, SETUP mode and demo; idempotent per {contract,
+  // method} through the dunning.new_method_detected event; contained — the
+  // mirror refresh above never depends on it.
+  // Ownership gate (golden rule): only OUR contracts reach the seam — the
+  // other app's mirrored contracts are never re-pointed nor messaged (the
+  // seam filters again; the query above is deliberately unfiltered because
+  // the mirror refresh above serves every contract of the customer).
+  const ourContracts = contracts.filter((c) => isBillableOwnership(c.ownership));
+  if (
+    methodGid &&
+    methods.some((m) => m.id === methodGid && !m.revoked) &&
+    ourContracts.some((c) => c.paymentMethodId !== methodGid)
+  ) {
+    try {
+      const { detectNewPaymentMethod } = await import(
+        "~/lib/dunning/new-method.server"
+      );
+      await detectNewPaymentMethod({
+        shop: {
+          id: shop.id,
+          domain: shop.domain,
+          ianaTimezone: shop.ianaTimezone,
+        },
+        customerGid,
+        methodGid,
+        contracts: ourContracts,
+        methods,
+        topic,
+      });
+    } catch (err) {
+      console.error(
+        "[webhooks] new-method detection failed (mirror refresh unaffected)",
+        webhookId,
+        err,
       );
     }
   }
@@ -1632,12 +1848,19 @@ async function handlePaymentMethodUpsert({
  * Payload: `admin_graphql_api_id` (revoked payment method GID), `customer_id`.
  *
  * For every non-cancelled contract paying with the revoked method:
+ * - revocation reason MERGED (v1.28.0) → the card was REPLACED, not removed:
+ *   Shopify de-duplicated the new instrument into an existing method and
+ *   migrated the contract itself. Re-read the contract, mirror the
+ *   merged-into method (or just log when Shopify exposes nothing) and send
+ *   the closed-loop payment_method_updated notice when the card changed —
+ *   never the "your card was removed" prompt;
  * - backup method mirrored + `dunning.backupPaymentFallback` on → switch the
- *   Shopify contract to the backup via a contract-edit draft and promote the
- *   mirror (backup becomes primary);
+ *   Shopify contract to the backup via a contract-edit draft, promote the
+ *   mirror (backup becomes primary) and tell the customer we switched to
+ *   their backup card (payment_method_updated, backup_promoted variant);
  * - otherwise → payment_failed_1 notification ("Your card was removed") whose
  *   link bundle carries the one-tap update-card magic link.
- * Both paths log contract.payment_method_updated with `revoked: true`.
+ * Every path logs contract.payment_method_updated with `revoked: true`.
  */
 async function handlePaymentMethodRevoke({
   shopDomain,
@@ -1664,15 +1887,72 @@ async function handlePaymentMethodRevoke({
       status: { in: ["ACTIVE", "PAUSED", "FAILED"] },
     },
   });
+  // The portal's payment-methods memo must forget the removed card at once
+  // (a warm entry would still offer it as "Use for this subscription").
+  // Customer id: the payload's when present, else every matched contract's.
+  const revokedCustomerGid = toGid(
+    "Customer",
+    pick(payload, "admin_graphql_api_customer_id", "customer_id"),
+  );
+  for (const gid of new Set(
+    [revokedCustomerGid, ...contracts.map((c) => c.customerId)].filter(
+      (g): g is string => typeof g === "string" && g.length > 0,
+    ),
+  )) {
+    await invalidatePortalPaymentMethodsMemo(gid);
+  }
+  // Contracts whose BACKUP (not primary) is the revoked method keep pointing
+  // at a dead card otherwise (v1.28.0) — cleared regardless of whether any
+  // primary matched.
+  await clearRevokedBackupPointers(shop.id, methodGid);
   if (contracts.length === 0) return;
 
   const dunningSettings = await getSetting(shop.id, "dunning");
   const admin = await getAdmin(shopDomain);
 
+  // Revocation reason: the payload carries it when Shopify includes it;
+  // otherwise it is looked up ONCE per customer from the revoked method's
+  // `revokedReason` (listCustomerPaymentMethods shows revoked methods).
+  // Unknown → treated as a plain removal (the historical behavior).
+  const payloadReason = asString(
+    pick(payload, "revoked_reason", "revokedReason", "revocation_reason"),
+  );
+  const reasonByCustomer = new Map<string, string | null>();
+  const revokedReasonFor = async (customerId: string): Promise<string | null> => {
+    if (payloadReason) return payloadReason.toUpperCase();
+    if (reasonByCustomer.has(customerId)) {
+      return reasonByCustomer.get(customerId) ?? null;
+    }
+    let reason: string | null = null;
+    try {
+      const methods = await listCustomerPaymentMethods(admin, customerId);
+      reason = methods.find((m) => m.id === methodGid)?.revokedReason ?? null;
+    } catch (err) {
+      console.error(
+        "[webhooks] revoked-reason lookup failed",
+        customerId,
+        err,
+      );
+    }
+    reasonByCustomer.set(customerId, reason);
+    return reason ? reason.toUpperCase() : null;
+  };
+
   for (const contract of contracts) {
     const backupId = contract.backupPaymentMethodId;
 
-    if (backupId && dunningSettings.backupPaymentFallback) {
+    // ── MERGED: replaced, not removed (v1.28.0) ─────────────────────────────
+    if ((await revokedReasonFor(contract.customerId)) === "MERGED") {
+      await handleMergedPaymentMethod(shop, admin, contract, methodGid);
+      continue;
+    }
+
+    // Promotion needs a backup that is NOT the revoked method itself: while
+    // the dunning engine charges the backup both pointers are equal, so a
+    // revoke of that card must read as a plain removal (never a "switch"
+    // to the method just revoked). The revert to the case's original card,
+    // if any, stays the engine's business.
+    if (backupId && backupId !== methodGid && dunningSettings.backupPaymentFallback) {
       try {
         await withContractDraft(
           admin,
@@ -1687,6 +1967,7 @@ async function handlePaymentMethodRevoke({
           cardLast4: null as string | null,
           cardExpiryMonth: null as number | null,
           cardExpiryYear: null as number | null,
+          paymentInstrumentType: null as string | null,
         };
         try {
           const methods = await listCustomerPaymentMethods(
@@ -1700,6 +1981,7 @@ async function handlePaymentMethodRevoke({
               cardLast4: backup.instrument.lastDigits,
               cardExpiryMonth: backup.instrument.expiryMonth,
               cardExpiryYear: backup.instrument.expiryYear,
+              paymentInstrumentType: backup.instrument.type,
             };
           }
         } catch (err) {
@@ -1715,6 +1997,8 @@ async function handlePaymentMethodRevoke({
           data: {
             paymentMethodId: backupId,
             backupPaymentMethodId: null,
+            // Promoted to a live method — the revoked stamp does not apply.
+            paymentMethodRevokedAt: null,
             ...card,
           },
         });
@@ -1728,7 +2012,24 @@ async function handlePaymentMethodRevoke({
             usedBackup: true,
             revokedMethodId: methodGid,
             paymentMethodId: backupId,
+            card_updated_by: "system",
           },
+        });
+
+        // v1.28.0: the customer is told that renewals moved to the backup
+        // card (previously a silent one-way promotion). Contained + deduped.
+        await sendPaymentMethodUpdatedOnce({
+          locale: contract.locale,
+          tz: shop.ianaTimezone,
+          contract: {
+            ...contract,
+            ...card,
+            paymentMethodId: backupId,
+            paymentMethodRevokedAt: null,
+          },
+          reason: "backup_promoted",
+          previousCard: contract,
+          cardUpdatedBy: "system",
         });
         continue;
       } catch (err) {
@@ -1741,6 +2042,25 @@ async function handlePaymentMethodRevoke({
       }
     }
 
+    // Revoked-state mirror (migration 0027): the primary is gone and no
+    // backup took over. paymentMethodId keeps pointing at the revoked method
+    // and cardLast4 stays for copy ("Card ····4242 was removed"); the stamp
+    // is what the portal / card-update resolver read to render the
+    // "card removed" state instead of a dead update button. Idempotent on
+    // redelivery (first stamp wins).
+    try {
+      await prisma.subscriptionContract.updateMany({
+        where: { id: contract.id, paymentMethodRevokedAt: null },
+        data: { paymentMethodRevokedAt: new Date() },
+      });
+    } catch (err) {
+      console.error(
+        "[webhooks] paymentMethodRevokedAt stamp failed",
+        contract.id,
+        err,
+      );
+    }
+
     await logEvent({
       ...contractEventBase(shop.id, contract),
       type: "contract.payment_method_updated",
@@ -1749,6 +2069,7 @@ async function handlePaymentMethodRevoke({
         revoked: true,
         usedBackup: false,
         revokedMethodId: methodGid,
+        card_updated_by: "customer",
       },
     });
 
@@ -1763,6 +2084,222 @@ async function handlePaymentMethodRevoke({
         decline_code: "payment_method_revoked",
       },
     });
+  }
+}
+
+/**
+ * Contracts whose BACKUP payment method is the revoked one keep pointing at
+ * a dead card otherwise — the engine (or a later promotion) would try to
+ * switch to it. Clears the pointer (backupSetBy ENGINE) and logs
+ * contract.backup_payment_cleared per contract. Contained: never throws.
+ */
+async function clearRevokedBackupPointers(
+  shopId: string,
+  methodGid: string,
+): Promise<void> {
+  try {
+    const staleBackups = await prisma.subscriptionContract.findMany({
+      where: {
+        shopId,
+        backupPaymentMethodId: methodGid,
+        paymentMethodId: { not: methodGid },
+      },
+      select: {
+        id: true,
+        customerId: true,
+        email: true,
+        paymentMethodId: true,
+        backupPaymentMethodId: true,
+      },
+    });
+    for (const stale of staleBackups) {
+      // Re-check in memory (the row may have moved between query and write).
+      if (
+        stale.backupPaymentMethodId !== methodGid ||
+        stale.paymentMethodId === methodGid
+      ) {
+        continue;
+      }
+      const now = new Date();
+      await prisma.subscriptionContract.updateMany({
+        where: { id: stale.id, backupPaymentMethodId: methodGid },
+        data: {
+          backupPaymentMethodId: null,
+          backupSetBy: "ENGINE",
+          backupSetAt: now,
+        },
+      });
+      await logEvent({
+        shopId,
+        contractId: stale.id,
+        customerId: stale.customerId,
+        email: stale.email,
+        type: "contract.backup_payment_cleared",
+        source: "WEBHOOK",
+        actor: "system",
+        payload: {
+          setBy: "ENGINE",
+          reason: "backup_method_revoked",
+          previousBackupPaymentMethodId: methodGid,
+        },
+      });
+    }
+  } catch (err) {
+    console.error(
+      "[webhooks] revoked backup pointer cleanup failed",
+      methodGid,
+      err,
+    );
+  }
+}
+
+/**
+ * MERGED revocation (v1.28.0): Shopify replaced the revoked method with an
+ * existing one and migrated the contract to it. Re-read the contract from
+ * Shopify (authoritative — golden rule 8) and mirror the merged-into method;
+ * when nothing usable comes back, just log. Sends the closed-loop
+ * payment_method_updated notice only when the mirrored card really changed
+ * (deduped per {contract,last4}/24h by the helper) — never payment_failed_1:
+ * nothing failed and nothing is missing. Contained end to end.
+ */
+async function handleMergedPaymentMethod(
+  shop: { id: string; ianaTimezone: string },
+  admin: AdminClient,
+  contract: SubscriptionContract,
+  revokedMethodId: string,
+): Promise<void> {
+  let mergedInto: {
+    id: string;
+    revokedAt: Date | null;
+    instrument: {
+      type: string;
+      brand: string | null;
+      lastDigits: string | null;
+      expiryMonth: number | null;
+      expiryYear: number | null;
+    } | null;
+  } | null = null;
+  try {
+    const remote = await getContract(admin, contract.shopifyContractId);
+    mergedInto = remote?.customerPaymentMethod ?? null;
+  } catch (err) {
+    console.error(
+      "[webhooks] MERGED revoke: contract re-read failed",
+      contract.id,
+      err,
+    );
+  }
+
+  const usable =
+    mergedInto != null &&
+    mergedInto.id !== revokedMethodId &&
+    mergedInto.revokedAt == null;
+  let changed = false;
+  let card = {
+    cardBrand: contract.cardBrand,
+    cardLast4: contract.cardLast4,
+    cardExpiryMonth: contract.cardExpiryMonth,
+    cardExpiryYear: contract.cardExpiryYear,
+    paymentInstrumentType: contract.paymentInstrumentType,
+  };
+  if (usable && mergedInto) {
+    const inst = mergedInto.instrument;
+    card = {
+      cardBrand: inst?.brand ?? null,
+      cardLast4: inst?.lastDigits ?? null,
+      cardExpiryMonth: inst?.expiryMonth ?? null,
+      cardExpiryYear: inst?.expiryYear ?? null,
+      paymentInstrumentType: inst?.type ?? null,
+    };
+    changed =
+      card.cardBrand !== contract.cardBrand ||
+      card.cardLast4 !== contract.cardLast4 ||
+      card.cardExpiryMonth !== contract.cardExpiryMonth ||
+      card.cardExpiryYear !== contract.cardExpiryYear;
+    try {
+      await prisma.subscriptionContract.update({
+        where: { id: contract.id },
+        data: {
+          paymentMethodId: mergedInto.id,
+          paymentMethodRevokedAt: null,
+          ...card,
+        },
+      });
+    } catch (err) {
+      console.error(
+        "[webhooks] MERGED revoke: mirror refresh failed",
+        contract.id,
+        err,
+      );
+    }
+  }
+
+  await logEvent({
+    ...contractEventBase(shop.id, contract),
+    type: "contract.payment_method_updated",
+    source: "WEBHOOK",
+    payload: {
+      revoked: true,
+      merged: true,
+      usedBackup: false,
+      revokedMethodId,
+      paymentMethodId: usable && mergedInto ? mergedInto.id : null,
+      mirrorRefreshed: usable,
+      brand: card.cardBrand,
+      last4: card.cardLast4,
+      card_updated_by: "customer",
+    },
+  });
+
+  let openCase: { id: string } | null = null;
+  try {
+    openCase = await prisma.dunningCase.findFirst({
+      where: { contractId: contract.id, resolvedAt: null },
+      select: { id: true },
+    });
+  } catch (err) {
+    console.error("[webhooks] MERGED revoke: open-case lookup failed", contract.id, err);
+  }
+
+  if (usable && mergedInto && changed) {
+    await sendPaymentMethodUpdatedOnce({
+      locale: contract.locale,
+      tz: shop.ianaTimezone,
+      contract: {
+        ...contract,
+        ...card,
+        paymentMethodId: mergedInto.id,
+        paymentMethodRevokedAt: null,
+      },
+      reason: "updated",
+      previousCard: contract,
+      cardUpdatedBy: "customer",
+      hasOpenCase: openCase != null,
+    });
+  }
+
+  // The card replacement IS the fix moment for a case waiting on the customer
+  // (or a FAILED contract): poke the engine exactly like the upsert path so
+  // the retry runs now instead of the case sleeping until its timeout while
+  // the notice above says everything is set. Same gate as the upsert handler.
+  if (usable && mergedInto && (openCase || contract.status === "FAILED")) {
+    await callOptionalHook(
+      () => import("~/lib/dunning/engine.server"),
+      "onPaymentMethodUpdated",
+      [
+        contract.id,
+        {
+          previous: {
+            paymentMethodId: revokedMethodId,
+            cardLast4: contract.cardLast4,
+            cardExpiryMonth: contract.cardExpiryMonth,
+            cardExpiryYear: contract.cardExpiryYear,
+            cardBrand: contract.cardBrand,
+          },
+        },
+      ],
+      "dunning.onPaymentMethodUpdated",
+    );
   }
 }
 
@@ -3274,9 +3811,17 @@ async function handleOrdersFulfilled({
   const orderGid = toGid("Order", pick(payload, "admin_graphql_api_id", "id"));
   if (!orderGid) return;
 
-  const fulfillment = asArray(payload.fulfillments)
+  // Shopify keeps CANCELLED fulfillments in `fulfillments`: the one that
+  // counts is the first with status "success" (a re-created shipment after a
+  // wrong-carrier cancel). Payloads without a status field (older shapes,
+  // tests) fall back to the first element.
+  const fulfillmentsAll = asArray(payload.fulfillments)
     .map(asRecord)
-    .find((f): f is Payload => f != null);
+    .filter((f): f is Payload => f != null);
+  const anyStatus = fulfillmentsAll.some((f) => asString(f.status) != null);
+  const fulfillment = anyStatus
+    ? fulfillmentsAll.find((f) => asString(f.status) === "success")
+    : fulfillmentsAll[0];
   const trackingNumber = fulfillment
     ? (asString(fulfillment.tracking_number) ??
       asString(asArray(fulfillment.tracking_numbers)[0]))
@@ -3341,6 +3886,25 @@ async function handleOrdersFulfilled({
       cycleIndex: attempt.cycleIndex,
       orderName: attempt.orderName ?? asString(payload.name),
     });
+    // Customer-facing delivery mirror (v1.28.0, P4.2): tracking + ship
+    // instant + the Shopify order-status page (the receipt). Contained and
+    // idempotent — see fulfillment-tracking.server.ts; the notification path
+    // below is unchanged whatever happens here.
+    await applyDeliveryTrackingContained({
+      shopId: shop.id,
+      orderGid,
+      source: "orders/fulfilled",
+      orderName: asString(payload.name),
+      orderStatusUrl: asString(payload.order_status_url),
+      tracking: fulfillment
+        ? { url: trackingUrl, company: trackingCompany, number: trackingNumber }
+        : null,
+      shippedAt: fulfillment ? fulfilledAt : null,
+      deliveredAt:
+        fulfillment && asString(fulfillment.shipment_status) === "delivered"
+          ? (parseWebhookDate(fulfillment.updated_at) ?? new Date())
+          : null,
+    });
 
     if (
       await hasSentForCycle(attempt.contractId, "order_shipped", attempt.cycleIndex)
@@ -3376,6 +3940,102 @@ async function handleOrdersFulfilled({
   await logFulfilledOnce(contract, {
     origin: true,
     orderName: asString(payload.name),
+  });
+}
+
+/**
+ * FULFILLMENTS_CREATE / FULFILLMENTS_UPDATE (v1.28.0, P4.2)
+ * Payload: fulfillment (REST-shaped) — `id`, `order_id`, `status`
+ * (pending | open | success | cancelled | error | failure), `created_at`,
+ * `updated_at`, `tracking_company`, `tracking_number(s)`, `tracking_url(s)`,
+ * `shipment_status` (… in_transit | out_for_delivery | delivered | failure).
+ *
+ * The delivery mirror's UPDATE channel: the tracking number a 3PL adds after
+ * the fulfillment was created only ever arrives on fulfillments/update, and
+ * shipment_status "delivered" is the delivered milestone for carriers whose
+ * status feed lands on the fulfillment itself. Only successful fulfillments
+ * count as shipped; a pending/open one writes nothing yet, and a
+ * cancelled/error/failure one UN-SHIPS the mirror when the stored tracking
+ * is that fulfillment's (the order is not on its way any more — a dead
+ * "Track parcel" link and a stale "Shipped" would otherwise stay until the
+ * merchant re-fulfils). Renewal orders only (matched via
+ * BillingAttempt.orderId inside the mirror); origin orders belong to
+ * Shopify's own order page. Contained + idempotent by construction
+ * (fulfillment-tracking.server.ts).
+ */
+function makeFulfillmentHandler(
+  topic: "fulfillments/create" | "fulfillments/update",
+): WebhookHandler {
+  return async ({ shopDomain, payload }) => {
+    const shop = await requireShop(shopDomain);
+    const orderGid = toGid("Order", pick(payload, "order_id"));
+    if (!orderGid) return;
+    const status = asString(payload.status);
+
+    const trackingNumber =
+      asString(payload.tracking_number) ??
+      asString(asArray(payload.tracking_numbers)[0]);
+    const trackingUrl =
+      asString(payload.tracking_url) ??
+      asString(asArray(payload.tracking_urls)[0]);
+    const trackingCompany = asString(payload.tracking_company);
+    const delivered = asString(payload.shipment_status) === "delivered";
+
+    if (status === "cancelled" || status === "error" || status === "failure") {
+      await applyDeliveryTrackingContained({
+        shopId: shop.id,
+        orderGid,
+        source: topic,
+        cancelledTracking: {
+          url: trackingUrl,
+          number: trackingNumber,
+          createdAt: parseWebhookDate(payload.created_at),
+        },
+      });
+      return;
+    }
+    if (status && status !== "success") return;
+
+    await applyDeliveryTrackingContained({
+      shopId: shop.id,
+      orderGid,
+      source: topic,
+      tracking: { url: trackingUrl, company: trackingCompany, number: trackingNumber },
+      shippedAt: parseWebhookDate(payload.created_at) ?? new Date(),
+      deliveredAt: delivered
+        ? (parseWebhookDate(payload.updated_at) ?? new Date())
+        : null,
+    });
+  };
+}
+
+/**
+ * FULFILLMENT_EVENTS_CREATE (v1.28.0, P4.2)
+ * Payload: fulfillment event (REST-shaped) — `id`, `fulfillment_id`,
+ * `order_id`, `status` (label_printed | label_purchased | attempted_delivery |
+ * ready_for_pickup | confirmed | in_transit | out_for_delivery | delivered |
+ * failure), `happened_at`.
+ *
+ * Only "delivered" is a milestone the portal shows; the ship instant comes
+ * from the fulfillment itself, and intermediate scan events carry nothing the
+ * customer cannot see on the carrier's page (the trackingUrl we already hold).
+ */
+async function handleFulfillmentEventsCreate({
+  shopDomain,
+  payload,
+}: WebhookHandlerContext): Promise<void> {
+  if (asString(payload.status) !== "delivered") return;
+  const shop = await requireShop(shopDomain);
+  const orderGid = toGid("Order", pick(payload, "order_id"));
+  if (!orderGid) return;
+  await applyDeliveryTrackingContained({
+    shopId: shop.id,
+    orderGid,
+    source: "fulfillment_events/create",
+    deliveredAt:
+      parseWebhookDate(payload.happened_at) ??
+      parseWebhookDate(payload.created_at) ??
+      new Date(),
   });
 }
 
@@ -3787,6 +4447,11 @@ async function handleCustomersDataRequest({
  * - GDPR_DATA_REQUEST alerts for the identity: message and context stored
  *   the customer's email and order list as operator guidance — rewritten to
  *   the redacted identity (the dataRequestId survives as the audit key).
+ * - v1.28.0 customer-authored free text: `deliveryInstructions` nulled,
+ *   `support.requested` event payloads lose message/cancelReasonDetail/
+ *   orderRef, SUPPORT_REQUEST alerts (name + email + excerpt in message,
+ *   cancelReasonDetail in context) rewritten to a neutral stub keyed by the
+ *   contract. Structural facts survive (topic, saveRequest, cancelSessionId).
  * BillingAttempt / DunningCase / revenue counters — including the origin
  * order money mirror (originOrder*Cents) — are retained (legitimate
  * financial records). Raises an INFO alert and logs admin.action.
@@ -3854,6 +4519,10 @@ async function handleCustomersRedact({
         lastName: null,
         phone: null,
         deliveryAddress: Prisma.JsonNull,
+        // v1.28.0 (migration 0028): customer-entered delivery note — free
+        // text ("leave with neighbour Mrs X, gate code …") is PII.
+        // MANDATORY: any new customer-authored column must be added here.
+        deliveryInstructions: null,
         // Acquisition data foundation (migration 0006): behavioral profile
         // data dies with the identity — every acq* column and the raw bundle.
         // MANDATORY: any new acq* column must be added here.
@@ -3927,6 +4596,32 @@ async function handleCustomersRedact({
         payload: { action: "acquisition_captured", redacted: true },
       },
     });
+  }
+  // v1.28.0 support requests (Get-help form + concierge save): the
+  // `support.requested` event payload keeps the customer's own words
+  // (`message`, up to MESSAGE_EVENT_MAX chars) and their cancel-survey free
+  // text (`cancelReasonDetail`), and the admin subscriber page renders both
+  // from this row. Free text authored by the person dies with the identity;
+  // the structural facts (topic / surface / pushBack / saveRequest /
+  // cancelReason / cancelSessionId) survive so the SLA job and the timeline
+  // still work. Per-row rewrite (Prisma cannot merge JSON in updateMany).
+  // MANDATORY: any new event type that stores customer-authored free text
+  // must be scrubbed here.
+  if (eventFilters.length > 0) {
+    const supportEvents = await prisma.subscriberEvent.findMany({
+      where: { shopId: shop.id, type: "support.requested", OR: eventFilters },
+      select: { id: true, payload: true },
+    });
+    for (const event of supportEvents) {
+      const p = (event.payload ?? {}) as Record<string, unknown>;
+      const { message: _m, cancelReasonDetail: _d, orderRef: _o, ...rest } = p;
+      await prisma.subscriberEvent.update({
+        where: { id: event.id },
+        data: {
+          payload: { ...rest, message: "", orderRef: null, redacted: true } as object,
+        },
+      });
+    }
   }
   // Identity rewrite — LAST, after every filter that matches on the original
   // identity has run. The order-keyed filters ride along: an event row keyed
@@ -4040,6 +4735,39 @@ async function handleCustomersRedact({
     }
   }
 
+  // v1.28.0 SUPPORT_REQUEST alerts embed the customer's full name, email, a
+  // message excerpt and the cancel-survey free text in message/context (the
+  // operator's inbox line). Their context carries only contractId (no
+  // customerId/email), so they are matched by the contracts we anonymised.
+  // The message becomes a neutral stub; the operational context keys the
+  // SLA job / admin queue read (contractId, saveRequest, cancelSessionId,
+  // cancelReason, topic, surface, subscriberUrl…) survive; only
+  // cancelReasonDetail (free text) is dropped. SUPPORT_SLA_BREACH rows carry
+  // no direct PII (contractId + reason code) and are left as they are.
+  if (contractIds.length > 0) {
+    const supportAlerts = await prisma.alert.findMany({
+      where: {
+        shopId: shop.id,
+        type: "SUPPORT_REQUEST",
+        OR: contractIds.map((contractId) => ({
+          context: { path: ["contractId"], equals: contractId },
+        })),
+      },
+      select: { id: true, context: true },
+    });
+    for (const alert of supportAlerts) {
+      const context = (alert.context ?? {}) as Record<string, unknown>;
+      const { cancelReasonDetail: _detail, ...rest } = context;
+      await prisma.alert.update({
+        where: { id: alert.id },
+        data: {
+          message: `Support request (redacted) — identity erased per customers/redact; see the subscriber page ${typeof rest.subscriberUrl === "string" ? rest.subscriberUrl : ""}`.trim(),
+          context: { ...rest, redacted: true } as object,
+        },
+      });
+    }
+  }
+
   await prisma.alert.create({
     data: {
       shopId: shop.id,
@@ -4107,11 +4835,14 @@ export const webhookHandlers: Record<string, WebhookHandler> = {
   SUBSCRIPTION_BILLING_CYCLE_EDITS_CREATE: makeBillingCycleEditHandler("CREATE"),
   SUBSCRIPTION_BILLING_CYCLE_EDITS_UPDATE: makeBillingCycleEditHandler("UPDATE"),
   SUBSCRIPTION_BILLING_CYCLE_EDITS_DELETE: makeBillingCycleEditHandler("DELETE"),
-  CUSTOMER_PAYMENT_METHODS_CREATE: handlePaymentMethodUpsert,
-  CUSTOMER_PAYMENT_METHODS_UPDATE: handlePaymentMethodUpsert,
+  CUSTOMER_PAYMENT_METHODS_CREATE: (ctx) => handlePaymentMethodUpsert(ctx, "CREATE"),
+  CUSTOMER_PAYMENT_METHODS_UPDATE: (ctx) => handlePaymentMethodUpsert(ctx, "UPDATE"),
   CUSTOMER_PAYMENT_METHODS_REVOKE: handlePaymentMethodRevoke,
   ORDERS_CREATE: handleOrdersCreate,
   ORDERS_FULFILLED: handleOrdersFulfilled,
+  FULFILLMENTS_CREATE: makeFulfillmentHandler("fulfillments/create"),
+  FULFILLMENTS_UPDATE: makeFulfillmentHandler("fulfillments/update"),
+  FULFILLMENT_EVENTS_CREATE: handleFulfillmentEventsCreate,
   ORDERS_CANCELLED: handleOrdersCancelled,
   REFUNDS_CREATE: handleRefundsCreate,
   SHOP_UPDATE: handleShopUpdate,

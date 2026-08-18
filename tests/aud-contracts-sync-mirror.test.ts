@@ -471,6 +471,80 @@ describe("card metadata lifecycle", () => {
     const data = updateData();
     expect(data.paymentMethodId).toBe("gid://shopify/CustomerPaymentMethod/9");
     expect(Object.keys(data)).not.toContain("cardBrand");
+    // A live method (revokedAt null) clears the revoked stamp even without
+    // instrument details (v1.28.0, migration 0027).
+    expect(data.paymentMethodRevokedAt).toBeNull();
+  });
+
+  it("mirrors the instrument type with the card columns and clears the revoked stamp on a live method (v1.28.0)", async () => {
+    mocks.contractFindUnique.mockResolvedValue(
+      localRow({ paymentMethodRevokedAt: new Date("2026-08-01T00:00:00Z") }),
+    );
+    mocks.getContract.mockResolvedValue(
+      shopifyContract({
+        customerPaymentMethod: {
+          id: "gid://shopify/CustomerPaymentMethod/9",
+          revokedAt: null,
+          instrument: {
+            type: "SHOP_PAY",
+            brand: "Shop Pay",
+            lastDigits: "8888",
+            expiryMonth: 1,
+            expiryYear: 2030,
+            expiresSoon: false,
+          },
+        },
+      }),
+    );
+
+    await syncContractFromShopify("cellexia.myshopify.com", CONTRACT_GID);
+
+    expect(updateData()).toMatchObject({
+      paymentMethodId: "gid://shopify/CustomerPaymentMethod/9",
+      cardBrand: "Shop Pay",
+      cardLast4: "8888",
+      paymentInstrumentType: "SHOP_PAY",
+      paymentMethodRevokedAt: null,
+    });
+  });
+
+  it("a method Shopify reports as revoked keeps the revoked stamp; a missing method clears the type with the card columns", async () => {
+    const revokedAt = new Date("2026-08-03T10:00:00Z");
+    mocks.contractFindUnique.mockResolvedValue(localRow());
+    mocks.getContract.mockResolvedValue(
+      shopifyContract({
+        customerPaymentMethod: {
+          id: "gid://shopify/CustomerPaymentMethod/9",
+          revokedAt,
+          instrument: {
+            type: "CREDIT_CARD",
+            brand: "Visa",
+            lastDigits: "4242",
+            expiryMonth: 4,
+            expiryYear: 2027,
+            expiresSoon: false,
+          },
+        },
+      }),
+    );
+    await syncContractFromShopify("cellexia.myshopify.com", CONTRACT_GID);
+    expect(updateData()).toMatchObject({
+      paymentInstrumentType: "CREDIT_CARD",
+      paymentMethodRevokedAt: revokedAt,
+    });
+
+    mocks.contractUpdate.mockClear();
+    mocks.contractFindUnique.mockResolvedValue(
+      localRow({ paymentInstrumentType: "CREDIT_CARD" }),
+    );
+    mocks.getContract.mockResolvedValue(
+      shopifyContract({ customerPaymentMethod: null }),
+    );
+    await syncContractFromShopify("cellexia.myshopify.com", CONTRACT_GID);
+    const data = updateData();
+    expect(data.paymentInstrumentType).toBeNull();
+    // Absent method: the revoke webhook's stamp is left as it is.
+    expect(Object.keys(data)).not.toContain("paymentMethodRevokedAt");
   });
 });
 

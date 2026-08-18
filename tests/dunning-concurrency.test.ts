@@ -367,10 +367,9 @@ describe("migration 0008 matches the engine's open-state list", () => {
     .split("\n")
     .filter((line) => !line.trimStart().startsWith("--"))
     .join("\n");
+  // The list lives in states.ts since v1.28.0 (engine re-exports it).
   const engine = readFileSync(
-    fileURLToPath(
-      new URL("../app/lib/dunning/engine.server.ts", import.meta.url),
-    ),
+    fileURLToPath(new URL("../app/lib/dunning/states.ts", import.meta.url)),
     "utf8",
   );
 

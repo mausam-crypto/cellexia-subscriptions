@@ -9,10 +9,13 @@ import {
 } from "~/lib/cancel/config.server";
 import {
   acceptSave,
+  completeCancel,
   getActiveSession,
+  keepScheduledCancel,
   startCancelSession,
 } from "~/lib/cancel/engine.server";
 import { buildRetentionSummary } from "~/lib/cancel/summary.server";
+import { pauseExtendChoices } from "~/lib/portal/flex.server";
 import { pageIntro } from "~/lib/cancel/pages.server";
 import {
   csrfOk,
@@ -52,6 +55,9 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     );
 
   if (contract.status === "CANCELLED") return redirect(to("done"));
+  // A scheduled cancellation already stands (v1.28.0, P3.8): the honest page
+  // is "cancels on {date} · keep my subscription", not a second flow.
+  if (contract.cancelScheduledAt) return redirect(to("scheduled"));
 
   const cancelFlow = await getSetting(shop.id, "cancelFlow");
   if (!cancelFlow.enabled) {
@@ -69,12 +75,39 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     }
   }
 
-  const [summary, pauseSettings] = await Promise.all([
+  const [summary, pauseSettings, portalSettings] = await Promise.all([
     buildRetentionSummary(shop, contract),
     getSetting(shop.id, "pause"),
+    getSetting(shop.id, "portal"),
   ]);
 
+  // Already PAUSED (v1.28.0 review fix): the one-tap pause would be a no-op
+  // recorded as a save (acceptSave refuses it) — offer the exit ramp (extend
+  // the hold) instead. A hold WITHOUT a resume day (paused from the Shopify
+  // admin / synced externally / legacy) gets the note only: no pause CTA,
+  // never a dead primary button.
+  const paused =
+    contract.status === "PAUSED"
+      ? {
+          resumeAt: contract.resumeAt ?? null,
+          choices: contract.resumeAt
+            ? pauseExtendChoices({
+                resumeAt: contract.resumeAt,
+                pausedAt: contract.pausedAt,
+                weeks: (portalSettings as { pauseExtendChoicesWeeks?: unknown[] })
+                  .pauseExtendChoicesWeeks,
+                maxMonths: pauseSettings.maxMonths,
+                tz: shop.ianaTimezone,
+              })
+            : [],
+        }
+      : null;
+
   return renderCancelPage(ctx, pageIntro({
+    paused,
+    // Plan lock window (P3.8): no one-tap pause (a reduction); the flow
+    // schedules the cancellation for the unlock day instead.
+    locked: ctx.lock.locked && ctx.lock.until ? { until: ctx.lock.until } : null,
     locale,
     csrf: ctx.portalSession.csrfToken,
     contractId: contract.id,
@@ -108,11 +141,55 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   // Preview sessions: navigation works, mutations never execute — the one-tap
   // pause bounces back with the preview toast instead of calling the engine.
   if (ctx.portalSession.isPreview) {
-    if (intent === "pause") {
+    if (
+      intent === "pause" ||
+      intent === "extend_pause" ||
+      intent === "keep_scheduled" ||
+      intent === "cancel_now"
+    ) {
       const base = to();
       const sep = base.includes("?") ? "&" : "?";
       return redirect(`${base}${sep}toast=preview_blocked`);
     }
+    return redirect(to("reason"));
+  }
+
+  if (intent === "keep_scheduled") {
+    // "Keep my subscription" on a scheduled cancel (P3.8): clears the
+    // schedule atomically; the scheduled page then reads "you're staying".
+    try {
+      await keepScheduledCancel(contract.id, {
+        source: "CUSTOMER_PORTAL",
+        actor: "customer",
+      });
+    } catch (err) {
+      console.error("[cancel] keep scheduled cancel failed", contract.id, err);
+      return redirect(to("scheduled", true));
+    }
+    return redirect(to("scheduled"));
+  }
+
+  if (intent === "cancel_now") {
+    // "Cancel now instead" on the scheduled page (P3.8): only when the lock
+    // has lifted since scheduling — the customer already asked to end the
+    // subscription; making them keep-then-re-enter would be a dark pattern.
+    // Still locked (stale page) → the schedule stands untouched.
+    if (!contract.cancelScheduledAt || ctx.lock.locked) return redirect(to("scheduled"));
+    try {
+      const session =
+        (await getActiveSession(contract.id)) ??
+        (await startCancelSession(contract.id, "PORTAL"));
+      await completeCancel(session.id, "customer");
+      return redirect(to("done"));
+    } catch (err) {
+      console.error("[cancel] cancel_now failed", contract.id, err);
+      return redirect(to("scheduled", true));
+    }
+  }
+
+  // Inside the plan lock window (P3.8) the one-tap pause is not offered and
+  // acceptSave refuses it — nothing to execute; on to the survey.
+  if (ctx.lock.locked && (intent === "pause" || intent === "extend_pause")) {
     return redirect(to("reason"));
   }
 
@@ -130,6 +207,23 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       return redirect(to("saved"));
     } catch (err) {
       console.error("[cancel] one-tap pause failed", contract.id, err);
+      return redirect(to(undefined, true));
+    }
+  }
+
+  if (intent === "extend_pause") {
+    // Pause exit ramp for an already-PAUSED contract: acceptSave refuses on
+    // any other status and requires the weeks to be an offered choice.
+    const session =
+      (await getActiveSession(contract.id)) ??
+      (await startCancelSession(contract.id, "PORTAL"));
+    const weeksRaw = Number(form.get("weeks"));
+    if (!Number.isInteger(weeksRaw) || weeksRaw < 1) return redirect(to(undefined, true));
+    try {
+      await acceptSave(session.id, "EXTEND_PAUSE", { weeks: weeksRaw });
+      return redirect(to("saved"));
+    } catch (err) {
+      console.error("[cancel] one-tap extend-pause failed", contract.id, err);
       return redirect(to(undefined, true));
     }
   }

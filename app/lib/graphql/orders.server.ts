@@ -30,6 +30,7 @@ const ORDER_SUMMARY_QUERY = `#graphql
       processedAt
       displayFinancialStatus
       displayFulfillmentStatus
+      statusPageUrl
       currentTotalPriceSet {
         shopMoney {
           amount
@@ -69,6 +70,15 @@ const ORDER_SUMMARY_QUERY = `#graphql
       customer {
         id
         email
+      }
+      fulfillments(first: 10) {
+        status
+        createdAt
+        trackingInfo(first: 1) {
+          url
+          company
+          number
+        }
       }
     }
   }
@@ -164,6 +174,7 @@ interface OrderSummaryResponse {
     processedAt?: string | null;
     displayFinancialStatus?: string | null;
     displayFulfillmentStatus?: string | null;
+    statusPageUrl?: string | null;
     currentTotalPriceSet?: RawMoneyBag | null;
     currentSubtotalPriceSet?: RawMoneyBag | null;
     currentTotalDiscountsSet?: RawMoneyBag | null;
@@ -171,6 +182,15 @@ interface OrderSummaryResponse {
     totalShippingPriceSet?: RawMoneyBag | null;
     totalRefundedSet?: RawMoneyBag | null;
     customer?: { id?: string | null; email?: string | null } | null;
+    fulfillments?: Array<{
+      status?: string | null;
+      createdAt?: string | null;
+      trackingInfo?: Array<{
+        url?: string | null;
+        company?: string | null;
+        number?: string | null;
+      }> | null;
+    }> | null;
   } | null;
 }
 
@@ -220,6 +240,13 @@ export interface OrderSummary {
   financialStatus: string | null;
   fulfillmentStatus: string | null;
   /**
+   * Shopify's order-status page (tracking + receipt) — mirrored onto
+   * BillingAttempt.orderStatusUrl at settlement so the portal's deliveries
+   * list can link it without an Admin API read (v1.28.0, P4.2). Null when
+   * the API omits it.
+   */
+  statusPageUrl: string | null;
+  /**
    * Null when Shopify omits the money set — callers must fall back to their
    * own context (the contract's currencyCode), never to a hardcoded currency:
    * inventing e.g. "GBP" on a CHF shop would slip the amount past every
@@ -234,6 +261,24 @@ export interface OrderSummary {
   refundedCents: number;
   customerId: string | null;
   customerEmail: string | null;
+  /**
+   * The order's fulfillments at fetch time (v1.28.0, P4.2). Lets the
+   * settlement feed the delivery mirror for an order that was ALREADY
+   * fulfilled when the success webhook settled (auto-fulfilment apps,
+   * digital lines, a redriven settlement) — those orders' fulfillment
+   * webhooks arrived before BillingAttempt.orderId existed and matched
+   * nothing. Empty when the API omits the connection.
+   */
+  fulfillments: OrderFulfillmentSummary[];
+}
+
+export interface OrderFulfillmentSummary {
+  /** SUCCESS | CANCELLED | ERROR | FAILURE | OPEN | PENDING (upper-case). */
+  status: string | null;
+  createdAt: Date | null;
+  trackingUrl: string | null;
+  trackingCompany: string | null;
+  trackingNumber: string | null;
 }
 
 /**
@@ -271,6 +316,7 @@ export async function getOrderSummary(
     processedAt: dateOrNull(order.processedAt),
     financialStatus: order.displayFinancialStatus ?? null,
     fulfillmentStatus: order.displayFulfillmentStatus ?? null,
+    statusPageUrl: order.statusPageUrl ?? null,
     currencyCode: order.currentTotalPriceSet?.shopMoney?.currencyCode ?? null,
     totalCents: centsFromMoneyOrZero(order.currentTotalPriceSet?.shopMoney),
     subtotalCents: centsFromMoneyOrZero(order.currentSubtotalPriceSet?.shopMoney),
@@ -280,6 +326,13 @@ export async function getOrderSummary(
     refundedCents: centsFromMoneyOrZero(order.totalRefundedSet?.shopMoney),
     customerId: order.customer?.id ?? null,
     customerEmail: order.customer?.email ?? null,
+    fulfillments: (order.fulfillments ?? []).map((f) => ({
+      status: f.status ?? null,
+      createdAt: dateOrNull(f.createdAt),
+      trackingUrl: f.trackingInfo?.[0]?.url ?? null,
+      trackingCompany: f.trackingInfo?.[0]?.company ?? null,
+      trackingNumber: f.trackingInfo?.[0]?.number ?? null,
+    })),
   };
 }
 

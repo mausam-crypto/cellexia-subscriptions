@@ -41,6 +41,10 @@ import {
 } from "~/lib/analytics/predicted-ltgp.server";
 import { sanitizeSurveyAnswers } from "~/lib/survey/shared";
 import {
+  recentSupportRequests,
+  supportTopicLabelEn,
+} from "~/lib/support/request.server";
+import {
   approxWeeks,
   contractFrequency,
   frequencyLabelEn,
@@ -63,10 +67,12 @@ import {
   cancelContract,
   changeFrequency,
   changeLineQuantity,
+  changePaymentMethod,
   ongoingDiscountPctForProduct,
   pauseContract,
   removeLine,
   resumeContract,
+  setBackupPaymentMethod,
   setLinePrice,
   setNextBillingDate,
   skipNextCycle,
@@ -77,12 +83,12 @@ import {
 import {
   createBillingAttempt,
   getBillingCycleByDate,
-  getPaymentMethodUpdateUrl,
   listCustomerPaymentMethods,
   refundOrderAmount,
   searchProducts,
   sendPaymentMethodUpdateEmail,
 } from "~/lib/graphql/index.server";
+import { resolveCardUpdatePath } from "~/lib/payments/cardUpdate.server";
 import {
   OWNERSHIP_FOREIGN,
   OWNERSHIP_OURS,
@@ -204,6 +210,41 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
 
   const events = await contractTimeline(contract.id, 200);
 
+  // Support requests (v1.28.0, P5.1): the newest Get-help submits, read off
+  // the event log (support.requested). Contained.
+  const supportRequests = await recentSupportRequests(contract.id, 5);
+
+  // Win-back episode (v1.28.0, P3.4): read-only view of the WinbackState —
+  // stage, next touch, and the cancel reason the episode was stamped with
+  // (migration 0028 `reason`). Contained: null renders "no episode".
+  let winback: {
+    status: string;
+    stage: number;
+    reason: string | null;
+    nextTouchAt: string | null;
+    predictedEmptyDate: string;
+    cancelledAt: string;
+    wonBackAt: string | null;
+  } | null = null;
+  try {
+    const state = await prisma.winbackState.findUnique({
+      where: { contractId: contract.id },
+    });
+    if (state) {
+      winback = {
+        status: state.status,
+        stage: state.stage,
+        reason: state.reason ?? null,
+        nextTouchAt: state.nextTouchAt?.toISOString() ?? null,
+        predictedEmptyDate: state.predictedEmptyDate.toISOString(),
+        cancelledAt: state.cancelledAt.toISOString(),
+        wonBackAt: state.wonBackAt?.toISOString() ?? null,
+      };
+    }
+  } catch (err) {
+    console.error("[admin] winback state read failed", contract.id, err);
+  }
+
   // Post-purchase survey (v1.21.0): one row per contract when the thank-you
   // page survey was shown for its origin order. Read-only surface here.
   const surveyRow = await prisma.surveyResponse.findFirst({
@@ -252,12 +293,21 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       resumeAt: contract.resumeAt?.toISOString() ?? null,
       cancelledAt: contract.cancelledAt?.toISOString() ?? null,
       cancelReason: contract.cancelReason,
+      // Scheduled cancel (v1.28.0, P3.8): the customer chose the end day.
+      cancelScheduledAt: contract.cancelScheduledAt?.toISOString() ?? null,
       ordersCount: contract.ordersCount,
       skipCount: contract.skipCount,
       lifetimeRevenue: formatMoney(contract.lifetimeRevenueCents, currency),
       currencyCode: currency,
       paymentMethodId: contract.paymentMethodId,
       backupPaymentMethodId: contract.backupPaymentMethodId,
+      // Backup provenance (migration 0027): admin Select and the customer
+      // toggle write the same column; this says who did it last.
+      backupSetBy: contract.backupSetBy,
+      backupSetAt: contract.backupSetAt?.toISOString() ?? null,
+      paymentInstrumentType: contract.paymentInstrumentType,
+      paymentMethodRevokedAt:
+        contract.paymentMethodRevokedAt?.toISOString() ?? null,
       cardBrand: contract.cardBrand,
       cardLast4: contract.cardLast4,
       cardExpiry:
@@ -300,6 +350,19 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
             )
           : null,
     },
+    winback,
+    supportRequests: supportRequests.map((r) => ({
+      id: r.id,
+      createdAt: r.createdAt.toISOString(),
+      topic: supportTopicLabelEn(r.topic),
+      message: r.message,
+      orderRef: r.orderRef,
+      pushBackApplied: r.pushBackApplied,
+      surface: r.surface,
+      cancelReason: r.cancelReason,
+      cancelReasonDetail: r.cancelReasonDetail,
+      saveRequest: r.saveRequest,
+    })),
     // Post-purchase survey card (v1.21.0). Null = never shown (order predates
     // the survey, or the shopper never saw the thank-you block).
     survey: surveyRow
@@ -568,6 +631,17 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
           action: "resume",
         });
         return ok("Subscription resumed");
+      }
+      case "keepScheduled": {
+        // Clear a scheduled cancel (v1.28.0, P3.8) on the customer's behalf
+        // — the same atomic path the portal Keep button and KEEP link use.
+        const { keepScheduledCancel } = await import("~/lib/cancel/engine.server");
+        const kept = await keepScheduledCancel(contractId, opts);
+        if (!kept) return ok("Nothing was scheduled");
+        await adminLog("Cleared the scheduled cancellation (kept)", {
+          action: "keepScheduled",
+        });
+        return ok("Scheduled cancellation cleared — the subscription continues");
       }
       case "cancel": {
         const reason = str(formData, "reason") || "OTHER";
@@ -857,9 +931,12 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       // ── Payment & dunning ───────────────────────────────────────────────
       case "setBackup": {
         const paymentMethodId = str(formData, "paymentMethodId") || null;
-        await prisma.subscriptionContract.update({
-          where: { id: contractId },
-          data: { backupPaymentMethodId: paymentMethodId },
+        // Contract-service seam (v1.28.0): validates ≠ primary and ∈ the
+        // customer's live methods, records backupSetBy ADMIN, logs
+        // contract.backup_payment_set|cleared.
+        await setBackupPaymentMethod(shop.domain, contractId, paymentMethodId, {
+          ...opts,
+          setBy: "ADMIN",
         });
         await adminLog(
           paymentMethodId
@@ -878,12 +955,64 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
             error: "No payment method on file",
           });
         }
-        const updateUrl = await getPaymentMethodUpdateUrl(admin, pmId);
-        await adminLog("Fetched the secure card-update URL", {
-          action: "open_card_update_url",
+        // ONE server-side decision (app/lib/payments/cardUpdate.server.ts):
+        // Shop Pay → hosted secure page (opened in a new tab); cards /
+        // PayPal → Shopify emails the customer its own 48h update link.
+        const path = await resolveCardUpdatePath({
+          admin,
+          contract: { ...contract, paymentMethodId: pmId },
+          source: "ADMIN",
+          actor,
+        });
+        if (path.kind === "redirect") {
+          await adminLog("Fetched the secure card-update URL", {
+            action: "open_card_update_url",
+            paymentMethodId: pmId,
+          });
+          return ok("Card-update URL ready", { updateUrl: path.url });
+        }
+        if (path.kind === "email_sent") {
+          await adminLog("Shopify emailed the customer a secure card-update link", {
+            action: "open_card_update_url",
+            channel: "shopify_email",
+            paymentMethodId: pmId,
+          });
+          return ok(
+            "Shopify emailed the customer a secure link to update this payment method (valid 48 hours) — the hosted page only supports Shop Pay.",
+          );
+        }
+        return json<ActionResponse>({
+          ok: false,
+          intent,
+          error:
+            path.reason === "payment_method_revoked"
+              ? "This payment method was removed from the customer's account — they need to add a new one."
+              : path.reason === "no_payment_method"
+                ? "No payment method on file"
+                : "Shopify refused both card-update paths — see server logs",
+        });
+      }
+      case "makePrimary": {
+        const pmId = str(formData, "paymentMethodId");
+        if (!pmId) {
+          return json<ActionResponse>({
+            ok: false,
+            intent,
+            error: "No payment method selected",
+          });
+        }
+        // Contract-service seam (v1.28.0): validates ∈ the customer's live
+        // methods, Shopify draft update, mirror refresh, pointer rules,
+        // contract.payment_method_updated {trigger:'admin'}, dunning poke.
+        await changePaymentMethod(shop.domain, contractId, pmId, {
+          ...opts,
+          trigger: "admin",
+        });
+        await adminLog("Made a vaulted payment method the primary", {
+          action: "make_primary_payment_method",
           paymentMethodId: pmId,
         });
-        return ok("Card-update URL ready", { updateUrl });
+        return ok("Primary payment method updated");
       }
       case "dunningRetryNow": {
         const caseId = str(formData, "caseId");
@@ -1417,6 +1546,9 @@ export default function SubscriberDetailPage() {
           {c.lockedUntil ? (
             <Badge tone="info">{`Locked until ${new Date(c.lockedUntil).toLocaleDateString("en-US", { month: "short", day: "numeric" })}`}</Badge>
           ) : null}
+          {c.cancelScheduledAt ? (
+            <Badge tone="warning">{`Cancels ${new Date(c.cancelScheduledAt).toLocaleDateString("en-US", { month: "short", day: "numeric" })}`}</Badge>
+          ) : null}
           {c.merged ? <Badge tone="new">Merged box</Badge> : null}
           {c.ownership === OWNERSHIP_FOREIGN ? (
             <Badge tone="warning">Another app</Badge>
@@ -1493,12 +1625,17 @@ export default function SubscriberDetailPage() {
                 Pause
               </Button>
             )}
+            {c.cancelScheduledAt && c.status !== "CANCELLED" ? (
+              <Button loading={busy} onClick={() => submit("keepScheduled")}>
+                Keep (clear scheduled cancel)
+              </Button>
+            ) : null}
             <Button
               tone="critical"
               disabled={c.status === "CANCELLED"}
               onClick={() => setCancelOpen(true)}
             >
-              Cancel
+              {c.cancelScheduledAt ? "Cancel now" : "Cancel"}
             </Button>
             <Button
               variant="primary"
@@ -1969,9 +2106,14 @@ export default function SubscriberDetailPage() {
                   </Text>
                   <Text as="p">
                     {c.cardBrand || c.cardLast4
-                      ? `${c.cardBrand ?? "Card"}${c.cardLast4 ? ` ending ${c.cardLast4}` : ""}${c.cardExpiry ? ` · exp ${c.cardExpiry}` : ""}`
+                      ? `${c.cardBrand ?? "Card"}${c.cardLast4 ? ` ending ${c.cardLast4}` : ""}${c.cardExpiry ? ` · exp ${c.cardExpiry}` : ""}${c.paymentInstrumentType ? ` · ${c.paymentInstrumentType}` : ""}`
                       : "No card details on the mirror."}
                   </Text>
+                  {c.paymentMethodRevokedAt ? (
+                    <Badge tone="critical">
+                      {`Payment method removed ${timeAgo(c.paymentMethodRevokedAt)}`}
+                    </Badge>
+                  ) : null}
                   <Button
                     loading={urlFetcher.state !== "idle"}
                     onClick={() =>
@@ -1980,9 +2122,49 @@ export default function SubscriberDetailPage() {
                   >
                     Open secure card-update page
                   </Button>
+                  {urlFetcher.state === "idle" && urlFetcher.data && !urlFetcher.data.updateUrl ? (
+                    <Banner tone={urlFetcher.data.ok ? "info" : "critical"}>
+                      <p>{urlFetcher.data.ok ? urlFetcher.data.message : urlFetcher.data.error}</p>
+                    </Banner>
+                  ) : null}
                   {data.paymentMethods ? (
                     <>
                       <Divider />
+                      <BlockStack gap="100">
+                        <Text as="h3" variant="headingSm">
+                          Methods on the customer's account
+                        </Text>
+                        {data.paymentMethods
+                          .filter((m) => !m.revoked)
+                          .map((m) => (
+                            <InlineStack key={m.id} gap="200" blockAlign="center" wrap>
+                              <Text as="span" variant="bodySm">
+                                {m.label}
+                              </Text>
+                              {m.id === c.paymentMethodId ? (
+                                <Badge tone="success">Primary</Badge>
+                              ) : (
+                                <Button
+                                  size="slim"
+                                  disabled={busy}
+                                  onClick={() =>
+                                    submit("makePrimary", { paymentMethodId: m.id })
+                                  }
+                                >
+                                  Make primary
+                                </Button>
+                              )}
+                              {m.id === c.backupPaymentMethodId ? (
+                                <Badge tone="info">Backup</Badge>
+                              ) : null}
+                            </InlineStack>
+                          ))}
+                      </BlockStack>
+                      {c.backupPaymentMethodId && c.backupSetBy && c.backupSetAt ? (
+                        <Badge tone="info">
+                          {`Backup set by ${c.backupSetBy.toLowerCase()} on ${formatDate(c.backupSetAt)}`}
+                        </Badge>
+                      ) : null}
                       <Select
                         label="Backup payment method"
                         options={[
@@ -2168,6 +2350,80 @@ export default function SubscriberDetailPage() {
                   )}
                 </BlockStack>
               </Card>
+
+              {/* Support requests (v1.28.0, P5.1) */}
+              <Card>
+                <BlockStack gap="300">
+                  <Text as="h2" variant="headingMd">
+                    Support requests
+                  </Text>
+                  {data.supportRequests.length === 0 ? (
+                    <Text as="p" tone="subdued">
+                      None yet. Requests from the portal's Get-help form and
+                      the cancel-flow support cards land here (and as a
+                      SUPPORT_REQUEST alert).
+                    </Text>
+                  ) : (
+                    <BlockStack gap="300">
+                      {data.supportRequests.map((r) => (
+                        <BlockStack gap="100" key={r.id}>
+                          <InlineStack gap="200" blockAlign="center">
+                            <Badge>{r.topic}</Badge>
+                            {r.saveRequest ? (
+                              <Badge tone="attention">Save request</Badge>
+                            ) : null}
+                            <Text as="span" variant="bodySm" tone="subdued">
+                              {timeAgo(r.createdAt)}
+                              {r.orderRef ? ` · order ${r.orderRef}` : ""}
+                              {r.cancelReason ? ` · cancel flow (${r.cancelReason})` : ""}
+                              {r.pushBackApplied ? " · next order pushed back 1 week" : ""}
+                            </Text>
+                          </InlineStack>
+                          <Text as="p" variant="bodySm">
+                            {r.message || "(no message)"}
+                          </Text>
+                          {r.cancelReasonDetail && r.cancelReasonDetail !== r.message ? (
+                            <Text as="p" variant="bodySm" tone="subdued">
+                              On the cancel survey they wrote: “{r.cancelReasonDetail}”
+                            </Text>
+                          ) : null}
+                        </BlockStack>
+                      ))}
+                    </BlockStack>
+                  )}
+                </BlockStack>
+              </Card>
+
+              {/* Win-back episode (v1.28.0, P3.4) — read-only */}
+              {data.winback ? (
+                <Card>
+                  <BlockStack gap="300">
+                    <Text as="h2" variant="headingMd">
+                      Win-back
+                    </Text>
+                    <InlineStack gap="200" blockAlign="center">
+                      <Badge>{data.winback.status}</Badge>
+                      <Text as="span" variant="bodySm" tone="subdued">
+                        stage {data.winback.stage}
+                        {data.winback.nextTouchAt
+                          ? ` · next touch ${new Date(data.winback.nextTouchAt).toLocaleDateString("en-GB", { timeZone: data.tz })}`
+                          : ""}
+                      </Text>
+                    </InlineStack>
+                    <Text as="p" variant="bodySm">
+                      Cancel reason:{" "}
+                      {data.winback.reason ?? "not recorded (episode opened before v1.28.0)"}
+                    </Text>
+                    <Text as="p" variant="bodySm" tone="subdued">
+                      Timed to the predicted empty date{" "}
+                      {new Date(data.winback.predictedEmptyDate).toLocaleDateString("en-GB", { timeZone: data.tz })}
+                      {data.winback.wonBackAt
+                        ? ` · won back ${new Date(data.winback.wonBackAt).toLocaleDateString("en-GB", { timeZone: data.tz })}`
+                        : ""}
+                    </Text>
+                  </BlockStack>
+                </Card>
+              ) : null}
 
               {/* Post-purchase survey (v1.21.0) */}
               <Card>

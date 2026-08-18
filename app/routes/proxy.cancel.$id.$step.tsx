@@ -6,13 +6,15 @@ import { t } from "~/lib/i18n/i18n.server";
 import { getSetting } from "~/lib/settings/settings.server";
 import { clampGrantPercentForContract } from "~/lib/billing/stacking.server";
 import { formatShopDate } from "~/lib/dates.server";
+import { formatMoney } from "~/lib/money";
 import {
   contractFrequency,
   formatFrequency,
   parseFrequencyToken,
   type Frequency,
 } from "~/lib/frequency";
-import { withLocale } from "~/lib/portal/layout.server";
+import { escapeHtml, portalPage, withLocale } from "~/lib/portal/layout.server";
+import { PORTAL_BASE_PATH } from "~/lib/portal/session.server";
 import {
   FINAL_DISCOUNT,
   REASONS,
@@ -29,6 +31,8 @@ import {
   acceptFinalOffer,
   acceptSave,
   completeCancel,
+  conciergeHoldPlan,
+  conciergeTopicForReason,
   eligibleForFinalOffer,
   getActiveSession,
   getLatestSavedSession,
@@ -37,8 +41,10 @@ import {
   recordFinalOfferShown,
   recordReason,
   recordSaveShown,
+  scheduleCancel,
   startCancelSession,
   type AcceptSaveParams,
+  type SaveOffer,
 } from "~/lib/cancel/engine.server";
 import {
   pageConfirm,
@@ -47,6 +53,8 @@ import {
   pageReason,
   pageSaved,
   pageSaves,
+  pageScheduled,
+  type ConciergeCardInfo,
 } from "~/lib/cancel/pages.server";
 import {
   csrfOk,
@@ -54,6 +62,19 @@ import {
   requireCancelContext,
   type CancelRouteContext,
 } from "~/lib/cancel/portal.server";
+import {
+  buildRetentionSummary,
+  type RetentionSummary,
+} from "~/lib/cancel/summary.server";
+import { getSupportChannels } from "~/lib/support/channels.server";
+import { resumeReminderPromised } from "~/lib/notifications/promise.server";
+import { getEducationLinks } from "~/lib/portal/education.server";
+import { educationTimelineTextFor } from "~/lib/portal/timeline.server";
+import {
+  isSupportTopic,
+  normalizeSupportMessage,
+  supportBudgetExceeded,
+} from "~/lib/support/request.server";
 
 /**
  * Cancel flow — steps 2..5, served through the app proxy at
@@ -116,6 +137,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
         ctx,
         hasError,
         new URL(request.url).searchParams.get("r"),
+        new URL(request.url).searchParams.get("error"),
       );
     case "final":
       return loadFinal(ctx, hasError);
@@ -125,6 +147,8 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       return loadDone(ctx);
     case "saved":
       return loadSaved(ctx);
+    case "scheduled":
+      return loadScheduled(ctx);
   }
 };
 
@@ -133,8 +157,42 @@ async function requireSessionOrRestart(
   ctx: CancelRouteContext,
 ): Promise<CancelSession | Response> {
   if (ctx.contract.status === "CANCELLED") return redirect(toPath(ctx, "done"));
+  // A scheduled cancel stands (P3.8): the only honest page is "scheduled".
+  if (ctx.contract.cancelScheduledAt) return redirect(toPath(ctx, "scheduled"));
   const session = await getActiveSession(ctx.contract.id);
   return session ?? redirect(toPath(ctx));
+}
+
+/**
+ * Concierge (SUPPORT) card inputs (v1.28.0, P3.7): topic matched to the
+ * reason, the survey free text as the draft, the reply promise from the
+ * support settings, and the hold day ONLY when conciergeHoldPlan says the
+ * hold applies right now (the accept path applies the same rule). Contained:
+ * a failed read renders Stage C's plain form.
+ */
+async function conciergeInfoFor(
+  ctx: CancelRouteContext,
+  offers: SaveOffer[],
+  reason: string | null,
+  reasonDetail: string | null,
+): Promise<ConciergeCardInfo | null> {
+  if (!offers.some((o) => o.kind === "SUPPORT")) return null;
+  try {
+    const [channels, hold] = await Promise.all([
+      getSupportChannels(ctx.shop.id),
+      conciergeHoldPlan(ctx.shop.id, ctx.contract, ctx.shop.ianaTimezone),
+    ]);
+    return {
+      topic: conciergeTopicForReason(reason),
+      prefill: reasonDetail ?? "",
+      slaBusinessDays: channels.slaBusinessDays,
+      holdUntil: hold.applies ? hold.newNextDate : null,
+      holdDays: hold.days,
+    };
+  } catch (err) {
+    console.error("[cancel] concierge card info failed", ctx.contract.id, err);
+    return null;
+  }
 }
 
 async function loadReason(ctx: CancelRouteContext, hasError: boolean) {
@@ -166,6 +224,7 @@ async function loadSaves(
   ctx: CancelRouteContext,
   hasError: boolean,
   previewReason?: string | null,
+  errorKind?: string | null,
 ) {
   const { shop, contract, locale } = ctx;
 
@@ -186,8 +245,22 @@ async function loadSaves(
       tz: shop.ianaTimezone,
       currencyCode: contract.currencyCode,
       showError: hasError,
+      errorKind,
       finalOfferEligible: true,
       previewToken: ctx.portalSession.previewToken,
+      support: await getSupportChannels(shop.id),
+      education: await getEducationLinks(shop.id),
+      resumeReminder: await resumeReminderPromised(shop.id),
+      educationTimelineText: offers.some((o) => o.kind === "EDUCATION")
+        ? await educationTimelineTextFor({
+            shopId: shop.id,
+            tz: shop.ianaTimezone,
+            locale,
+            contract,
+            isPreview: true,
+          })
+        : null,
+      concierge: await conciergeInfoFor(ctx, offers, reason.key, null),
     }));
   }
 
@@ -220,8 +293,26 @@ async function loadSaves(
     tz: shop.ianaTimezone,
     currencyCode: contract.currencyCode,
     showError: hasError,
+    errorKind,
     finalOfferEligible,
     previewToken: ctx.portalSession.previewToken,
+    support: await getSupportChannels(shop.id),
+    education: await getEducationLinks(shop.id),
+    resumeReminder: await resumeReminderPromised(shop.id),
+    // Results-timeline reuse (P4.1): the EDUCATION card speaks to the
+    // customer's own routine week (holdout arm / timeline off ⇒ static copy).
+    educationTimelineText: offers.some((o) => o.kind === "EDUCATION")
+      ? await educationTimelineTextFor({
+          shopId: shop.id,
+          tz: shop.ianaTimezone,
+          locale,
+          contract,
+          isPreview: ctx.portalSession.isPreview,
+        })
+      : null,
+    // Concierge save (P3.7): reason-matched topic, the survey text as draft,
+    // the reply promise and the hold day (only when it will apply).
+    concierge: await conciergeInfoFor(ctx, offers, session.reason, session.reasonDetail),
   }));
 }
 
@@ -280,6 +371,7 @@ async function loadFinal(ctx: CancelRouteContext, hasError: boolean) {
 
 async function loadConfirm(ctx: CancelRouteContext, hasError: boolean) {
   if (ctx.contract.status === "CANCELLED") return redirect(toPath(ctx, "done"));
+  if (ctx.contract.cancelScheduledAt) return redirect(toPath(ctx, "scheduled"));
 
   // The final offer is opt-in only: offer the link when eligible and not
   // already seen this session (never auto-redirect into it).
@@ -296,13 +388,33 @@ async function loadConfirm(ctx: CancelRouteContext, hasError: boolean) {
       }));
   }
 
+  // Money-true ledger of what cancelling forfeits (v1.28.0). Contained: a
+  // failed read renders the generic points — the confirm page (and its
+  // cancel button) must never depend on it.
+  let summary: RetentionSummary | null = null;
+  try {
+    summary = await buildRetentionSummary(ctx.shop, ctx.contract);
+  } catch (err) {
+    console.error("[cancel] confirm: retention summary failed", ctx.contract.id, err);
+  }
+
   return renderCancelPage(ctx, pageConfirm({
     locale: ctx.locale,
     csrf: ctx.portalSession.csrfToken,
     contractId: ctx.contract.id,
     showError: hasError,
     finalOfferEligible,
+    summary,
     previewToken: ctx.portalSession.previewToken,
+    // Plan lock window (P3.8): the CTA schedules the cancellation for the
+    // unlock day — never a hidden "cancel today" the lock would refuse.
+    scheduled:
+      ctx.lock.locked && ctx.lock.until
+        ? { date: ctx.lock.until, tz: ctx.shop.ianaTimezone }
+        : null,
+    // Prepaid (P3.8): only app-controlled facts (no new charge); nothing is
+    // claimed about deliveries already paid for (Shopify-side fulfilment).
+    prepaid: ctx.contract.isPrepaid === true,
   }));
 }
 
@@ -312,6 +424,23 @@ async function loadDone(ctx: CancelRouteContext) {
     locale: ctx.locale,
     contractId: ctx.contract.id,
     csrf: ctx.portalSession.csrfToken,
+    previewToken: ctx.portalSession.previewToken,
+  }));
+}
+
+/** Scheduled-cancel page (P3.8): "cancels on {date} · keep", or "kept". */
+async function loadScheduled(ctx: CancelRouteContext) {
+  if (ctx.contract.status === "CANCELLED") return redirect(toPath(ctx, "done"));
+  return renderCancelPage(ctx, pageScheduled({
+    locale: ctx.locale,
+    csrf: ctx.portalSession.csrfToken,
+    contractId: ctx.contract.id,
+    tz: ctx.shop.ianaTimezone,
+    scheduledAt: ctx.contract.cancelScheduledAt ?? null,
+    // The lock lifted since scheduling (lockDays lowered / plan changed):
+    // an immediate cancel is honest now — offer it (P3.8; the index route's
+    // cancel_now intent executes it under the same guard).
+    canCancelNow: !ctx.lock.locked && !ctx.portalSession.isPreview,
     previewToken: ctx.portalSession.previewToken,
   }));
 }
@@ -331,15 +460,36 @@ async function loadSaved(ctx: CancelRouteContext) {
   let showSupportLink = false;
 
   switch (saved.saveAccepted) {
-    case "SKIP":
-      messageKey = "cancel.saved.skip";
-      messageVars = { date: fmt(contract.nextBillingDate) };
+    case "SKIP": {
+      // Per-line variant (P2.5): the accepted save left ONE product out of
+      // the next order — the mirror flag on that line is the witness (the
+      // whole-order skip clears every per-line flag, so a flag here means
+      // the per-line save was the one accepted).
+      const skippedLine = contract.lines.find(
+        (l) => !l.isGift && !l.isOneTimeAddon && l.skippedCycleIndex != null,
+      );
+      if (skippedLine) {
+        messageKey = "cancel.saved.skip_line";
+        messageVars = {
+          title: skippedLine.title,
+          date: fmt(contract.nextBillingDate),
+        };
+      } else {
+        messageKey = "cancel.saved.skip";
+        messageVars = { date: fmt(contract.nextBillingDate) };
+      }
       break;
+    }
     case "FREQUENCY":
-      messageKey = "cancel.saved.frequency";
       // The accepted cadence is read back off the contract itself:
       // contractFrequency uses the exact unit/count mirror when present, else
-      // the legacy intervalWeeks as a WEEK cadence.
+      // the legacy intervalWeeks as a WEEK cadence. A PAUSED contract (the
+      // "resume later, slower" save, v1.28.0) resumes on its resume day —
+      // its nextBillingDate is not the next order.
+      messageKey =
+        contract.status === "PAUSED" && contract.resumeAt
+          ? "cancel.saved.frequency_paused"
+          : "cancel.saved.frequency";
       messageVars = {
         frequency: formatFrequency(
           (key, vars) => t(locale, key, vars),
@@ -347,10 +497,21 @@ async function loadSaved(ctx: CancelRouteContext) {
           contractFrequency(contract),
         ),
         date: fmt(contract.nextBillingDate),
+        resumeDate: fmt(contract.resumeAt),
       };
       break;
     case "PAUSE":
-      messageKey = "cancel.saved.pause";
+      // "We'll remind you first" only when the reminder will actually go out
+      // (review fix): merchant switches can silence it.
+      messageKey = (await resumeReminderPromised(shop.id))
+        ? "cancel.saved.pause"
+        : "cancel.saved.pause_noremind";
+      messageVars = { resumeDate: fmt(contract.resumeAt) };
+      break;
+    case "EXTEND_PAUSE":
+      messageKey = (await resumeReminderPromised(shop.id))
+        ? "cancel.saved.extend_pause"
+        : "cancel.saved.extend_pause_noremind";
       messageVars = { resumeDate: fmt(contract.resumeAt) };
       break;
     case "DISCOUNT": {
@@ -385,6 +546,42 @@ async function loadSaved(ctx: CancelRouteContext) {
       messageVars = { title: swapped?.title ?? contract.lines[0]?.title ?? "" };
       break;
     }
+    case "DOWNSIZE": {
+      // The new per-order figure is read back off the contract itself (the
+      // recurring subtotal after the quantity/variant change) — the same
+      // base the card's totals were computed on.
+      const total = contract.lines
+        .filter((l) => !l.isGift && !l.isOneTimeAddon)
+        .reduce((sum, l) => sum + l.currentPriceCents * l.quantity, 0);
+      // A smaller size / different product DID change what arrives — say
+      // which (the swapped line carries addedVia SWAP); only the fewer-units
+      // mode can truthfully claim nothing else changed.
+      const swappedLine = contract.lines.find((l) => l.addedVia === "SWAP");
+      let mode: string | null = null;
+      try {
+        const ev = await prisma.subscriberEvent.findFirst({
+          where: { contractId: contract.id, type: "cancel.save_accepted" },
+          orderBy: { createdAt: "desc" },
+          select: { payload: true },
+        });
+        const p = ev?.payload as { downsizeMode?: unknown } | null;
+        mode = typeof p?.downsizeMode === "string" ? p.downsizeMode : null;
+      } catch (err) {
+        console.error("[cancel] saved page: downsize mode read failed", contract.id, err);
+      }
+      const productChanged =
+        mode === "VARIANT" || mode === "PRODUCT" || (mode == null && !!swappedLine);
+      messageKey = productChanged
+        ? "cancel.saved.downsize_swapped"
+        : "cancel.saved.downsize";
+      messageVars = {
+        total: formatMoney(total, contract.currencyCode, locale),
+        ...(productChanged
+          ? { title: swappedLine?.title ?? contract.lines[0]?.title ?? "" }
+          : {}),
+      };
+      break;
+    }
     case "GIFT": {
       // The granted variant title lives on the newest SAVE_FLOW grant's
       // scheduling event payload; the session's savesShown offer is the
@@ -405,10 +602,39 @@ async function loadSaved(ctx: CancelRouteContext) {
       messageKey = "cancel.saved.education";
       showEducationLinks = true;
       break;
-    case "SUPPORT":
-      messageKey = "cancel.saved.support";
+    case "SUPPORT": {
+      // Concierge save (P3.7): the honest state is PENDING — the request is
+      // in, a human answers within the promised business days, and when the
+      // hold applied the next order's new day is stated (read back off the
+      // contract; the accept event says whether the hold happened).
       showSupportLink = true;
+      let holdApplied = false;
+      let sla = 1;
+      try {
+        const [ev, channels] = await Promise.all([
+          prisma.subscriberEvent.findFirst({
+            where: { contractId: contract.id, type: "cancel.save_accepted" },
+            orderBy: { createdAt: "desc" },
+            select: { payload: true },
+          }),
+          getSupportChannels(shop.id),
+        ]);
+        const p = ev?.payload as { holdApplied?: unknown; slaBusinessDays?: unknown } | null;
+        holdApplied = p?.holdApplied === true;
+        sla =
+          typeof p?.slaBusinessDays === "number" ? p.slaBusinessDays : channels.slaBusinessDays;
+      } catch (err) {
+        console.error("[cancel] saved page: concierge read failed", contract.id, err);
+      }
+      if (holdApplied && contract.nextBillingDate) {
+        messageKey = sla === 1 ? "cancel.saved.support_hold_one" : "cancel.saved.support_hold_other";
+        messageVars = { days: sla, date: fmt(contract.nextBillingDate) };
+      } else {
+        messageKey = sla === 1 ? "cancel.saved.support_pending_one" : "cancel.saved.support_pending_other";
+        messageVars = { days: sla };
+      }
       break;
+    }
   }
 
   return renderCancelPage(ctx, pageSaved({
@@ -419,6 +645,11 @@ async function loadSaved(ctx: CancelRouteContext) {
     showEducationLinks,
     showSupportLink,
     previewToken: ctx.portalSession.previewToken,
+    support:
+      showEducationLinks || showSupportLink
+        ? await getSupportChannels(ctx.shop.id)
+        : undefined,
+    education: showEducationLinks ? await getEducationLinks(ctx.shop.id) : undefined,
   }));
 }
 
@@ -445,7 +676,9 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       return actionConfirm(ctx);
     case "done":
     case "saved":
-      // Terminal pages take no POSTs.
+    case "scheduled":
+      // Terminal pages take no POSTs (the scheduled page's keep button posts
+      // to /cancel/:id — the step-1 route).
       return redirect(toPath(ctx, step));
   }
 };
@@ -482,6 +715,7 @@ function previewAction(ctx: CancelRouteContext, step: CancelStep, form: FormData
       );
     case "done":
     case "saved":
+    case "scheduled":
       return redirect(toPath(ctx, step));
   }
 }
@@ -536,19 +770,67 @@ async function actionSaves(ctx: CancelRouteContext, form: FormData) {
   }
   const kind = kindRaw as SaveKind;
 
+  // SUPPORT / EDUCATION (v1.28.0): the inline Get-help form's fields ride
+  // along; acceptSave refuses these kinds without a message (the save IS
+  // the submitted request — see AcceptSaveParams.support).
+  const supportTopicRaw = String(form.get("support_topic") ?? "");
+  const supportMessage = normalizeSupportMessage(form.get("support_message"));
   const cleanParams: AcceptSaveParams = {
     frequency: optionalFrequency(form.get("frequency")),
     weeks: parsePositiveInt(form.get("weeks")),
     months: parsePositiveInt(form.get("months")),
     lineId: optionalString(form.get("lineId")),
     variantId: optionalString(form.get("variantId")),
+    quantity: parsePositiveInt(form.get("quantity")),
+    ...(supportMessage
+      ? {
+          support: {
+            topic: isSupportTopic(supportTopicRaw) ? supportTopicRaw : "OTHER",
+            message: supportMessage,
+          },
+        }
+      : {}),
   };
+
+  // Support-bearing saves share the portal's per-customer support budget
+  // (portal.mutationsPerHour + support.requestsPerHour, insert-then-count on
+  // the same attempt rows POST /api/support uses): the SUPPORT/EDUCATION
+  // card is a second door to submitSupportRequest, and a looped
+  // reason→saves→submit would otherwise send the merchant an unbounded
+  // stream of emails and Klaviyo events. Checked BEFORE the save is
+  // claimed, so nothing is recorded when the budget is exhausted.
+  if ((kind === "SUPPORT" || kind === "EDUCATION") && cleanParams.support) {
+    if (
+      await supportBudgetExceeded({
+        shopId: ctx.shop.id,
+        customerId: ctx.portalSession.customerId,
+        email: ctx.portalSession.email,
+        recordAttempt: true,
+      })
+    ) {
+      return ctx.liquid(
+        portalPage({
+          locale: ctx.locale,
+          title: t(ctx.locale, "portal.rate_limited.title"),
+          body: `<div class="cxs-card"><p style="margin:0 0 8px">${escapeHtml(t(ctx.locale, "portal.rate_limited.body"))}</p><a class="cxs-btn cxs-btn--quiet cxs-btn--small" href="${withLocale(`${PORTAL_BASE_PATH}/`, ctx.locale, ctx.portalSession.previewToken)}">${escapeHtml(t(ctx.locale, "portal.rate_limited.back"))}</a></div>`,
+          activeNav: "subscriptions",
+          previewToken: ctx.portalSession.previewToken,
+        }),
+        { status: 429 },
+      );
+    }
+  }
 
   try {
     await acceptSave(session.id, kind, cleanParams);
     return redirect(toPath(ctx, "saved"));
   } catch (err) {
     console.error("[cancel] save accept failed", contract.id, kind, err);
+    // Shopify refused a contract-level save (FREQUENCY / DOWNSIZE / SWAP)
+    // while one-off changes are staged on the next order: say so.
+    if (err instanceof Error && err.name === "ContractEditBlockedError") {
+      return redirect(withParam(toPath(ctx, "saves"), "error", "cycle_edits"));
+    }
     return redirect(toPath(ctx, "saves", true));
   }
 }
@@ -581,9 +863,24 @@ async function actionConfirm(ctx: CancelRouteContext) {
   const { contract } = ctx;
   if (contract.status === "CANCELLED") return redirect(toPath(ctx, "done"));
 
+  if (contract.cancelScheduledAt) return redirect(toPath(ctx, "scheduled"));
+
   const session =
     (await getActiveSession(contract.id)) ??
     (await startCancelSession(contract.id, "PORTAL"));
+
+  // Plan lock window (P3.8): the confirm CTA read "schedule my cancellation
+  // for {date}" — write cancelScheduledAt (the hourly job completes it);
+  // never a cancel today the lock refuses, never a silent keep.
+  if (ctx.lock.locked) {
+    try {
+      await scheduleCancel(session.id, "customer");
+      return redirect(toPath(ctx, "scheduled"));
+    } catch (err) {
+      console.error("[cancel] scheduleCancel failed", contract.id, err);
+      return redirect(toPath(ctx, "confirm", true));
+    }
+  }
 
   try {
     await completeCancel(session.id, "customer");

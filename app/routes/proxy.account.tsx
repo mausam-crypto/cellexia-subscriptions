@@ -10,6 +10,7 @@ import {
   localeFromRequest,
   portalPage,
   closedPortalPage,
+  resolveToast,
   withLocale,
 } from "~/lib/portal/layout.server";
 import {
@@ -17,6 +18,13 @@ import {
   requireCustomer,
 } from "~/lib/portal/session.server";
 import { OURS_ONLY } from "~/lib/ownership/ownership.server";
+import { getSupportChannels } from "~/lib/support/channels.server";
+import { supportCardHtml, supportChannelsHtml } from "~/lib/support/portal-card.server";
+import { getSetting } from "~/lib/settings/settings.server";
+import {
+  deliveriesCardHtml,
+  listCustomerDeliveries,
+} from "~/lib/portal/deliveries.server";
 
 /**
  * Account tab: who is signed in, when they joined, shortcuts to each
@@ -81,6 +89,65 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     <button type="submit" class="cxs-btn cxs-btn--quiet cxs-btn--full">${escapeHtml(t(locale, "portal.account.sign_out"))}</button>
   </form>`;
 
+  // Get-help card (v1.28.0, P5.1): resolved channels + the quick form. The
+  // form is contract-scoped (the dispatcher's ownership guard), so it offers
+  // a subscription picker when there are several and renders channels only
+  // when there is none to attach a request to.
+  const channels = await getSupportChannels(shop.id);
+  const contractLabel = (c: (typeof contracts)[number]) =>
+    `${c.lines.map((l) => l.title).join(", ") || t(locale, "portal.account.subscription_fallback")} — ${t(locale, `portal.status.${c.status.toLowerCase()}`)}`;
+  const supportHtml = contracts.length
+    ? supportCardHtml({
+        locale,
+        channels,
+        formAction: withLocale(`${PORTAL_BASE_PATH}/api/support`, locale, portalSession.previewToken),
+        hiddenFields:
+          `<input type="hidden" name="_csrf" value="${escapeHtml(portalSession.csrfToken)}">` +
+          `<input type="hidden" name="return_to" value="/">` +
+          `<input type="hidden" name="surface" value="portal_account">` +
+          (contracts.length === 1
+            ? `<input type="hidden" name="contractId" value="${escapeHtml(contracts[0].id)}">`
+            : ""),
+        contractPicker:
+          contracts.length > 1
+            ? contracts.map((c) => ({ id: c.id, label: contractLabel(c) }))
+            : null,
+        allowPushBack: false,
+      })
+    : channels.hasAny
+      ? `<div class="cxs-card cxs-support" id="cxs-support"><h2 style="font-size:18px;margin:0 0 6px">${escapeHtml(t(locale, "portal.support.title"))}</h2>${supportChannelsHtml(locale, channels)}</div>`
+      : "";
+
+  // "Your deliveries" (v1.28.0, P4.2): the last 10 charged orders across
+  // every owned contract, from the local mirror only (no Admin API — the
+  // 60-day read_orders horizon would blank older rows). Behind
+  // portalGrowth.deliveriesList; contained — a read failure hides the card,
+  // never the page.
+  let deliveriesHtml = "";
+  if (contracts.length > 0) {
+    try {
+      const [growth, portalSettings] = await Promise.all([
+        getSetting(shop.id, "portalGrowth"),
+        getSetting(shop.id, "portal"),
+      ]);
+      if (growth.deliveriesList) {
+        const rows = await listCustomerDeliveries(shop.id, portalSession.customerId, {
+          limit: 10,
+          processingMaxDays: portalSettings.deliveriesProcessingMaxDays,
+        });
+        deliveriesHtml = deliveriesCardHtml({
+          locale,
+          tz: shop.ianaTimezone,
+          rows,
+          hideWhenEmpty: true,
+        });
+      }
+    } catch (err) {
+      console.error("[portal] deliveries card failed", err);
+      deliveriesHtml = "";
+    }
+  }
+
   const body = `
 <div class="cxs-card">
   <span class="cxs-label">${escapeHtml(t(locale, "portal.account.signed_in_as"))}</span>
@@ -100,8 +167,10 @@ ${
     ? `<div class="cxs-card"><span class="cxs-label">${escapeHtml(t(locale, "portal.account.your_subscriptions"))}</span>${subscriptionLinks}</div>`
     : ""
 }
+${deliveriesHtml}
+${supportHtml}
 <div class="cxs-card">
-  <p class="cxs-muted cxs-small" style="margin:0 0 14px">${escapeHtml(t(locale, "portal.account.help"))}</p>
+  ${supportHtml ? "" : `<p class="cxs-muted cxs-small" style="margin:0 0 14px">${escapeHtml(t(locale, "portal.account.help"))}</p>`}
   ${signOutHtml}
 </div>`;
 
@@ -110,6 +179,7 @@ ${
       locale,
       title: t(locale, "portal.account.title"),
       body,
+      toast: resolveToast(request, locale)?.toast ?? null,
       activeNav: "account",
       isPreview: portalSession.isPreview,
       previewToken: portalSession.previewToken,

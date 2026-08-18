@@ -93,13 +93,83 @@ export const TOAST_KEYS = new Set([
   "resumed",
   "date_changed",
   "address_updated",
+  "card_link_sent",
+  "payment_method_changed",
+  // Payment-methods list (v1.28.0, P1.7) — payment_select / payment_backup;
+  // success reuses payment_method_changed, refusals map typed service /
+  // Shopify errors (payment-methods.server.ts paymentMethodErrorToast).
+  "backup_set",
+  "backup_cleared",
+  "payment_not_on_account",
+  "backup_equals_primary",
+  "backup_in_use",
+  "payment_stale",
+  "retry_started",
+  "retry_too_soon",
+  "retry_needs_bank",
+  "retry_paused",
+  "retry_unavailable",
+  // Skip the held order & continue (v1.28.0, P1.9) — payment_skip_and_resume;
+  // `d1` = the resume day.
+  "skip_resumed",
+  "skip_resume_card_dead",
+  "skip_resume_unavailable",
+  "threeds_paid",
+  "threeds_failed",
+  "threeds_none",
+  "threeds_unavailable",
   "restarted",
   "saved_pending",
   "not_found",
   "cannot_remove_last",
   "preview_blocked",
   "locked",
+  // Preparing-your-order refusal (v1.28.0, P2.1) — the api dispatcher's
+  // isPreparingOrder guard for skip/delay/next_date/frequency/swap.
+  "preparing",
+  // Open dunning case owns the cycle (v1.28.0 audit) — the dispatcher's
+  // refusal of skip/delay/next_date/frequency/per-line edits mid-case.
+  "payment_issue_schedule",
   "error",
+  // Undo (v1.28.0, P2.2) — see resolveToast's undo branch + undo.server.ts.
+  "undone",
+  "undo_stale",
+  "undo_expired",
+  // Support request (v1.28.0, P5.1) — POST /api/support; `sla` param carries
+  // the reply promise in business days (settings.support.slaBusinessDays).
+  "support_sent",
+  "support_pushback_failed",
+  // Per-line cycle edits (v1.28.0, P2.5) — line_skip / line_unskip /
+  // line_qty_once; `d1` = the order date, `qty` = the one-order quantity.
+  "line_skipped",
+  "line_unskipped",
+  "line_qty_once",
+  "line_qty_restored",
+  "skip_line_last_line",
+  // Contract-level edit refused by Shopify while per-cycle edits are staged
+  // (ContractEditBlockedError, review fix) — "undo the one-off changes first".
+  "cycle_edits_pending",
+  // Vacation hold with dates / pause exit ramp (v1.28.0, P2.6) — `d1` = the
+  // resume day (or, on pause_too_far, the latest allowed day).
+  "paused_until",
+  "pause_extended",
+  "pause_too_far",
+  "pause_date_past",
+  // "Change resume date" moved EARLIER (P2.6): the hold ended, the first
+  // order is scheduled on `d1`.
+  "resume_on",
+  // Run-out "already out" branch (P2.7) — send_tomorrow; `d1`/`d2` + Undo.
+  "send_tomorrow_done",
+  "send_tomorrow_soon",
+  "send_tomorrow_payment",
+  // Delivery instructions (P2.8).
+  "instructions_saved",
+  "instructions_cleared",
+  // Address form region validation (P2.8 review fix).
+  "address_region_invalid",
+  // Routine check-in answer landing (v1.28.0, P4.1 — magic CHECKIN).
+  "checkin_great",
+  "checkin_unsure",
 ]);
 
 export interface PortalToast {
@@ -107,16 +177,266 @@ export interface PortalToast {
   text: string;
   /** Optional extra HTML rendered inside the toast (e.g. an undo form). */
   html?: string;
+  /**
+   * Screen-reader tone (v1.28.0, P5.3): "alert" toasts (refusals, errors)
+   * render role=alert; everything else is role=status / aria-live=polite.
+   * Defaults to status when omitted.
+   */
+  tone?: "status" | "alert";
 }
 
-/** Resolve ?toast= from the request into localized toast content, if valid. */
+/**
+ * Toast keys that report a refusal or a failure — announced assertively
+ * (role=alert) so a screen-reader user hears WHY nothing changed. Everything
+ * else is a confirmation and stays polite.
+ */
+export const TOAST_ALERT_KEYS = new Set([
+  "retry_too_soon",
+  "retry_needs_bank",
+  "retry_paused",
+  "retry_unavailable",
+  "skip_resume_card_dead",
+  "skip_resume_unavailable",
+  "threeds_failed",
+  "threeds_unavailable",
+  "payment_not_on_account",
+  "backup_equals_primary",
+  "backup_in_use",
+  "payment_stale",
+  "not_found",
+  "cannot_remove_last",
+  "preview_blocked",
+  "locked",
+  "preparing",
+  "payment_issue_schedule",
+  "error",
+  "undo_stale",
+  "undo_expired",
+  "support_pushback_failed",
+  "skip_line_last_line",
+  "cycle_edits_pending",
+  "address_region_invalid",
+  "pause_too_far",
+  "pause_date_past",
+  "send_tomorrow_soon",
+  "send_tomorrow_payment",
+]);
+
+/** The tone a toast key renders with (see TOAST_ALERT_KEYS). */
+export function toastTone(key: string): "status" | "alert" {
+  return TOAST_ALERT_KEYS.has(key) ? "alert" : "status";
+}
+
+/**
+ * What a page must hand the resolver for it to render an Undo form inside a
+ * toast (v1.28.0): the session's CSRF token (every portal POST is CSRF
+ * guarded, undo included), the preview token for link building, and —
+ * optionally — the contract ids the page owns, so a `cid` the page does not
+ * show never gets a form. Pages that pass nothing get the plain toast text,
+ * exactly as before.
+ */
+export interface ToastUndoContext {
+  csrfToken: string;
+  previewToken?: string | null;
+  contractIds?: Set<string> | null;
+}
+
+/**
+ * Toast query params the schedule writers append (all optional, all
+ * validated here as untrusted): `d1` / `d2` — shop-tz calendar days
+ * (YYYY-MM-DD) for the next and the following order; `mode` — delay
+ * semantics (reanchor | once); `every` — the frequency token ("4:WEEK");
+ * `undo` — a signed undo token; `cid` — the contract the undo targets.
+ */
+const CALENDAR_DAY = /^\d{4}-\d{2}-\d{2}$/;
+
+function calendarDayLabel(
+  value: string | null,
+  locale: string,
+): string | null {
+  if (!value || !CALENDAR_DAY.test(value)) return null;
+  const parsed = new Date(`${value}T00:00:00Z`);
+  if (!Number.isFinite(parsed.getTime())) return null;
+  if (parsed.toISOString().slice(0, 10) !== value) return null;
+  return new Intl.DateTimeFormat(locale, {
+    dateStyle: "long",
+    timeZone: "UTC",
+  }).format(parsed);
+}
+
+function frequencyPhrase(
+  token: string | null,
+  locale: string,
+): string | null {
+  if (!token) return null;
+  const match = /^(\d{1,3}):(DAY|WEEK|MONTH)$/.exec(token);
+  if (!match) return null;
+  const count = Number(match[1]);
+  if (!Number.isInteger(count) || count < 1) return null;
+  const unit = match[2].toLowerCase();
+  const form = count === 1 ? "one" : "other";
+  return t(locale, `freq.every.${unit}.${form}`, { count });
+}
+
+/** Portal path (return_to form) of the page the request renders. */
+function returnToOf(url: URL): string {
+  const rest = url.pathname.startsWith(PORTAL_PROXY_BASE)
+    ? url.pathname.slice(PORTAL_PROXY_BASE.length)
+    : url.pathname;
+  const match = /^\/subscription\/([A-Za-z0-9_-]+)\/?$/.exec(rest);
+  return match ? `/subscription/${match[1]}` : "/";
+}
+
+/** The Undo form rendered inside a toast (undo.server.ts consumes it). */
+function undoFormHtml(
+  url: URL,
+  locale: string,
+  ctx: ToastUndoContext,
+): string | null {
+  const token = url.searchParams.get("undo") ?? "";
+  const cid = url.searchParams.get("cid") ?? "";
+  if (!token || !cid) return null;
+  if (!/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(token)) return null;
+  if (!/^[A-Za-z0-9_-]+$/.test(cid)) return null;
+  if (ctx.contractIds && !ctx.contractIds.has(cid)) return null;
+  const action = withLocale(
+    `${PORTAL_PROXY_BASE}/api/undo`,
+    locale,
+    ctx.previewToken ?? null,
+  );
+  return (
+    `<form method="post" action="${escapeHtml(action)}" class="cxs-toast__undo">` +
+    `<input type="hidden" name="contractId" value="${escapeHtml(cid)}">` +
+    `<input type="hidden" name="_csrf" value="${escapeHtml(ctx.csrfToken)}">` +
+    `<input type="hidden" name="return_to" value="${escapeHtml(returnToOf(url))}">` +
+    `<input type="hidden" name="undo_token" value="${escapeHtml(token)}">` +
+    `<button type="submit">${escapeHtml(t(locale, "portal.toast.undo"))}</button>` +
+    `</form>`
+  );
+}
+
+/**
+ * Resolve ?toast= from the request into localized toast content, if valid.
+ * `undoCtx` (optional, v1.28.0) lets the schedule toasts (delayed /
+ * date_changed / frequency_changed) carry their Undo form; without it the
+ * text is still date-aware but no form is rendered.
+ */
 export function resolveToast(
   request: Request,
   locale: string,
+  undoCtx?: ToastUndoContext | null,
+): { key: string; toast: PortalToast } | null {
+  const resolved = resolveToastText(request, locale, undoCtx);
+  if (!resolved) return null;
+  resolved.toast.tone = toastTone(resolved.key);
+  return resolved;
+}
+
+/** Text + optional undo form; the exported wrapper stamps the tone. */
+function resolveToastText(
+  request: Request,
+  locale: string,
+  undoCtx?: ToastUndoContext | null,
 ): { key: string; toast: PortalToast } | null {
   const url = new URL(request.url);
   const key = url.searchParams.get("toast");
   if (!key || !TOAST_KEYS.has(key)) return null;
+
+  // Schedule toasts (v1.28.0, P2.2): both dates in the confirmation — the
+  // new next order AND what follows it — so a delay never leaves the
+  // customer guessing whether later orders moved too. Params are validated
+  // exactly like the friendly lock toast below; anything malformed falls
+  // back to the classic one-liner.
+  if (
+    key === "delayed" ||
+    key === "date_changed" ||
+    key === "frequency_changed" ||
+    key === "undone" ||
+    key === "line_skipped" ||
+    key === "line_qty_once" ||
+    key === "paused_until" ||
+    key === "pause_extended" ||
+    key === "pause_too_far" ||
+    key === "resume_on" ||
+    key === "resumed" ||
+    key === "skip_resumed" ||
+    key === "send_tomorrow_done"
+  ) {
+    const d1 = calendarDayLabel(url.searchParams.get("d1"), locale);
+    const qtyRaw = Number(url.searchParams.get("qty") ?? "");
+    const qty = Number.isInteger(qtyRaw) && qtyRaw >= 1 && qtyRaw <= 1000 ? qtyRaw : null;
+    const d2 = calendarDayLabel(url.searchParams.get("d2"), locale);
+    const every = frequencyPhrase(url.searchParams.get("every"), locale);
+    const mode = url.searchParams.get("mode");
+    let text: string;
+    if (key === "delayed" && d1 && d2 && mode === "once") {
+      text = t(locale, "portal.toast.delayed_once", { date: d1, orig: d2 });
+    } else if (key === "delayed" && d1 && every && mode === "reanchor") {
+      text = t(locale, "portal.toast.delayed_reanchor", {
+        date: d1,
+        frequency: every,
+      });
+    } else if (key === "date_changed" && d1 && d2) {
+      text = t(locale, "portal.toast.date_changed_dates", {
+        date: d1,
+        following: d2,
+      });
+    } else if (key === "frequency_changed" && every && d1) {
+      text = t(locale, "portal.toast.frequency_changed_dates", {
+        frequency: every,
+        date: d1,
+      });
+    } else if (key === "line_skipped" && d1) {
+      text = t(locale, "portal.toast.line_skipped_date", { date: d1 });
+    } else if (key === "line_qty_once" && qty != null && d1) {
+      text = t(locale, "portal.toast.line_qty_once_date", { quantity: qty, date: d1 });
+    } else if (key === "line_qty_once" && qty != null) {
+      text = t(locale, "portal.toast.line_qty_once_qty", { quantity: qty });
+    } else if (key === "undone" && d1) {
+      text = t(locale, "portal.toast.undone", { date: d1 });
+    } else if (key === "undone") {
+      text = t(locale, "portal.toast.undone_plain");
+    } else if (key === "paused_until" && d1) {
+      text = t(locale, "portal.toast.paused_until_date", { date: d1 });
+    } else if (key === "pause_extended" && d1) {
+      text = t(locale, "portal.toast.pause_extended_date", { date: d1 });
+    } else if (key === "pause_too_far" && d1) {
+      text = t(locale, "portal.toast.pause_too_far_date", { date: d1 });
+    } else if (key === "resume_on" && d1) {
+      text = t(locale, "portal.toast.resume_on_date", { date: d1 });
+    } else if (key === "resumed" && d1) {
+      // "Resume now" names the first charge day (review fix): the service
+      // schedules it ~3 days out, which the bare toast never said.
+      text = t(locale, "portal.toast.resumed_date", { date: d1 });
+    } else if (key === "skip_resumed" && d1) {
+      text = t(locale, "portal.toast.skip_resumed_date", { date: d1 });
+    } else if (key === "send_tomorrow_done" && d1 && d2) {
+      text = t(locale, "portal.toast.send_tomorrow_done_dates", {
+        date: d1,
+        following: d2,
+      });
+    } else if (key === "send_tomorrow_done" && d1) {
+      text = t(locale, "portal.toast.send_tomorrow_done_date", { date: d1 });
+    } else {
+      text = t(locale, `portal.toast.${key}`);
+    }
+    const toast: PortalToast = { text };
+    // Undo rides only on the schedule-moving confirmations (a pause / hold
+    // is reversed with the banner's own controls, never a signed token).
+    const undoable =
+      key !== "undone" &&
+      key !== "paused_until" &&
+      key !== "pause_extended" &&
+      key !== "pause_too_far" &&
+      key !== "resume_on" &&
+      key !== "resumed" &&
+      key !== "skip_resumed";
+    if (undoable && undoCtx) {
+      const html = undoFormHtml(url, locale, undoCtx);
+      if (html) toast.html = html;
+    }
+    return { key, toast };
+  }
   // Friendly lock toast (v1.19.0): the refusing writer appends the unlock
   // day label + remaining days ONLY when portal.friendlyLockMessaging is on
   // (the writers hold the lock state and the setting; this resolver holds
@@ -124,6 +444,29 @@ export function resolveToast(
   // or any tampered value — falls back to the classic factual toast. The
   // label is the shop-tz calendar day, formatted here as a UTC-midnight
   // date so no second timezone conversion can shift the promised day.
+  // Support toast (v1.28.0, P5.1): "within {days} business day(s)" — the
+  // writer appends `sla` from settings; malformed/missing ⇒ the copy without
+  // a number (never a promise the settings did not make).
+  if (key === "support_sent" || key === "support_pushback_failed") {
+    const sla = Number(url.searchParams.get("sla") ?? "");
+    const days = Number.isInteger(sla) && sla >= 1 && sla <= 30 ? sla : null;
+    const sent = days
+      ? t(
+          locale,
+          days === 1 ? "portal.toast.support_sent_one" : "portal.toast.support_sent_other",
+          { days },
+        )
+      : t(locale, "portal.toast.support_sent");
+    return {
+      key,
+      toast: {
+        text:
+          key === "support_pushback_failed"
+            ? `${sent} ${t(locale, "portal.toast.support_pushback_failed")}`
+            : sent,
+      },
+    };
+  }
   if (key === "locked") {
     const label = url.searchParams.get("locked_until") ?? "";
     const days = Number(url.searchParams.get("locked_days") ?? "");
@@ -197,12 +540,50 @@ export interface PortalPageInput {
   isSetupGate?: boolean;
 }
 
+/**
+ * Colour tokens of the portal shell (v1.28.0, P5.3 accessibility pass).
+ * Exported so the a11y self-check and tests/portal-a11y.test.ts can compute
+ * WCAG contrast on the SAME values the stylesheet interpolates — a token
+ * edit that drops a pair under AA 4.5:1 fails the test, not a customer.
+ * Pairs that must stay ≥ 4.5:1 (body-size text):
+ *   muted on card / bg / the cancelled-chip grey; amber on amber-soft;
+ *   danger on danger-soft; accent on accent-soft; accent-ink on accent;
+ *   rewardsMuted on every stop of the rewards gradient; toast text on toast.
+ * History: muted was #8a837a (3.7:1 on white, 3.2:1 on the grey chip) and
+ * amber #8a6d3b (4.2:1 on amber-soft) — both below AA.
+ */
+export const PORTAL_TOKENS = {
+  bg: "#faf8f5",
+  card: "#ffffff",
+  ink: "#2b2b28",
+  muted: "#6f6a62",
+  line: "#ece7df",
+  accent: "#4a5d4a",
+  accentSoft: "#eef1ee",
+  accentInk: "#f6f4ef",
+  amber: "#7a5c2a",
+  amberSoft: "#f6efe2",
+  danger: "#a04b3c",
+  dangerSoft: "#f7ebe8",
+  /** Grey chip background (cancelled / expired). */
+  chipGrey: "#f0eeea",
+  /** Rewards card gradient stops (dark → light) and its muted text. */
+  rewardsGradient: ["#42533f", "#4a5d4a", "#5b7058"],
+  rewardsMuted: "#edf1eb",
+  toastBg: "#2b2b28",
+  toastInk: "#faf8f5",
+  toastLink: "#b8c4b6",
+  navBg: "#fffdfa",
+} as const;
+
+const T = PORTAL_TOKENS;
+
 const STYLE = `
 .cxs-portal{
-  --cxs-bg:#faf8f5;--cxs-card:#ffffff;--cxs-ink:#2b2b28;--cxs-muted:#8a837a;
-  --cxs-line:#ece7df;--cxs-accent:#4a5d4a;--cxs-accent-soft:#eef1ee;
-  --cxs-accent-ink:#f6f4ef;--cxs-amber:#8a6d3b;--cxs-amber-soft:#f6efe2;
-  --cxs-danger:#a04b3c;--cxs-danger-soft:#f7ebe8;--cxs-radius:12px;
+  --cxs-bg:${T.bg};--cxs-card:${T.card};--cxs-ink:${T.ink};--cxs-muted:${T.muted};
+  --cxs-line:${T.line};--cxs-accent:${T.accent};--cxs-accent-soft:${T.accentSoft};
+  --cxs-accent-ink:${T.accentInk};--cxs-amber:${T.amber};--cxs-amber-soft:${T.amberSoft};
+  --cxs-danger:${T.danger};--cxs-danger-soft:${T.dangerSoft};--cxs-radius:12px;
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
   color:var(--cxs-ink);max-width:680px;margin:0 auto;
   padding:24px 16px 96px;line-height:1.55;font-size:16px;
@@ -227,8 +608,9 @@ const STYLE = `
 .cxs-chip{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:3px 12px;font-size:12px;letter-spacing:0.06em;text-transform:uppercase;font-weight:600}
 .cxs-chip--active{background:var(--cxs-accent-soft);color:var(--cxs-accent)}
 .cxs-chip--paused{background:var(--cxs-amber-soft);color:var(--cxs-amber)}
-.cxs-chip--cancelled,.cxs-chip--expired{background:#f0eeea;color:var(--cxs-muted)}
+.cxs-chip--cancelled,.cxs-chip--expired{background:${T.chipGrey};color:var(--cxs-muted)}
 .cxs-chip--failed{background:var(--cxs-danger-soft);color:var(--cxs-danger)}
+.cxs-chip--warn{background:var(--cxs-amber-soft);color:var(--cxs-amber)}
 .cxs-btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:44px;padding:10px 20px;border-radius:8px;border:1px solid var(--cxs-accent);background:var(--cxs-accent);color:var(--cxs-accent-ink);font-size:15px;font-weight:500;text-decoration:none;cursor:pointer;transition:opacity .15s ease;font-family:inherit;line-height:1.2}
 .cxs-btn:hover{opacity:.9}
 .cxs-btn:disabled{opacity:.5;cursor:default}
@@ -259,6 +641,21 @@ const STYLE = `
 .cxs-stepper button{min-width:44px;min-height:44px;border:0;background:transparent;font-size:18px;cursor:pointer;color:var(--cxs-ink);font-family:inherit}
 .cxs-stepper button:disabled{color:var(--cxs-line);cursor:default}
 .cxs-stepper__qty{min-width:36px;text-align:center;font-variant-numeric:tabular-nums}
+.cxs-items__every,.cxs-items__once{display:flex;flex-direction:column;gap:4px}
+.cxs-items__once{margin-top:8px}
+.cxs-items__qty-label{font-size:12px}
+.cxs-stepper--once{border-style:dashed}
+.cxs-items__once-badge{margin-top:2px}
+.cxs-items__once-reset,.cxs-items__unskip,.cxs-items__skip-line{display:inline-flex}
+.cxs-linklike{background:none;border:0;padding:0;min-height:44px;color:var(--cxs-muted);text-decoration:underline;cursor:pointer;font-family:inherit;font-size:inherit}
+.cxs-items__skipped{margin-top:8px;display:flex;align-items:center;gap:6px;color:var(--cxs-muted)}
+.cxs-badge--muted{display:inline-block;border-radius:999px;padding:2px 10px;font-size:12px;background:${T.chipGrey};color:var(--cxs-muted)}
+.cxs-item--skipped .cxs-item__title{text-decoration:line-through;color:var(--cxs-muted)}
+.cxs-next__line--skipped .cxs-item__title,.cxs-next__line--skipped .cxs-price{color:var(--cxs-muted)}
+.cxs-supply{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline}
+.cxs-supply__days{color:var(--cxs-ink);font-weight:600}
+.cxs-pause-until{padding-top:12px;border-top:1px solid var(--cxs-line)}
+.cxs-pause-extend .cxs-actions{flex-wrap:wrap}
 details.cxs-acc{border:1px solid var(--cxs-line);border-radius:var(--cxs-radius);background:var(--cxs-card);margin:0 0 12px}
 details.cxs-acc>summary{list-style:none;display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:56px;padding:16px 20px;cursor:pointer;font-family:Georgia,"Times New Roman",serif;font-size:17px}
 details.cxs-acc>summary::-webkit-details-marker{display:none}
@@ -267,9 +664,25 @@ details.cxs-acc[open]>summary::after{transform:rotate(-135deg)}
 details.cxs-acc>.cxs-acc__body{padding:4px 20px 20px}
 .cxs-banner{display:flex;flex-wrap:wrap;align-items:center;gap:12px;background:var(--cxs-accent-soft);border:1px solid #dde4dd;border-radius:var(--cxs-radius);padding:16px 20px;margin:0 0 16px}
 .cxs-banner p{margin:0;flex:1;min-width:200px;font-size:15px}
-.cxs-rewards{background:linear-gradient(135deg,#42533f,#4a5d4a 55%,#5b7058);color:var(--cxs-accent-ink);border-radius:var(--cxs-radius);padding:20px;margin:0 0 16px}
+.cxs-dunning{background:var(--cxs-danger-soft);border-color:#eadad6}
+.cxs-dunning .cxs-actions{gap:8px}
+.cxs-payment__note{margin:8px 0 0;border-radius:8px;padding:10px 12px;line-height:1.45}
+.cxs-payment__note--warn{background:var(--cxs-amber-soft);color:var(--cxs-amber)}
+.cxs-payment__note--danger{background:var(--cxs-danger-soft);color:var(--cxs-danger)}
+.cxs-payment__note--info{background:var(--cxs-accent-soft);color:var(--cxs-accent)}
+.cxs-payment__manage--primary{font-weight:600}
+.cxs-pm__list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+.cxs-pm__row{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 12px;border:1px solid var(--cxs-line);border-radius:10px;padding:10px 12px}
+.cxs-pm__row--backup{border-color:var(--cxs-accent)}
+.cxs-pm__label{display:flex;align-items:center;gap:8px;font-weight:500}
+.cxs-pm__actions{display:flex;flex-wrap:wrap;gap:8px}
+.cxs-pm__actions form{margin:0}
+.cxs-pm__chip,.cxs-chip--info{background:var(--cxs-accent-soft);color:var(--cxs-accent)}
+details.cxs-acc--attention{border-color:var(--cxs-amber)}
+.cxs-next-charge{font-variant-numeric:tabular-nums}
+.cxs-rewards{background:linear-gradient(135deg,${T.rewardsGradient[0]},${T.rewardsGradient[1]} 55%,${T.rewardsGradient[2]});color:var(--cxs-accent-ink);border-radius:var(--cxs-radius);padding:20px;margin:0 0 16px}
 .cxs-rewards h2{color:#fdfcf9;font-size:18px;margin:0 0 12px}
-.cxs-rewards .cxs-muted{color:#cfd7cd}
+.cxs-rewards .cxs-muted{color:${T.rewardsMuted}}
 .cxs-rewards__grid{display:flex;gap:20px;flex-wrap:wrap}
 .cxs-rewards__cell{flex:1;min-width:150px}
 .cxs-rewards__num{font-family:Georgia,serif;font-size:24px;line-height:1.1}
@@ -278,11 +691,11 @@ details.cxs-acc>.cxs-acc__body{padding:4px 20px 20px}
 .cxs-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
 .cxs-grid .cxs-card{margin:0;padding:14px;display:flex;flex-direction:column;gap:8px}
 .cxs-grid .cxs-thumb{width:100%;height:120px}
-.cxs-toast{position:fixed;left:50%;bottom:88px;transform:translateX(-50%);z-index:60;display:flex;align-items:center;gap:12px;background:#2b2b28;color:#faf8f5;border-radius:10px;padding:12px 18px;font-size:14px;box-shadow:0 8px 24px rgba(0,0,0,.18);max-width:calc(100vw - 32px);transition:opacity .3s ease}
+.cxs-toast{position:fixed;left:50%;bottom:88px;transform:translateX(-50%);z-index:60;display:flex;align-items:center;gap:12px;background:${T.toastBg};color:${T.toastInk};border-radius:10px;padding:12px 18px;font-size:14px;box-shadow:0 8px 24px rgba(0,0,0,.18);max-width:calc(100vw - 32px);transition:opacity .3s ease}
 .cxs-toast--hide{opacity:0;pointer-events:none}
 .cxs-toast form{display:inline}
-.cxs-toast button[type=submit]{background:none;border:0;color:#b8c4b6;text-decoration:underline;cursor:pointer;font-size:14px;min-height:44px;padding:0 4px;font-family:inherit}
-.cxs-nav{position:fixed;left:0;right:0;bottom:0;z-index:50;display:flex;background:#fffdfa;border-top:1px solid var(--cxs-line);padding-bottom:env(safe-area-inset-bottom)}
+.cxs-toast button[type=submit]{background:none;border:0;color:${T.toastLink};text-decoration:underline;cursor:pointer;font-size:14px;min-height:44px;padding:0 4px;font-family:inherit}
+.cxs-nav{position:fixed;left:0;right:0;bottom:0;z-index:50;display:flex;background:${T.navBg};border-top:1px solid var(--cxs-line);padding-bottom:env(safe-area-inset-bottom)}
 .cxs-nav a{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;min-height:56px;text-decoration:none;color:var(--cxs-muted);font-size:12px;letter-spacing:0.02em}
 .cxs-nav a.cxs-nav--on{color:var(--cxs-accent);font-weight:600}
 .cxs-nav svg{width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:1.6}
@@ -290,6 +703,33 @@ details.cxs-acc>.cxs-acc__body{padding:4px 20px 20px}
 .cxs-preview-bar{position:fixed;top:0;left:0;right:0;z-index:2147483200;background:#2b2b28;color:#faf8f5;text-align:center;font-size:13px;line-height:1.4;padding:11px 16px;letter-spacing:0.01em}
 .cxs-error{background:var(--cxs-danger-soft);color:var(--cxs-danger);border-radius:8px;padding:12px 16px;font-size:14px;margin:0 0 14px}
 .cxs-note{background:var(--cxs-bg);border:1px dashed var(--cxs-line);border-radius:8px;padding:12px 16px;font-size:14px;color:var(--cxs-muted)}
+.cxs-textarea{width:100%;min-height:88px;padding:10px 14px;border:1px solid var(--cxs-line);border-radius:8px;background:#fff;color:var(--cxs-ink);font-size:16px;font-family:inherit;line-height:1.45;resize:vertical}
+.cxs-textarea:focus{outline:2px solid var(--cxs-accent);outline-offset:1px;border-color:var(--cxs-accent)}
+.cxs-check{display:flex;gap:10px;align-items:flex-start;font-size:14px;margin:0 0 14px;cursor:pointer}
+.cxs-check[hidden]{display:none}
+.cxs-check input{margin-top:3px;width:18px;height:18px;flex:none}
+.cxs-support__channels{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0 4px}
+.cxs-support__hours{margin:6px 0 0}
+.cxs-support__privacy{margin:10px 0 0}
+.cxs-skip{position:absolute;left:-9999px;top:auto;width:1px;height:1px;overflow:hidden;background:var(--cxs-accent);color:var(--cxs-accent-ink);padding:10px 16px;border-radius:8px;text-decoration:none;font-size:14px;z-index:70}
+.cxs-skip:focus,.cxs-skip:focus-visible{position:fixed;left:16px;top:16px;width:auto;height:auto;overflow:visible;outline:2px solid var(--cxs-ink);outline-offset:2px}
+.cxs-portal main:focus{outline:none}
+.cxs-portal a:focus-visible,.cxs-portal button:focus-visible,.cxs-portal input:focus-visible,.cxs-portal select:focus-visible,.cxs-portal textarea:focus-visible,.cxs-portal summary:focus-visible,.cxs-portal [tabindex]:focus-visible{outline:2px solid var(--cxs-accent);outline-offset:2px}
+.cxs-portal .cxs-btn:focus-visible,.cxs-portal .cxs-nav a:focus-visible{outline-offset:3px}
+.cxs-portal .cxs-toast button[type=submit]:focus-visible{outline-color:var(--cxs-accent-ink)}
+.cxs-progress[role=progressbar]{outline:none}
+.cxs-remove{display:flex;flex-direction:column;align-items:flex-end;max-width:100%}
+.cxs-confirm{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:8px;padding:10px 12px;border:1px solid var(--cxs-danger);border-radius:8px;background:var(--cxs-danger-soft);font-size:14px;max-width:100%}
+.cxs-confirm[hidden]{display:none}
+.cxs-confirm__q{flex:1 1 100%;margin:0;color:var(--cxs-ink)}
+.cxs-confirm .cxs-btn--danger{background:var(--cxs-danger);color:#fff;border-color:var(--cxs-danger)}
+.cxs-education{margin:0 0 16px}
+.cxs-education__links{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 0}
+.cxs-education__links .cxs-btn{flex:1 1 auto}
+.cxs-education__help{margin:12px 0 0}
+@media (prefers-reduced-motion:reduce){
+  .cxs-portal *,.cxs-portal *::before,.cxs-portal *::after{transition:none !important;animation:none !important;scroll-behavior:auto !important}
+}
 .cxs-portal[dir=rtl] .cxs-compare{margin-right:0;margin-left:6px}
 .cxs-portal[dir=rtl] details.cxs-acc>summary::after{margin-right:0;margin-left:4px}
 @media (min-width:720px){
@@ -325,10 +765,71 @@ const SCRIPT = `
   if(toast){
     setTimeout(function(){toast.classList.add("cxs-toast--hide")},7000);
   }
-  root.querySelectorAll("form[data-cellexia-confirm]").forEach(function(f){
-    f.addEventListener("submit",function(e){
-      if(!window.confirm(f.getAttribute("data-cellexia-confirm"))){e.preventDefault();}
+  // Address form (v1.28.0, P2.8): the region datalist follows the country
+  // select. Without JS the field keeps the current country's list.
+  var country=root.querySelector("select[data-cellexia-country]");
+  var provField=root.querySelector("[data-cellexia-province-field]");
+  if(country&&provField){
+    var table={};
+    try{table=JSON.parse(provField.getAttribute("data-cellexia-provinces")||"{}");}catch(e){table={};}
+    var input=provField.querySelector("input");
+    var list=provField.querySelector("datalist");
+    country.addEventListener("change",function(){
+      if(!input||!list){return;}
+      var rows=table[country.value]||[];
+      list.textContent="";
+      rows.forEach(function(r){var o=document.createElement("option");o.value=r[0];o.textContent=r[1];list.appendChild(o);});
+      input.required=rows.length>0;
+      input.value="";
     });
+  }
+  // Inline destructive confirm (v1.28.0, P5.3): no window.confirm — the
+  // form carries an "arm" button and a hidden confirm panel ("Remove X?
+  // Keep / Remove"). Arm shows the panel and moves focus into it; Keep hides
+  // it and hands focus back. Without JS the arm button submits directly, as
+  // the old confirm() version did (server rules still apply either way).
+  root.querySelectorAll("form[data-cellexia-confirm]").forEach(function(f){
+    var arm=f.querySelector("[data-cellexia-confirm-arm]");
+    var panel=f.querySelector("[data-cellexia-confirm-panel]");
+    var keep=f.querySelector("[data-cellexia-confirm-keep]");
+    if(!arm||!panel){return;}
+    arm.addEventListener("click",function(e){
+      e.preventDefault();
+      panel.hidden=false;arm.hidden=true;
+      var first=panel.querySelector("button");
+      if(first){first.focus();}
+    });
+    if(keep){
+      keep.addEventListener("click",function(){
+        panel.hidden=true;arm.hidden=false;arm.focus();
+      });
+    }
+  });
+  // Frequency consequence preview (v1.28.0): every <option> carries its
+  // server-rendered "next order …, then …" text; mirror the selected one
+  // into the hint so the customer sees the resulting dates BEFORE saving.
+  // Rooted at our node like everything else; no-op without the elements.
+  root.querySelectorAll("select[data-cellexia-freq-select]").forEach(function(sel){
+    var hint=sel.closest(".cxs-field");
+    hint=hint?hint.querySelector("[data-cellexia-freq-preview]"):null;
+    if(!hint){return;}
+    var sync=function(){
+      var opt=sel.options[sel.selectedIndex];
+      hint.textContent=opt?(opt.getAttribute("data-cxs-preview")||""):"";
+    };
+    sel.addEventListener("change",sync);
+    sync();
+  });
+  // Get-help form (v1.28.0, P5.1): the "push my next order back" row is a
+  // Delivery-problem option only — shown when that topic is selected. The
+  // server ignores the checkbox for every other topic regardless.
+  root.querySelectorAll("select[data-cellexia-support-topic]").forEach(function(sel){
+    var form=sel.closest("form");
+    var row=form?form.querySelector("[data-cellexia-support-delivery]"):null;
+    if(!row){return;}
+    var sync=function(){row.hidden=sel.value!=="DELIVERY";};
+    sel.addEventListener("change",sync);
+    sync();
   });
   // Double-submit guard: the FIRST submit marks the form; any further submit
   // (double-tap, impatient retry) is prevented outright, and the buttons are
@@ -423,9 +924,18 @@ export function portalPage(input: PortalPageInput): string {
         <a href="${withLocale(`${base}/account`, locale, preview)}"${input.activeNav === "account" ? ' class="cxs-nav--on" aria-current="page"' : ""}>${NAV_ICON_ACCOUNT}<span>${escapeHtml(t(locale, "portal.nav.account"))}</span></a>
       </nav>`;
 
+  // Screen-reader tone (P5.3): confirmations are polite live regions;
+  // refusals / errors are role=alert so they are announced immediately.
+  const toastRole =
+    input.toast?.tone === "alert"
+      ? 'role="alert"'
+      : 'role="status" aria-live="polite"';
   const toast = input.toast
-    ? `<div class="cxs-toast" data-cellexia-toast role="status">${escapeHtml(input.toast.text)}${input.toast.html ?? ""}</div>`
+    ? `<div class="cxs-toast" data-cellexia-toast ${toastRole}>${escapeHtml(input.toast.text)}${input.toast.html ?? ""}</div>`
     : "";
+  // Skip link (P5.3): the portal is injected below the theme's header/nav,
+  // so keyboard users get a first-tab jump straight to the page content.
+  const skip = `<a class="cxs-skip" href="#cxs-main">${escapeHtml(t(locale, "portal.a11y.skip_to_content"))}</a>`;
 
   const back = input.backHref
     ? `<a class="cxs-back" href="${escapeHtml(input.backHref)}">${backArrow} ${escapeHtml(input.backLabel ?? t(locale, "portal.back"))}</a>`
@@ -447,6 +957,7 @@ export function portalPage(input: PortalPageInput): string {
   const gateAttr = input.isSetupGate ? ' data-cellexia-gate=""' : "";
   return `<div class="cxs-portal" data-cellexia-portal lang="${escapeHtml(locale)}" dir="${dir}"${gateAttr}>
 <style>${STYLE}</style>
+${skip}
 ${previewBar}
 <div class="cxs-shell">
 ${nav}
@@ -454,7 +965,7 @@ ${nav}
 ${back}
 <h1>${escapeHtml(input.title)}</h1>
 </header>
-<main>
+<main id="cxs-main" tabindex="-1">
 ${body}
 </main>
 </div>

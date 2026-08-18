@@ -50,19 +50,28 @@ describe("REASONS structural integrity", () => {
 describe("surplus (TOO_MUCH_PRODUCT) never gets a discount", () => {
   const surplus = REASONS.find((r) => r.key === "TOO_MUCH_PRODUCT")!;
 
-  it("leads with SKIP then FREQUENCY — logistics fixes before anything else", () => {
-    expect(surplus.savesOrder[0]).toBe("SKIP");
-    expect(surplus.savesOrder[1]).toBe("FREQUENCY");
+  it("leads with DELAY, then SKIP, DOWNSIZE, FREQUENCY — logistics fixes before anything else", () => {
+    // v1.28.0: DELAY ("push my next order to the predicted run-out day",
+    // P3.3) leads — it only renders when the churn model knows a run-out
+    // day after the next charge, so SKIP keeps the slot otherwise. DOWNSIZE
+    // (fewer units / smaller size / cheaper product) sits right after SKIP —
+    // a structural fix for surplus that keeps every delivery at a lower
+    // ARPU; it only renders when a genuinely cheaper option exists, so
+    // FREQUENCY still fills the visible slice otherwise.
+    expect(surplus.savesOrder[0]).toBe("DELAY");
+    expect(surplus.savesOrder[1]).toBe("SKIP");
+    expect(surplus.savesOrder[2]).toBe("DOWNSIZE");
+    expect(surplus.savesOrder[3]).toBe("FREQUENCY");
   });
 
   it("contains no DISCOUNT anywhere in its savesOrder", () => {
     expect(surplus.savesOrder).not.toContain("DISCOUNT" satisfies SaveKind);
   });
 
-  it("the visible slice (MAX_SAVES_SHOWN) is exactly [SKIP, FREQUENCY]", () => {
+  it("the visible slice (MAX_SAVES_SHOWN) is [DELAY, SKIP] — never a discount", () => {
     expect(surplus.savesOrder.slice(0, MAX_SAVES_SHOWN)).toEqual([
+      "DELAY",
       "SKIP",
-      "FREQUENCY",
     ]);
   });
 });
@@ -78,8 +87,12 @@ describe("discount gating", () => {
   it("even for TOO_EXPENSIVE, the discount is not the lead offer", () => {
     const expensive = REASONS.find((r) => r.key === "TOO_EXPENSIVE")!;
     expect(expensive.savesOrder.indexOf("DISCOUNT")).toBeGreaterThan(0);
-    // The reframe (pause) comes first; the margin give-away is the fallback.
-    expect(expensive.savesOrder[0]).toBe("PAUSE");
+    // v1.28.0: the cheaper configuration (DOWNSIZE — not a discount) leads,
+    // the reframe (pause) follows; the margin give-away is the fallback and
+    // the LAST entry, so at the default cap it only shows when no cheaper
+    // configuration exists.
+    expect(expensive.savesOrder).toEqual(["DOWNSIZE", "PAUSE", "DISCOUNT"]);
+    expect(expensive.savesOrder.at(-1)).toBe("DISCOUNT");
   });
 
   it("FINAL_DISCOUNT is a step-4 outcome marker, not a reason-matched save", () => {

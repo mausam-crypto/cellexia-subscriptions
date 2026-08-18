@@ -223,6 +223,9 @@ describe("runPreExpiryNotices contract query", () => {
     const whereBlock = query.slice(0, query.indexOf("include:"));
     expect(whereBlock).toContain("OURS_ONLY");
     expect(whereBlock).toContain("isDemo: false");
-    expect(whereBlock).toContain('status: "ACTIVE"');
+    // v1.28.0: PAUSED contracts join the sweep (a card expiring before
+    // resumeAt would fail the first resumed charge) — the resumeAt gate lives
+    // in the loop, pinned by tests/dunning-preexpiry-paused.test.ts.
+    expect(whereBlock).toContain('status: { in: ["ACTIVE", "PAUSED"] }');
   });
 });

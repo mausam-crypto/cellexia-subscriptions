@@ -3,6 +3,11 @@
   "progress": "Vraag {{current}} van {{total}} — één tik per vraag",
   "doneTitle": "Dank je wel!",
   "doneBody": "Je antwoorden helpen alles op jou af te stemmen.",
+  "manage": {
+    "title": "Beheer je abonnement",
+    "body": "Wissel van producten, sla een levering over of stel hem uit, werk je adres of kaart bij — altijd, vanuit je abonnementsaccount.",
+    "cta": "Mijn abonnement beheren"
+  },
   "q": {
     "plannedDuration": {
       "title": "Hoe denk je dit product te gebruiken?",

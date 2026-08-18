@@ -76,8 +76,12 @@ describe("acceptSave guardrails (source contract)", () => {
       "was never offered in cancel session",
     );
     // PAUSE stays exempt — the step-1 one-tap pause runs before anything is
-    // recorded, and pause is the flow's always-available default.
-    expect(engineSource).toContain('if (saveKind !== "PAUSE")');
+    // recorded, and pause is the flow's always-available default. Its
+    // PAUSED-contract sibling EXTEND_PAUSE (v1.28.0) shares the exemption
+    // (the intro exit ramp) and is status-gated at execution instead.
+    expect(engineSource).toContain(
+      'if (saveKind !== "PAUSE" && saveKind !== "EXTEND_PAUSE")',
+    );
   });
 
   it("re-checks the reason-offer cooldown at accept time (not only at show time)", () => {
@@ -114,11 +118,13 @@ describe("cancel-session closure races (source contract)", () => {
   // as the FIRST write in all three closers, execute only after winning, and
   // revert the claim if the mutation fails.
 
-  it("all three closers (acceptSave, acceptFinalOffer, completeCancel) claim atomically", () => {
+  it("all four closers (acceptSave, acceptFinalOffer, completeCancel, scheduleCancel) claim atomically", () => {
+    // v1.28.0 (P3.8): scheduleCancel is the fourth closer — it claims the
+    // session as CANCEL_SCHEDULED before writing cancelScheduledAt.
     const claims = engineSource.match(
       /where: \{ id: session\.id, outcome: null \}/g,
     );
-    expect(claims).toHaveLength(3);
+    expect(claims).toHaveLength(4);
   });
 
   it("each closer reverts its claim when the execution fails", () => {

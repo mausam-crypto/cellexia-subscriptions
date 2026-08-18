@@ -6,6 +6,7 @@ import {
   buildPortalUrl,
 } from "~/lib/magiclinks/builder.server";
 import { formatShopDate } from "~/lib/dates.server";
+import { t } from "~/lib/i18n/i18n.server";
 import { contractFrequency } from "~/lib/frequency";
 import { formatMoney } from "~/lib/money";
 import { enqueue } from "./outbox.server";
@@ -37,10 +38,27 @@ const EVENT_METRIC_MAP: Record<string, string> = {
   "contract.frequency_changed": "Cellexia Frequency Changed",
   "contract.line_swapped": "Cellexia Product Swapped",
   "cycle.addon_added": "Cellexia Add-on Added",
+  // v1.28.0 (P2.5) — per-line "not this time" / one-order quantity tweak.
+  "cycle.line_skipped": "Cellexia Product Skipped Once",
+  "cycle.line_unskipped": "Cellexia Product Skip Undone",
+  "cycle.line_quantity_set": "Cellexia Product Quantity Once",
+  // v1.28.0 (P2.6 / P2.7) — pause exit ramp + "already out" rush. Analytics
+  // / segmentation metrics only (no notification template rides them, so no
+  // cellexia_send verdict): the paused-until confirmation itself travels on
+  // "Cellexia Subscription Paused" (contract.paused, until:true).
+  "contract.pause_extended": "Cellexia Pause Extended",
+  "cycle.rushed": "Cellexia Order Rushed",
   "billing.attempt_failed": "Cellexia Payment Failed",
   "dunning.recovered": "Cellexia Payment Recovered",
   "dunning.card_expiring_notice": "Cellexia Card Expiring",
   "dunning.threeds_link_sent": "Cellexia 3DS Action Required",
+  // v1.28.0 — the canonical "card behind the subscription changed" moment
+  // (webhook mirror, portal/admin change, backup promotion, engine swap).
+  // Shares its metric with the router's payment_method_updated template;
+  // the outbox graft supersedes this content-less twin exactly like
+  // billing.attempt_failed × payment_failed_1. Properties carry
+  // card_updated_by (customer | merchant | system) for segmentation.
+  "contract.payment_method_updated": "Cellexia Payment Method Updated",
   "cancel.save_accepted": "Cellexia Cancel Save Accepted",
   "cancel.final_offer_accepted": "Cellexia Final Offer Accepted",
   "winback.soft_touch": "Cellexia Winback Soft Touch",
@@ -58,6 +76,9 @@ const EVENT_METRIC_MAP: Record<string, string> = {
   "lifecycle.rewards_unlocked": "Cellexia Rewards Unlocked",
   "lifecycle.gift_scheduled": "Cellexia Gift Scheduled",
   "lifecycle.incentive_announced": "Cellexia Incentive Announced",
+  // v1.28.0 (P4.1) — the routine check-in email's one-tap answer
+  // (great | unsure); segmentation metric only, no template rides it.
+  "lifecycle.checkin_answered": "Cellexia Routine Check-in Answered",
   "contract.price_propagated": "Cellexia Price Change Notice",
   "stockout.delayed": "Cellexia Stockout Delay",
   // Post-purchase survey (v1.21.0). Analytics/segmentation metric ONLY — no
@@ -70,7 +91,26 @@ const EVENT_METRIC_MAP: Record<string, string> = {
   // canonical non-confirmation events stay verdict-absent (the frozen-flag
   // lesson pinned by tests/outbox-graft-verdict.test.ts).
   "survey.answered": "Cellexia Survey Answered",
+  // Support request (v1.28.0, P5.1) — the portal Get-help form / cancel-flow
+  // support cards. Segmentation + merchant-side helpdesk flows only; no
+  // notification template rides this metric, so no cellexia_send verdict.
+  // Properties are the event payload verbatim (camelCase, see
+  // request.server.ts): topic, contractId, orderRef, pushBack,
+  // pushBackApplied, pushBackMode?, message (truncated), surface,
+  // cancelReason?, cancelSessionId? — plus the contract snapshot. Person-
+  // typed (never a dual-writer metric): enqueued with dedupe OFF so two
+  // distinct requests inside the 120 s window both reach Klaviyo.
+  "support.requested": "Cellexia Support Requested",
 };
+
+/**
+ * Event types whose every occurrence is a distinct customer act — enqueued
+ * with the outbox dedupe OFF (see enqueueKlaviyoForEvent). Only add person-
+ * typed events that never carry a cellexia_send verdict / content twin.
+ */
+export const NO_DEDUPE_EVENT_TYPES: ReadonlySet<string> = new Set([
+  "support.requested",
+]);
 
 /** Event types whose flows need one-tap action links (dunning family). */
 const LINK_BUNDLE_TYPES = new Set([
@@ -233,6 +273,21 @@ export async function contractSnapshotProperties(
       tz,
       contract.locale,
     );
+  }
+  // Pause exit ramp (v1.28.0, P2.6): a PAUSED contract's exact resume day,
+  // so the pause confirmation (and any flow) can quote the date the hold
+  // ends. `resume_line` is the ready sentence — empty when there is no
+  // scheduled resume (an external pause), so copy never shows a bare
+  // placeholder.
+  if (contract.status === "PAUSED" && contract.resumeAt) {
+    const resumeDate = formatShopDate(contract.resumeAt, tz, contract.locale);
+    props.resume_date = resumeDate;
+    props.resume_date_iso = contract.resumeAt.toISOString();
+    props.resume_line = t(contract.locale, "email.pause_confirmed.resume_line", {
+      resume_date: resumeDate,
+    });
+  } else {
+    props.resume_line = "";
   }
   try {
     props.portal_url = await buildPortalUrl(contract.shopId);
@@ -432,6 +487,31 @@ export async function enqueueKlaviyoForEvent(
         await contractSnapshotProperties(contract, tz),
       );
 
+      // Cancellation (v1.28.0, P3.2): the signed one-tap `restart_url` rides
+      // on the metric so a Klaviyo-rendered cancel_confirmed (auto-created
+      // flow or the merchant's own) can offer a login-free restart. Minted
+      // BEFORE the confirmation render below so {restart_url} resolves in
+      // the content. Contained: {} on failure / MERGED / foreign / demo.
+      if (event.type === "contract.cancelled") {
+        try {
+          const { restartLinkVars } = await import("~/lib/winback/links.server");
+          Object.assign(
+            properties,
+            await restartLinkVars(contract, { createdVia: "KLAVIYO_FLOW" }),
+          );
+        } catch (err) {
+          console.error("[klaviyo] restart link failed", contract.id, err);
+        }
+        // Never a literal {restart_url} in a Klaviyo-rendered body: degrade
+        // to the portal link when the mint failed.
+        if (
+          typeof properties.restart_url !== "string" &&
+          typeof properties.portal_url === "string"
+        ) {
+          properties.restart_url = properties.portal_url;
+        }
+      }
+
       if (confirmationTemplate && cellexiaSend) {
         try {
           const { renderEmail } = await import(
@@ -501,13 +581,22 @@ export async function enqueueKlaviyoForEvent(
       properties[CELLEXIA_SEND_PROPERTY] = cellexiaSend ? "true" : "false";
     }
 
-    await enqueue(event.shopId, {
-      eventName: metric,
-      email,
-      phone,
-      profileAttrs,
-      properties,
-    });
+    await enqueue(
+      event.shopId,
+      {
+        eventName: metric,
+        email,
+        phone,
+        profileAttrs,
+        properties,
+      },
+      // The outbox dedupe collapses same shop+metric+email+contract rows
+      // inside 120 s regardless of properties — right for dual-writer
+      // metrics, wrong for a customer typing two different support requests
+      // (a delivery problem, then a plan question) whose second topic /
+      // message would silently never reach Klaviyo.
+      NO_DEDUPE_EVENT_TYPES.has(event.type) ? { dedupe: false } : {},
+    );
   } catch (err) {
     console.error("[klaviyo] event mapping failed", event.type, err);
   }

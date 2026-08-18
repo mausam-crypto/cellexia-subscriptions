@@ -11,7 +11,16 @@
 import "@shopify/ui-extensions/preact";
 import { render } from "preact";
 import { Survey } from "./survey-core.jsx";
+import { ManageSubscriptionLink } from "./manage-link.jsx";
 
+// v1.28.0 (P5.2): the "Manage your subscription" entry point renders in the
+// same block, above the survey — subscription orders only (manage-link.jsx).
 export default async () => {
-  render(<Survey source="ORDER_STATUS" orderSource="order" />, document.body);
+  render(
+    <s-stack gap="base">
+      <ManageSubscriptionLink />
+      <Survey source="ORDER_STATUS" orderSource="order" />
+    </s-stack>,
+    document.body,
+  );
 };

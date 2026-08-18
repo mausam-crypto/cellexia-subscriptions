@@ -14,8 +14,10 @@ import { t } from "~/lib/i18n/i18n.server";
 import { isRtlLocale } from "~/lib/portal/layout.server";
 import {
   bestEffortPortalLoginUrl,
+  cycleEditsBlockedResult,
   describeMagicAction,
   executeMagicAction,
+  isContractEditBlockedError,
   type MagicActionDescription,
   type MagicActionResult,
 } from "~/lib/magiclinks/handlers.server";
@@ -137,25 +139,41 @@ function confirmPage(desc: MagicActionDescription): string {
       )}</a>`
     : "";
 
+  // Multi-choice landing page (v1.28.0, EXTEND_PAUSE): one submit button per
+  // choice, each posting `choice=<value>` — still only the customer's own tap
+  // submits (same scanner-safety contract as the single button).
+  const buttonsHtml =
+    desc.choices && desc.choices.length > 0
+      ? desc.choices
+          .map(
+            (c, i) =>
+              `<button class="btn${i > 0 ? " secondary" : ""} choice-btn" type="submit" name="choice" value="${esc(
+                c.value,
+              )}">${esc(c.label)}</button>`,
+          )
+          .join("\n    ")
+      : `<button class="btn" id="confirm-btn" type="submit">${esc(
+          desc.confirmLabel,
+        )}</button>`;
+
   const body = `<div class="card">
   <h1>${esc(desc.title)}</h1>
   <p class="desc">${esc(desc.description)}</p>
   <form method="post" id="magic-form">
-    <button class="btn" id="confirm-btn" type="submit">${esc(
-      desc.confirmLabel,
-    )}</button>
+    ${buttonsHtml}
   </form>
   ${cancelHtml}
 </div>
 <script>
 (function () {
   var form = document.getElementById("magic-form");
-  var btn = document.getElementById("confirm-btn");
-  if (!form || !btn) return;
+  if (!form) return;
+  var buttons = form.querySelectorAll("button[type=submit]");
+  if (!buttons.length) return;
   var confirming = ${jsStr(t(locale, "magic.confirm.confirming"))};
   var submitted = false;
   // Double-submit guard + button feedback ONLY. The POST is caused solely by
-  // the customer's tap on the confirm button: no timer, no programmatic
+  // the customer's tap on a confirm button: no timer, no programmatic
   // submit — a script-driven POST here is exactly what lets email-security
   // sandboxes burn the token and execute the verb (see the module doc).
   form.addEventListener("submit", function (event) {
@@ -164,8 +182,21 @@ function confirmPage(desc: MagicActionDescription): string {
       return;
     }
     submitted = true;
-    btn.disabled = true;
-    btn.textContent = confirming;
+    var sub = event.submitter || document.activeElement;
+    // A disabled submitter is left out of the form data set, so copy the
+    // tapped choice into a hidden field BEFORE disabling the buttons.
+    if (sub && sub.tagName === "BUTTON" && sub.name === "choice") {
+      var hidden = document.createElement("input");
+      hidden.type = "hidden";
+      hidden.name = "choice";
+      hidden.value = sub.value;
+      form.appendChild(hidden);
+    }
+    for (var i = 0; i < buttons.length; i++) {
+      buttons[i].disabled = true;
+    }
+    var target = sub && sub.tagName === "BUTTON" ? sub : buttons[0];
+    target.textContent = confirming;
   });
 })();
 </script>`;
@@ -295,7 +326,17 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   if (!verified.ok) return errorPage(toErrorKind(verified.reason));
 
   try {
-    const result = await executeMagicAction(verified.payload);
+    // Landing-page choice (EXTEND_PAUSE): read once, passed as data — the
+    // handler validates it against the token's own allowed list.
+    let choice: string | null = null;
+    try {
+      const form = await request.formData();
+      const raw = form.get("choice");
+      choice = typeof raw === "string" ? raw : null;
+    } catch {
+      choice = null;
+    }
+    const result = await executeMagicAction(verified.payload, { choice });
 
     if (result.redirect) {
       // 303: the browser follows with GET. UPDATE_CARD tokens carry maxUses 5
@@ -308,6 +349,12 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     return html(successPage(result));
   } catch (err) {
     console.error("[magic] action failed", verified.payload.action, err);
+    // Shopify refused a contract-level verb while one-off changes are staged
+    // on the next order: say so (the token is consumed — "try again in a
+    // moment" would be a lie, the same link now answers USED).
+    if (isContractEditBlockedError(err)) {
+      return html(successPage(await cycleEditsBlockedResult(verified.payload)));
+    }
     return errorPage("GENERIC");
   }
 };

@@ -60,6 +60,9 @@ api_version = "2025-01"
     "orders/create",
     "orders/cancelled",
     "orders/fulfilled",
+    "fulfillments/create",
+    "fulfillments/update",
+    "fulfillment_events/create",
     "refunds/create",
     "shop/update"
   ]

@@ -71,6 +71,10 @@ interface FunnelStats {
   windowDays: number;
   starts: number;
   saved: number;
+  /** Concierge saves awaiting the merchant's reply (SAVED_PENDING, v1.28.0). */
+  pending: number;
+  /** Locked contracts that scheduled their cancellation (CANCEL_SCHEDULED). */
+  scheduled: number;
   cancelled: number;
   abandoned: number;
   saveRatePct: number | null;
@@ -99,6 +103,19 @@ interface CancelFlowValues {
   sessionFreshMinutes: number;
   giftSaveEnabled: boolean;
   giftSaveCooldownDays: number;
+  downsizeSaveEnabled: boolean;
+  delaySaveEnabled: boolean;
+  delaySaveMaxDays: number;
+  conciergeHoldDays: number;
+  conciergeHoldMinLeadHours: number;
+  scheduledCancelEnabled: boolean;
+  scheduledCancelNoticeDays: number;
+  keepLinkTtlDays: number;
+  intentFollowupEnabled: boolean;
+  intentFollowupHours: number;
+  intentFollowupChargeBufferHours: number;
+  intentFollowupCooldownDays: number;
+  intentBannerDays: number;
 }
 
 interface ActionData {
@@ -187,6 +204,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   const starts = sessions.length;
   let saved = 0;
+  let pending = 0;
+  let scheduled = 0;
   let cancelled = 0;
   let abandoned = 0;
   let finalOfferShown = 0;
@@ -198,6 +217,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   for (const session of sessions) {
     if (session.outcome === "SAVED") saved += 1;
+    else if (session.outcome === "SAVED_PENDING") pending += 1;
+    else if (session.outcome === "CANCEL_SCHEDULED") scheduled += 1;
     else if (session.outcome === "CANCELLED") cancelled += 1;
     else abandoned += 1;
 
@@ -272,6 +293,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     windowDays: FUNNEL_WINDOW_DAYS,
     starts,
     saved,
+    pending,
+    scheduled,
     cancelled,
     abandoned,
     saveRatePct: starts > 0 ? round1((saved / starts) * 100) : null,
@@ -331,6 +354,19 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       sessionFreshMinutes: intField("sessionFreshMinutes"),
       giftSaveEnabled: formData.get("giftSaveEnabled") === "true",
       giftSaveCooldownDays: intField("giftSaveCooldownDays"),
+      downsizeSaveEnabled: formData.get("downsizeSaveEnabled") === "true",
+      delaySaveEnabled: formData.get("delaySaveEnabled") === "true",
+      delaySaveMaxDays: intField("delaySaveMaxDays"),
+      conciergeHoldDays: intField("conciergeHoldDays"),
+      conciergeHoldMinLeadHours: intField("conciergeHoldMinLeadHours"),
+      scheduledCancelEnabled: formData.get("scheduledCancelEnabled") === "true",
+      scheduledCancelNoticeDays: intField("scheduledCancelNoticeDays"),
+      keepLinkTtlDays: intField("keepLinkTtlDays"),
+      intentFollowupEnabled: formData.get("intentFollowupEnabled") === "true",
+      intentFollowupHours: intField("intentFollowupHours"),
+      intentFollowupChargeBufferHours: intField("intentFollowupChargeBufferHours"),
+      intentFollowupCooldownDays: intField("intentFollowupCooldownDays"),
+      intentBannerDays: intField("intentBannerDays"),
     };
     const parsed = settingsSchemas.cancelFlow.safeParse(candidate);
     if (!parsed.success) {
@@ -382,15 +418,15 @@ const REASON_SAVES_PREVIEW: Array<{
   // that contradicts the live mapping tunes the merchant blind.
   {
     reason: "Too much product",
-    saves: "Skip next order → slow down frequency → pause",
+    saves: "Skip next order → downsize (fewer units / smaller size / cheaper product) → slow down frequency → pause",
     rationale:
-      "Cadence mismatch, not dissatisfaction — costs nothing to fix, no discount needed.",
+      "Cadence mismatch, not dissatisfaction — costs nothing to fix, no discount needed. Downsize keeps every delivery at a lower ARPU instead of zero.",
   },
   {
     reason: "Too expensive",
-    saves: "Pause → reason-offer discount (N cycles)",
+    saves: "Downsize (fewer units / smaller size / cheaper product, each with its new total) → pause → reason-offer discount (N cycles)",
     rationale:
-      "The pause reframes the spend without discounting; the small temporary discount is the fallback, not the lead.",
+      "A cheaper configuration answers the price objection without repricing anything; the pause reframes the spend; the small temporary discount stays the fallback, not the lead.",
   },
   {
     reason: "Not seeing results",
@@ -481,6 +517,44 @@ export default function CancelFlowPage() {
   const [giftSaveCooldown, setGiftSaveCooldown] = useState(
     String(initial.giftSaveCooldownDays),
   );
+  const [downsizeSaveEnabled, setDownsizeSaveEnabled] = useState(
+    initial.downsizeSaveEnabled ?? true,
+  );
+  const [delaySaveEnabled, setDelaySaveEnabled] = useState(
+    initial.delaySaveEnabled ?? true,
+  );
+  const [delaySaveMaxDays, setDelaySaveMaxDays] = useState(
+    String(initial.delaySaveMaxDays ?? 42),
+  );
+  const [conciergeHoldDays, setConciergeHoldDays] = useState(
+    String(initial.conciergeHoldDays ?? 7),
+  );
+  const [conciergeHoldMinLeadHours, setConciergeHoldMinLeadHours] = useState(
+    String(initial.conciergeHoldMinLeadHours ?? 48),
+  );
+  const [scheduledCancelEnabled, setScheduledCancelEnabled] = useState(
+    initial.scheduledCancelEnabled ?? true,
+  );
+  const [scheduledCancelNoticeDays, setScheduledCancelNoticeDays] = useState(
+    String(initial.scheduledCancelNoticeDays ?? 3),
+  );
+  const [keepLinkTtlDays, setKeepLinkTtlDays] = useState(
+    String(initial.keepLinkTtlDays ?? 60),
+  );
+  const [intentFollowupEnabled, setIntentFollowupEnabled] = useState(
+    initial.intentFollowupEnabled ?? true,
+  );
+  const [intentFollowupHours, setIntentFollowupHours] = useState(
+    String(initial.intentFollowupHours ?? 18),
+  );
+  const [intentFollowupChargeBufferHours, setIntentFollowupChargeBufferHours] =
+    useState(String(initial.intentFollowupChargeBufferHours ?? 48));
+  const [intentFollowupCooldownDays, setIntentFollowupCooldownDays] = useState(
+    String(initial.intentFollowupCooldownDays ?? 30),
+  );
+  const [intentBannerDays, setIntentBannerDays] = useState(
+    String(initial.intentBannerDays ?? 14),
+  );
 
   useEffect(() => {
     if (!actionData) return;
@@ -515,6 +589,19 @@ export default function CancelFlowPage() {
         sessionFreshMinutes: sessionFresh,
         giftSaveEnabled: String(giftSaveEnabled),
         giftSaveCooldownDays: giftSaveCooldown,
+        downsizeSaveEnabled: String(downsizeSaveEnabled),
+        delaySaveEnabled: String(delaySaveEnabled),
+        delaySaveMaxDays,
+        conciergeHoldDays,
+        conciergeHoldMinLeadHours,
+        scheduledCancelEnabled: String(scheduledCancelEnabled),
+        scheduledCancelNoticeDays,
+        keepLinkTtlDays,
+        intentFollowupEnabled: String(intentFollowupEnabled),
+        intentFollowupHours,
+        intentFollowupChargeBufferHours,
+        intentFollowupCooldownDays,
+        intentBannerDays,
       },
       { method: "post" },
     );
@@ -677,6 +764,175 @@ export default function CancelFlowPage() {
                 </InlineStack>
                 <Divider />
                 <Text as="h3" variant="headingSm">
+                  Downsize save
+                </Text>
+                <Checkbox
+                  label="Offer a cheaper configuration as a save"
+                  checked={downsizeSaveEnabled}
+                  onChange={setDownsizeSaveEnabled}
+                  helpText='For "too expensive" (before the discount) and "too much product" (after skip): fewer units, a smaller size of the same product, or a cheaper product from the same catalog group — each shown with its concrete new per-order total, priced exactly as the swap/quantity change will apply it. Only renders when a genuinely cheaper option exists; counts toward the max cards below.'
+                />
+                <Divider />
+                <Text as="h3" variant="headingSm">
+                  Delay save
+                </Text>
+                <InlineStack gap="400" wrap blockAlign="start">
+                  <Checkbox
+                    label="Offer “push my next order to when you'll run out”"
+                    checked={delaySaveEnabled}
+                    onChange={setDelaySaveEnabled}
+                    helpText='For "too much product", before the skip: when the churn model predicts the run-out day and it lies after the next charge, the card moves the next order to that day (using your portal delay semantics — whole schedule or this order only). Only renders when the prediction exists and is within the maximum below.'
+                  />
+                  <Box minWidth="200px">
+                    <TextField
+                      label="Maximum delay (days)"
+                      autoComplete="off"
+                      type="number"
+                      min={1}
+                      max={180}
+                      value={delaySaveMaxDays}
+                      onChange={setDelaySaveMaxDays}
+                      error={errors.delaySaveMaxDays}
+                      helpText="Predicted run-out days further out than this fall back to the skip card."
+                    />
+                  </Box>
+                </InlineStack>
+                <Divider />
+                <Text as="h3" variant="headingSm">
+                  Concierge save
+                </Text>
+                <InlineStack gap="400" wrap>
+                  <Box minWidth="200px">
+                    <TextField
+                      label="Hold the next order (days)"
+                      autoComplete="off"
+                      type="number"
+                      min={0}
+                      max={30}
+                      value={conciergeHoldDays}
+                      onChange={setConciergeHoldDays}
+                      error={errors.conciergeHoldDays}
+                      helpText='When a customer sends the "talk to a human" request from the cancel flow, their next order is pushed back this many days so nothing charges while you answer (only when the charge is further away than the lead time on the right). 0 = never hold. The card promises the reply within Support → SLA business days; an unanswered request raises a critical alert after that. The session counts as "pending" until you resolve the request alert.'
+                    />
+                  </Box>
+                  <Box minWidth="200px">
+                    <TextField
+                      label="Only when the charge is more than (hours) away"
+                      autoComplete="off"
+                      type="number"
+                      min={1}
+                      max={240}
+                      value={conciergeHoldMinLeadHours}
+                      onChange={setConciergeHoldMinLeadHours}
+                      error={errors.conciergeHoldMinLeadHours}
+                      helpText="A hold inside your order cut-off would edit a cycle already being prepared, so the request is recorded without moving the order. Match this to the edit cut-off you communicate to customers."
+                    />
+                  </Box>
+                </InlineStack>
+                <Divider />
+                <Text as="h3" variant="headingSm">
+                  Scheduled cancel (commitment periods)
+                </Text>
+                <InlineStack gap="400" wrap blockAlign="start">
+                  <Checkbox
+                    label="Let locked subscribers schedule their cancellation"
+                    checked={scheduledCancelEnabled}
+                    onChange={setScheduledCancelEnabled}
+                    helpText="Inside a plan's commitment period (Plans → lock days) the flow offers “schedule my cancellation for {unlock date}” instead of turning the customer away; the subscription runs as agreed until then and ends automatically that day (never billed after it). Off = the customer is redirected with the unlock date, as before."
+                  />
+                  <Box minWidth="200px">
+                    <TextField
+                      label="Reminder before the scheduled cancel (days)"
+                      autoComplete="off"
+                      type="number"
+                      min={1}
+                      max={14}
+                      value={scheduledCancelNoticeDays}
+                      onChange={setScheduledCancelNoticeDays}
+                      error={errors.scheduledCancelNoticeDays}
+                      helpText="The “your subscription ends on {date}” email with the one-tap keep link goes out this many days before."
+                    />
+                  </Box>
+                  <Box minWidth="200px">
+                    <TextField
+                      label="Keep link valid for (days)"
+                      autoComplete="off"
+                      type="number"
+                      min={1}
+                      max={365}
+                      value={keepLinkTtlDays}
+                      onChange={setKeepLinkTtlDays}
+                      error={errors.keepLinkTtlDays}
+                      helpText="How long the one-tap “keep my subscription” link in the scheduled-cancel emails works. Must outlive your longest plan commitment period, or the link in the first email expires before the cancel date."
+                    />
+                  </Box>
+                </InlineStack>
+                <Divider />
+                <Text as="h3" variant="headingSm">
+                  Abandoned cancel intent
+                </Text>
+                <Checkbox
+                  label="Follow up when a customer starts cancelling but leaves without deciding"
+                  checked={intentFollowupEnabled}
+                  onChange={setIntentFollowupEnabled}
+                  helpText="One email (“Cancel intent follow-up” in Emails) with the one-tap saves that match the reason they picked — skip, push back, slower cadence, smaller order or pause — plus a plain link to finish cancelling. Never sent once they saved, cancelled, scheduled a cancel or opened a newer session, and only when at least one save genuinely applies. The portal home shows the same choices as a banner for the days below."
+                />
+                <InlineStack gap="400" wrap>
+                  <Box minWidth="160px">
+                    <TextField
+                      label="Send after (hours)"
+                      autoComplete="off"
+                      type="number"
+                      min={1}
+                      max={72}
+                      value={intentFollowupHours}
+                      onChange={setIntentFollowupHours}
+                      error={errors.intentFollowupHours}
+                      helpText="Hours after the abandoned session closes."
+                    />
+                  </Box>
+                  <Box minWidth="160px">
+                    <TextField
+                      label="Not within (hours) of the next charge"
+                      autoComplete="off"
+                      type="number"
+                      min={0}
+                      max={240}
+                      value={intentFollowupChargeBufferHours}
+                      onChange={setIntentFollowupChargeBufferHours}
+                      error={errors.intentFollowupChargeBufferHours}
+                      helpText="Skipped when the next charge is closer than this."
+                    />
+                  </Box>
+                  <Box minWidth="160px">
+                    <TextField
+                      label="Per-customer cooldown (days)"
+                      autoComplete="off"
+                      type="number"
+                      min={0}
+                      max={365}
+                      value={intentFollowupCooldownDays}
+                      onChange={setIntentFollowupCooldownDays}
+                      error={errors.intentFollowupCooldownDays}
+                      helpText="At most one follow-up email per customer in this window."
+                    />
+                  </Box>
+                  <Box minWidth="160px">
+                    <TextField
+                      label="Portal banner (days)"
+                      autoComplete="off"
+                      type="number"
+                      min={0}
+                      max={60}
+                      value={intentBannerDays}
+                      onChange={setIntentBannerDays}
+                      error={errors.intentBannerDays}
+                      helpText="How long the home banner with the same choices stays. 0 = no banner."
+                    />
+                  </Box>
+                </InlineStack>
+                <Divider />
+                <Text as="h3" variant="headingSm">
                   Flow behavior
                 </Text>
                 <InlineStack gap="400" wrap>
@@ -690,7 +946,7 @@ export default function CancelFlowPage() {
                       value={maxSaves}
                       onChange={setMaxSaves}
                       error={errors.maxSavesShown}
-                      helpText="Step-3 cards per reason."
+                      helpText='Step-3 cards per reason. At the default of 2, a "too expensive" customer with a downsize option sees downsize + pause (the discount then only appears when no cheaper configuration exists).'
                     />
                   </Box>
                   <Box minWidth="160px">
@@ -756,6 +1012,8 @@ export default function CancelFlowPage() {
                         : ""
                     }`}
                   />
+                  <StatBox label="Pending (concierge)" value={String(stats.pending)} />
+                  <StatBox label="Cancel scheduled" value={String(stats.scheduled)} />
                   <StatBox label="Cancelled" value={String(stats.cancelled)} />
                   <StatBox label="Abandoned" value={String(stats.abandoned)} />
                   <StatBox

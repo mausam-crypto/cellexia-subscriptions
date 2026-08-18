@@ -128,6 +128,10 @@ vi.mock("~/lib/settings/settings.server", () => ({
       };
     }
     if (key === "pause") return { maxMonths: 3 };
+    // v1.28.0 (P3.8): with scheduled cancel ON a locked contract ENTERS the
+    // flow (to schedule its cancellation — tests/cancel-scheduled.test.ts);
+    // this file pins the classic redirect, i.e. the toggle OFF.
+    if (key === "cancelFlow") return { scheduledCancelEnabled: false };
     return {};
   }),
 }));
@@ -624,6 +628,25 @@ describe("requireCancelContext inside the lock window", () => {
     );
     expect(ctx.contract.id).toBe("ctr_1");
   });
+
+  it("a locked contract that ALREADY carries a scheduled cancel passes even with scheduledCancelEnabled OFF (Keep must stay reachable)", async () => {
+    // The mock serves cancelFlow.scheduledCancelEnabled = false. Turning the
+    // toggle off after schedules exist must never strand the customer: the
+    // 'Keep my subscription' POST and the scheduled page go through this
+    // context while the hourly job still executes the schedule.
+    const scheduled = {
+      ...makeContract({ createdDaysAgo: 5, firstChargeDaysAgo: 5 }),
+      cancelScheduledAt: new Date(Date.now() + 25 * DAY_MS),
+    };
+    mocks.contractFindUnique.mockResolvedValue(scheduled);
+    mocks.contractFindFirst.mockResolvedValue(scheduled);
+    const ctx = await requireCancelContext(
+      new Request(proxyUrl("/cancel/ctr_1", { logged_in_customer_id: "1" })),
+      "ctr_1",
+    );
+    expect(ctx.contract.id).toBe("ctr_1");
+    expect(ctx.lock.locked).toBe(true);
+  });
 });
 
 // ── 5. Source pins on every other enforcement surface ────────────────────────
@@ -857,11 +880,17 @@ describe("lock window source pins", () => {
     expect(source).toContain("magic.sms.locked");
   });
 
-  it("the subscription page hides schedule, pause and the cancel link while locked", () => {
+  it("the subscription page hides schedule and pause while locked; the cancel link stays only through the scheduled-cancel toggle", () => {
     const source = readSource("app/routes/proxy.subscription.$id.tsx");
     expect(source).toContain("if (isActive && !lock.locked) {");
-    expect(source).toContain("if (editable && !lock.locked) {");
+    // v1.28.0 (P3.8): the cancel entry is never hidden by the lock alone —
+    // with cancelFlow.scheduledCancelEnabled (default ON) it leads to
+    // "schedule my cancellation for {date}"; the toggle OFF restores the
+    // classic hidden link + redirect (tests/cancel-scheduled-portal-entry.test.ts
+    // pins both behaviourally).
+    expect(source).toContain("if (editable && (!lock.locked || scheduledCancelEnabled)) {");
     expect(source).toContain("portal.locked.notice");
+    expect(source).toContain("portal.locked.notice_scheduled");
   });
 
   it("the portal home hides the one-tap skip/delay while locked", () => {

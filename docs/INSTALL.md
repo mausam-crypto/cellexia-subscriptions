@@ -491,6 +491,33 @@ products, and each renders its own widget.
    never automatic, never a side effect of going live:
    [MIGRATION.md §5](./MIGRATION.md#5-migrating-off-another-subscription-app-that-stays-installed).
 
+### 7e. Add a "Manage subscription" link to your account/menu
+
+Subscribers must be able to *find* the portal without digging up an email —
+otherwise the first place they look is the bank statement or Shopify's
+native account page, which cancels without any of your saves. Three entry
+points; do all three (a few minutes, no code):
+
+1. **Theme navigation**: **Online Store → Navigation** → open the menu your
+   theme shows to logged-in customers (usually the main or footer menu) →
+   **Add menu item** → name it *Manage subscription* → paste the link
+   `/apps/cellexia-subs/` (the portal on your own domain, §7c) → **Save**.
+   While the app is in Setup mode the link shows the "not yet available"
+   page, so it is safe to add now.
+2. **Thank-you and Order status pages**: the *Cellexia Post-purchase Survey*
+   block (deployed with the app by `npm run deploy`, v1.21.0) also renders a
+   **Manage your subscription** card on subscription orders — nothing to
+   configure beyond adding the block once (Settings → Checkout → Customize →
+   *Thank you* page, and again for *Order status*). It renders on
+   subscription orders only.
+3. **New customer accounts (profile page)**: Shopify's new customer accounts
+   pages have no merchant-editable menu, so the link customers see *inside*
+   their account is the *Order status* card from (2), on each subscription
+   order. Cellexia does not ship a customer-account profile block yet
+   (planned as a later extension); until then the storefront header/footer
+   menu from (1) — which stays yours on every theme page — is the standing
+   entry point.
+
 ---
 
 ## 8. Klaviyo

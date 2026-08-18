@@ -67,6 +67,14 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       severity: a.severity,
       message: a.message,
       contextJson: JSON.stringify(a.context ?? {}, null, 2),
+      // Contract-scoped alerts (SUPPORT_REQUEST, …) link straight to the
+      // subscriber page.
+      contractId:
+        a.context &&
+        typeof a.context === "object" &&
+        typeof (a.context as { contractId?: unknown }).contractId === "string"
+          ? ((a.context as { contractId: string }).contractId)
+          : null,
       createdAt: a.createdAt.toISOString(),
       resolvedAt: a.resolvedAt?.toISOString() ?? null,
     })),
@@ -344,6 +352,17 @@ export default function AlertsPage() {
                         </pre>
                       </Box>
                     </Popover>{" "}
+                    {row.contractId ? (
+                      <>
+                        <Button
+                          size="micro"
+                          variant="plain"
+                          url={`/app/subscribers/${row.contractId}`}
+                        >
+                          Subscriber
+                        </Button>{" "}
+                      </>
+                    ) : null}
                     {data.tab === "open" ? (
                       <Button
                         size="slim"

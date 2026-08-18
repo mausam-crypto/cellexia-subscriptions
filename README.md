@@ -70,11 +70,26 @@ conversion; minimise voluntary and involuntary churn.**
 - **Dunning engine** — decline-code taxonomy (soft/hard/auth), payday-aligned
   retry ladder (time-anchored, per-billing-cycle cases), backup-card fallback
   with automatic revert, 3DS challenge links, pre-expiry card notices,
-  crash-safe deduped customer notifications, recovery tracking.
+  crash-safe deduped customer notifications, recovery tracking. Since v1.28.0
+  the customer sees and fixes the case from the portal (payment-issue banner
+  with Retry now / Confirm with my bank / Update card / Use another card /
+  Set as backup / Pause instead / Skip that order and continue), the card
+  update path is decided server-side (Shop Pay → hosted page; card / PayPal
+  → Shopify's own update email), a new card saved mid-trouble is detected,
+  and parked FAILED subscriptions get post-exhaustion touches instead of
+  silence.
 - **Customer portal** (app proxy, store domain) — OTP login (enumeration-safe)
   and HttpOnly-cookie sessions; skip, delay, frequency, swap, quantity,
   add/remove lines, one-time add-ons, pause/resume, address & card updates,
-  cancel — and one-tap restart after cancelling; RTL-aware.
+  cancel — and one-tap restart after cancelling; RTL-aware. v1.28.0 (the
+  portal churn pack): a "Your next delivery" hero with the charge cut-off and
+  the one discounted next-order total every surface shares, delay that
+  re-anchors (or "just this once") with Undo, per-line "not this time" and
+  one-order quantity tweaks, a vacation hold with a real resume date, "send
+  my next order tomorrow", delivery instructions, deliveries with tracking,
+  a results timeline and rewards roadmap, a Get-help card, accessibility
+  contract, scheduled cancellation for locked plans, cancel-intent follow-up
+  and win-back offer parity with a welcome-back landing.
 - **Magic links** — signed single-use action links (skip, delay, add-to-next,
   update card, resume, 3DS confirm…) with zero login, straight from emails.
 - **Cancel-save flow** — reason survey (with a visible skip) → reason-matched

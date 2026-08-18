@@ -3,6 +3,11 @@
   "progress": "Domanda {{current}} di {{total}} — basta un tocco",
   "doneTitle": "Grazie!",
   "doneBody": "Le tue risposte servono a personalizzare tutto per te.",
+  "manage": {
+    "title": "Gestisci il tuo abbonamento",
+    "body": "Cambia prodotti, salta o rinvia una consegna, aggiorna indirizzo o carta — in qualsiasi momento, dal tuo account abbonamento.",
+    "cta": "Gestisci il mio abbonamento"
+  },
   "q": {
     "plannedDuration": {
       "title": "Come pensi di usare questo prodotto?",

@@ -4,13 +4,14 @@ import { adminClientForShop } from "~/shopify.server";
 import { getPrimaryShop } from "~/lib/shop/install.server";
 import { logEvent } from "~/lib/events/log.server";
 import { getSetting } from "~/lib/settings/settings.server";
-import {
-  addDaysTz,
-  addIntervalTz,
-  isDueNow,
-  shopDayStartUtc,
-} from "~/lib/dates.server";
+import { addIntervalTz } from "~/lib/dates.server";
 import { contractFrequency } from "~/lib/frequency";
+import {
+  dueBeforeUtc,
+  isChargeDue,
+  resolveChargeTiming,
+  type ChargeTiming,
+} from "./timing.server";
 import {
   gql,
   ShopifyUserError,
@@ -43,7 +44,8 @@ import {
  * Billing scheduler — the heart of the app.
  *
  * `runBillingSweep(now)` finds every ACTIVE contract of the primary shop whose
- * nextBillingDate is due (shop-timezone day semantics) with no in-flight
+ * nextBillingDate is due (shop-timezone day semantics, shifted by
+ * settings.billing.chargeHourLocal — see timing.server.ts) with no in-flight
  * attempt (an un-started SCHEDULER residue row does not count — see the b2
  * resume exception), and pushes each through the pre-charge pipeline:
  *
@@ -146,8 +148,13 @@ export async function runBillingSweep(now: Date): Promise<BillingSweepStats> {
   // FAILED JobRun so the BILLING_RUN_FAILED alert fires — so we let it throw.
   const admin = await adminClientForShop(shop.domain);
 
-  // Due = nextBillingDate on or before today's end in the shop timezone.
-  const dueBefore = addDaysTz(shopDayStartUtc(now, tz), 1, tz);
+  // Due = the charge moment of nextBillingDate has arrived: shop-tz day start
+  // + settings.billing.chargeHourLocal (v1.28.0, P2.1; hour 0 = on or before
+  // today's end in the shop timezone, the pre-v1.28 window byte-for-byte).
+  // Overdue contracts stay inside the window. Timing resolution is contained
+  // (a broken settings read means hour 0), never a reason to skip a sweep.
+  const timing: ChargeTiming = await resolveChargeTiming(shop.id, tz);
+  const dueBefore = dueBeforeUtc(now, timing);
   const dueWhere = {
     shopId: shop.id,
     // Only OUR contracts are ever charged. The shop may run a second
@@ -158,6 +165,12 @@ export async function runBillingSweep(now: Date): Promise<BillingSweepStats> {
     status: "ACTIVE",
     isDemo: false, // portal-preview fixtures are never billed
     nextBillingDate: { not: null, lt: dueBefore },
+    // Scheduled cancel (v1.28.0, P3.8): a contract whose scheduled end
+    // moment has arrived is never billed again — the hourly
+    // cancel_scheduled_run job completes the cancel, and even if it is late
+    // no charge may land after the moment the customer chose. A future
+    // scheduled moment bills normally (the plan's terms run until it).
+    OR: [{ cancelScheduledAt: null }, { cancelScheduledAt: { gt: now } }],
     // No in-flight attempt may block a contract twice — but an un-started
     // SCHEDULER residue row (PENDING, never confirmed by Shopify: transport
     // error or crash between the local insert and the API call) is exactly
@@ -196,7 +209,7 @@ export async function runBillingSweep(now: Date): Promise<BillingSweepStats> {
       try {
         await processDueContract(
           admin,
-          { id: shop.id, domain: shop.domain, tz },
+          { id: shop.id, domain: shop.domain, tz, timing },
           contract,
           now,
           stats,
@@ -213,13 +226,14 @@ export async function runBillingSweep(now: Date): Promise<BillingSweepStats> {
 
 async function processDueContract(
   admin: AdminClient,
-  shop: { id: string; domain: string; tz: string },
+  shop: { id: string; domain: string; tz: string; timing: ChargeTiming },
   contract: ContractWithLines,
   now: Date,
   stats: BillingSweepStats,
 ): Promise<void> {
   const nextBillingDate = contract.nextBillingDate;
-  if (!nextBillingDate || !isDueNow(nextBillingDate, shop.tz, now)) return;
+  // Charge moment reached? (hour 0 ≡ the old shop-day isDueNow check.)
+  if (!nextBillingDate || !isChargeDue(nextBillingDate, shop.timing, now)) return;
 
   // a. Stockout: the contracts module may delay the cycle, skip-and-notify or
   //    substitute the variant. When it acted, this cycle is no longer chargeable
@@ -796,6 +810,10 @@ async function resolveStaleAttempt(
       shippingCents: number;
       subtotalCents: number;
       orderProcessedAt: Date | null;
+      // v1.28.0 — the Shopify order-status page, mirrored for the portal's
+      // "Your deliveries" surfaces (P4.2); key omitted when the summary has
+      // none, exactly like the webhook claim (orders/fulfilled refreshes it).
+      orderStatusUrl?: string;
     } | null = null;
     if (admin) {
       try {
@@ -809,6 +827,9 @@ async function resolveStaleAttempt(
           shippingCents: summary.shippingCents,
           subtotalCents: summary.subtotalCents,
           orderProcessedAt: summary.processedAt,
+          ...(summary.statusPageUrl
+            ? { orderStatusUrl: summary.statusPageUrl }
+            : {}),
         };
         if (
           summary.createdAt != null &&

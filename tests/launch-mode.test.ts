@@ -151,6 +151,8 @@ describe("launch settings default", () => {
 describe("job runner SETUP gate list", () => {
   const EXPECTED_GATED = [
     "billing_run",
+    // v1.28.0 (P1.9): the post-exhaustion "fix your payment" touches ride
+    // inside dunning_run — no separate job, so this gate covers them.
     "dunning_run",
     "reminders_run",
     "pause_autoresume",
@@ -158,7 +160,13 @@ describe("job runner SETUP gate list", () => {
     "winback_run",
     "consolidation_run",
     "pre_expiry_notices",
+    // v1.28.0 (P4.1): the week-N routine check-in email runs inside
+    // lifecycle_run (runRoutineCheckin) — covered by this gate.
     "lifecycle_run",
+    // v1.28.0 (P3.6): the cancel-intent follow-up emails a customer.
+    "cancel_intent_followup_run",
+    // v1.28.0 (P3.8): emails the customer and cancels contracts.
+    "cancel_scheduled_run",
   ];
 
   const EXPECTED_UNGATED = [
@@ -171,6 +179,13 @@ describe("job runner SETUP gate list", () => {
     // there are no billed attempts, so the sweep is a no-op — and gating it
     // would leave any pre-upgrade residue stranded until go-live.
     "settlement_redrive",
+    // v1.28.0 (P3.7): merchant-facing only — raises the SLA-breach alert and
+    // flips SAVED_PENDING → SAVED once the request is resolved; it never
+    // contacts the customer, and gating it would hide an unanswered request.
+    "concierge_sla_run",
+    // Internal hygiene: closes walked-away sessions (cancel.aborted); the
+    // customer contact lives in the gated cancel_intent_followup_run.
+    "cancel_session_gc",
   ];
 
   it("gates exactly the customer-facing jobs", () => {

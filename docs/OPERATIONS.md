@@ -20,7 +20,7 @@ Subscriptions) unless a shell command is shown.
    90-day MRR trend, the 12-week new-vs-churned chart, the forecast teaser
    (with its accuracy grade chip) and the top open failed payments.
 2. **Debug** — the self-check verdict chip should read **Healthy**. The same
-   41 checks re-run automatically every 30 minutes (`selfcheck_run`, also in
+   44 checks re-run automatically every 30 minutes (`selfcheck_run`, also in
    setup mode); a **Broken** verdict raises one CRITICAL `SELF_CHECK_FAILED`
    alert (emailed to Settings → alerts → `emailTo`) and every failing row on
    the page carries a named fix. The alert auto-resolves when a later run
@@ -37,11 +37,21 @@ Subscriptions) unless a shell command is shown.
    order feed (see §15, "Running a design test", for what to do). v1.27.0
    adds `widget_visits`, which WARNs when a live store keeps receiving
    orders that saw the buy box while the storefront visit beacon records
-   nothing (extension not deployed or app embed disabled; see §15).
+   nothing (extension not deployed or app embed disabled; see §15). v1.28.0
+   adds three: `payment_update_path` (WARNs while live subscribers still
+   have no mirrored payment-instrument type — their "Update card" button
+   probes the Shop-Pay-only page before falling back to Shopify's update
+   email; the nightly sync backfills it), `delivery_tracking` (WARNs when
+   renewal orders fulfilled in the last 14 days carry no tracking in the
+   mirror — either `npm run deploy` was skipped after the update, so the
+   fulfillment webhooks never arrive, or the store ships without tracking;
+   the detail says which) and `portal_a11y` (WARNs if a code change regressed
+   the portal's accessibility contract; see §24).
 3. **Alerts** — unresolved alerts (`BILLING_RUN_FAILED`, `WEBHOOK_FAILURES`,
    `ORIGIN_BACKFILL_FAILURES`, `STUCK_CONTRACTS`, `FAILURE_SPIKE`,
    `CHURN_SPIKE`, `FAST_SHIPPING_SKIPS`, `STOCKOUT_RENEWALS`,
-   `FOREIGN_CONTRACTS`, `KLAVIYO_OUTBOX_BACKLOG`, `SELF_CHECK_FAILED`).
+   `FOREIGN_CONTRACTS`, `KLAVIYO_OUTBOX_BACKLOG`, `SELF_CHECK_FAILED`,
+   and since v1.28.0 `SUPPORT_REQUEST` / `SUPPORT_SLA_BREACH` — see §24).
    Triage per the runbooks below;
    resolve when handled. Critical alerts also email everyone in Settings →
    alerts → `emailTo`. `FOREIGN_CONTRACTS` (severity WARNING, raised while any
@@ -140,6 +150,24 @@ Meaning: `STUCK_CONTRACTS` alert — contracts past `nextBillingDate` by more th
   FAILED while paused. The case simply parks; on resume the window continues
   from where it stood. Expect a few long-open cases on paused contracts in
   the queue — that is the feature, not a stuck case.
+- **The customer now fixes most cases themselves** (v1.28.0): the portal
+  shows the case (home card "Payment issue · Order held since {date}",
+  detail banner) with **Retry now** (per-case cooldown
+  `dunning.customerRetryCooldownMinutes`, default 60 — a retry never
+  consumes a ladder rung, exactly like yours), **Confirm with my bank**
+  (3DS), **Update card** (Shop Pay → hosted page; card / PayPal → Shopify's
+  update email — the old button was dead for card payers), **Use another
+  card** / **Set as backup** from the customer's other vaulted methods,
+  **Pause instead**, and on an exhausted FAILED contract **Skip that order
+  and continue from {date}**. Expect the `AWAITING_CUSTOMER` pile to shrink
+  and `dunning.retry_scheduled {trigger: "customer"}` / `portal.payment_*`
+  events on the timeline. A customer who saves a NEW card while in trouble
+  is switched to it automatically when the old one is dead
+  (`dunning.newMethodAutoSwitch`) or offered a one-tap switch. Parked FAILED
+  contracts receive `payment_failed_parked` at
+  `dunning.postExhaustionTouchDays` (default 7 and 21 days after exhaustion)
+  — set the array to `[]` to stop those touches. "Send card link" in admin
+  now says which path it took.
 
 ## 6. Issuing refunds
 
@@ -201,8 +229,14 @@ a price increase properly:
    variants → the batch computes affected contracts and old→new prices.
 3. **Send notices** — batch status `DRAFT → NOTICE_SENT`; every affected
    subscriber gets the price-change notification with their date and new price.
-4. On the effective date the batch applies automatically (`NOTICE_SENT → APPLIED`),
-   updating contract lines and logging `contract.price_propagated` per contract.
+4. On (or after) the effective date, press **Apply** on the batch (`NOTICE_SENT →
+   APPLIED`) — there is NO job that applies it for you. Applying updates contract
+   lines and logs `contract.price_propagated` per contract. Until you apply, the
+   portal hero / home card / `upcoming_order` reminder keep quoting the pre-change
+   total (the estimate prices from the mirror; the portal banner discloses the
+   old→new price, the notice email is the authoritative post-change figure) — so
+   apply promptly on the effective date, before the day's charges, or the customer
+   is told one total and charged another.
    Contracts flagged `grandfatheredPricing` are excluded.
 5. Expect a small cancel bump; the cancel-flow reasons (`TOO_EXPENSIVE`) tell you
    if it was too aggressive.
@@ -239,7 +273,12 @@ records receipts:
   readouts must stay whole (DATA_FOUNDATION.md Part 4). The
   `SubscribableOrder` fact table holds no personal data at all, and neither
   does the v1.27.0 visit ledger `WidgetVisitorDay` (a random browser-local
-  visitor id, no cookie, no IP, no user agent; nothing to redact).
+  visitor id, no cookie, no IP, no user agent; nothing to redact). Since
+  v1.28.0 the customer-authored free text is erased too: the
+  `deliveryInstructions` note, the `support.requested` event payloads
+  (message / cancel-survey text / order ref) and the `SUPPORT_REQUEST` alert
+  line (name, email, excerpt); the structural facts (topic, save flag,
+  cancel session) stay so the concierge SLA job keeps working.
 - `shop/redact` → arrives 48h after uninstall; wipes shop data.
 
 Manual GDPR requests (email/DSAR) about a subscriber: use Shopify admin's
@@ -1497,3 +1536,65 @@ Under the hood: `app/lib/klaviyo/setup-task.server.ts` (task runner,
 state in `klaviyoFlowSetup.task`), `flows.server.ts` (index, retry, setup),
 `/app/emails/setup/status` (the DB-only polling endpoint). Audit trail:
 `admin.action` `klaviyo_flow_setup` per completed setup run.
+
+## 24. Runbook — support requests, concierge saves, scheduled cancels (v1.28.0)
+
+**Where the customer reaches you.** Settings → Support holds the address
+every "talk to us" surface uses (portal Get-help card on Account and on each
+subscription page, the payment-issue banner, the cancel flow's support and
+education cards, the welcome and cancel-intent emails, the Reply-To of every
+app email). If it is empty the app falls back to the store contact email;
+if that is empty too the email CTA is hidden — never a dead `mailto:`. Set
+`slaBusinessDays` only to what a human can meet: the number is promised to
+the customer.
+
+**`SUPPORT_REQUEST` alert (WARNING, one per contract per day).** A
+subscriber submitted the Get-help form (topic, message, optionally the order
+it concerns and "push my next order back a week", which is already applied
+when the alert arrives — `pushBackApplied` in the context). The same request
+was emailed to the support inbox and, with Klaviyo, fired "Cellexia Support
+Requested" (segmentation only). Answer the customer from your helpdesk, then
+**resolve the alert** — for a concierge save (context `saveRequest: true`,
+raised from the cancel flow) resolving it while the customer still
+subscribes is what turns the session's `SAVED_PENDING` into `SAVED`
+(`cancel.save_confirmed`) — the app cannot know a human answered otherwise.
+The subscriber page lists the newest requests in a "Support requests" card.
+
+**`SUPPORT_SLA_BREACH` (CRITICAL).** A concierge save request has been
+unresolved for more than `support.slaBusinessDays` business days. The
+customer was told "we reply within N business days" and is one broken
+promise from cancelling: answer, then resolve both alerts.
+
+**Scheduled cancellations.** Only for plans with `lockDays > 0`: a locked
+subscriber may schedule the cancel for the unlock day instead of being told
+"you can't". The subscription stays ACTIVE with a "Cancels {date}" badge on
+the subscriber page; the sweep never bills past that moment; the customer
+receives `cancel_upcoming` three days before (`cancelFlow.scheduledCancelNoticeDays`)
+with a one-tap Keep link, and can keep from the portal too. If the customer
+asks you to keep it, press **Keep (clear scheduled cancel)** on the
+subscriber page; **Cancel now** ends it immediately instead. The hourly
+`cancel_scheduled_run` completes due cancels through the normal path (they
+appear as `contract.cancelled` with the reason the customer gave and feed
+win-back like any other cancel).
+
+**Cancel-intent follow-ups.** A customer who opens the cancel flow and
+leaves undecided gets ONE reason-matched email about 18 hours later
+(`cancelFlow.intentFollowupHours`; never within 48 hours of the next charge,
+at most one per customer per 30 days) and a 14-day banner on the portal
+home. `cancel.intent_followup_sent` on the timeline; disable with
+`cancelFlow.intentFollowupEnabled` if your own Klaviyo flow covers it
+("Cellexia Cancel Intent" carries the same one-tap links).
+
+**Delivery instructions and tracking.** A customer's delivery note lives on
+the contract as the `_cellexia_delivery_instructions` attribute and is copied
+onto every renewal order — your 3PL sees it on the order like a checkout
+attribute. The portal's "Your deliveries" list reads tracking from the
+fulfillment webhooks; if it stays on "Being prepared" for orders you know
+shipped, check the Debug `delivery_tracking` check (missing `npm run deploy`,
+or fulfillments without tracking numbers).
+
+**Accessibility.** The `portal_a11y` self-check renders the portal shell and
+asserts the contract (AA contrast, focus rings, reduced motion, skip link,
+live-region toasts, inline confirms). A WARN means a code change regressed
+it — a developer item, not an incident; the portal keeps working.
+

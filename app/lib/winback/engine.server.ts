@@ -22,6 +22,7 @@ import { OURS_ONLY, isBillableOwnership } from "~/lib/ownership/ownership.server
 import { pickGiftForContract } from "~/lib/gifts/picker.server";
 import { giftEmailLines } from "~/lib/gifts/emailLines.server";
 import { settingOverride } from "~/lib/experiments/index.server";
+import { restartLinkVars } from "./links.server";
 
 /**
  * Win-back engine — staged re-acquisition of cancelled subscribers, timed to
@@ -141,6 +142,30 @@ async function buildReactivationUrl(
 // ── Scheduling (called by cancelContract) ────────────────────────────────────
 
 /**
+ * The cancel reason a win-back episode is stamped with (WinbackState.reason):
+ * `contract.cancelReason` first (the cancel flow / admin form / dunning
+ * wrote it), else the reason of the contract's most recent CancelSession
+ * that ended CANCELLED, else null. Contained: a failed session read never
+ * blocks scheduling. Exported for tests/winback-reason.test.ts.
+ */
+export async function resolveWinbackReason(
+  contract: Pick<SubscriptionContract, "id" | "cancelReason">,
+): Promise<string | null> {
+  if (contract.cancelReason) return contract.cancelReason;
+  try {
+    const session = await prisma.cancelSession.findFirst({
+      where: { contractId: contract.id, outcome: "CANCELLED", reason: { not: null } },
+      orderBy: { startedAt: "desc" },
+      select: { reason: true },
+    });
+    return session?.reason ?? null;
+  } catch (err) {
+    console.error("[winback] cancel reason lookup failed", contract.id, err);
+    return null;
+  }
+}
+
+/**
  * Open (or restart) the win-back campaign for a cancelled contract. No-op for
  * merge-cancels (reason MERGED — an internal consolidation, the customer never
  * left), for non-cancelled contracts, when win-back is disabled, and when a
@@ -183,6 +208,14 @@ export async function scheduleWinback(
   if (existing?.status === "ACTIVE") return existing; // already scheduled
   if (existing?.status === "OPTED_OUT") return existing; // never re-engage
 
+  // Cancel reason snapshot (v1.28.0, P3.4 — migration 0028): the reason the
+  // episode opened with, so touches can be reason-aware later without
+  // re-reading the (possibly since-overwritten) contract column. The
+  // contract's own cancelReason is the resolved reason (completeCancel /
+  // the admin form wrote it); the latest CANCELLED CancelSession is the
+  // fallback for cancels that reached the mirror without one. Contained.
+  const reason = await resolveWinbackReason(contract);
+
   let state: WinbackState;
   if (existing) {
     // WON_BACK or SUNSET and cancelled again — restart the campaign.
@@ -195,6 +228,7 @@ export async function scheduleWinback(
         nextTouchAt,
         status: "ACTIVE",
         wonBackAt: null,
+        reason,
       },
     });
   } else {
@@ -207,6 +241,7 @@ export async function scheduleWinback(
         stage: 0,
         nextTouchAt,
         status: "ACTIVE",
+        reason,
       },
     });
   }
@@ -503,6 +538,14 @@ async function processDueTouch(
     // ── Soft touch: no offer — education / results framing. ─────────────────
     const already = await hasEventSince(contract.id, "winback.soft_touch", since);
     if (!already) {
+      // One-tap restart (v1.28.0, P3.2): a signed, single-use restart link so
+      // the "restarting takes one tap" line is true without a login wall. It
+      // carries no offer — the tap applies whatever the engine stands behind
+      // at that moment (restart.server.ts). Contained: {} on failure.
+      const restartVars = await restartLinkVars(contract, {
+        createdVia: "KLAVIYO_FLOW",
+        settings,
+      });
       await sendNotification({
         shopId: contract.shopId,
         contractId: contract.id,
@@ -510,6 +553,10 @@ async function processDueTouch(
         vars: {
           predicted_empty_date: predictedEmpty.toISOString(),
           stage: 0,
+          ...restartVars,
+          // The template's button (ctaLabelKey email.cta.reactivate) is the
+          // restart link — no cta_url meant no button before v1.28.0.
+          ...(restartVars.restart_url ? { cta_url: restartVars.restart_url } : {}),
         },
       });
       await logEvent({
@@ -800,6 +847,15 @@ export async function reactivateFromWinback(
       `Subscription contract is not managed by this app: ${contractLocalId}`,
     );
   }
+  // A MERGED source (auto-consolidation) keeps its own lines on Shopify while
+  // the primary already ships them: activating it again would be a duplicate
+  // subscription for the same products. No caller may re-activate one
+  // (campaign / link minting refuse earlier; the portal doors are closed).
+  if (contract.cancelReason === "MERGED") {
+    throw new Error(
+      `Subscription contract was merged into another and cannot be reactivated: ${contractLocalId}`,
+    );
+  }
   const shop = await prisma.shop.findUniqueOrThrow({
     where: { id: contract.shopId },
   });
@@ -960,6 +1016,8 @@ export async function reactivateFromWinback(
         failedAt: null,
         nextBillingDate: effectiveNext,
         winbackEligibleAt: null,
+        // Reactivation clears any scheduled cancel (v1.28.0, P3.8).
+        cancelScheduledAt: null,
       },
     });
     releasedAttempts = await releaseHeldCycleAttempts(contract.id, tx);

@@ -109,6 +109,7 @@ describe("production refuses the implicit console fallback", () => {
       ok: true,
       provider: "console",
       source: "env",
+      from: "Cellexia <no-reply@cellexia.com>",
     });
   });
 });
@@ -142,6 +143,7 @@ describe("MAIL_PROVIDER is case-insensitive", () => {
       ok: true,
       provider: "smtp",
       source: "env",
+      from: "Cellexia <no-reply@cellexia.com>",
     });
     expect(transport.verify).toHaveBeenCalledTimes(1);
   });

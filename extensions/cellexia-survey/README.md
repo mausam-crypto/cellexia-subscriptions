@@ -6,6 +6,17 @@ POST to the app backend (`/api/survey`) with a Shopify session token, attach
 to the subscription contract, and feed the churn-risk score, the predicted
 LTGP forecast, and the `Cellexia Survey Answered` Klaviyo metric.
 
+## "Manage your subscription" link (v1.28.0)
+
+The same block also renders a **Manage your subscription** card
+(`src/manage-link.jsx`) above the survey, on subscription orders only,
+linking to the store-domain portal `${shop.storefrontUrl}/apps/cellexia-subs/`.
+It has none of the survey's gates — no App URL, no backend call — so a new
+subscriber always learns where their subscription lives, even with the
+survey off. The subpath is pinned to `PORTAL_PROXY_SUBPATH` by
+`tests/extension-manage-link.test.ts`. Adding it changed the extension
+bundle: `npm run deploy` is required for it to appear.
+
 ## The instrument is frozen
 
 `src/questions.json` mirrors `app/lib/survey/shared.ts` (extension sources

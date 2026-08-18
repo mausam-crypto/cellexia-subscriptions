@@ -43,11 +43,18 @@ const KB = 1024;
  * dependency step); v1.26.0 3,209,002 bytes (+81KB: the design-measurement
  * modules, the Results tab route + component). Raised to 4MB in v1.26.0 in a
  * reviewed change — the same ~25% headroom the original limit gave.
+ * v1.28.0 5,286,477 bytes (+2.07MB, accounted for: the 22 locale JSON files
+ * grew by 1.43MB in total — the portal churn pack added ~600 keys per locale,
+ * all inlined into the server chunk — plus ~0.6MB of new portal/payments/
+ * cancel/dunning code; `git diff --stat` shows no dependency added). Raised
+ * to 6.5MB in v1.28.0 with the same ~25% headroom. If locale growth continues
+ * the right remediation is loading locale JSON at runtime instead of raising
+ * this again.
  */
-const SERVER_CHUNK_LIMIT = 4 * KB * KB;
+const SERVER_CHUNK_LIMIT = 6.5 * KB * KB;
 
-/** Ceiling for the whole build/server tree (v1.26.0: ~3.35MB). */
-const SERVER_TOTAL_LIMIT = 5 * KB * KB;
+/** Ceiling for the whole build/server tree (v1.26.0: ~3.35MB; v1.28.0: ~5.5MB). */
+const SERVER_TOTAL_LIMIT = 7.5 * KB * KB;
 
 function reportBytes(bytes: number): string {
   return `${bytes.toLocaleString("en-US")} bytes`;

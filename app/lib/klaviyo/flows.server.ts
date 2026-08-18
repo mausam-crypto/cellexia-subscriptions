@@ -98,6 +98,11 @@ export const EXCLUDED_FROM_SETUP: Array<{ template: TemplateKey; reason: string 
       "SMS needs Klaviyo SMS consent and a sending number — build it in Klaviyo when you enable SMS (the event carries the ready-made text).",
   },
   {
+    template: "threeds_action_sms",
+    reason:
+      "SMS needs Klaviyo SMS consent and a sending number — build it in Klaviyo when you enable SMS (the event carries the ready-made text and the secure confirmation link).",
+  },
+  {
     template: "otp_code",
     reason: "Login codes are security mail and never leave the app.",
   },
@@ -124,12 +129,22 @@ const WHY_BY_METRIC: Record<string, string> = {
     "The recovery ladder (all three notices ride this one flow) — recovered payments are saved subscribers.",
   "Cellexia Card Expiring":
     "Fixing the card BEFORE it fails avoids the whole dunning journey.",
+  "Cellexia Payment Parked":
+    "The parked cohort — subscriptions the retry ladder gave up on used to go silent forever; the day-7/21 touches offer the three ways back (update, retry, skip and continue).",
   "Cellexia Payment Method Updated":
-    "Transparency when billing switched to the backup card — surprises erode trust.",
+    "Closes the loop after a card change — the customer hears that the fix worked (or that billing moved to the backup card); surprises erode trust.",
+  "Cellexia New Card Detected":
+    "Turns the customer's own new card into the recovery: one tap moves the held subscription to it, instead of another dunning email about the old one.",
   "Cellexia Gift Scheduled":
     "Announced gifts create anticipation for the next delivery instead of indifference.",
   "Cellexia Gift Teaser":
     "The 'a surprise is coming' tease before box two — anticipation exactly at the highest-churn charge.",
+  "Cellexia Subscription Started":
+    "The welcome: what happens next, when the next charge is, and WHERE to manage it — a subscriber who can find the portal skips or delays instead of disputing charge #2 or cancelling from Shopify's native page.",
+  "Cellexia Routine Check-in":
+    "Week-N 'how is it going?' with where they are in the routine and a one-tap answer — catches 'not seeing results yet' before it becomes a cancel reason.",
+  "Cellexia Cancel Intent":
+    "The highest-intent cohort there is — someone who opened the cancel flow and walked away undecided — gets the reason-matched one-tap fixes before the next charge decides for them.",
   "Cellexia Milestone Reached":
     "Celebrating tenure makes the subscription feel like progress worth keeping.",
   "Cellexia Rewards Unlocked":
@@ -161,6 +176,10 @@ const WHY_BY_METRIC: Record<string, string> = {
     "Confirms the new rhythm — right-sized frequency prevents 'too much product' churn.",
   "Cellexia Subscription Cancelled":
     "The graceful goodbye that keeps the door open (their benefits stay saved).",
+  "Cellexia Cancellation Scheduled":
+    "Honesty inside a commitment period: the customer chose an end date and gets it in writing — with one tap to change their mind before it arrives.",
+  "Cellexia Cancellation Upcoming":
+    "The last, truthful reminder before a scheduled cancellation runs — a second save moment with a one-tap keep, never a silent charge.",
 };
 
 /**
@@ -231,11 +250,17 @@ export function effectiveDeliveryFor(
 
 // ── Definition building ──────────────────────────────────────────────────────
 
-function parseFromAddress(from: string): { label: string; email: string } {
+function parseFromAddress(
+  from: string,
+  fallbackEmail: string | null = null,
+): { label: string; email: string } {
   const match = from.match(/^\s*(.*?)\s*<([^>]+)>\s*$/);
   if (match) return { label: match[1] || "Cellexia", email: match[2].trim() };
   if (from.includes("@")) return { label: "Cellexia", email: from.trim() };
-  return { label: "Cellexia", email: "no-reply@cellexia.com" };
+  // No usable From anywhere: the shop's support email (settings.support →
+  // Shop.contactEmail) rather than a hard-coded address on a domain the
+  // store may not own (v1.28.0). Empty string = let Klaviyo reject loudly.
+  return { label: "Cellexia", email: fallbackEmail ?? "" };
 }
 
 /**
@@ -277,6 +302,8 @@ export function buildFlowDefinition(input: {
   flowName: string;
   fromEmail: string;
   fromLabel: string;
+  /** settings.support.replyTo → support.email (v1.28.0); null = none. */
+  replyToEmail?: string | null;
   messageStatus: "live" | "draft";
 }): Record<string, unknown> {
   return {
@@ -315,7 +342,7 @@ export function buildFlowDefinition(input: {
           message: {
             from_email: input.fromEmail,
             from_label: input.fromLabel,
-            reply_to_email: null,
+            reply_to_email: input.replyToEmail ?? null,
             cc_email: null,
             bcc_email: null,
             subject_line: "{{ event.content_subject }}",
@@ -1110,7 +1137,12 @@ async function runGuidedSetupInner(
     }
   }
 
-  const from = parseFromAddress((await resolveMailConfig(shopId)).from);
+  // Support channels (v1.28.0, P5.1): Reply-To on every auto-created flow's
+  // email so a customer who hits Reply reaches the merchant; also the From
+  // fallback of last resort. Contained — the resolver never throws.
+  const { getSupportChannels } = await import("~/lib/support/channels.server");
+  const support = await getSupportChannels(shopId);
+  const from = parseFromAddress((await resolveMailConfig(shopId)).from, support.email);
   const rows = evaluateCoverage(specs, byName, index.flows, emailsTemplates);
 
   // ── "Click until green": drafts WE created get their set-live retried.
@@ -1167,6 +1199,7 @@ async function runGuidedSetupInner(
           flowName: row.name,
           fromEmail: from.email,
           fromLabel: from.label,
+          replyToEmail: support.replyTo,
         },
         {
           ...timing,
@@ -1278,6 +1311,7 @@ async function createFlowForSpec(
     flowName: string;
     fromEmail: string;
     fromLabel: string;
+    replyToEmail?: string | null;
   },
   retry: RetryOptions,
 ): Promise<
@@ -1304,6 +1338,7 @@ async function createFlowForSpec(
       flowName: input.flowName,
       fromEmail: input.fromEmail,
       fromLabel: input.fromLabel,
+      replyToEmail: input.replyToEmail ?? null,
       messageStatus,
     });
     const response = await requestWithRetry(

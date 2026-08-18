@@ -1,7 +1,6 @@
 import { Prisma } from "@prisma/client";
 import type {
   BillingAttempt,
-  ContractLine,
   DunningCase,
   DunningState,
   SubscriptionContract,
@@ -14,13 +13,14 @@ import {
 } from "~/lib/events/log.server";
 import { getSetting } from "~/lib/settings/settings.server";
 import type { SettingsValue } from "~/lib/settings/registry.server";
-import { addDaysTz, alignToPayday } from "~/lib/dates.server";
+import { addDaysTz, alignToPayday, cardExpiryMoment } from "~/lib/dates.server";
 import { formatMoney } from "~/lib/money";
 import { buildMagicUrl } from "~/lib/magiclinks/builder.server";
 import {
   sendNotification,
   type TemplateKey,
 } from "~/lib/notifications/index.server";
+import { paymentMethodUpdatedVars } from "~/lib/notifications/payment-method.server";
 import { adminClientForShop } from "~/shopify.server";
 import {
   type AdminClient,
@@ -44,6 +44,8 @@ import {
   type DeclineCodeInfo,
 } from "./decline-codes.server";
 import { selectNextRetryOffsetDays } from "./ladder.server";
+import { OPEN_CASE_STATES } from "./states";
+import { estimateHeldAmountCents, planSumCents } from "./held-amount.server";
 import { OURS_ONLY, isBillableOwnership } from "~/lib/ownership/ownership.server";
 
 /**
@@ -133,12 +135,9 @@ type CancelContractFn = (
   },
 ) => Promise<unknown>;
 
-export const OPEN_CASE_STATES: DunningState[] = [
-  "OPEN",
-  "RETRYING",
-  "AWAITING_CUSTOMER",
-  "AWAITING_3DS",
-];
+// Defined in ./states (dependency-free) since v1.28.0; re-exported here for
+// every existing importer.
+export { OPEN_CASE_STATES };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -159,6 +158,24 @@ const CREATE_FAILURE_BACKOFF_MS = 60 * 60 * 1000;
  * forever — the sweep's cancelAfterFailedDays timeout then resolves it.
  */
 const CREATE_FAILURE_MAX = 24;
+/**
+ * BillingAttemptUserErrorCode values that mean "not now", never "never"
+ * (v1.28.0): Shopify's trust-metric rate limit and its review hold clear on
+ * their own, so the case must keep its ladder (PENDING row + idempotency key
+ * reused, no rung consumed) instead of parking AWAITING_CUSTOMER — which
+ * would silently kill the automatic retries behind a customer's single tap.
+ * These do NOT count toward CREATE_FAILURE_MAX (a throttle is not a fault).
+ */
+const TRANSIENT_ATTEMPT_REFUSAL_CODES: ReadonlySet<string> = new Set([
+  "THROTTLED",
+  "TOO_MANY_REQUESTS",
+  "CONTRACT_UNDER_REVIEW",
+  "PROCESSING_FAILED",
+]);
+/** ">24h before the cycle's expected date" — retry when the date is reachable. */
+const BEFORE_EXPECTED_DATE_CODE = "BILLING_CYCLE_CHARGE_BEFORE_EXPECTED_DATE";
+/** The held cycle was skipped (customer/merchant) — nothing left to collect. */
+const CYCLE_SKIPPED_CODE = "BILLING_CYCLE_SKIPPED";
 /** Days of update-card link validity beyond the case's cancel window. */
 const UPDATE_CARD_LINK_GRACE_DAYS = 7;
 const CONFIRM_3DS_TTL_SECONDS = 3 * 24 * 3600;
@@ -379,9 +396,14 @@ async function ensureOpenCase(
   // recoveredCents later holds the actual): failed attempts carry no
   // amountCents (Shopify only prices an attempt on success), and once the
   // case resolves the contract's lines may have changed, so this is the only
-  // moment the at-risk amount is knowable. Priced from the contract's lines
-  // + delivery, hence the contract's own currency.
-  const amountAtRiskCents = estimateContractAmountCents(attempt.contract);
+  // moment the at-risk amount is knowable. Priced by THE next-order estimate
+  // (grant / parked-cycle marker / per-line edits applied — the same figure
+  // the hero, items card and reminder print; plan-sum fallback inside),
+  // hence the contract's own currency.
+  const amountAtRiskCents = await estimateHeldAmountCents(
+    { id: attempt.contract.shop.id, ianaTimezone: attempt.contract.shop.ianaTimezone },
+    attempt.contract,
+  );
   let kase: DunningCase;
   try {
     kase = await prisma.dunningCase.create({
@@ -429,17 +451,19 @@ async function ensureOpenCase(
   return kase;
 }
 
-/** Line total + delivery — fallback when the attempt carries no amount. */
-function estimateContractAmountCents(contract: {
-  lines: ContractLine[];
-  deliveryPriceCents: number;
-}): number | null {
-  if (contract.lines.length === 0) return null;
-  const lineSum = contract.lines.reduce(
-    (sum, line) => sum + line.currentPriceCents * line.quantity,
-    0,
+/**
+ * The held order's amount for a notification — Shopify's own figure when the
+ * attempt carries one (success only), else THE next-order estimate (grant /
+ * parked marker / per-line edits, plan-sum fallback inside). One figure with
+ * the portal banner, hero and reminder.
+ */
+async function estimateContractAmountCents(
+  contract: AttemptFull["contract"],
+): Promise<number | null> {
+  return estimateHeldAmountCents(
+    { id: contract.shop.id, ianaTimezone: contract.shop.ianaTimezone },
+    contract,
   );
-  return lineSum + contract.deliveryPriceCents;
 }
 
 /**
@@ -471,13 +495,13 @@ async function buildUpdateCardUrl(
 }
 
 /** Standard template vars for failure notifications. */
-function failureVars(
+async function failureVars(
   attempt: AttemptFull,
   info: DeclineCodeInfo,
-): Record<string, unknown> {
+): Promise<Record<string, unknown>> {
   const contract = attempt.contract;
   const amountCents =
-    attempt.amountCents ?? estimateContractAmountCents(contract);
+    attempt.amountCents ?? (await estimateContractAmountCents(contract));
   return {
     attempt_number: attempt.attemptNumber,
     amount:
@@ -789,12 +813,16 @@ async function handleSoftFailure(
       try {
         // The id being replaced must survive somewhere durable BEFORE the
         // switch: both contract pointers are equal afterwards ("on backup"),
-        // so the case column is what the revert reads. Cases opened before
-        // the column existed (null) get it stamped here with the precise
-        // pre-switch instrument; newer cases already carry their case-open
-        // snapshot from ensureOpenCase.
+        // so the case column is what the revert reads. Always restamped with
+        // the PRECISE pre-switch instrument (v1.28.0): the case-open snapshot
+        // may be a card the customer has since replaced explicitly (portal /
+        // admin "Make primary" during the case) — reverting to THAT would
+        // silently drop their chosen card for a known-bad one.
         const previousPaymentMethodId = contract.paymentMethodId;
-        if (kase.originalPaymentMethodId == null && previousPaymentMethodId) {
+        if (
+          previousPaymentMethodId &&
+          kase.originalPaymentMethodId !== previousPaymentMethodId
+        ) {
           await prisma.dunningCase.update({
             where: { id: kase.id },
             data: { originalPaymentMethodId: previousPaymentMethodId },
@@ -803,7 +831,12 @@ async function handleSoftFailure(
         }
         // The switch syncs the in-memory contract onto the backup card
         // (pointer + card mirror) — the event payload below must carry the
-        // id captured BEFORE it.
+        // id captured BEFORE it, and the notice names the card it replaced.
+        const previousCard = {
+          cardBrand: contract.cardBrand,
+          cardLast4: contract.cardLast4,
+          paymentInstrumentType: contract.paymentInstrumentType,
+        };
         await changePaymentMethodToBackup(contract);
         viaBackup = true;
         await logEvent({
@@ -819,7 +852,11 @@ async function handleSoftFailure(
         });
         // The instrument the renewals charge just changed — tell the customer
         // (trust: never silently bill a different card).
-        await notifyPaymentMethodChanged(contract);
+        await notifyPaymentMethodChanged(
+          contract,
+          previousCard,
+          attempt.amountCents ?? null,
+        );
       } catch (err) {
         // Switch failed — fall back to the normal ladder on the original card.
         console.error(
@@ -951,6 +988,71 @@ async function revertToOriginalPaymentMethod(
 }
 
 /**
+ * Collapse the "on backup" pointer marker once the case that swapped to the
+ * backup is closed (v1.28.0 review fix). The engine's swap keeps both
+ * pointers equal (`paymentMethodId === backupPaymentMethodId`) so the same
+ * case can revert; but the success path never re-pointed them, so after ANY
+ * recovery on the backup card the contract read "on backup" forever: the
+ * portal hid the Set-as-backup toggle and printed "we're using your backup
+ * card while your main card is fixed", setBackupPaymentMethod refused with
+ * BACKUP_IN_USE, and the next cycle had no backup coverage at all.
+ *
+ * Collapse rule: the old primary (the case's `originalPaymentMethodId`, i.e.
+ * the exact pre-swap instrument) becomes the backup — the historical swap
+ * semantics `changePaymentMethod(trigger "backup")` documents ("old primary
+ * becomes the backup so a later swap can restore it") — or the backup is
+ * cleared when no distinct original is known. Best-effort: a failure leaves
+ * the pointers as they were (the portal / service scope the marker to an
+ * OPEN case, so the customer is never locked out either way).
+ */
+async function collapseBackupMarkerAfterCase(
+  contract: ContractWithShop,
+  kase: DunningCase,
+  reason: "recovered" | "exhausted",
+): Promise<void> {
+  try {
+    if (
+      contract.backupPaymentMethodId == null ||
+      contract.paymentMethodId !== contract.backupPaymentMethodId
+    ) {
+      return; // not on the backup — nothing to collapse
+    }
+    const original =
+      kase.originalPaymentMethodId &&
+      kase.originalPaymentMethodId !== contract.paymentMethodId
+        ? kase.originalPaymentMethodId
+        : null;
+    const previousBackupPaymentMethodId = contract.backupPaymentMethodId;
+    await prisma.subscriptionContract.update({
+      where: { id: contract.id },
+      data: {
+        backupPaymentMethodId: original,
+        backupSetBy: "ENGINE",
+        backupSetAt: new Date(),
+      },
+    });
+    contract.backupPaymentMethodId = original;
+    await logEvent({
+      ...eventBase(contract),
+      type: original ? "contract.backup_promoted" : "contract.backup_payment_cleared",
+      source: "WEBHOOK",
+      payload: {
+        dunningCaseId: kase.id,
+        reason,
+        setBy: "ENGINE",
+        // The backup card is now the plain primary; the old primary (if any)
+        // is demoted to backup so the next case can still fall back.
+        paymentMethodId: contract.paymentMethodId,
+        previousBackupPaymentMethodId,
+        backupPaymentMethodId: original,
+      },
+    });
+  } catch (err) {
+    console.error("[dunning] backup marker collapse failed", contract.id, err);
+  }
+}
+
+/**
  * Best-effort mirror refresh of card metadata for the given method — DB row
  * AND the in-memory contract, so notifications sent later in the same handler
  * (notifyPaymentMethodChanged, failure emails) describe the card actually
@@ -973,12 +1075,17 @@ async function refreshCardMirror(
         cardLast4: method.instrument.lastDigits,
         cardExpiryMonth: method.instrument.expiryMonth,
         cardExpiryYear: method.instrument.expiryYear,
+        paymentInstrumentType: method.instrument.type,
+        // Refreshed to a live method → the revoked stamp no longer applies.
+        ...(method.revoked ? {} : { paymentMethodRevokedAt: null }),
       },
     });
     contract.cardBrand = method.instrument.brand;
     contract.cardLast4 = method.instrument.lastDigits;
     contract.cardExpiryMonth = method.instrument.expiryMonth;
     contract.cardExpiryYear = method.instrument.expiryYear;
+    contract.paymentInstrumentType = method.instrument.type;
+    if (!method.revoked) contract.paymentMethodRevokedAt = null;
   } catch (err) {
     console.error("[dunning] card mirror refresh failed", contract.id, err);
   }
@@ -993,17 +1100,32 @@ async function refreshCardMirror(
  */
 async function notifyPaymentMethodChanged(
   contract: ContractWithShop,
+  previousCard: {
+    cardBrand: string | null;
+    cardLast4: string | null;
+    paymentInstrumentType?: string | null;
+  } | null = null,
+  amountCents: number | null = null,
 ): Promise<void> {
   try {
+    // v1.28.0: the template body renders {change_line}/{next_line} — every
+    // sender builds its vars through the shared helper (the "backup_failed"
+    // variant names the card that failed and the backup now charged).
+    const vars = await paymentMethodUpdatedVars({
+      locale: contract.locale,
+      tz: contract.shop.ianaTimezone,
+      contract,
+      reason: "backup_failed",
+      previousCard,
+      cardUpdatedBy: "system",
+      amountCents,
+      hasOpenCase: true, // mid-ladder by construction
+    });
     await sendNotification({
       shopId: contract.shopId,
       contractId: contract.id,
       template: "payment_method_updated",
-      vars: {
-        card_brand: contract.cardBrand ?? "",
-        card_last4: contract.cardLast4 ?? "",
-        via_backup: true,
-      },
+      vars,
     });
   } catch (err) {
     console.error(
@@ -1154,7 +1276,7 @@ async function handleHardFailure(
     "payment_failed_1",
     `${kase.id}:EMAIL:0`,
     {
-      ...failureVars(attempt, info),
+      ...(await failureVars(attempt, info)),
       ...(ctaUrl ? { cta_url: ctaUrl } : {}),
     },
   );
@@ -1198,7 +1320,7 @@ async function handleAuthRequiredFailure(
     "threeds_action",
     `${kase.id}:THREEDS:fallback`,
     {
-      ...failureVars(attempt, info),
+      ...(await failureVars(attempt, info)),
       ...(ctaUrl ? { cta_url: ctaUrl } : {}),
     },
   );
@@ -1303,6 +1425,12 @@ export async function onBillingAttemptChallenged(
     where: { id: attempt.id, status: { in: ["PENDING", "CHALLENGED"] } },
     data: {
       status: "CHALLENGED",
+      // The last 3DS challenge URL observed for this attempt (migration 0027):
+      // the portal's "Confirm with my bank" prefers a fresh Admin query but
+      // falls back to this column when Shopify is unreachable at tap time —
+      // it must be stamped HERE, at challenge time, or the fallback is empty
+      // on the customer's first (and typically only) tap.
+      ...(redirectUrl ? { challengeUrl: redirectUrl } : {}),
       // Fold the 3DS challenge into the stored-credential evidence blob.
       mitEvidence: withThreeDsOutcome(attempt.mitEvidence, {
         challenged: true,
@@ -1326,6 +1454,9 @@ export async function onBillingAttemptChallenged(
   });
 
   let ctaUrl: string | null = null;
+  // The real CONFIRM_3DS link (null when the build failed and ctaUrl is the
+  // update-card fallback) — the SMS leg below only ever texts THIS one.
+  let confirmUrl: string | null = null;
   try {
     ctaUrl = await buildMagicUrl({
       action: "CONFIRM_3DS",
@@ -1337,6 +1468,7 @@ export async function onBillingAttemptChallenged(
       maxUses: CONFIRM_3DS_MAX_USES,
       createdVia: "DUNNING",
     });
+    confirmUrl = ctaUrl;
   } catch (err) {
     console.error("[dunning] CONFIRM_3DS magic link failed", contract.id, err);
     ctaUrl = await buildUpdateCardUrl(contract);
@@ -1353,7 +1485,7 @@ export async function onBillingAttemptChallenged(
     "threeds_action",
     `${kase.id}:THREEDS:challenge:${attempt.id}`,
     {
-      ...failureVars(attempt, info),
+      ...(await failureVars(attempt, info)),
       ...(ctaUrl ? { cta_url: ctaUrl } : {}),
     },
   );
@@ -1362,6 +1494,33 @@ export async function onBillingAttemptChallenged(
     // a real fresh email — the count-every-SENT rule in the commit helper is
     // what finally counts it.
     await commitCaseNotificationCursor(kase, status, now);
+  }
+
+  // v1.28.0 — day-0 SMS leg (P1.6): the same secure confirmation link as a
+  // short text, through the SAME consent path payment_failed_sms uses (a
+  // phone on the contract; the notifications SMS channel toggle and the
+  // template's enable switch inside the router; Klaviyo SMS consent at
+  // delivery). Only the real CONFIRM_3DS link is worth a text — the
+  // update-card fallback stays email-only. Deduped per attempt like the
+  // email; never counted against the ladder's single smsDay text; contained.
+  let smsStatus: "SENT" | "SUPPRESSED" | "FAILED" | "DUPLICATE" | "SKIPPED" =
+    "SKIPPED";
+  if (contract.phone && confirmUrl) {
+    try {
+      smsStatus = await sendCaseNotificationOnce(
+        contract,
+        "threeds_action_sms",
+        `${kase.id}:THREEDS_SMS:challenge:${attempt.id}`,
+        {
+          ...(await failureVars(attempt, info)),
+          confirm_url: confirmUrl,
+          cta_url: confirmUrl,
+        },
+      );
+    } catch (err) {
+      smsStatus = "FAILED";
+      console.error("[dunning] 3DS SMS leg failed", contract.id, err);
+    }
   }
 
   await logEvent({
@@ -1387,6 +1546,7 @@ export async function onBillingAttemptChallenged(
       maxUses: CONFIRM_3DS_MAX_USES,
       ttlDays: CONFIRM_3DS_TTL_SECONDS / 86400,
       notificationStatus: status,
+      smsNotificationStatus: smsStatus,
     },
   });
 }
@@ -1510,6 +1670,12 @@ export async function onBillingAttemptSucceeded(
     });
   }
 
+  // The backup card carried the recovery: collapse the "on backup" pointer
+  // marker now that the case is closed (v1.28.0 review fix). Contained.
+  if (kase) {
+    await collapseBackupMarkerAfterCase(contract, kase, "recovered");
+  }
+
   if (contract.status === "FAILED") {
     try {
       const admin = await adminClientForShop(contract.shop.domain);
@@ -1587,8 +1753,52 @@ export async function onBillingAttemptSucceeded(
  * A contract that was already FAILED by an exhausted PAUSE ladder gets its
  * newest EXHAUSTED case reopened so the retry → success path can reactivate it.
  */
+/**
+ * Optional knowledge a caller has about the instrument BEFORE the change
+ * (the pre-update mirror row): lets a RETRYING case retry immediately when
+ * the card actually changed (new method id, or the same id re-vaulted with a
+ * new last4 through Shopify's hosted replace flow), instead of waiting for
+ * its scheduled rung. Without it the engine falls back to comparing the
+ * contract's method id with the id on file when the case opened.
+ */
+export interface PaymentMethodUpdatedOptions {
+  previous?: {
+    paymentMethodId?: string | null;
+    cardLast4?: string | null;
+    /**
+     * Expiry / brand of the instrument before the change (v1.28.0): a renewed
+     * card usually keeps its PAN (same last4) and only moves the expiry —
+     * the EXPIRED_CARD fix — so a difference here counts as a real change.
+     */
+    cardExpiryMonth?: number | null;
+    cardExpiryYear?: number | null;
+    cardBrand?: string | null;
+  };
+}
+
+/**
+ * True when an attempt for the case's cycle is already on its way to Shopify
+ * (PENDING with a Shopify id, outcome webhook pending). Scheduling another
+ * retry NOW on top of it would have fireRetry mint a second attempt for the
+ * same cycle — the in-flight one's outcome drives the next step instead.
+ */
+async function hasInFlightAttempt(kase: DunningCase): Promise<boolean> {
+  const cycleIndex = await caseCycleIndex(kase);
+  const inFlight = await prisma.billingAttempt.findFirst({
+    where: {
+      contractId: kase.contractId,
+      status: "PENDING",
+      shopifyAttemptId: { not: null },
+      ...(cycleIndex != null ? { cycleIndex } : {}),
+    },
+    select: { id: true, shopifyAttemptId: true },
+  });
+  return inFlight != null && inFlight.shopifyAttemptId != null;
+}
+
 export async function onPaymentMethodUpdated(
   contractLocalId: string,
+  options: PaymentMethodUpdatedOptions = {},
 ): Promise<void> {
   const contract = await prisma.subscriptionContract.findUnique({
     where: { id: contractLocalId },
@@ -1614,12 +1824,78 @@ export async function onPaymentMethodUpdated(
     }
   }
   if (!kase) return;
+
+  // A RETRYING case keeps its schedule UNLESS the instrument really changed
+  // (v1.28.0): a customer who just fixed the card should not wait days for
+  // the next rung. "Really changed" = the caller's pre-update snapshot
+  // differs (method id or last4), or — without a snapshot — the contract now
+  // charges a different method than the one on file at case-open (engine
+  // backup switches excluded: both pointers equal marks "on backup").
+  let cardChanged = false;
+  if (kase.state === "RETRYING") {
+    const previous = options.previous;
+    if (previous) {
+      const differs = <T,>(a: T | null | undefined, b: T | null | undefined) =>
+        a !== undefined && (a ?? null) !== (b ?? null);
+      cardChanged =
+        differs(previous.paymentMethodId, contract.paymentMethodId) ||
+        differs(previous.cardLast4, contract.cardLast4) ||
+        differs(previous.cardExpiryMonth, contract.cardExpiryMonth) ||
+        differs(previous.cardExpiryYear, contract.cardExpiryYear) ||
+        differs(previous.cardBrand, contract.cardBrand);
+    } else {
+      const onBackup =
+        contract.backupPaymentMethodId != null &&
+        contract.paymentMethodId === contract.backupPaymentMethodId;
+      cardChanged =
+        !onBackup &&
+        kase.originalPaymentMethodId != null &&
+        contract.paymentMethodId != null &&
+        kase.originalPaymentMethodId !== contract.paymentMethodId;
+    }
+    if (cardChanged && (await hasInFlightAttempt(kase))) {
+      cardChanged = false; // its outcome webhook drives the next step
+    }
+  }
   if (
     !reopened &&
     kase.state !== "AWAITING_CUSTOMER" &&
-    kase.state !== "AWAITING_3DS"
+    kase.state !== "AWAITING_3DS" &&
+    !(kase.state === "RETRYING" && cardChanged)
   ) {
     return; // RETRYING cases already have a schedule; recovery closes the rest
+  }
+
+  // Same guards as the customer "Retry now" (v1.28.0): a CHALLENGED attempt
+  // of the case's cycle (bank verification pending) or an in-flight PENDING
+  // one must settle first — re-arming now would have the sweep mint a second
+  // live attempt for the same cycle (two keys, two possible charges). The
+  // challenge/pending outcome re-enters the engine and drives the next step.
+  if (kase.state !== "RETRYING" || !cardChanged) {
+    const cycleIndex = await caseCycleIndex(kase);
+    const challenged = await prisma.billingAttempt.findFirst({
+      where: {
+        contractId: contract.id,
+        status: "CHALLENGED",
+        shopifyAttemptId: { not: null },
+        ...(cycleIndex != null ? { cycleIndex } : {}),
+      },
+      select: { id: true },
+    });
+    if (challenged || (await hasInFlightAttempt(kase))) {
+      await logEvent({
+        ...eventBase(contract),
+        type: "dunning.retry_deferred",
+        source: "WEBHOOK",
+        payload: {
+          dunningCaseId: kase.id,
+          trigger: "payment_method_updated",
+          reason: challenged ? "challenge_pending" : "attempt_in_flight",
+          reopened,
+        },
+      });
+      return;
+    }
   }
 
   await prisma.dunningCase.update({
@@ -1639,9 +1915,283 @@ export async function onPaymentMethodUpdated(
       trigger: "payment_method_updated",
       immediate: true,
       reopened,
+      cardChanged,
       nextRetryAt: now.toISOString(),
     },
   });
+}
+
+// ── Customer "Retry now" (v1.28.0) ───────────────────────────────────────────
+
+export type CustomerRetryOutcome =
+  | { kind: "started"; caseId: string; reopened: boolean; inFlight: boolean }
+  | { kind: "too_soon"; caseId: string; retryAgainAt: Date }
+  | { kind: "no_case" }
+  | {
+      kind: "unavailable";
+      caseId: string | null;
+      reason:
+        | "not_found"
+        | "not_ours"
+        | "setup_mode"
+        | "contract_paused"
+        | "contract_status"
+        | "challenge_pending"
+        | "claim_lost"
+        /** Shopify refused the attempt for good — case parked AWAITING_CUSTOMER. */
+        | "refused"
+        /** The held cycle turned out to be skipped — case closed. */
+        | "cycle_skipped";
+    };
+
+export interface CustomerRetryOptions {
+  source: EventSource;
+  actor: string;
+  now?: Date;
+  /** Override for tests; defaults to settings.dunning.customerRetryCooldownMinutes. */
+  cooldownMinutes?: number;
+}
+
+/**
+ * Customer-initiated retry (portal "Retry now", magic RETRY_PAYMENT, SMS
+ * RETRY). Requires an OPEN case — or, for a FAILED contract, its newest
+ * EXHAUSTED case, which is reopened exactly the way onPaymentMethodUpdated
+ * does (resolvedAt/resolution cleared). Guarded:
+ *
+ *  - per-case cooldown on DunningCase.customerRetryAt (setting
+ *    dunning.customerRetryCooldownMinutes) — enforced INSIDE the atomic
+ *    claim, so two taps racing each other cannot both fire;
+ *  - PAUSED contracts refuse (Shopify rejects attempts on paused contracts —
+ *    a permanent refusal would park the case AWAITING_CUSTOMER);
+ *  - a CHALLENGED attempt of the case's cycle refuses (the bank must settle
+ *    it first — the portal's "Confirm with my bank" is the path);
+ *  - an in-flight PENDING attempt is reported as started (its outcome
+ *    webhook is the retry the customer is asking for).
+ *
+ * The retry itself goes through fireRetry — the same idempotency-key /
+ * PENDING-row-reuse bookkeeping the sweep uses, so a double charge stays
+ * impossible. Rung selection is time-anchored (offsets from openedAt), so a
+ * customer retry consumes NO ladder rung: the next automatic retry lands
+ * where it always would have. If the inline fire throws, the case is already
+ * RETRYING with nextRetryAt = now and the next sweep fires it. Logs
+ * dunning.retry_scheduled {trigger:'customer'} and portal.payment_retry
+ * {outcome} (every tap leaves a trace, refusals included). Never throws.
+ */
+export async function requestCustomerRetry(
+  contractLocalId: string,
+  options: CustomerRetryOptions,
+): Promise<CustomerRetryOutcome> {
+  const now = options.now ?? new Date();
+  const contract = await prisma.subscriptionContract.findUnique({
+    where: { id: contractLocalId },
+    include: { shop: true, lines: true },
+  });
+  if (!contract) return { kind: "unavailable", caseId: null, reason: "not_found" };
+  if (!assertOurContract(contract, "customer-retry")) {
+    return { kind: "unavailable", caseId: null, reason: "not_ours" };
+  }
+
+  const audit = async (
+    outcome: CustomerRetryOutcome,
+    extra: Record<string, unknown> = {},
+  ): Promise<CustomerRetryOutcome> => {
+    try {
+      await logEvent({
+        ...eventBase(contract),
+        type: "portal.payment_retry",
+        source: options.source,
+        actor: options.actor,
+        payload: {
+          outcome: outcome.kind,
+          dunningCaseId: "caseId" in outcome ? outcome.caseId : null,
+          ...("reason" in outcome ? { reason: outcome.reason } : {}),
+          ...extra,
+        },
+      });
+    } catch (err) {
+      console.error("[dunning] customer retry audit failed", contract.id, err);
+    }
+    return outcome;
+  };
+
+  // Launch gate at the single choke point (v1.28.0): the portal dispatcher
+  // and the magic-link executor refuse mutations in SETUP mode upstream, but
+  // the SMS RETRY keyword reaches here directly — and this is a live charge.
+  // Fail closed: an unreadable launch state refuses too.
+  let setupMode = true;
+  try {
+    setupMode = (await getSetting(contract.shopId, "launch")).mode === "SETUP";
+  } catch (err) {
+    console.error("[dunning] customer retry launch-state read failed", err);
+  }
+  if (setupMode) {
+    return audit({ kind: "unavailable", caseId: null, reason: "setup_mode" });
+  }
+
+  if (contract.status === "PAUSED") {
+    return audit({ kind: "unavailable", caseId: null, reason: "contract_paused" });
+  }
+  if (contract.status !== "ACTIVE" && contract.status !== "FAILED") {
+    return audit({ kind: "unavailable", caseId: null, reason: "contract_status" });
+  }
+
+  let kase = await findOpenCase(contract.id);
+  let reopened = false;
+  if (!kase && contract.status === "FAILED") {
+    const exhausted = await prisma.dunningCase.findFirst({
+      where: { contractId: contract.id, state: "EXHAUSTED" },
+      orderBy: { openedAt: "desc" },
+    });
+    if (exhausted) {
+      kase = exhausted;
+      reopened = true;
+    }
+  }
+  if (!kase) return audit({ kind: "no_case" });
+  // The rung the ladder held before this tap — a throttled inline fire
+  // re-arms it instead of reshaping the schedule (fireRetry options).
+  const previousRung =
+    !reopened && kase.state === "RETRYING" ? kase.nextRetryAt : null;
+
+  let cooldownMinutes = options.cooldownMinutes;
+  if (cooldownMinutes == null) {
+    try {
+      cooldownMinutes = (await getSetting(contract.shopId, "dunning"))
+        .customerRetryCooldownMinutes;
+    } catch (err) {
+      console.error("[dunning] customer retry settings read failed", err);
+      cooldownMinutes = 60;
+    }
+  }
+  const cooldownMs = cooldownMinutes * 60_000;
+  if (
+    kase.customerRetryAt &&
+    now.getTime() - kase.customerRetryAt.getTime() < cooldownMs
+  ) {
+    return audit({
+      kind: "too_soon",
+      caseId: kase.id,
+      retryAgainAt: new Date(kase.customerRetryAt.getTime() + cooldownMs),
+    });
+  }
+
+  const cycleIndex = await caseCycleIndex(kase);
+  const challenged = await prisma.billingAttempt.findFirst({
+    where: {
+      contractId: contract.id,
+      status: "CHALLENGED",
+      shopifyAttemptId: { not: null },
+      ...(cycleIndex != null ? { cycleIndex } : {}),
+    },
+    select: { id: true },
+  });
+  if (challenged) {
+    return audit({
+      kind: "unavailable",
+      caseId: kase.id,
+      reason: "challenge_pending",
+    });
+  }
+  if (await hasInFlightAttempt(kase)) {
+    // The retry the customer wants is already on its way — stamp the
+    // cooldown so a second tap does not read as a fresh request.
+    await prisma.dunningCase.updateMany({
+      where: { id: kase.id },
+      data: { customerRetryAt: now },
+    });
+    return audit({ kind: "started", caseId: kase.id, reopened: false, inFlight: true });
+  }
+
+  // Atomic claim: state guard (open, or the exhausted case we are reopening)
+  // AND the cooldown live in the same statement — a concurrent tap, sweep
+  // resolution or webhook recovery cannot slip between a check and the write.
+  const claimed = await prisma.dunningCase.updateMany({
+    where: {
+      id: kase.id,
+      contractId: contract.id,
+      state: reopened ? "EXHAUSTED" : { in: OPEN_CASE_STATES },
+      OR: [
+        { customerRetryAt: null },
+        { customerRetryAt: { lt: new Date(now.getTime() - cooldownMs) } },
+      ],
+    },
+    data: {
+      state: "RETRYING",
+      nextRetryAt: now,
+      customerRetryAt: now,
+      ...(reopened ? { resolvedAt: null, resolution: null } : {}),
+    },
+  });
+  if (claimed.count !== 1) {
+    return audit({ kind: "unavailable", caseId: kase.id, reason: "claim_lost" });
+  }
+
+  await logEvent({
+    ...eventBase(contract),
+    type: "dunning.retry_scheduled",
+    source: options.source,
+    actor: options.actor,
+    payload: {
+      dunningCaseId: kase.id,
+      trigger: "customer",
+      immediate: true,
+      reopened,
+      cycleIndex,
+      nextRetryAt: now.toISOString(),
+    },
+  });
+
+  // Inline fire through the sweep's own path (idempotency + attempt
+  // bookkeeping). Contained: on any error the case stays RETRYING/due and
+  // the next dunning sweep fires it. The fire's outcome decides what the
+  // customer is told (v1.28.0): a throttle is "try again later" (the case
+  // keeps its ladder), a permanent refusal is "unavailable", a skipped cycle
+  // closed the case — never a blanket "started".
+  let fired: FireRetryOutcome | null = null;
+  try {
+    const fresh = await prisma.dunningCase.findUnique({
+      where: { id: kase.id },
+      include: { contract: { include: { shop: true, lines: true } } },
+    });
+    if (fresh && fresh.state === "RETRYING") {
+      const adminCache = new Map<string, AdminClient>();
+      const adminFor = async (domain: string): Promise<AdminClient> => {
+        const cached = adminCache.get(domain);
+        if (cached) return cached;
+        const admin = await adminClientForShop(domain);
+        adminCache.set(domain, admin);
+        return admin;
+      };
+      fired = await fireRetry(fresh, now, adminFor, emptyStats(), {
+        restoreNextRetryAt: previousRung,
+      });
+    }
+  } catch (err) {
+    console.error("[dunning] customer retry inline fire failed", kase.id, err);
+  }
+
+  if (fired?.kind === "transient") {
+    return audit(
+      { kind: "too_soon", caseId: kase.id, retryAgainAt: fired.retryAt },
+      { cycleIndex, fired: fired.kind, errorCode: fired.code },
+    );
+  }
+  if (fired?.kind === "permanent") {
+    return audit(
+      { kind: "unavailable", caseId: kase.id, reason: "refused" },
+      { cycleIndex, fired: fired.kind, errorCode: fired.code },
+    );
+  }
+  if (fired?.kind === "closed") {
+    return audit(
+      { kind: "unavailable", caseId: kase.id, reason: "cycle_skipped" },
+      { cycleIndex, fired: fired.kind },
+    );
+  }
+  return audit(
+    { kind: "started", caseId: kase.id, reopened, inFlight: false },
+    { cycleIndex, fired: fired?.kind ?? null },
+  );
 }
 
 // ── Exhaustion ───────────────────────────────────────────────────────────────
@@ -1701,6 +2251,9 @@ export async function exhaustCase(
       nextRetryAt: null,
     },
   });
+  // A case parked while still on the backup card (failed revert) must not
+  // leave the "on backup" marker behind for the next case / the portal.
+  await collapseBackupMarkerAfterCase(contract, kase, "exhausted");
   await logEvent({
     ...eventBase(contract),
     type: "dunning.exhausted",
@@ -1806,6 +2359,16 @@ export async function runDunningSweep(
     if (kase.state !== "RETRYING") continue;
     if (!kase.nextRetryAt || kase.nextRetryAt > now) continue;
     if (kase.contract.status === "PAUSED") continue; // resume re-enters billing
+    // A scheduled cancel whose moment has passed (v1.28.0, P3.8): the
+    // customer was told "no further charges after {date}" — no retry (and no
+    // ladder email) past it; cancel_scheduled_run ends the contract and the
+    // auto-close above settles the case.
+    if (
+      kase.contract.cancelScheduledAt &&
+      kase.contract.cancelScheduledAt.getTime() <= now.getTime()
+    ) {
+      continue;
+    }
     try {
       await fireRetry(kase, now, adminFor, stats);
     } catch (err) {
@@ -1941,6 +2504,18 @@ export async function runDunningSweep(
     }
   }
 
+  // (e) Post-exhaustion touches (v1.28.0, P1.9): the parked cohort —
+  // FAILED contracts whose newest case is EXHAUSTED — gets the "three ways
+  // back" email at settings.dunning.postExhaustionTouchDays offsets
+  // (post-exhaustion.server.ts owns the dedupe / stop conditions). Rides
+  // this SETUP-gated job; contained — never blocks the sweep's own stats.
+  try {
+    const { runPostExhaustionTouches } = await import("./post-exhaustion.server");
+    await runPostExhaustionTouches(now);
+  } catch (err) {
+    console.error("[dunning] post-exhaustion touches failed", err);
+  }
+
   return stats;
 }
 
@@ -1983,19 +2558,58 @@ async function recheckAwaiting3ds(
   }
 }
 
+/** What one fireRetry call did — the customer path maps it to honest copy. */
+export type FireRetryOutcome =
+  | { kind: "started" }
+  /** Shopify said "not now" — case still RETRYING, re-fires at `retryAt`. */
+  | { kind: "transient"; retryAt: Date; code: string | null }
+  /** Permanent refusal — case parked AWAITING_CUSTOMER. */
+  | { kind: "permanent"; code: string | null }
+  /** The held cycle was skipped — case closed, nothing to collect. */
+  | { kind: "closed" }
+  /** Another fire (sweep vs. customer tap) owns this case right now. */
+  | { kind: "claim_lost" }
+  /** Data-integrity edge (no failed attempt behind a RETRYING case). */
+  | { kind: "no_attempt" };
+
+export interface FireRetryOptions {
+  /**
+   * The rung the case held BEFORE a customer-triggered claim moved it to
+   * "now": a transient refusal (throttle) re-arms this rung instead of an
+   * hourly backoff, so one tap never reshapes the ladder.
+   */
+  restoreNextRetryAt?: Date | null;
+}
+
 /**
  * Create + fire one dunning retry. Crash-safe: a PENDING retry row without a
  * Shopify attempt id is reused with its original idempotency key, so even if
  * the process died mid-flight (or Shopify errored after accepting the call) a
  * re-fire can never double charge — Shopify dedupes on the key.
+ *
+ * Atomic claim (v1.28.0): the sweep iterates a snapshot while customer taps
+ * fire inline outside its job lock, so before minting anything the case row
+ * is claimed with `state RETRYING AND nextRetryAt = <the value the caller
+ * saw>` and leased one backoff ahead. The loser returns `claim_lost` without
+ * touching Shopify — two callers can no longer mint two attempts (two keys)
+ * for one cycle. The lease keeps a crash between claim and Shopify call
+ * re-drivable (same PENDING row, same key) after CREATE_FAILURE_BACKOFF_MS.
  */
 async function fireRetry(
   kase: CaseWithContract,
   now: Date,
   adminFor: (domain: string) => Promise<AdminClient>,
   stats: DunningSweepStats,
-): Promise<void> {
+  options: FireRetryOptions = {},
+): Promise<FireRetryOutcome> {
   const contract = kase.contract;
+
+  const leaseUntil = new Date(now.getTime() + CREATE_FAILURE_BACKOFF_MS);
+  const claimed = await prisma.dunningCase.updateMany({
+    where: { id: kase.id, state: "RETRYING", nextRetryAt: kase.nextRetryAt },
+    data: { nextRetryAt: leaseUntil },
+  });
+  if (claimed.count !== 1) return { kind: "claim_lost" };
 
   // The case's own cycle first (trigger attempt); newest failed attempt as a
   // legacy fallback for cases without one.
@@ -2023,7 +2637,7 @@ async function fireRetry(
         nextRetryAt: null,
       },
     });
-    return;
+    return { kind: "no_attempt" };
   }
   const cycleIndex = anchoredCycle ?? lastFailed.cycleIndex;
 
@@ -2077,8 +2691,17 @@ async function fireRetry(
   try {
     shopifyAttemptId = (await create()).attemptId;
   } catch (err) {
-    if (err instanceof ShopifyUserError && contract.status === "FAILED") {
+    const firstCode =
+      err instanceof ShopifyUserError ? structuredUserErrorCode(err.errors) : null;
+    const notNow =
+      firstCode != null &&
+      (TRANSIENT_ATTEMPT_REFUSAL_CODES.has(firstCode) ||
+        firstCode === BEFORE_EXPECTED_DATE_CODE ||
+        firstCode === CYCLE_SKIPPED_CODE);
+    if (err instanceof ShopifyUserError && contract.status === "FAILED" && !notNow) {
       // Shopify refuses attempts on FAILED contracts — reactivate, then charge.
+      // (A throttle / skipped-cycle refusal is not that refusal: reactivating
+      // on it would leave an ACTIVE contract with no retry scheduled.)
       await contractActivate(admin, contract.shopifyContractId);
       await prisma.subscriptionContract.update({
         where: { id: contract.id },
@@ -2094,12 +2717,16 @@ async function fireRetry(
     } else {
       // A ShopifyUserError outside the FAILED-contract branch is a permanent
       // refusal (cycle already billed, contract config, permissions) — hourly
-      // re-fires can never succeed. Likewise a transient error that has
-      // already failed CREATE_FAILURE_MAX times is treated as permanent.
-      // Either way: park the case on AWAITING_CUSTOMER (the sweep's
-      // cancelAfterFailedDays timeout resolves it), expire the un-started
-      // PENDING row so it stops blocking the contract's regular billing, and
-      // never loop forever.
+      // re-fires can never succeed — EXCEPT the documented "not now" codes
+      // (v1.28.0): THROTTLED & co. keep the ladder and back off (or re-arm
+      // the rung a customer tap displaced); BILLING_CYCLE_CHARGE_BEFORE_
+      // EXPECTED_DATE re-arms at the cycle's date (a "Delay" moved it);
+      // BILLING_CYCLE_SKIPPED closes the case (nothing left to collect).
+      // Likewise a transient error that has already failed CREATE_FAILURE_MAX
+      // times is treated as permanent. Permanent: park the case on
+      // AWAITING_CUSTOMER (the sweep's cancelAfterFailedDays timeout resolves
+      // it), expire the un-started PENDING row so it stops blocking the
+      // contract's regular billing, and never loop forever.
       const priorCreateFailures = await prisma.subscriberEvent.count({
         where: {
           contractId: contract.id,
@@ -2115,9 +2742,31 @@ async function fireRetry(
         err instanceof ShopifyUserError
           ? structuredUserErrorCode(err.errors)
           : null;
+      const message = err instanceof Error ? err.message : String(err);
+
+      if (refusalCode === CYCLE_SKIPPED_CODE) {
+        await prisma.billingAttempt.updateMany({
+          where: { id: row.id, shopifyAttemptId: null, startedAt: null },
+          data: {
+            status: "EXPIRED",
+            completedAt: now,
+            errorCode: refusalCode,
+            errorMessage: message,
+          },
+        });
+        await closeCaseForSkippedCycle(kase, contract, cycleIndex, now, {
+          source: "SCHEDULER",
+          reason: "attempt_create_refused_cycle_skipped",
+        });
+        return { kind: "closed" };
+      }
+
+      const throttled =
+        refusalCode != null && TRANSIENT_ATTEMPT_REFUSAL_CODES.has(refusalCode);
+      const beforeExpected = refusalCode === BEFORE_EXPECTED_DATE_CODE;
       const permanent =
-        err instanceof ShopifyUserError ||
-        priorCreateFailures + 1 >= CREATE_FAILURE_MAX;
+        (err instanceof ShopifyUserError && !throttled && !beforeExpected) ||
+        (!throttled && !beforeExpected && priorCreateFailures + 1 >= CREATE_FAILURE_MAX);
 
       if (permanent) {
         // The refusal reason must survive on the terminal row itself, not
@@ -2150,13 +2799,30 @@ async function fireRetry(
             error: err instanceof Error ? err.message : String(err),
           },
         });
-        return;
+        return { kind: "permanent", code: refusalCode };
       }
 
-      // Transient — back off an hour and re-fire with the SAME idempotency key
-      // (the PENDING row is reused), so a double charge is impossible even if
-      // Shopify actually accepted this call.
-      const backoffUntil = new Date(now.getTime() + CREATE_FAILURE_BACKOFF_MS);
+      // Transient — back off and re-fire with the SAME idempotency key (the
+      // PENDING row is reused), so a double charge is impossible even if
+      // Shopify actually accepted this call. Where to re-arm:
+      //  - >24h before the cycle's expected date → that date itself (the
+      //    mirror's nextBillingDate carries it after a delay), else backoff;
+      //  - a throttled customer tap → the rung it displaced (options), so the
+      //    ladder keeps its shape; else the plain hourly backoff.
+      const backoff = new Date(now.getTime() + CREATE_FAILURE_BACKOFF_MS);
+      let backoffUntil = backoff;
+      let reason = "attempt_create_failed";
+      if (beforeExpected) {
+        reason = "attempt_create_before_expected_date";
+        const expected = contract.nextBillingDate;
+        if (expected && expected.getTime() > now.getTime()) {
+          backoffUntil = expected;
+        }
+      } else if (throttled) {
+        reason = "attempt_create_throttled";
+        const restore = options.restoreNextRetryAt;
+        if (restore && restore.getTime() > now.getTime()) backoffUntil = restore;
+      }
       await prisma.dunningCase.update({
         where: { id: kase.id },
         data: { nextRetryAt: backoffUntil },
@@ -2169,13 +2835,14 @@ async function fireRetry(
           dunningCaseId: kase.id,
           cycleIndex,
           rescheduled: true,
-          reason: "attempt_create_failed",
-          error: err instanceof Error ? err.message : String(err),
+          reason,
+          errorCode: refusalCode,
+          error: message,
           nextRetryAt: backoffUntil.toISOString(),
           idempotencyKey: row.idempotencyKey,
         },
       });
-      return;
+      return { kind: "transient", retryAt: backoffUntil, code: refusalCode };
     }
   }
 
@@ -2204,6 +2871,150 @@ async function fireRetry(
     },
   });
   stats.retriesScheduled += 1;
+  return { kind: "started" };
+}
+
+/**
+ * The held cycle is gone (skipped on Shopify — by the customer's skip verb,
+ * the merchant's stockout tool, or found skipped when the retry was refused
+ * with BILLING_CYCLE_SKIPPED): nothing is left to collect, so the open case
+ * for that cycle closes instead of retrying into refusals, emailing "still
+ * holding your order" and exhausting the contract to FAILED at
+ * cancelAfterFailedDays. Un-started PENDING retry rows for the cycle are
+ * expired so the regular billing sweep is not held by them. Logs
+ * dunning.case_closed {reason}. Best-effort caller-side; throws nothing.
+ */
+async function closeCaseForSkippedCycle(
+  kase: DunningCase,
+  contract: ContractWithShop,
+  cycleIndex: number | null,
+  now: Date,
+  meta: { source: EventSource; reason: string },
+): Promise<boolean> {
+  const closed = await prisma.dunningCase.updateMany({
+    where: { id: kase.id, state: { in: OPEN_CASE_STATES } },
+    data: {
+      state: "CANCELLED",
+      resolvedAt: now,
+      resolution: "CYCLE_SKIPPED",
+      nextRetryAt: null,
+    },
+  });
+  if (closed.count !== 1) return false;
+  if (cycleIndex != null) {
+    await prisma.billingAttempt.updateMany({
+      where: {
+        contractId: contract.id,
+        cycleIndex,
+        status: "PENDING",
+        originatingAction: "DUNNING_RETRY",
+        shopifyAttemptId: null,
+        startedAt: null,
+      },
+      data: {
+        status: "EXPIRED",
+        completedAt: now,
+        errorCode: CYCLE_SKIPPED_CODE,
+        errorMessage: "Billing cycle skipped while a dunning case was open",
+      },
+    });
+  }
+  await logEvent({
+    ...eventBase(contract),
+    type: "dunning.case_closed",
+    source: meta.source,
+    payload: {
+      dunningCaseId: kase.id,
+      cycleIndex,
+      resolution: "CYCLE_SKIPPED",
+      reason: meta.reason,
+    },
+  });
+  return true;
+}
+
+/**
+ * A billing cycle was skipped (contracts service `skipNextCycle`, v1.28.0
+ * reconciliation): if the contract's open case is anchored on THAT cycle,
+ * close it — see closeCaseForSkippedCycle. Legacy cases without a trigger
+ * attempt (unknown cycle) are left alone. Contained: never throws.
+ */
+export async function onCycleSkipped(
+  contractLocalId: string,
+  cycleIndex: number,
+  source: EventSource = "CUSTOMER_PORTAL",
+): Promise<boolean> {
+  try {
+    const kase = await findOpenCase(contractLocalId);
+    if (!kase) return false;
+    const caseCycle = await caseCycleIndex(kase);
+    if (caseCycle == null || caseCycle !== cycleIndex) return false;
+    const contract = await prisma.subscriptionContract.findUnique({
+      where: { id: contractLocalId },
+      include: { shop: true },
+    });
+    if (!contract) return false;
+    return await closeCaseForSkippedCycle(kase, contract, cycleIndex, new Date(), {
+      source,
+      reason: "cycle_skipped",
+    });
+  } catch (err) {
+    console.error("[dunning] onCycleSkipped failed", contractLocalId, err);
+    return false;
+  }
+}
+
+/**
+ * A billing cycle's expected date moved (contracts service `delayNextCycle`,
+ * v1.28.0 reconciliation): a RETRYING case anchored on THAT cycle re-arms at
+ * the new date — Shopify refuses attempts more than 24h before a cycle's
+ * billingAttemptExpectedDate, and the customer asked for the delay. Cases
+ * waiting on the customer / the bank keep their state (nothing to re-arm).
+ * Contained: never throws.
+ */
+export async function onCycleDelayed(
+  contractLocalId: string,
+  cycleIndex: number,
+  newExpectedDate: Date,
+  source: EventSource = "CUSTOMER_PORTAL",
+): Promise<boolean> {
+  try {
+    const kase = await findOpenCase(contractLocalId);
+    if (!kase || kase.state !== "RETRYING") return false;
+    const caseCycle = await caseCycleIndex(kase);
+    if (caseCycle == null || caseCycle !== cycleIndex) return false;
+    if (kase.nextRetryAt && kase.nextRetryAt.getTime() >= newExpectedDate.getTime()) {
+      return false; // already at or past the new date
+    }
+    const moved = await prisma.dunningCase.updateMany({
+      where: { id: kase.id, state: "RETRYING", nextRetryAt: kase.nextRetryAt },
+      data: { nextRetryAt: newExpectedDate },
+    });
+    if (moved.count !== 1) return false;
+    const contract = await prisma.subscriptionContract.findUnique({
+      where: { id: contractLocalId },
+      include: { shop: true },
+    });
+    if (contract) {
+      await logEvent({
+        ...eventBase(contract),
+        type: "dunning.retry_scheduled",
+        source,
+        payload: {
+          dunningCaseId: kase.id,
+          cycleIndex,
+          rescheduled: true,
+          reason: "cycle_delayed",
+          previousNextRetryAt: kase.nextRetryAt?.toISOString() ?? null,
+          nextRetryAt: newExpectedDate.toISOString(),
+        },
+      });
+    }
+    return true;
+  } catch (err) {
+    console.error("[dunning] onCycleDelayed failed", contractLocalId, err);
+    return false;
+  }
 }
 
 /**
@@ -2250,7 +3061,10 @@ async function sendLadderNotification(
     orderBy: [{ cycleIndex: "desc" }, { attemptNumber: "desc" }],
   });
   const amountCents =
-    lastFailed?.amountCents ?? estimateContractAmountCents(contract);
+    lastFailed?.amountCents ??
+    (await estimateContractAmountCents(contract)) ??
+    kase.amountAtRiskCents ??
+    planSumCents(contract);
   const ctaUrl = await buildUpdateCardUrl(contract);
 
   const vars: Record<string, unknown> = {
@@ -2270,6 +3084,31 @@ async function sendLadderNotification(
   };
   if (lastFailed) vars.cycleIndex = lastFailed.cycleIndex;
   if (ctaUrl) vars.cta_url = ctaUrl;
+
+  // "Use my card ····1234 instead" (v1.28.0, P1.7): payment_failed_2/3 carry
+  // one USE_METHOD link per OTHER live, unexpired vaulted method (computed
+  // at send time; contained — empty block otherwise, so
+  // the `{other_cards_block}` placeholder renders as nothing). Always set:
+  // the template must never print the literal placeholder.
+  vars.other_cards_block = "";
+  if (template === "payment_failed_2" || template === "payment_failed_3") {
+    try {
+      const { otherCardsBlockForContract } = await import(
+        "./other-cards.server"
+      );
+      const settings = await getSetting(contract.shopId, "dunning");
+      const admin = await adminClientForShop(contract.shop.domain);
+      vars.other_cards_block = await otherCardsBlockForContract({
+        admin,
+        contract,
+        ttlDays: settings.cancelAfterFailedDays + UPDATE_CARD_LINK_GRACE_DAYS,
+        createdVia: "DUNNING",
+        tz: contract.shop.ianaTimezone,
+      });
+    } catch (err) {
+      console.error("[dunning] other-cards block skipped", contract.id, err);
+    }
+  }
 
   const result = await sendNotification({
     shopId: contract.shopId,
@@ -2301,7 +3140,12 @@ export async function runPreExpiryNotices(
     where: {
       ...OURS_ONLY, // never warn another app's subscriber about their card
       isDemo: false, // the portal-preview fixture carries a fake 12/{Y+1} visa
-      status: "ACTIVE",
+      // v1.28.0: PAUSED contracts are included — a card that expires BEFORE
+      // the pause ends would fail the very first resumed charge, and the
+      // ACTIVE-only filter used to leave exactly those customers unwarned.
+      // The resumeAt gate below keeps indefinite pauses and pauses that end
+      // before the expiry out of the notice.
+      status: { in: ["ACTIVE", "PAUSED"] },
       cardExpiryMonth: { not: null },
       cardExpiryYear: { not: null },
     },
@@ -2314,6 +3158,19 @@ export async function runPreExpiryNotices(
       const expMonth = contract.cardExpiryMonth;
       const expYear = contract.cardExpiryYear;
       if (expMonth == null || expYear == null) continue;
+      if (contract.status === "PAUSED") {
+        // Only when the card is gone before the subscription wakes up:
+        // resumeAt at or after the expiry moment (first instant of the month
+        // after the expiry month) means the resumed charge would hit an
+        // expired card. No resumeAt = indefinite pause = nothing scheduled.
+        const expiryMoment = cardExpiryMoment(
+          expMonth,
+          expYear,
+          contract.shop.ianaTimezone,
+        );
+        if (!expiryMoment) continue;
+        if (!contract.resumeAt || contract.resumeAt < expiryMoment) continue;
+      }
 
       let settings = settingsCache.get(contract.shopId);
       if (!settings) {
@@ -2323,9 +3180,10 @@ export async function runPreExpiryNotices(
       const tz = contract.shop.ianaTimezone;
 
       // The card works through the last day of its expiry month; expiry moment
-      // ~ first instant of the following month (UTC midnight is close enough
-      // for a multi-week notice window; the offset itself is tz-anchored).
-      const expiresAt = new Date(Date.UTC(expYear, expMonth, 1));
+      // = first instant of the following month at the shop's local midnight
+      // (v1.28.0 audit — same clock as nextBillingDate / resumeAt).
+      const expiresAt = cardExpiryMoment(expMonth, expYear, tz);
+      if (!expiresAt) continue;
       const noticeFrom = addDaysTz(expiresAt, -settings.preExpiryNoticeDays, tz);
       if (now < noticeFrom || now >= expiresAt) continue;
 

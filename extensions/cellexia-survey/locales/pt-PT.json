@@ -3,6 +3,11 @@
   "progress": "Pergunta {{current}} de {{total}} — um toque apenas",
   "doneTitle": "Obrigado!",
   "doneBody": "As suas respostas servem para personalizar tudo para si.",
+  "manage": {
+    "title": "Gira a sua subscrição",
+    "body": "Troque produtos, salte ou adie uma entrega, atualize a morada ou o cartão — a qualquer momento, na sua conta de subscrição.",
+    "cta": "Gerir a minha subscrição"
+  },
   "q": {
     "plannedDuration": {
       "title": "Como pensa usar este produto?",

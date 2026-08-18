@@ -3,7 +3,8 @@ import prisma from "~/db.server";
 import { applyDiscountPct, discountAmount } from "~/lib/money";
 import { type AdminClient } from "~/lib/graphql/client.server";
 import { withBillingCycleEdit } from "~/lib/graphql/billingCycles.server";
-import { draftLineUpdate } from "~/lib/graphql/contracts.server";
+import { draftLineUpdate, draftLines } from "~/lib/graphql/contracts.server";
+import { matchDraftLine } from "~/lib/contracts/draft-lines";
 
 /**
  * Per-cycle DiscountGrant application.
@@ -58,6 +59,33 @@ async function grantAppliedToCycle(
  * that has already been applied to that cycle is not returned again
  * (idempotent sweep re-runs).
  */
+/**
+ * Best live grant percent per contract, batched for list pages (portal home):
+ * same selection rule as getActiveDiscountForCycle (highest percent, oldest
+ * first), no per-cycle applied check (the estimate is for the upcoming
+ * cycle, which has not been billed). Contracts without a grant are absent.
+ */
+export async function activeDiscountPercentByContract(
+  contractIds: string[],
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  if (contractIds.length === 0) return out;
+  const grants = await prisma.discountGrant.findMany({
+    where: {
+      contractId: { in: contractIds },
+      cyclesRemaining: { gt: 0 },
+      exhaustedAt: null,
+      percent: { gt: 0 },
+    },
+    orderBy: [{ percent: "desc" }, { createdAt: "asc" }],
+    select: { contractId: true, percent: true },
+  });
+  for (const g of grants) {
+    if (!out.has(g.contractId)) out.set(g.contractId, g.percent);
+  }
+  return out;
+}
+
 export async function getActiveDiscountForCycle(
   contractId: string,
   cycleIndex?: number,
@@ -101,27 +129,57 @@ export async function applyGrantToCycle(
   grant: DiscountGrant,
   cycleIndex: number,
 ): Promise<boolean> {
+  // Per-line "not this time" (v1.28.0, P2.5): a line skipped for THIS cycle
+  // is no longer on the cycle draft — updating it would fail the whole edit.
   const eligibleLines = contract.lines.filter(
-    (line) => !line.isGift && line.shopifyLineId,
+    (line) =>
+      !line.isGift &&
+      line.shopifyLineId &&
+      line.skippedCycleIndex !== cycleIndex,
   );
   if (eligibleLines.length === 0) return false;
+  // Units that actually bill this cycle (one-cycle quantity tweak honoured).
+  const billedQuantity = (line: ContractLine): number =>
+    line.cycleQuantityOverrideIndex === cycleIndex &&
+    line.cycleQuantityOverride != null &&
+    line.cycleQuantityOverride >= 1
+      ? line.cycleQuantityOverride
+      : line.quantity;
 
+  // Resolve each mirrored line to the draft line it is on THIS cycle
+  // (v1.28.0 review fix): a line re-added by an unskip / a quantity tweak
+  // carries a cycle-scoped id, not ContractLine.shopifyLineId — updating the
+  // stale id would fail the whole edit and bill the cycle at full price
+  // while the portal promised the offer. Lines not on the draft at all are
+  // left out (and out of the discount total).
+  const discountedLines: ContractLine[] = [];
   await withBillingCycleEdit(
     admin,
     contract.shopifyContractId,
     { index: cycleIndex },
     async (draftId, run) => {
+      const onDraft = await draftLines(run, draftId);
       for (const line of eligibleLines) {
-        await draftLineUpdate(run, draftId, line.shopifyLineId as string, {
+        const target = matchDraftLine(onDraft, contract.lines, {
+          id: line.id,
+          shopifyLineId: line.shopifyLineId as string,
+          variantId: line.variantId,
+        });
+        if (!target) continue;
+        await draftLineUpdate(run, draftId, target.id, {
           currentPriceCents: applyDiscountPct(line.currentPriceCents, grant.percent),
         });
+        discountedLines.push(line);
       }
     },
   );
+  if (discountedLines.length === 0) return false;
 
-  const discountCents = eligibleLines.reduce(
+  const discountCents = discountedLines.reduce(
     (sum, line) =>
-      sum + discountAmount(line.currentPriceCents, grant.percent) * line.quantity,
+      sum +
+      discountAmount(line.currentPriceCents, grant.percent) *
+        billedQuantity(line),
     0,
   );
 

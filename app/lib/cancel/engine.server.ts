@@ -1,9 +1,21 @@
 import type { CancelSession, Prisma, Shop } from "@prisma/client";
+import { z } from "zod";
 import prisma from "~/db.server";
 import { logEvent, type EventSource } from "~/lib/events/log.server";
 import { getSetting } from "~/lib/settings/settings.server";
 import { clampGrantPercentForContract } from "~/lib/billing/stacking.server";
-import { addDaysTz, addIntervalTz } from "~/lib/dates.server";
+import {
+  grantDiscountCents,
+  loadParkedCycleDiscount,
+  nextCycleIndex,
+} from "~/lib/billing/estimate.server";
+import { getActiveDiscountForCycle } from "~/lib/billing/discounts.server";
+import {
+  isPreparingOrder,
+  resolveChargeTiming,
+} from "~/lib/billing/timing.server";
+import { addDaysTz, addIntervalTz, shopDayStartUtc } from "~/lib/dates.server";
+import { delayModeFor, type DelayMode } from "~/lib/portal/schedule.server";
 import {
   approxWeeks,
   contractFrequency,
@@ -19,22 +31,39 @@ import {
   getBillingCycleByIndex,
 } from "~/lib/graphql/billingCycles.server";
 import {
+  CycleLineEditError,
   applyDiscountGrant,
   cancelContract,
   changeFrequency,
+  changeLineQuantity,
+  delayNextCycle,
+  delaySchedule,
+  extendPause,
   pauseContract,
+  skipLineThisCycle,
   skipNextCycle,
   swapLineVariant,
 } from "~/lib/contracts/service.server";
-import type { LocalContractWithLines } from "~/lib/contracts/shared.server";
+import { pauseExtendChoices } from "~/lib/portal/flex.server";
+import { getPortalCatalog } from "~/lib/portal/catalog.server";
+import {
+  ongoingDiscountPctForProduct,
+  swapPriceCentsSync,
+  type LocalContractWithLines,
+} from "~/lib/contracts/shared.server";
 import { resolveLockState } from "~/lib/contracts/lock.server";
 import {
+  CANCEL_SCHEDULED,
   FINAL_DISCOUNT,
+  LOCK_BLOCKED_SAVES,
+  MAX_DOWNSIZE_OPTIONS,
   MAX_SWAP_OPTIONS,
+  SAVED_PENDING,
   SESSION_FRESH_MINUTES,
   copyVariantFor,
   mergeSavesShown,
   reasonConfig,
+  savesOrderFor,
   type CancelReason,
   type SaveKind,
 } from "./config.server";
@@ -72,14 +101,60 @@ export type CancelChannel = "PORTAL" | "ADMIN" | "MAGIC_LINK";
 export interface SwapOption {
   variantId: string;
   title: string;
+  /** Unit price the swap WILL apply — from the service's swapPriceCentsFor
+   * (v1.28.0), so the card and the executed swap can never disagree. */
   displayPriceCents: number;
   imageUrl: string | null;
+}
+
+/**
+ * One cheaper configuration on a DOWNSIZE card (v1.28.0). Exactly one of
+ * `quantity` (fewer units of the same variant) or `variantId` (a smaller
+ * size of the same product / a cheaper product from the catalog group) is
+ * set; `newTotalCents` is the contract's recurring per-order subtotal after
+ * accepting, computed with the same pricing helper the swap applies.
+ */
+export interface DownsizeOption {
+  mode: "QUANTITY" | "VARIANT" | "PRODUCT";
+  quantity?: number;
+  variantId?: string;
+  title: string;
+  imageUrl: string | null;
+  /** Unit price of the option (per unit of the line after accepting). */
+  unitPriceCents: number;
+  newTotalCents: number;
 }
 
 /** JSON-serializable offer shapes (dates as ISO strings) — persisted verbatim
  * into CancelSession.savesShown, so keep them stable. */
 export type SaveOffer =
-  | { kind: "SKIP"; currentNextDate: string | null; newNextDate: string | null }
+  | {
+      /**
+       * "Push my next order to {predicted empty date}" (v1.28.0, P3.3): the
+       * churn model's run-out day lies AFTER the next charge, so the fitted
+       * fix for "too much product" is one delivery timed to it. `days` is
+       * the whole shop-tz days the next order moves; `mode` is the portal's
+       * delay semantics at offer time (portal.delayReanchors) — re-derived
+       * at accept, the card only promises the date.
+       */
+      kind: "DELAY";
+      currentNextDate: string;
+      newNextDate: string;
+      days: number;
+      mode: DelayMode;
+    }
+  | {
+      kind: "SKIP";
+      currentNextDate: string | null;
+      newNextDate: string | null;
+      /**
+       * Per-line "Skip just {product}" (v1.28.0, P2.5): on TOO_MUCH_PRODUCT
+       * with several recurring products, the card also offers leaving ONE
+       * product out of the next order (skipLineThisCycle) — the rest ships.
+       * Absent on single-line contracts / other reasons / older sessions.
+       */
+      lines?: Array<{ lineId: string; title: string }>;
+    }
   | {
       kind: "FREQUENCY";
       currentWeeks: number;
@@ -91,8 +166,27 @@ export type SaveOffer =
       suggestedUnit?: FrequencyUnit;
       suggestedCount?: number;
       estNextDate: string | null;
+      /**
+       * Set when the contract was PAUSED at offer time (v1.28.0): the card
+       * reads "resume later, at a slower cadence" — the hold runs to this
+       * day, the slower cadence applies from the first order after it.
+       */
+      pausedResumeAt?: string;
     }
   | { kind: "PAUSE"; months: number; resumeDate: string }
+  | {
+      /**
+       * Pause exit ramp inside the cancel flow (v1.28.0, P2.6 review fix):
+       * offered INSTEAD of PAUSE when the contract is already PAUSED — a
+       * one-tap "pause for N months" on a paused contract was a no-op the
+       * flow still recorded as a save. Choices mirror the portal's
+       * "need a little longer?" controls (portal.pauseExtendChoicesWeeks,
+       * clamped from the pause start like extendPause).
+       */
+      kind: "EXTEND_PAUSE";
+      currentResumeAt: string;
+      choices: Array<{ weeks: number; resumeAt: string }>;
+    }
   | {
       kind: "DISCOUNT";
       percent: number;
@@ -114,6 +208,22 @@ export type SaveOffer =
       retailCents: number;
       currencyCode: string;
     }
+  | {
+      kind: "DOWNSIZE";
+      lineId: string;
+      lineTitle: string;
+      /** Recurring per-order subtotal today (same base as every option's
+       * newTotalCents) — the "was" figure. PLAN prices: a live DiscountGrant
+       * is not folded in (it is temporary and rides whatever the lines are);
+       * when one is live its percent / cycles left ride along so the card can
+       * say so next to the figures (review fix — the hero shows the
+       * discounted estimate, the card must not look like it contradicts it). */
+      currentTotalCents: number;
+      currencyCode: string;
+      options: DownsizeOption[];
+      discountPercent?: number;
+      discountCyclesRemaining?: number;
+    }
   | { kind: "EDUCATION" }
   | { kind: "SUPPORT" }
   | { kind: "FINAL_DISCOUNT"; percent: number; cycles: number };
@@ -134,8 +244,28 @@ export interface SaveConfirmation {
   frequency?: Frequency;
   /** SWAP */
   swappedTitle?: string;
+  /** SKIP, per-line variant (P2.5): the product left out of the next order. */
+  skippedLineTitle?: string;
   /** GIFT */
   giftTitle?: string;
+  /** DOWNSIZE — the accepted option (mode + new per-order subtotal). */
+  downsize?: {
+    mode: DownsizeOption["mode"];
+    title: string;
+    quantity?: number;
+    newTotalCents: number;
+    currencyCode: string;
+  };
+  /**
+   * SUPPORT concierge save (v1.28.0, P3.7): whether the next order was held
+   * (moved by cancelFlow.conciergeHoldDays) and the reply promise in
+   * business days — the saved page states exactly what happened.
+   */
+  concierge?: {
+    holdApplied: boolean;
+    holdDays: number;
+    slaBusinessDays: number;
+  };
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
@@ -388,8 +518,10 @@ export async function closeStaleCancelSessions(
 export async function getLatestSavedSession(
   contractLocalId: string,
 ): Promise<CancelSession | null> {
+  // SAVED_PENDING (v1.28.0, P3.7): the concierge request went out — the
+  // saved page must render for it too (with its own copy).
   return prisma.cancelSession.findFirst({
-    where: { contractId: contractLocalId, outcome: "SAVED" },
+    where: { contractId: contractLocalId, outcome: { in: ["SAVED", SAVED_PENDING] } },
     orderBy: { startedAt: "desc" },
   });
 }
@@ -478,38 +610,272 @@ function centsFromPrice(price: string | null | undefined): number | null {
 }
 
 /**
- * Sibling variants of the line's product (other sizes/formulas), priced for
- * display at the line's proportional subscriber discount. The authoritative
- * price is computed by swapLineVariant when the swap executes.
+ * Sibling variants of the line's product (other sizes/formulas), each priced
+ * with the service's `swapPriceCentsFor` — the exact unit price the swap
+ * applies (grandfathered same-product swaps keep the line price; otherwise
+ * the plan's ongoing discount / proportional ratio) — capped in the
+ * merchant's variant order, then sorted by price ascending for display
+ * (v1.28.0). Before v1.28.0 the card showed a proportional-ratio price the
+ * executed swap could differ from.
  */
 async function fetchSwapOptions(
   admin: AdminClient,
+  shopId: string,
+  contract: { grandfatheredPricing: boolean },
   line: LocalContractWithLines["lines"][number],
 ): Promise<SwapOption[]> {
+  const siblings = await fetchSiblingVariants(admin, line);
+  const priceFor = swapPricer(shopId, contract);
+  const options: SwapOption[] = [];
+  for (const node of siblings) {
+    if (node.variantId === line.variantId) continue;
+    options.push({
+      variantId: node.variantId,
+      title: node.title || line.title,
+      displayPriceCents: await priceFor(line, {
+        productId: line.productId,
+        priceCents: node.priceCents,
+      }),
+      imageUrl: node.imageUrl,
+    });
+  }
+  // The SHOWN set is the merchant's variant order (Shopify order — the
+  // stronger / pricier formulas a results-driven swap needs stay on the
+  // card); the cap applies before the display sort so sorting can never
+  // drop them (review fix). Display: price ascending.
+  const shown = options.slice(0, MAX_SWAP_OPTIONS);
+  shown.sort((a, b) => a.displayPriceCents - b.displayPriceCents);
+  return shown;
+}
+
+interface SiblingVariant {
+  variantId: string;
+  title: string;
+  priceCents: number;
+  imageUrl: string | null;
+}
+
+/** Available-for-sale variants of the line's product (catalog prices). */
+async function fetchSiblingVariants(
+  admin: AdminClient,
+  line: LocalContractWithLines["lines"][number],
+): Promise<SiblingVariant[]> {
   const data = await gql<SwapSiblingsResponse>(admin, SWAP_SIBLINGS_QUERY, {
     id: line.productId,
   });
   const nodes = data.product?.variants?.nodes ?? [];
-  const ratio =
-    line.compareAtPriceCents && line.compareAtPriceCents > 0
-      ? line.currentPriceCents / line.compareAtPriceCents
-      : 1;
-
-  const options: SwapOption[] = [];
+  const out: SiblingVariant[] = [];
   for (const node of nodes) {
-    if (!node?.id || node.id === line.variantId) continue;
+    if (!node?.id) continue;
     if (node.availableForSale === false) continue;
-    const baseCents = centsFromPrice(node.price);
-    if (baseCents == null) continue;
-    options.push({
+    const priceCents = centsFromPrice(node.price);
+    if (priceCents == null) continue;
+    out.push({
       variantId: node.id,
       title: node.title || data.product?.title || line.title,
-      displayPriceCents: Math.round(baseCents * ratio),
+      priceCents,
       imageUrl: node.image?.url ?? null,
     });
-    if (options.length >= MAX_SWAP_OPTIONS) break;
+  }
+  return out;
+}
+
+/**
+ * Per-render swap pricer: the ongoing percent is resolved ONCE per product
+ * (Map cache) and priced with the pure rule — the same number
+ * `swapPriceCentsFor` returns, without one SellingPlanConfig query per
+ * candidate variant (review fix).
+ */
+function swapPricer(shopId: string, contract: { grandfatheredPricing: boolean }) {
+  const pctCache = new Map<string, number | null>();
+  return async (
+    line: Pick<
+      LocalContractWithLines["lines"][number],
+      "productId" | "currentPriceCents" | "compareAtPriceCents"
+    >,
+    variant: { productId: string | null; priceCents: number },
+  ): Promise<number> => {
+    const key = variant.productId ?? "";
+    let pct = pctCache.get(key);
+    if (pct === undefined) {
+      pct = await ongoingDiscountPctForProduct(shopId, variant.productId);
+      pctCache.set(key, pct);
+    }
+    return swapPriceCentsSync(contract, line, variant, pct);
+  };
+}
+
+/** Saves that edit the cycle being billed — refused while "preparing". */
+const PREPARING_BLOCKED_SAVES = new Set<SaveKind>([
+  "DELAY",
+  "SKIP",
+  "FREQUENCY",
+  "DOWNSIZE",
+]);
+
+/** The recurring line the DOWNSIZE card acts on: the biggest lever (highest
+ * line total) among non-gift, non-add-on lines. */
+function downsizeTargetLine(
+  contract: LocalContractWithLines,
+): LocalContractWithLines["lines"][number] | null {
+  const recurring = contract.lines.filter((l) => !l.isGift && !l.isOneTimeAddon);
+  if (recurring.length === 0) return null;
+  return recurring.reduce((best, l) =>
+    l.currentPriceCents * l.quantity > best.currentPriceCents * best.quantity
+      ? l
+      : best,
+  );
+}
+
+/**
+ * Cheaper configurations for the DOWNSIZE save (v1.28.0), in this order:
+ *   (a) fewer units — quantity − 1 when quantity > 1;
+ *   (b) a smaller size / cheaper variant of the SAME product, priced with the
+ *       swap helper, ordered by price ascending, only strictly cheaper ones;
+ *   (c) a cheaper product from the same catalog group (the products the
+ *       line's SellingPlanConfig covers; without a covering config, the
+ *       subscribable portal catalog), cheapest available variant per
+ *       product, priced with the swap helper, ascending.
+ * Every option carries the concrete new recurring per-order subtotal
+ * (Σ non-gift recurring lines with this line replaced), so the card can only
+ * ever promise a total the accept path produces. Capped at
+ * MAX_DOWNSIZE_OPTIONS. Contained: any Shopify/catalog hiccup yields fewer
+ * options, never a thrown error — the cancel flow must render regardless.
+ */
+export async function buildDownsizeOptions(
+  shopId: string,
+  shopDomain: string,
+  contract: LocalContractWithLines,
+  line: LocalContractWithLines["lines"][number],
+): Promise<DownsizeOption[]> {
+  const subtotal = cycleSubtotalCents(contract);
+  const lineTotal = line.currentPriceCents * line.quantity;
+  const rest = subtotal - lineTotal;
+  const options: DownsizeOption[] = [];
+  const priceFor = swapPricer(shopId, contract);
+
+  // (a) fewer units — only when changeLineQuantity can act (a line without
+  // a mirrored Shopify line id would throw at accept; never promise it).
+  if (line.quantity > 1 && line.shopifyLineId) {
+    const quantity = line.quantity - 1;
+    options.push({
+      mode: "QUANTITY",
+      quantity,
+      title: line.title,
+      imageUrl: line.imageUrl,
+      unitPriceCents: line.currentPriceCents,
+      newTotalCents: rest + line.currentPriceCents * quantity,
+    });
+  }
+  if (options.length >= MAX_DOWNSIZE_OPTIONS) return options;
+
+  let admin: AdminClient | null = null;
+  try {
+    admin = await adminClientForShop(shopDomain);
+  } catch (err) {
+    console.error("[cancel] downsize: admin client unavailable", contract.id, err);
+    return options;
+  }
+
+  // (b) smaller size / cheaper variant of the same product
+  try {
+    const siblings = await fetchSiblingVariants(admin, line);
+    const cheaper: DownsizeOption[] = [];
+    for (const v of siblings) {
+      if (v.variantId === line.variantId) continue;
+      const unit = await priceFor(line, {
+        productId: line.productId,
+        priceCents: v.priceCents,
+      });
+      if (unit >= line.currentPriceCents) continue;
+      cheaper.push({
+        mode: "VARIANT",
+        variantId: v.variantId,
+        title: v.title,
+        imageUrl: v.imageUrl,
+        unitPriceCents: unit,
+        newTotalCents: rest + unit * line.quantity,
+      });
+    }
+    cheaper.sort((a, b) => a.unitPriceCents - b.unitPriceCents);
+    for (const o of cheaper) {
+      if (options.length >= MAX_DOWNSIZE_OPTIONS) break;
+      options.push(o);
+    }
+  } catch (err) {
+    console.error("[cancel] downsize: sibling variants read failed", contract.id, err);
+  }
+  if (options.length >= MAX_DOWNSIZE_OPTIONS) return options;
+
+  // (c) cheaper product from the same catalog group
+  try {
+    const catalog = await getPortalCatalog(admin, shopId);
+    const group = await catalogGroupProductIds(shopId, line.productId);
+    const cheaper: DownsizeOption[] = [];
+    for (const product of catalog) {
+      if (product.id === line.productId) continue;
+      if (group != null && !group.has(product.id)) continue;
+      let best: DownsizeOption | null = null;
+      for (const v of product.variants) {
+        if (!v.availableForSale) continue;
+        const unit = await priceFor(line, {
+          productId: product.id,
+          priceCents: v.priceCents,
+        });
+        if (unit >= line.currentPriceCents) continue;
+        if (best && best.unitPriceCents <= unit) continue;
+        best = {
+          mode: "PRODUCT",
+          variantId: v.id,
+          title:
+            v.title && v.title !== "Default Title"
+              ? `${product.title} — ${v.title}`
+              : product.title,
+          imageUrl: product.imageUrl,
+          unitPriceCents: unit,
+          newTotalCents: rest + unit * line.quantity,
+        };
+      }
+      if (best) cheaper.push(best);
+    }
+    cheaper.sort((a, b) => a.unitPriceCents - b.unitPriceCents);
+    for (const o of cheaper) {
+      if (options.length >= MAX_DOWNSIZE_OPTIONS) break;
+      options.push(o);
+    }
+  } catch (err) {
+    console.error("[cancel] downsize: catalog read failed", contract.id, err);
   }
   return options;
+}
+
+const productIdsSchema = z.array(z.string());
+
+/**
+ * Product ids sharing the line's SellingPlanConfig ("catalog group"); null
+ * when no active config covers the product — the caller then treats the whole
+ * subscribable catalog as the group. Contained.
+ */
+async function catalogGroupProductIds(
+  shopId: string,
+  productId: string,
+): Promise<Set<string> | null> {
+  try {
+    const configs = await prisma.sellingPlanConfig.findMany({
+      where: { shopId, active: true },
+      orderBy: { createdAt: "asc" },
+    });
+    for (const config of configs) {
+      const parsed = productIdsSchema.safeParse(config.productIds);
+      if (parsed.success && parsed.data.includes(productId)) {
+        return new Set(parsed.data);
+      }
+    }
+    return null;
+  } catch (err) {
+    console.error("[cancel] downsize: selling plan config read failed", err);
+    return null;
+  }
 }
 
 /**
@@ -519,10 +885,12 @@ async function fetchSwapOptions(
  * and at most settings.cancelFlow.maxSavesShown offers are returned,
  * preserving order.
  *
- * EDUCATION deliberately carries no URLs here: the routine-guide link and the
- * consultation contact are i18n-keyed copy (`cancel.saves.education.guide_url`
- * / `.consult_url`, defaulting to /pages/routine-guide and a mailto:) so
- * operators can retarget them per locale without a settings-registry change.
+ * EDUCATION deliberately carries no URLs here: the routine-guide link
+ * resolves from settings.portal.routineGuideUrl / howToUseUrl / faqUrl at
+ * render time (education.server.ts — v1.28.0 P4.4, the same URLs the
+ * portal's routine card shows; nothing configured ⇒ no button); the
+ * consultation / support contact resolves from settings.support at render
+ * time (getSupportChannels — v1.28.0, no more hard-coded mailto:).
  */
 export async function getSavesForReason(
   shopId: string,
@@ -537,11 +905,69 @@ export async function getSavesForReason(
   const pauseSettings = await getSetting(shopId, "pause");
   const tz = shop.ianaTimezone;
   const isActive = contract.status === "ACTIVE";
+  // Preparing-your-order window (v1.28.0 review fix — parity with the portal
+  // dispatcher): once the charge moment has passed or an attempt is in
+  // flight, saves that edit the cycle being billed (SKIP / FREQUENCY /
+  // DOWNSIZE) are neither offered nor accepted. Contained (false on failure).
+  const preparing = isActive
+    ? await isPreparingOrder(
+        contract,
+        await resolveChargeTiming(shopId, tz),
+      )
+    : false;
+
+  // Plan lock window (v1.28.0, P3.8): a locked contract walks the flow only
+  // to schedule its cancellation — the reducing saves are neither offered
+  // nor accepted (LOCK_BLOCKED_SAVES); the additive ones still are.
+  // Contained: a failed rules read treats the contract as unlocked, exactly
+  // like the portal (accept re-checks).
+  let locked = false;
+  try {
+    locked = (await resolveLockState(shopId, contract, tz)).locked;
+  } catch (err) {
+    console.error("[cancel] lock state read failed for offers", contract.id, err);
+  }
 
   const offers: SaveOffer[] = [];
-  for (const kind of cfg.savesOrder) {
+  // PAUSED cancellers (v1.28.0): the exit ramp + "resume later, slower"
+  // lead whatever the reason — see PAUSED_SAVES_LEAD.
+  for (const kind of savesOrderFor(cfg, contract.status)) {
     if (offers.length >= cancelFlow.maxSavesShown) break;
+    if (preparing && PREPARING_BLOCKED_SAVES.has(kind)) continue;
+    if (locked && LOCK_BLOCKED_SAVES.has(kind)) continue;
     switch (kind) {
+      case "DELAY": {
+        // "Push my next order to {predicted empty date}" (P3.3): only when
+        // the churn model has a run-out day AFTER the next charge (shop-tz
+        // days) and within cancelFlow.delaySaveMaxDays. The date on the
+        // card is the exact day the delay will set (whole-day move through
+        // the portal's own delay semantics — re-anchor or this order only).
+        const delayOn =
+          (cancelFlow as { delaySaveEnabled?: boolean }).delaySaveEnabled !== false;
+        if (!delayOn || !isActive || !contract.nextBillingDate) break;
+        const predicted = contract.predictedEmptyDate;
+        if (!predicted || Number.isNaN(predicted.getTime())) break;
+        const nextDay = shopDayStartUtc(contract.nextBillingDate, tz);
+        const emptyDay = shopDayStartUtc(predicted, tz);
+        const days = Math.round((emptyDay.getTime() - nextDay.getTime()) / 86_400_000);
+        const maxDays =
+          (cancelFlow as { delaySaveMaxDays?: number }).delaySaveMaxDays ?? 42;
+        if (days < 1 || days > maxDays) break;
+        let mode: DelayMode = "once";
+        try {
+          mode = delayModeFor(await getSetting(shopId, "portal"), null);
+        } catch (err) {
+          console.error("[cancel] DELAY offer: portal settings read failed", contract.id, err);
+        }
+        offers.push({
+          kind: "DELAY",
+          currentNextDate: contract.nextBillingDate.toISOString(),
+          newNextDate: addDaysTz(contract.nextBillingDate, days, tz).toISOString(),
+          days,
+          mode,
+        });
+        break;
+      }
       case "SKIP": {
         if (!isActive || !contract.nextBillingDate) break;
         // The card promises an exact date, so preview what accepting actually
@@ -582,15 +1008,56 @@ export async function getSavesForReason(
             err,
           );
         }
+        // Per-line option (P2.5): "too much product" on a multi-product
+        // subscription — the customer may only have too much of ONE thing.
+        // Honours the merchant switch (portal.perLineCycleEdits) like the
+        // portal does, and never offers a line already "not this time" for
+        // the upcoming cycle (review fix — accepting it threw LAST_LINE /
+        // no-op'd instead of saving anything).
+        let skippableLines: typeof contract.lines = [];
+        if (reason === "TOO_MUCH_PRODUCT") {
+          const portalSettings = await getSetting(shopId, "portal");
+          const perLineOn =
+            (portalSettings as { perLineCycleEdits?: boolean }).perLineCycleEdits !==
+            false;
+          if (perLineOn) {
+            let upcoming: number | null = null;
+            try {
+              upcoming = await nextCycleIndex(contract);
+            } catch (err) {
+              console.error("[cancel] SKIP per-line: cycle hint failed", contract.id, err);
+            }
+            skippableLines = contract.lines.filter(
+              (l) =>
+                !l.isGift &&
+                !l.isOneTimeAddon &&
+                l.shopifyLineId &&
+                (upcoming == null || l.skippedCycleIndex !== upcoming),
+            );
+          }
+        }
         offers.push({
           kind: "SKIP",
           currentNextDate: contract.nextBillingDate.toISOString(),
           newNextDate: newNextDate.toISOString(),
+          ...(skippableLines.length >= 2
+            ? {
+                lines: skippableLines.map((l) => ({
+                  lineId: l.id,
+                  title: l.title,
+                })),
+              }
+            : {}),
         });
         break;
       }
       case "FREQUENCY": {
-        if (!isActive) break;
+        // ACTIVE, or PAUSED (v1.28.0 — "resume later with a slower cadence":
+        // the hold stands, nothing is charged before it ends, the slower
+        // cadence applies from the first order after it; the card says so).
+        const pausedResume =
+          contract.status === "PAUSED" && contract.resumeAt ? contract.resumeAt : null;
+        if (!isActive && !pausedResume) break;
         // The settings knob stays "+weeks" and applies to WEEK cadences
         // directly; DAY/MONTH cadences translate it (×7 days, ≈÷4 months,
         // min 1) so the suggestion stays in the contract's own unit. Past
@@ -622,20 +1089,40 @@ export async function getSavesForReason(
           suggestedUnit: suggested.unit,
           suggestedCount: suggested.count,
           // Advanced by the ADDED slack only — the next order still arrives,
-          // just later; the full new cadence starts after it.
-          estNextDate: contract.nextBillingDate
-            ? addIntervalTz(
-                contract.nextBillingDate,
-                suggested.unit,
-                addedCount,
-                tz,
-              ).toISOString()
-            : null,
+          // just later; the full new cadence starts after it. PAUSED: the
+          // first order is the resume day itself (resumeContract bills ON it).
+          estNextDate: pausedResume
+            ? pausedResume.toISOString()
+            : contract.nextBillingDate
+              ? addIntervalTz(
+                  contract.nextBillingDate,
+                  suggested.unit,
+                  addedCount,
+                  tz,
+                ).toISOString()
+              : null,
+          ...(pausedResume ? { pausedResumeAt: pausedResume.toISOString() } : {}),
         });
         break;
       }
       case "PAUSE": {
-        if (contract.status !== "ACTIVE") break; // already paused → not an offer
+        if (contract.status === "PAUSED") {
+          // Already on hold: the honest offer is the exit ramp — push the
+          // resume day back, never a no-op "pause" recorded as a save.
+          const choices = await pausedExtendChoices(shopId, contract, tz);
+          if (contract.resumeAt && choices.length > 0) {
+            offers.push({
+              kind: "EXTEND_PAUSE",
+              currentResumeAt: contract.resumeAt.toISOString(),
+              choices: choices.map((c) => ({
+                weeks: c.weeks,
+                resumeAt: c.resumeAt.toISOString(),
+              })),
+            });
+          }
+          break;
+        }
+        if (contract.status !== "ACTIVE") break; // not an offer
         const months = Math.min(
           cancelFlow.pauseSuggestMonths,
           pauseSettings.maxMonths,
@@ -663,13 +1150,16 @@ export async function getSavesForReason(
           cancelFlow.reasonOfferPctDefault,
         );
         if (clamp.percent < 1) break; // no headroom → no discount card
-        const subtotal = cycleSubtotalCents(contract);
+        // The sweep's arithmetic (grantDiscountCents: per unit price ×
+        // quantity, as applyGrantToCycle edits the cycle) — never a third
+        // rounding of the same percent.
         offers.push({
           kind: "DISCOUNT",
           percent: clamp.percent,
           cycles: cancelFlow.reasonOfferCyclesDefault,
-          estSavingsCentsPerCycle: Math.round(
-            (subtotal * clamp.percent) / 100,
+          estSavingsCentsPerCycle: grantDiscountCents(
+            contract.lines.filter((l) => !l.isGift && !l.isOneTimeAddon),
+            clamp.percent,
           ),
           currencyCode: contract.currencyCode,
         });
@@ -682,7 +1172,7 @@ export async function getSavesForReason(
         if (!line) break;
         try {
           const admin = await adminClientForShop(shop.domain);
-          const options = await fetchSwapOptions(admin, line);
+          const options = await fetchSwapOptions(admin, shopId, contract, line);
           if (options.length === 0) break;
           offers.push({
             kind: "SWAP",
@@ -698,6 +1188,52 @@ export async function getSavesForReason(
             err,
           );
         }
+        break;
+      }
+      case "DOWNSIZE": {
+        // A cheaper configuration (v1.28.0) — a lower ARPU beats zero, and
+        // unlike DISCOUNT it reprices nothing and trains nobody. Rendered
+        // only when a genuinely cheaper option exists (the card must never
+        // be an empty promise); every option's total comes from the same
+        // pricing helper the accept path applies.
+        if (!cancelFlow.downsizeSaveEnabled) break;
+        if (!isActive) break;
+        const line = downsizeTargetLine(contract);
+        if (!line) break;
+        const options = await buildDownsizeOptions(
+          shopId,
+          shop.domain,
+          contract,
+          line,
+        );
+        if (options.length === 0) break;
+        // Live grant (or the applied one dunning is retrying) — disclosed on
+        // the card, never silently omitted next to plan-price figures.
+        let discount: { percent: number; cyclesRemaining: number } | null = null;
+        try {
+          const grant = await getActiveDiscountForCycle(contract.id);
+          if (grant && grant.percent > 0 && grant.cyclesRemaining > 0) {
+            discount = { percent: grant.percent, cyclesRemaining: grant.cyclesRemaining };
+          }
+          const parked = await loadParkedCycleDiscount(contract.id);
+          if (parked) discount = { percent: parked.percent, cyclesRemaining: parked.cyclesRemaining };
+        } catch (err) {
+          console.error("[cancel] downsize: grant read failed", contract.id, err);
+        }
+        offers.push({
+          kind: "DOWNSIZE",
+          lineId: line.id,
+          lineTitle: line.title,
+          currentTotalCents: cycleSubtotalCents(contract),
+          currencyCode: contract.currencyCode,
+          options,
+          ...(discount
+            ? {
+                discountPercent: discount.percent,
+                discountCyclesRemaining: discount.cyclesRemaining,
+              }
+            : {}),
+        });
         break;
       }
       case "GIFT": {
@@ -864,8 +1400,27 @@ function offerSummary(offer: SaveOffer): Record<string, unknown> {
       };
     case "PAUSE":
       return { kind: offer.kind, months: offer.months };
+    case "DELAY":
+      return {
+        kind: offer.kind,
+        days: offer.days,
+        newNextDate: offer.newNextDate,
+        mode: offer.mode,
+      };
     case "GIFT":
       return { kind: offer.kind, variantId: offer.variantId, title: offer.title };
+    case "DOWNSIZE":
+      return {
+        kind: offer.kind,
+        lineId: offer.lineId,
+        currentTotalCents: offer.currentTotalCents,
+        options: offer.options.map((o) => ({
+          mode: o.mode,
+          ...(o.quantity != null ? { quantity: o.quantity } : {}),
+          ...(o.variantId ? { variantId: o.variantId } : {}),
+          newTotalCents: o.newTotalCents,
+        })),
+      };
     default:
       return { kind: offer.kind };
   }
@@ -945,13 +1500,26 @@ export function hasSeenFinalOffer(session: CancelSession): boolean {
 export interface AcceptSaveParams {
   /** FREQUENCY: exact new cadence — preferred over `weeks`. */
   frequency?: Frequency;
-  /** FREQUENCY: new interval in weeks (legacy form field, mapped to WEEK). */
+  /** FREQUENCY: new interval in weeks (legacy form field, mapped to WEEK).
+   *  EXTEND_PAUSE: the offered choice's week count (must match a choice). */
   weeks?: number;
   /** PAUSE: months to pause. */
   months?: number;
-  /** SWAP */
+  /** SWAP / DOWNSIZE */
   lineId?: string;
   variantId?: string;
+  /** DOWNSIZE (fewer units): the new quantity — must equal the shown option. */
+  quantity?: number;
+  /**
+   * EDUCATION / SUPPORT (v1.28.0, P5.1): the submitted Get-help form. These
+   * two saves USED to close the session as SAVED on a bare "I'll keep it"
+   * button next to a dead mailto: — a click nobody acted on counted as a
+   * save. Now the save IS the request: without a submitted message the
+   * accept is refused (analytics truth), and the request lands exactly like
+   * a portal Get-help submit (support.requested event, SUPPORT_REQUEST
+   * alert, Klaviyo, merchant email), tagged with the cancel reason/session.
+   */
+  support?: { topic: "DELIVERY" | "PAYMENT" | "PLAN" | "OTHER"; message: string };
 }
 
 /**
@@ -960,6 +1528,31 @@ export interface AcceptSaveParams {
  * "saved" page. Idempotent: re-accepting the same kind on a closed session
  * rebuilds the confirmation without re-executing.
  */
+/**
+ * The extend choices a PAUSED contract may take right now — the same rule the
+ * portal's pause banner uses (portal.pauseExtendChoicesWeeks, clamped from
+ * the pause start by pause.maxMonths). Empty when not paused / no resume day.
+ */
+async function pausedExtendChoices(
+  shopId: string,
+  contract: LocalContractWithLines,
+  tz: string,
+): Promise<Array<{ weeks: number; resumeAt: Date }>> {
+  if (contract.status !== "PAUSED" || !contract.resumeAt) return [];
+  const [portalSettings, pauseSettings] = await Promise.all([
+    getSetting(shopId, "portal"),
+    getSetting(shopId, "pause"),
+  ]);
+  return pauseExtendChoices({
+    resumeAt: contract.resumeAt,
+    pausedAt: contract.pausedAt,
+    weeks: (portalSettings as { pauseExtendChoicesWeeks?: unknown[] })
+      .pauseExtendChoicesWeeks,
+    maxMonths: pauseSettings.maxMonths,
+    tz,
+  });
+}
+
 export async function acceptSave(
   sessionId: string,
   saveKind: SaveKind,
@@ -969,8 +1562,17 @@ export async function acceptSave(
   const { session, contract, shop } = await loadSessionContext(sessionId);
   const source = channelSource(session.channel);
   const opts = { source, actor };
+  // Concierge save (P3.7): the SUPPORT request is recorded, the subscription
+  // stands, but a human still has to answer — the session closes as
+  // SAVED_PENDING, distinct from SAVED for analytics (promoted by the
+  // concierge job once the merchant resolves the alert; see
+  // scheduled.server.ts).
+  const closedOutcome = saveKind === "SUPPORT" ? SAVED_PENDING : "SAVED";
 
-  if (session.outcome === "SAVED" && session.saveAccepted === saveKind) {
+  if (
+    (session.outcome === "SAVED" || session.outcome === SAVED_PENDING) &&
+    session.saveAccepted === saveKind
+  ) {
     return buildConfirmation(saveKind, contract, shop, params);
   }
   if (session.outcome != null) {
@@ -985,7 +1587,7 @@ export async function acceptSave(
   // before anything is recorded). Everything else (notably DISCOUNT) must
   // appear in savesShown, so a crafted POST with a kind the reason never
   // unlocks is refused instead of executed.
-  if (saveKind !== "PAUSE") {
+  if (saveKind !== "PAUSE" && saveKind !== "EXTEND_PAUSE") {
     const shownKinds = savesShownArray(session).map((s) => s.kind);
     if (!shownKinds.includes(saveKind)) {
       throw new Error(
@@ -1005,13 +1607,16 @@ export async function acceptSave(
   const now = new Date();
   const claimed = await prisma.cancelSession.updateMany({
     where: { id: session.id, outcome: null },
-    data: { outcome: "SAVED", saveAccepted: saveKind, completedAt: now },
+    data: { outcome: closedOutcome, saveAccepted: saveKind, completedAt: now },
   });
   if (claimed.count === 0) {
     const settled = await prisma.cancelSession.findUniqueOrThrow({
       where: { id: session.id },
     });
-    if (settled.outcome === "SAVED" && settled.saveAccepted === saveKind) {
+    if (
+      (settled.outcome === "SAVED" || settled.outcome === SAVED_PENDING) &&
+      settled.saveAccepted === saveKind
+    ) {
       return buildConfirmation(saveKind, contract, shop, params);
     }
     throw new Error(
@@ -1021,11 +1626,25 @@ export async function acceptSave(
 
   let updated: LocalContractWithLines = contract;
   let swappedTitle: string | undefined;
+  let skippedLineTitle: string | undefined;
   let discountPercent: number | undefined;
   let discountCycles: number | undefined;
   let giftTitle: string | undefined;
+  let downsize: SaveConfirmation["downsize"];
+  let concierge: SaveConfirmation["concierge"];
 
   try {
+    // Plan lock window backstop (P3.8): the reducing saves are refused on a
+    // locked contract however the POST was crafted — same set the offer
+    // path hides. Customer channels only (ADMIN acts through its own tools).
+    if (source !== "ADMIN" && LOCK_BLOCKED_SAVES.has(saveKind)) {
+      const lock = await resolveLockState(shop.id, contract, shop.ianaTimezone);
+      if (lock.locked) {
+        throw new Error(
+          `Save ${saveKind} refused for contract ${contract.id}: inside the plan lock window until ${lock.until?.toISOString()}`,
+        );
+      }
+    }
     // The contract can be cancelled outside this session (admin, Shopify-side
     // cancel mirrored by webhook) between the loader read and the claim —
     // never execute a save (or grant a discount) on a cancelled contract.
@@ -1036,6 +1655,19 @@ export async function acceptSave(
     if (current.status === "CANCELLED") {
       throw new Error(
         `Contract ${contract.id} is cancelled — save ${saveKind} refused`,
+      );
+    }
+    // A "pause" on an already-PAUSED contract changes nothing (pauseContract
+    // returns early) — it must never close the session as SAVED (review
+    // fix: analytics truth; the exit ramp is EXTEND_PAUSE).
+    if (saveKind === "PAUSE" && current.status === "PAUSED") {
+      throw new Error(
+        `Contract ${contract.id} is already paused — save PAUSE refused (use EXTEND_PAUSE)`,
+      );
+    }
+    if (saveKind === "EXTEND_PAUSE" && current.status !== "PAUSED") {
+      throw new Error(
+        `Contract ${contract.id} is not paused — save EXTEND_PAUSE refused`,
       );
     }
 
@@ -1059,9 +1691,105 @@ export async function acceptSave(
   }
 
   async function executeSaveKind(): Promise<void> {
+    // Same preparing gate at accept time (a card rendered before the charge
+    // moment can be submitted after it) — refuse rather than edit the cycle
+    // Shopify is billing.
+    if (PREPARING_BLOCKED_SAVES.has(saveKind)) {
+      const preparing = await isPreparingOrder(
+        contract,
+        await resolveChargeTiming(shop.id, shop.ianaTimezone),
+      );
+      if (preparing) {
+        throw new Error(
+          `Save ${saveKind} refused for contract ${contract.id}: the order is being prepared`,
+        );
+      }
+    }
     switch (saveKind) {
+    case "DELAY": {
+      // Value-gating like every dated save: the day count comes from the
+      // offer this session actually showed (savesShown is the record) — a
+      // crafted POST cannot pick its own delay through the card. The mode
+      // is re-derived from the merchant's CURRENT delay semantics; the card
+      // only ever promised the date, which both modes set identically.
+      const shownDelay = savesShownArray(session).find(
+        (s): s is Extract<SaveOffer, { kind: "DELAY" }> => s.kind === "DELAY",
+      );
+      if (!shownDelay || shownDelay.days < 1) {
+        throw new Error(
+          `DELAY save was never offered in cancel session ${session.id}`,
+        );
+      }
+      const cancelFlow = await getSetting(shop.id, "cancelFlow");
+      if ((cancelFlow as { delaySaveEnabled?: boolean }).delaySaveEnabled === false) {
+        throw new Error(
+          `Delay save disabled for contract ${contract.id} (cancelFlow.delaySaveEnabled)`,
+        );
+      }
+      // The next order must still be the one the card was computed on —
+      // otherwise "+N days" lands on a different day than promised.
+      if (
+        !contract.nextBillingDate ||
+        contract.nextBillingDate.toISOString() !== shownDelay.currentNextDate
+      ) {
+        throw new Error(
+          `DELAY save refused for contract ${contract.id}: the next order moved since the offer`,
+        );
+      }
+      const mode = delayModeFor(await getSetting(shop.id, "portal"), null);
+      updated =
+        mode === "reanchor"
+          ? await delaySchedule(shop.domain, contract.id, { days: shownDelay.days }, opts)
+          : await delayNextCycle(shop.domain, contract.id, { days: shownDelay.days }, opts);
+      break;
+    }
     case "SKIP": {
+      // Per-line variant (P2.5): the accepted lineId must be one the SKIP
+      // card actually offered (savesShown is the record) — otherwise a
+      // crafted POST could target any line through the whole-order card.
+      if (params.lineId) {
+        const shownSkip = savesShownArray(session).find(
+          (s): s is Extract<SaveOffer, { kind: "SKIP" }> => s.kind === "SKIP",
+        );
+        const offeredLine = shownSkip?.lines?.find(
+          (l) => l.lineId === params.lineId,
+        );
+        if (!offeredLine) {
+          throw new Error(
+            `SKIP lineId ${String(params.lineId)} was not offered in cancel session ${session.id}`,
+          );
+        }
+        try {
+          updated = await skipLineThisCycle(
+            shop.domain,
+            contract.id,
+            offeredLine.lineId,
+            opts,
+          );
+          skippedLineTitle = offeredLine.title;
+          break;
+        } catch (err) {
+          // Every other line is already "not this time": leaving this one
+          // out would empty the order — the honest save is the whole-order
+          // skip the portal points at too (review fix; the saved page reads
+          // the cleared per-line flags and shows the whole-order copy).
+          if (!(err instanceof CycleLineEditError && err.code === "LAST_LINE")) {
+            throw err;
+          }
+        }
+      }
       updated = await skipNextCycle(shop.domain, contract.id, opts);
+      break;
+    }
+    case "EXTEND_PAUSE": {
+      const choices = await pausedExtendChoices(shop.id, contract, shop.ianaTimezone);
+      const choice = choices.find((c) => c.weeks === params.weeks);
+      if (!choice) {
+        throw new Error(
+          `EXTEND_PAUSE weeks ${String(params.weeks)} is not an offered choice for contract ${contract.id}`,
+        );
+      }
+      updated = await extendPause(shop.domain, contract.id, choice.resumeAt, opts);
       break;
     }
     case "FREQUENCY": {
@@ -1158,8 +1886,24 @@ export async function acceptSave(
         throw new Error("SWAP save requires lineId and variantId");
       }
       const line = contract.lines.find((l) => l.id === lineId);
-      if (!line) {
+      if (!line || line.isGift) {
         throw new Error(`Swap line ${lineId} not on contract ${contract.id}`);
+      }
+      // Value-gating like DOWNSIZE: the accepted variant must be one the
+      // card actually showed for this line (savesShown is the record) — a
+      // crafted POST cannot swap to an unshown or cross-product variant
+      // through the save.
+      const shownSwap = savesShownArray(session).find(
+        (s): s is Extract<SaveOffer, { kind: "SWAP" }> => s.kind === "SWAP",
+      );
+      if (
+        !shownSwap ||
+        shownSwap.lineId !== lineId ||
+        !shownSwap.options.some((o) => o.variantId === variantId)
+      ) {
+        throw new Error(
+          `SWAP option ${variantId} was not offered for line ${lineId} in cancel session ${session.id}`,
+        );
       }
       updated = await swapLineVariant(
         shop.domain,
@@ -1170,6 +1914,71 @@ export async function acceptSave(
       );
       swappedTitle =
         updated.lines.find((l) => l.id === lineId)?.title ?? line.title;
+      break;
+    }
+    case "DOWNSIZE": {
+      // Value-gating like FREQUENCY/GIFT: the accepted option must be one
+      // the card actually showed (savesShown is the record) — a crafted
+      // POST cannot pick an arbitrary quantity or variant through it.
+      const shown = savesShownArray(session).find(
+        (s): s is Extract<SaveOffer, { kind: "DOWNSIZE" }> =>
+          s.kind === "DOWNSIZE",
+      );
+      if (!shown) {
+        throw new Error(
+          `DOWNSIZE save was never offered in cancel session ${session.id}`,
+        );
+      }
+      const cancelFlow = await getSetting(shop.id, "cancelFlow");
+      if (!cancelFlow.downsizeSaveEnabled) {
+        throw new Error(
+          `Downsize save disabled for contract ${contract.id} (cancelFlow.downsizeSaveEnabled)`,
+        );
+      }
+      const { lineId } = params;
+      if (!lineId || lineId !== shown.lineId) {
+        throw new Error(
+          `DOWNSIZE lineId ${String(lineId)} was not the offered line in cancel session ${session.id}`,
+        );
+      }
+      const line = contract.lines.find((l) => l.id === lineId);
+      if (!line) {
+        throw new Error(`Downsize line ${lineId} not on contract ${contract.id}`);
+      }
+      const option = shown.options.find((o) =>
+        params.quantity != null
+          ? o.mode === "QUANTITY" && o.quantity === params.quantity
+          : params.variantId != null && o.variantId === params.variantId,
+      );
+      if (!option) {
+        throw new Error(
+          `DOWNSIZE option ${JSON.stringify({ quantity: params.quantity ?? null, variantId: params.variantId ?? null })} was not offered in cancel session ${session.id}`,
+        );
+      }
+      if (option.mode === "QUANTITY") {
+        updated = await changeLineQuantity(
+          shop.domain,
+          contract.id,
+          lineId,
+          option.quantity as number,
+          opts,
+        );
+      } else {
+        updated = await swapLineVariant(
+          shop.domain,
+          contract.id,
+          lineId,
+          option.variantId as string,
+          opts,
+        );
+      }
+      downsize = {
+        mode: option.mode,
+        title: option.title,
+        quantity: option.quantity,
+        newTotalCents: option.newTotalCents,
+        currencyCode: shown.currencyCode,
+      };
       break;
     }
     case "GIFT": {
@@ -1271,8 +2080,63 @@ export async function acceptSave(
     }
     case "EDUCATION":
     case "SUPPORT": {
-      // Nothing to mutate on the contract — the customer keeps subscribing
-      // and gets pointed at the routine guide / support channel.
+      // Nothing to mutate on the contract — the customer keeps subscribing.
+      // The save is the submitted request (see AcceptSaveParams.support): a
+      // bare accept — the pre-v1.28.0 "stay" button beside a mailto: nobody
+      // could act on — is refused so SAVED means something happened.
+      const message = params.support?.message?.trim() ?? "";
+      if (!message) {
+        throw new Error(
+          `${saveKind} save for contract ${contract.id} requires a submitted support request`,
+        );
+      }
+      // NOT wrapped: submitSupportRequest contains every downstream step
+      // (alert, email, push-back) itself and only throws when the
+      // `support.requested` record of truth could not be written. A save
+      // whose request was never recorded is not a save (SAVED means a
+      // request was submitted) — so the throw propagates to the claim-revert
+      // path above, exactly like every other save kind, and the customer
+      // gets the saves page back with the error to retry.
+      const { submitSupportRequest } = await import(
+        "~/lib/support/request.server"
+      );
+      const result = await submitSupportRequest({
+        shopId: shop.id,
+        shopDomain: shop.domain,
+        contract,
+        topic:
+          params.support?.topic ??
+          (saveKind === "SUPPORT"
+            ? conciergeTopicForReason(session.reason)
+            : "OTHER"),
+        message,
+        pushBack: false,
+        surface: "cancel_flow",
+        cancelReason: session.reason ?? null,
+        cancelReasonDetail: session.reasonDetail ?? null,
+        cancelSessionId: session.id,
+        // Concierge save (P3.7): the alert carries the save flag so the
+        // admin queue and the SLA job can tell a retention request from a
+        // plain Get-help submit.
+        saveRequest: saveKind === "SUPPORT",
+        source,
+        actor: actor ?? "customer",
+      });
+      if (saveKind === "SUPPORT") {
+        // Concierge HOLD (P3.7): move the next order by
+        // cancelFlow.conciergeHoldDays so nothing charges while a human
+        // answers — only when the charge is more than 48h away (a same-week
+        // order is already in motion), the contract is ACTIVE and not
+        // locked. Contained: the request IS the save; a failed hold is
+        // reported on the saved page, never a reverted save.
+        const hold = await applyConciergeHold(shop, contract, opts);
+        if (hold.updated) updated = hold.updated;
+        concierge = {
+          holdApplied: hold.applied,
+          holdDays: hold.days,
+          slaBusinessDays: result.slaBusinessDays,
+        };
+      }
       break;
     }
     }
@@ -1306,7 +2170,29 @@ export async function acceptSave(
           : {}),
         ...(params.months ? { months: params.months } : {}),
         ...(params.variantId ? { variantId: params.variantId } : {}),
+        ...(skippedLineTitle
+          ? { lineId: params.lineId, skippedLineTitle, perLine: true }
+          : {}),
         ...(giftTitle ? { giftTitle } : {}),
+        ...(downsize
+          ? {
+              downsizeMode: downsize.mode,
+              ...(downsize.quantity != null
+                ? { quantity: downsize.quantity }
+                : {}),
+              newTotalCents: downsize.newTotalCents,
+            }
+          : {}),
+        ...(concierge
+          ? {
+              // Distinct from a full save in the stream too (P3.7): the
+              // outcome is pending until the merchant answers.
+              pending: true,
+              holdApplied: concierge.holdApplied,
+              holdDays: concierge.holdDays,
+              slaBusinessDays: concierge.slaBusinessDays,
+            }
+          : {}),
       },
     });
   }
@@ -1316,8 +2202,103 @@ export async function acceptSave(
     percent: discountPercent,
     cycles: discountCycles,
     swappedTitle,
+    skippedLineTitle,
     giftTitle,
+    downsize,
+    concierge,
   });
+}
+
+/**
+ * The Get-help topic the concierge (SUPPORT) card prefills from the cancel
+ * reason (P3.7): shipping problems are a delivery topic, price / quantity
+ * objections a plan conversation, everything else "something else". Pure —
+ * the pages render it, the accept path uses it as the fallback topic.
+ */
+export function conciergeTopicForReason(
+  reason: string | null | undefined,
+): "DELIVERY" | "PAYMENT" | "PLAN" | "OTHER" {
+  switch (reason) {
+    case "SHIPPING_ISSUES":
+      return "DELIVERY";
+    case "TOO_EXPENSIVE":
+    case "TOO_MUCH_PRODUCT":
+      return "PLAN";
+    default:
+      return "OTHER";
+  }
+}
+
+/** Fallback minimum lead time (hours) before the charge for the concierge
+ * hold to apply — the merchant value is cancelFlow.conciergeHoldMinLeadHours
+ * (golden rule 7); this only covers an unreadable settings row. */
+export const CONCIERGE_HOLD_MIN_LEAD_HOURS_DEFAULT = 48;
+
+/**
+ * Whether the concierge hold WOULD apply right now (P3.7) — the SUPPORT card
+ * promises the hold only when this says so, and the accept path applies it
+ * under the same rule: cancelFlow.conciergeHoldDays > 0, ACTIVE, a next
+ * order more than cancelFlow.conciergeHoldMinLeadHours away, not inside the
+ * plan lock window (a hold is a schedule reduction). Pure apart from the
+ * lock read; contained to false.
+ */
+export async function conciergeHoldPlan(
+  shopId: string,
+  contract: LocalContractWithLines,
+  tz: string,
+  now: Date = new Date(),
+): Promise<{ days: number; applies: boolean; newNextDate: Date | null }> {
+  let days = 0;
+  let minLeadHours = CONCIERGE_HOLD_MIN_LEAD_HOURS_DEFAULT;
+  try {
+    const cf = (await getSetting(shopId, "cancelFlow")) as {
+      conciergeHoldDays?: number;
+      conciergeHoldMinLeadHours?: number;
+    };
+    days = cf.conciergeHoldDays ?? 0;
+    minLeadHours = cf.conciergeHoldMinLeadHours ?? CONCIERGE_HOLD_MIN_LEAD_HOURS_DEFAULT;
+  } catch (err) {
+    console.error("[cancel] concierge hold: settings read failed", contract.id, err);
+  }
+  if (days <= 0 || contract.status !== "ACTIVE" || !contract.nextBillingDate) {
+    return { days, applies: false, newNextDate: null };
+  }
+  if (contract.nextBillingDate.getTime() - now.getTime() <= minLeadHours * 3600_000) {
+    return { days, applies: false, newNextDate: null };
+  }
+  try {
+    if ((await resolveLockState(shopId, contract, tz, now)).locked) {
+      return { days, applies: false, newNextDate: null };
+    }
+  } catch (err) {
+    console.error("[cancel] concierge hold: lock read failed", contract.id, err);
+    return { days, applies: false, newNextDate: null };
+  }
+  return {
+    days,
+    applies: true,
+    newNextDate: addDaysTz(contract.nextBillingDate, days, tz),
+  };
+}
+
+async function applyConciergeHold(
+  shop: Shop,
+  contract: LocalContractWithLines,
+  opts: { source: EventSource; actor: string | null },
+): Promise<{ applied: boolean; days: number; updated: LocalContractWithLines | null }> {
+  const plan = await conciergeHoldPlan(shop.id, contract, shop.ianaTimezone);
+  if (!plan.applies) return { applied: false, days: plan.days, updated: null };
+  try {
+    // Always a ONE-cycle hold (mode "once"), whatever portal.delayReanchors
+    // says: the customer is told "we'll hold your next order until {date}
+    // while we sort it out" — a temporary hold, never a permanent shift of
+    // every later order (that would be a re-anchor the copy never promised).
+    const updated = await delayNextCycle(shop.domain, contract.id, { days: plan.days }, opts);
+    return { applied: true, days: plan.days, updated };
+  } catch (err) {
+    console.error("[cancel] concierge hold failed", contract.id, err);
+    return { applied: false, days: plan.days, updated: null };
+  }
 }
 
 function buildConfirmation(
@@ -1328,7 +2309,10 @@ function buildConfirmation(
     percent?: number;
     cycles?: number;
     swappedTitle?: string;
+    skippedLineTitle?: string;
     giftTitle?: string;
+    downsize?: SaveConfirmation["downsize"];
+    concierge?: SaveConfirmation["concierge"];
   } = {},
 ): SaveConfirmation {
   // Exact cadence for the confirmation page's localized phrase; `weeks`
@@ -1349,7 +2333,10 @@ function buildConfirmation(
     weeks: approxWeeks(frequency.unit, frequency.count),
     frequency,
     swappedTitle: extras.swappedTitle,
+    skippedLineTitle: extras.skippedLineTitle,
     giftTitle: extras.giftTitle,
+    downsize: extras.downsize,
+    concierge: extras.concierge,
   };
 }
 
@@ -1722,4 +2709,202 @@ export async function completeCancel(
   });
 
   return updated;
+}
+
+// ── Scheduled cancel (plan lock window) ──────────────────────────────────────
+
+/**
+ * Locked contract (v1.28.0, P3.8): instead of turning the customer away, the
+ * flow lets them SCHEDULE the cancellation for the unlock moment
+ * (`SubscriptionContract.cancelScheduledAt` = lock.until, shop-tz midnight
+ * of the displayed unlock date). The contract stays ACTIVE and bills as its
+ * plan says until then; the hourly `cancel_scheduled_run` job (see
+ * scheduled.server.ts) completes the cancel through the normal service path
+ * with source CUSTOMER_PORTAL and the reason recorded here, and the billing
+ * sweep refuses to bill past the scheduled moment. The session closes as
+ * CANCEL_SCHEDULED while the schedule stands (the funnel sees the
+ * customer's decision honestly); it settles to SAVED/saveAccepted KEEP when
+ * the customer keeps (`keepScheduledCancel`) or CANCELLED when the job
+ * executes it. Logs `cancel.scheduled`; the cancel_scheduled email is sent
+ * contained.
+ *
+ * Refuses when the contract is NOT locked (an unlocked contract cancels
+ * immediately — the generic "cancel after next delivery" is out of scope) or
+ * when the session already closed.
+ */
+export async function scheduleCancel(
+  sessionId: string,
+  actor: string | null = "customer",
+): Promise<{ contract: LocalContractWithLines; scheduledAt: Date }> {
+  const { session, contract, shop } = await loadSessionContext(sessionId);
+  const source = channelSource(session.channel);
+
+  if (session.outcome === CANCEL_SCHEDULED && contract.cancelScheduledAt) {
+    return { contract, scheduledAt: contract.cancelScheduledAt };
+  }
+  if (session.outcome != null) {
+    throw new Error(
+      `Cancel session ${session.id} already completed (${session.outcome})`,
+    );
+  }
+  if (contract.status === "CANCELLED") {
+    throw new Error(`Contract ${contract.id} is already cancelled`);
+  }
+  const cancelFlow = await getSetting(shop.id, "cancelFlow");
+  if ((cancelFlow as { scheduledCancelEnabled?: boolean }).scheduledCancelEnabled === false) {
+    throw new Error(
+      `Scheduled cancel disabled for contract ${contract.id} (cancelFlow.scheduledCancelEnabled)`,
+    );
+  }
+  const lock = await resolveLockState(shop.id, contract, shop.ianaTimezone);
+  if (!lock.locked || !lock.until) {
+    throw new Error(
+      `Contract ${contract.id} is not inside a plan lock window — cancel immediately instead`,
+    );
+  }
+  const scheduledAt = lock.until;
+
+  // Reason: the session's own, else the most recent stated one (7 days),
+  // else OTHER — the same fallback completeCancel applies, written onto the
+  // session so the job cancels with the customer's real reason.
+  let reason = session.reason;
+  if (reason == null) {
+    const recent = await prisma.cancelSession.findFirst({
+      where: {
+        contractId: contract.id,
+        reason: { not: null },
+        startedAt: { gte: new Date(Date.now() - 7 * 24 * 3600_000) },
+      },
+      orderBy: { startedAt: "desc" },
+      select: { reason: true },
+    });
+    reason = recent?.reason ?? null;
+  }
+  reason = reason ?? "OTHER";
+
+  const claimed = await prisma.cancelSession.updateMany({
+    where: { id: session.id, outcome: null },
+    data: { outcome: CANCEL_SCHEDULED, completedAt: new Date(), reason },
+  });
+  if (claimed.count === 0) {
+    const settled = await prisma.cancelSession.findUniqueOrThrow({
+      where: { id: session.id },
+    });
+    if (settled.outcome === CANCEL_SCHEDULED) {
+      const fresh = await prisma.subscriptionContract.findUniqueOrThrow({
+        where: { id: contract.id },
+        include: { lines: true },
+      });
+      return { contract: fresh, scheduledAt: fresh.cancelScheduledAt ?? scheduledAt };
+    }
+    throw new Error(
+      `Cancel session ${session.id} already completed (${settled.outcome})`,
+    );
+  }
+
+  let updated: LocalContractWithLines;
+  try {
+    updated = await prisma.subscriptionContract.update({
+      where: { id: contract.id },
+      data: { cancelScheduledAt: scheduledAt },
+      include: { lines: true },
+    });
+  } catch (err) {
+    await prisma.cancelSession
+      .update({
+        where: { id: session.id },
+        data: { outcome: null, completedAt: null, reason: session.reason },
+      })
+      .catch((revertErr) => {
+        console.error("[cancel] scheduleCancel claim revert failed", session.id, revertErr);
+      });
+    throw err;
+  }
+
+  const shown = savesShownArray(session);
+  await logEvent({
+    ...identity(contract),
+    type: "cancel.scheduled",
+    source,
+    actor,
+    payload: {
+      sessionId: session.id,
+      reason,
+      scheduledAt: scheduledAt.toISOString(),
+      lockDays: lock.lockDays,
+      savesShownCount: shown.length,
+      savesShownKinds: shown.map((s) => s.kind),
+    },
+  });
+
+  // Confirmation email — contained (golden rule 9).
+  try {
+    const { sendCancelScheduledEmail } = await import("./scheduled.server");
+    await sendCancelScheduledEmail(shop, updated, scheduledAt);
+  } catch (err) {
+    console.error("[cancel] cancel_scheduled email failed", contract.id, err);
+  }
+
+  return { contract: updated, scheduledAt };
+}
+
+/**
+ * Keep the subscription (v1.28.0, P3.8): clear a scheduled cancellation.
+ * Atomic (only rows whose cancelScheduledAt is set flip), so the hourly job
+ * — which re-reads under its lock right before cancelling — can never
+ * cancel a contract the customer just kept. Portal "Keep my subscription",
+ * the KEEP magic verb and admin all route here. Returns whether anything
+ * was scheduled. Logs `cancel.schedule_kept`.
+ */
+export async function keepScheduledCancel(
+  contractLocalId: string,
+  options: { source: EventSource; actor?: string | null },
+): Promise<boolean> {
+  const contract = await prisma.subscriptionContract.findUnique({
+    where: { id: contractLocalId },
+    select: {
+      id: true,
+      shopId: true,
+      customerId: true,
+      email: true,
+      cancelScheduledAt: true,
+    },
+  });
+  if (!contract || !contract.cancelScheduledAt) return false;
+  const cleared = await prisma.subscriptionContract.updateMany({
+    where: { id: contract.id, cancelScheduledAt: { not: null } },
+    data: { cancelScheduledAt: null },
+  });
+  if (cleared.count === 0) return false;
+  // The scheduling session's terminal outcome: a kept schedule is a save
+  // (saveAccepted "KEEP") — kept and executed schedules must be
+  // distinguishable at the session level (admin funnel, insights). Contained.
+  try {
+    const scheduled = await prisma.cancelSession.findFirst({
+      where: { contractId: contract.id, outcome: CANCEL_SCHEDULED },
+      orderBy: { completedAt: "desc" },
+      select: { id: true },
+    });
+    if (scheduled) {
+      // Guarded claim (updateMany on the current outcome), never a plain
+      // update — the closure-race contract of this module.
+      await prisma.cancelSession.updateMany({
+        where: { id: scheduled.id, outcome: CANCEL_SCHEDULED },
+        data: { outcome: "SAVED", saveAccepted: "KEEP", completedAt: new Date() },
+      });
+    }
+  } catch (err) {
+    console.error("[cancel] keep: session close failed", contract.id, err);
+  }
+  await logEvent({
+    shopId: contract.shopId,
+    contractId: contract.id,
+    customerId: contract.customerId,
+    email: contract.email,
+    type: "cancel.schedule_kept",
+    source: options.source,
+    actor: options.actor ?? "customer",
+    payload: { previousScheduledAt: contract.cancelScheduledAt.toISOString() },
+  });
+  return true;
 }

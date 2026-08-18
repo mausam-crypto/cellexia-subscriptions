@@ -88,6 +88,18 @@ You do not need to build any flow by hand anymore. Open the app's
    verification cannot read Klaviyo, the last known rows stay and a banner
    says what to fix; the checklist is never empty while a key is connected.
 
+**Sender and Reply-To of auto-created flows are set at creation only.**
+Each flow's send-email action is created with the From address and the
+Reply-To resolved from Settings → Support (support email → store contact
+email; "Reply-To override" wins when set) *at the moment the flow is
+created*. The checklist and **Create my flows** never edit an existing flow
+(that is the "flows that already exist are never touched" promise), so a
+support email or Reply-To changed AFTER the flows exist — including flows
+created before v1.28.0 — is not pushed to Klaviyo: open the flow in Klaviyo
+and change the sender there, or delete the flow and let **Create my flows**
+recreate it. Emails the app delivers itself (sender "Cellexia", OTP, 3DS,
+alerts, the support-request mail) always use the current setting.
+
 **Templates added by app updates join the same way.** When an update ships a
 new customer email — v1.24.0 added the gift teaser (metric
 `Cellexia Gift Teaser`) — the checklist simply shows one more row ("Not
@@ -162,8 +174,8 @@ Every contract-scoped event also carries the **standard snapshot properties**
 
 | Metric | Fired when | Key properties |
 |---|---|---|
-| `Cellexia Subscription Started` | New contract created (checkout or import) | snapshot |
-| `Cellexia Subscription Cancelled` | Contract cancelled (any source) | snapshot, `cancelReason`* |
+| `Cellexia Subscription Started` | New contract created (checkout or import). Since v1.28.0 the app's `subscription_started` welcome email ALSO rides this metric (content-carrying leg, `cellexia_send = "true"`, checkout contracts only — never imports/backfills); the auto-created flow (§0) delivers it, and a custom onboarding journey on the same metric keeps working unchanged | snapshot; welcome leg adds `product`, `first_order_line`, `next_line`, `changes_line`, `edit_cutoff`, `support_line`, `content_*` |
+| `Cellexia Subscription Cancelled` | Contract cancelled (any source) | snapshot, `cancelReason`*; the app's `cancel_confirmed` email leg adds **`restart_url`** (v1.28.0 — signed one-tap restart, empty for merged/internal cancels) |
 | `Cellexia Subscription Paused` | Contract paused | snapshot, `resumeAt`* |
 | `Cellexia Subscription Resumed` | Contract resumed | snapshot |
 | `Cellexia Order Skipped` | Next cycle skipped | snapshot, `cycleIndex`* |
@@ -178,7 +190,7 @@ Every contract-scoped event also carries the **standard snapshot properties**
 | `Cellexia 3DS Action Required` | Bank requires authentication for a renewal | snapshot, `threeds_url` (bank challenge URL), **magic links** |
 | `Cellexia Cancel Save Accepted` | Customer accepted a save offer in the cancel flow | snapshot, offer details* |
 | `Cellexia Final Offer Accepted` | Customer accepted the last-chance offer | snapshot, offer details* |
-| `Cellexia Winback Soft Touch` | Win-back stage 0 (education, no offer) | snapshot |
+| `Cellexia Winback Soft Touch` | Win-back stage 0 (education, no offer) | snapshot, **`restart_url`** (v1.28.0 — one-tap restart with the current offer re-derived server-side) |
 | `Cellexia Winback Perk` | Win-back stage 1 (free gift perk) | snapshot, perk details* |
 | `Cellexia Winback Discount` | Win-back stage 2 (capped discount) | snapshot, `percent`* |
 | `Cellexia Winback Reactivated` | Cancelled subscriber came back | snapshot |
@@ -189,6 +201,12 @@ Every contract-scoped event also carries the **standard snapshot properties**
 | `Cellexia Price Change Notice` | Price change applied/announced to a contract | snapshot, old/new price* |
 | `Cellexia Stockout Delay` | Renewal delayed because an item is out of stock | snapshot, `delayDays`* |
 | `Cellexia Survey Answered` | Post-purchase survey linked to the subscription and answered (v1.21.0; partials flush via the daily sweep) | snapshot, `survey_planned_duration`*, `survey_motive`*, `survey_expected_speed`*, `survey_routine`*, `survey_completed`*, `survey_holdout`* |
+| `Cellexia Support Requested` | A subscriber submitted the portal Get-help form or a cancel-flow support/education card (v1.28.0). Segmentation and helpdesk flows only — no app email rides it, no `cellexia_send`; every request is a separate event (the 120 s outbox dedupe is off for this metric) | snapshot, `topic` (`DELIVERY`/`PAYMENT`/`PLAN`/`OTHER`), `contractId`, `orderRef`, `pushBack`, `pushBackApplied`, `pushBackMode`*, `message` (max 1000 chars), `surface` (`portal_account`/`portal_detail`/`portal_dunning`/`cancel_flow`), `cancelReason`*, `cancelSessionId`* — property names are camelCase exactly as listed |
+| `Cellexia Product Skipped Once` / `Cellexia Product Skip Undone` / `Cellexia Product Quantity Once` | Per-line "not this time" / undo / one-order quantity in the portal (v1.28.0). Segmentation only — no app email rides them | snapshot, `lineId`*, `variantId`*, `cycleIndex`*, `quantity`* |
+| `Cellexia Pause Extended` | The pause exit ramp — "need a little longer?" moved the resume day (v1.28.0). Segmentation only; the paused-until confirmation itself travels on `Cellexia Subscription Paused` | snapshot, `from`*, `to`* (resume day before / after), `days`* |
+| `Cellexia Order Rushed` | The "already out" prompt / send-tomorrow verb pulled the next order forward (v1.28.0). Segmentation only | snapshot, `from`*, `to`* |
+| `Cellexia Routine Check-in Answered` | The routine check-in email's one-tap answer (v1.28.0). Segmentation only — the check-in email itself is `Cellexia Routine Check-in` below | snapshot, `answer` (`great` / `unsure`)*, `via`* |
+| `Cellexia Winback Opted Out` / `Cellexia Winback Sunset` | The customer texted STOP / the win-back campaign ended without a restart (v1.28.0). Use as flow exit conditions and suppression segments | snapshot |
 
 \* = passed through from the internal event payload; exact keys depend on the
 emitting module. Build flows against the snapshot + the explicitly named
@@ -201,10 +219,16 @@ properties; treat the rest as bonus context.
 | `Cellexia Upcoming Order` | N days before each renewal (default 3, setting `notifications.upcomingOrderDaysBefore`), once per cycle | snapshot, `cycleIndex`, **magic links** incl. `addon_url`, plus the **add-on suggestion properties** (`addon_variant_id`, `addon_product_id`, `addon_title`, `addon_price_cents`, `addon_price_formatted`, `addon_image_url`) when a suggestion is attached — see 2.2 |
 | `Cellexia Order Confirmed` | Renewal charged successfully | snapshot, order name/amount |
 | `Cellexia Order Shipped` | Fulfillment shipped | snapshot, tracking vars |
-| `Cellexia Resume Reminder` | A few days before a paused subscription auto-resumes | snapshot, **magic links** |
+| `Cellexia Resume Reminder` | A few days before a paused subscription auto-resumes | snapshot, **magic links** + **`resume_url`** (resume now) and **`extend_pause_url`** ("need a little longer?" choices page) since v1.28.0 |
 | `Cellexia Quantity Changed` | Line quantity changed | snapshot |
 | `Cellexia Address Updated` | Delivery address changed | snapshot |
-| `Cellexia Payment Method Updated` | Card updated | snapshot |
+| `Cellexia Payment Method Updated` | The card behind the subscription changed — since v1.28.0 the webhook closed loop: customer/admin card change, a removed card's backup taking over, or the dunning engine moving renewals to the backup. One notice per card per 24 h | snapshot, `card_label`, `card_brand`, `card_last4`, `previous_card_label`, `change_line`, `next_line`, `next_date`, `amount`, `via_backup`, `change_reason`, `card_updated_by` (`customer` / `merchant` / `system`), `portal_url` |
+| `Cellexia New Card Detected` | A subscriber with a held payment or an expiring card saved a NEW payment method while the subscription's card is still live (v1.28.0) — one tap to use it, or set it as backup. Once per new method | snapshot, `card_label` (the new card), `current_card_label`, `intro_line`, `backup_line`, `new_method_reason`, **`use_url`**, **`backup_url`** (each empty when the link could not be minted), `portal_url` |
+| `Cellexia Payment Parked` | The retry ladder gave up and the subscription is parked (v1.28.0) — sent on the `dunning.postExhaustionTouchDays` offsets (default days 7 / 21) with the three ways back | snapshot, `amount`, `days_since_failure`, `decline_human`, `ways_intro`, `ways_more`, **magic links** incl. `retry_payment_url` and **`skip_resume_url`** (skip the held order and continue from the next cycle; empty when the card is hard-dead), `other_cards_block` (pre-rendered "use another card on your account" lines, empty when none) |
+| `Cellexia Cancellation Scheduled` | A customer inside a plan lock chose to end the subscription at the unlock date (v1.28.0) — the confirmation with the one-tap keep | snapshot, `cancel_date`, **`keep_url`**, `portal_url` |
+| `Cellexia Cancellation Upcoming` | `cancelFlow.scheduledCancelNoticeDays` before a scheduled cancellation runs (v1.28.0) — the last truthful reminder; the hourly job cancels at the moment | snapshot, `cancel_date`, **`keep_url`**, `portal_url` |
+| `Cellexia Routine Check-in` | Week-N "how is it going?" (v1.28.0, `lifecycle.checkinWeeks`) with where they are in the routine and two one-tap answers | snapshot, `week`, `phase_title`, `phase_body`, `expectation_line`, `next_phase_line`, **`checkin_great_url`**, **`checkin_unsure_url`**, `portal_url` |
+| `Cellexia Cancel Intent` | A customer opened the cancel flow and walked away undecided (v1.28.0) — the reason-matched one-tap fixes before the next charge decides | snapshot, `reason`, `step`, `reason_line`, `support_line`, `actions` (comma list of the offered options), **`options_block`** (pre-composed list of the applicable one-tap options), `skip_url`, `delay_3w_url`, `set_frequency_url`, `pause_url`, `manage_url`, `support_url`, `cancel_url` — each empty when not applicable, so read them through `options_block` or wrap in `{% if %}` |
 | `Cellexia Stockout Skip` | Cycle skipped due to stockout | snapshot |
 | `Cellexia Stockout Substitute` | Item substituted due to stockout | snapshot |
 | `Cellexia Gift Teaser` | After the first order's billing success, only when the cycle-2 surprise gift will actually happen — surprise setting on, an active order-2 gift rule, and the customer not in the gift2 holdout (v1.24.0) | snapshot, `cycleIndex` |
@@ -238,18 +262,29 @@ and an explicit confirmation notification never double-fire a flow.
 
 ### 2.2 Magic-link properties (one-tap, zero-login)
 
-Attached to: `Cellexia Upcoming Order`, `Cellexia Payment Failed`,
-`Cellexia Card Expiring`, `Cellexia 3DS Action Required`,
-`Cellexia Resume Reminder`, all `Cellexia Winback *` notification sends.
+Standard bundle attached to: `Cellexia Upcoming Order`, `Cellexia Payment
+Failed`, `Cellexia Payment Parked`, `Cellexia Card Expiring`, `Cellexia 3DS
+Action Required`, `Cellexia Resume Reminder`. Metric-specific one-tap links
+(v1.28.0) ride the metrics named in the third column; every one of them is
+signed and expiring like the bundle.
 
-| Property | Action |
-|---|---|
-| `skip_url` | Skip the next order |
-| `delay_1w_url` | Push the next order out 1 week |
-| `delay_3w_url` | Push the next order out 3 weeks |
-| `update_card_url` | Secure card-update page (multi-use, 5 uses) |
-| `pause_url` | Pause for 1 month |
-| `addon_url` | Add the suggested product to the next order (present only when a suggestion is attached) |
+| Property | Action | Metrics |
+|---|---|---|
+| `skip_url` | Skip the next order | bundle, Cancel Intent |
+| `delay_1w_url` | Push the next order out 1 week | bundle |
+| `delay_3w_url` | Push the next order out 3 weeks | bundle, Cancel Intent |
+| `update_card_url` | Secure card-update page (multi-use, 5 uses) | bundle |
+| `retry_payment_url` | Retry the held payment now (v1.28.0; same guards as the portal "Retry now") | bundle |
+| `pause_url` | Pause for 1 month | bundle, Cancel Intent |
+| `addon_url` | Add the suggested product to the next order (present only when a suggestion is attached) | Upcoming Order, Resume Reminder |
+| `skip_resume_url` | Skip the held order and continue from the next cycle (v1.28.0; empty when the card is hard-dead) | Payment Parked |
+| `resume_url` / `extend_pause_url` | Resume now / "need a little longer?" choices page (v1.28.0) | Resume Reminder |
+| `restart_url` | One-tap restart with the CURRENT win-back offer re-derived server-side (v1.28.0; empty for merged/internal cancels) | Subscription Cancelled (app email leg), Winback Soft Touch |
+| `keep_url` | Keep the subscription — clears a scheduled cancellation (v1.28.0) | Cancellation Scheduled, Cancellation Upcoming |
+| `use_url` / `backup_url` | Use the newly saved card for this subscription / set it as backup (v1.28.0) | New Card Detected |
+| `checkin_great_url` / `checkin_unsure_url` | The two one-tap check-in answers (v1.28.0) | Routine Check-in |
+| `set_frequency_url`, `manage_url`, `support_url`, `cancel_url` | Reason-matched cancel-intent options (v1.28.0; each empty when not applicable — prefer the pre-composed `options_block`) | Cancel Intent |
+| `other_cards_block` / `options_block` | Pre-rendered text blocks (not links): the "use another card on your account" lines / the applicable intent options. Empty strings when nothing applies | Payment Failed & Parked / Cancel Intent |
 
 Links are signed, expire after 14 days (setting `portal.magicLinkTtlDays`) and
 are single-use unless noted. **Always** pair them with `portal_url` as the
@@ -372,7 +407,9 @@ never suppressed, and ON for marketing-style touches (win-back, onboarding).
 
 - **Trigger:** metric `Cellexia Subscription Started`
 - **Flow filter:** `event.orders_count = 0` (skips imported/migrated
-  subscribers who already have history)
+  subscribers who already have history). Note: the v1.28.0 welcome email
+  (`subscription_started`, auto-created flow of §0) covers day 0 — start this
+  education series at day 1 so the two never land together.
 - **Timing & content:**
   - Day 1: "How to get the most from your routine" (usage, expectations —
     anti-aging results take 4–6 weeks; sets up the "not seeing results"
@@ -422,7 +459,11 @@ each customer's predicted product-empty date, not the cancel date), Klaviyo
 owns the content:
 
 - **Trigger `Cellexia Winback Soft Touch`:** helpful, no offer. "How's your
-  skin doing without it?" + routine tips. Buttons: `{{ event.portal_url }}`.
+  skin doing without it?" + routine tips. Buttons: `{{ event.restart_url }}`
+  (v1.28.0 — one-tap restart, the current offer re-derived server-side; wrap
+  in `{% if event.restart_url %}`) with `{{ event.portal_url }}` as the
+  fallback. The `Cellexia Subscription Cancelled` app email carries the same
+  `restart_url`.
 - **Trigger `Cellexia Winback Perk`:** free-gift offer to restart. Since
   v1.24.0 this metric only fires when a gift is actually grantable (a dynamic
   pick from the gift pool, or the order-2 rule as fallback) — otherwise the
@@ -544,7 +585,14 @@ Variables available in Klaviyo templates via `{{ event.* }}`:
 | `items` | all contract metrics | array of `{title, variant_title, quantity, is_gift, is_one_time_addon}` |
 | `next_billing_date`, `next_billing_date_formatted` | all contract metrics | formatted = shop timezone + locale |
 | `portal_url` | all contract metrics | always include as fallback CTA |
-| `skip_url`, `delay_1w_url`, `delay_3w_url`, `update_card_url`, `pause_url`, `addon_url` | link-bundle metrics (2.2) | signed, expiring; `addon_url` conditional |
+| `skip_url`, `delay_1w_url`, `delay_3w_url`, `update_card_url`, `retry_payment_url`, `pause_url`, `addon_url` | link-bundle metrics (2.2) | signed, expiring; `addon_url` conditional |
+| `skip_resume_url`, `other_cards_block` | Payment Parked (block also on Payment Failed) | v1.28.0; both empty when not applicable |
+| `resume_url`, `extend_pause_url`, `resume_date` | Resume Reminder | v1.28.0 |
+| `restart_url` | Subscription Cancelled (app email leg), Winback Soft Touch | v1.28.0; empty for merged/internal cancels |
+| `keep_url`, `cancel_date` | Cancellation Scheduled, Cancellation Upcoming | v1.28.0 |
+| `use_url`, `backup_url` | New Card Detected | v1.28.0 |
+| `checkin_great_url`, `checkin_unsure_url`, `week` | Routine Check-in | v1.28.0 |
+| `options_block`, `set_frequency_url`, `manage_url`, `support_url`, `cancel_url`, `reason`, `reason_line` | Cancel Intent | v1.28.0; links empty when not applicable |
 | `addon_variant_id`, `addon_product_id`, `addon_title`, `addon_price_cents`, `addon_price_formatted`, `addon_image_url` | Upcoming Order | present only alongside `addon_url` (see 2.2); price is at the ongoing subscription discount |
 | `attempt_number` | Payment Failed | 1-based; drives the dunning splits |
 | `amount_cents`, `amount_formatted` | Payment Failed | `amount_formatted` is locale/currency aware |

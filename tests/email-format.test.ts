@@ -296,6 +296,11 @@ describe("renderEmail integration (design parameter)", () => {
       next_date: "12 Aug",
       items_summary: "1× Serum",
       total_estimate: "CHF 64.00",
+      // v1.28.0: the reminder always supplies its card vars (P1.5) and the
+      // edit cut-off line (P2.1).
+      payment_line: "Payment method: Visa ····4242",
+      card_expiry_warning: "",
+      edit_cutoff_line: "You can make changes until 12 Aug, 00:00.",
       skip_url: "https://magic/skip",
       delay_3w_url: "https://magic/delay3w",
       portal_url: "https://portal",

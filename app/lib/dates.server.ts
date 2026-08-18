@@ -100,3 +100,34 @@ export function formatShopDate(date: Date, tz: string, locale?: string): string 
     timeZone: tz,
   }).format(date);
 }
+
+/**
+ * The instant a card with expiry MM/YYYY stops working: the first moment of
+ * the month AFTER the expiry month, at the shop's local midnight when `tz` is
+ * given (golden rule 5 — nextBillingDate / resumeAt are shop-tz instants, so
+ * "expires before this order" must compare in the same clock; UTC month
+ * start is off by the tz offset at month boundaries), UTC midnight otherwise.
+ * Null for a missing / malformed expiry.
+ */
+export function cardExpiryMoment(
+  month: number | null | undefined,
+  year: number | null | undefined,
+  tz?: string | null,
+): Date | null {
+  if (month == null || year == null) return null;
+  if (!Number.isInteger(month) || !Number.isInteger(year)) return null;
+  if (month < 1 || month > 12 || year < 1970) return null;
+  const nextYear = month === 12 ? year + 1 : year;
+  const nextMonth = month === 12 ? 1 : month + 1;
+  if (!tz) return new Date(Date.UTC(nextYear, nextMonth - 1, 1));
+  const wall = `${nextYear}-${String(nextMonth).padStart(2, "0")}-01T00:00:00`;
+  return fromZonedTime(wall, tz);
+}
+
+/** Wall-clock time in the shop's timezone ("14:35" / "2:35 PM" per locale). */
+export function formatShopTime(date: Date, tz: string, locale?: string): string {
+  return new Intl.DateTimeFormat(locale ?? "en", {
+    timeStyle: "short",
+    timeZone: tz,
+  }).format(date);
+}

@@ -839,6 +839,8 @@ describe("migration 0003 backfills fail-SAFE and stays additive", () => {
       "0024_dynamic_gifts_experiments",
       "0025_design_measurement",
       "0026_widget_visits",
+      "0027_portal_payments",
+      "0028_flexibility_deliveries",
     ]);
   });
 });
@@ -1824,6 +1826,103 @@ describe("migration 0026 (widget visits) stays additive and leaves ownership alo
   it("never mentions ownership at all — visits are anonymous rows with no contract link", () => {
     expect(sql).not.toMatch(/ownership/i);
     expect(sql).not.toMatch(/SubscriptionContract/);
+    expect(sql).not.toMatch(/ALTER\s+COLUMN[^;]*SET DEFAULT/i);
+  });
+});
+
+describe("migration 0027 (portal payments) stays additive and leaves ownership alone", () => {
+  const sql = read("prisma/migrations/0027_portal_payments/migration.sql")
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("is additive only — no destructive verb anywhere in it", () => {
+    for (const verb of [
+      /\bDROP\b/i,
+      /\bTRUNCATE\b/i,
+      /\bDELETE\s+FROM\b/i,
+      /\bUPDATE\s+"/i,
+      /\bRENAME\b/i,
+      /\bALTER\s+TYPE\b/i,
+      /\bALTER\s+COLUMN\s+"\w+"\s+TYPE\b/i,
+    ]) {
+      expect(sql, String(verb)).not.toMatch(verb);
+    }
+  });
+
+  it("adds exactly six NULLABLE columns and creates no table or index", () => {
+    // Every column is nullable with no default, so v1.27 code runs unchanged
+    // against the schema and a rollback leaves the columns in place, unread.
+    const adds = sql.match(/ALTER TABLE "\w+" ADD COLUMN "\w+" [^;]+;/g) ?? [];
+    expect(adds).toHaveLength(6);
+    for (const add of adds) {
+      expect(add).not.toMatch(/NOT NULL/i);
+      expect(add).not.toMatch(/DEFAULT/i);
+    }
+    expect(sql).toMatch(/ALTER TABLE "SubscriptionContract" ADD COLUMN "paymentInstrumentType" TEXT/);
+    expect(sql).toMatch(/ALTER TABLE "SubscriptionContract" ADD COLUMN "paymentMethodRevokedAt" TIMESTAMP\(3\)/);
+    expect(sql).toMatch(/ALTER TABLE "SubscriptionContract" ADD COLUMN "backupSetBy" TEXT/);
+    expect(sql).toMatch(/ALTER TABLE "SubscriptionContract" ADD COLUMN "backupSetAt" TIMESTAMP\(3\)/);
+    expect(sql).toMatch(/ALTER TABLE "DunningCase" ADD COLUMN "customerRetryAt" TIMESTAMP\(3\)/);
+    expect(sql).toMatch(/ALTER TABLE "BillingAttempt" ADD COLUMN "challengeUrl" TEXT/);
+    expect(sql).not.toMatch(/CREATE TABLE/i);
+    expect(sql).not.toMatch(/CREATE (?:UNIQUE )?INDEX/i);
+  });
+
+  it("leaves the ownership column alone", () => {
+    expect(sql).not.toMatch(/ownership/i);
+    expect(sql).not.toMatch(/ALTER\s+COLUMN[^;]*SET DEFAULT/i);
+  });
+});
+
+describe("migration 0028 (flexibility & deliveries) stays additive and leaves ownership alone", () => {
+  const sql = read("prisma/migrations/0028_flexibility_deliveries/migration.sql")
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("is additive only — no destructive verb anywhere in it", () => {
+    for (const verb of [
+      /\bDROP\b/i,
+      /\bTRUNCATE\b/i,
+      /\bDELETE\s+FROM\b/i,
+      /\bUPDATE\s+"/i,
+      /\bRENAME\b/i,
+      /\bALTER\s+TYPE\b/i,
+      /\bALTER\s+COLUMN\s+"\w+"\s+TYPE\b/i,
+    ]) {
+      expect(sql, String(verb)).not.toMatch(verb);
+    }
+  });
+
+  it("adds exactly twelve NULLABLE columns and creates no table or index", () => {
+    // Every column is nullable with no default, so v1.27 code runs unchanged
+    // against the schema and a rollback leaves the columns in place, unread.
+    // pausedReason is NOT re-added (it exists since 0016).
+    const adds = sql.match(/ALTER TABLE "\w+" ADD COLUMN "\w+" [^;]+;/g) ?? [];
+    expect(adds).toHaveLength(12);
+    for (const add of adds) {
+      expect(add).not.toMatch(/NOT NULL/i);
+      expect(add).not.toMatch(/DEFAULT/i);
+    }
+    expect(sql).toMatch(/ALTER TABLE "ContractLine" ADD COLUMN "skippedCycleIndex" INTEGER/);
+    expect(sql).toMatch(/ALTER TABLE "ContractLine" ADD COLUMN "cycleQuantityOverride" INTEGER/);
+    expect(sql).toMatch(/ALTER TABLE "ContractLine" ADD COLUMN "cycleQuantityOverrideIndex" INTEGER/);
+    expect(sql).toMatch(/ALTER TABLE "SubscriptionContract" ADD COLUMN "deliveryInstructions" TEXT/);
+    expect(sql).toMatch(/ALTER TABLE "SubscriptionContract" ADD COLUMN "cancelScheduledAt" TIMESTAMP\(3\)/);
+    expect(sql).not.toMatch(/"pausedReason"/);
+    for (const col of ["trackingUrl", "trackingCompany", "trackingNumber", "orderStatusUrl"]) {
+      expect(sql).toMatch(new RegExp(`ALTER TABLE "BillingAttempt" ADD COLUMN "${col}" TEXT`));
+    }
+    expect(sql).toMatch(/ALTER TABLE "BillingAttempt" ADD COLUMN "shippedAt" TIMESTAMP\(3\)/);
+    expect(sql).toMatch(/ALTER TABLE "BillingAttempt" ADD COLUMN "deliveredAt" TIMESTAMP\(3\)/);
+    expect(sql).toMatch(/ALTER TABLE "WinbackState" ADD COLUMN "reason" TEXT/);
+    expect(sql).not.toMatch(/CREATE TABLE/i);
+    expect(sql).not.toMatch(/CREATE (?:UNIQUE )?INDEX/i);
+  });
+
+  it("leaves the ownership column alone", () => {
+    expect(sql).not.toMatch(/ownership/i);
     expect(sql).not.toMatch(/ALTER\s+COLUMN[^;]*SET DEFAULT/i);
   });
 });

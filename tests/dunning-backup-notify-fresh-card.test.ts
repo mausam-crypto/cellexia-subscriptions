@@ -251,7 +251,9 @@ beforeEach(() => {
     },
     {
       id: "pm_backup",
+      revoked: false,
       instrument: {
+        type: "CREDIT_CARD",
         brand: "Mastercard",
         lastDigits: "1111",
         expiryMonth: 12,
@@ -279,6 +281,8 @@ describe("the switch notification names the card ACTUALLY being charged", () => 
 
     // The card mirror was refreshed in the DB too (failure emails later in
     // the case read it from there).
+    // v1.28.0 (migration 0027): the refresh also mirrors the instrument
+    // type and clears the revoked stamp — the method just chosen is live.
     expect(mocks.contractUpdate).toHaveBeenCalledWith({
       where: { id: "cm_c1" },
       data: {
@@ -286,6 +290,8 @@ describe("the switch notification names the card ACTUALLY being charged", () => 
         cardLast4: "1111",
         cardExpiryMonth: 12,
         cardExpiryYear: 2028,
+        paymentInstrumentType: "CREDIT_CARD",
+        paymentMethodRevokedAt: null,
       },
     });
   });

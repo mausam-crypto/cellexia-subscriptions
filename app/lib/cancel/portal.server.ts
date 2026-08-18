@@ -20,7 +20,7 @@ import {
   type PortalSessionContext,
 } from "~/lib/portal/session.server";
 import type { LocalContractWithLines } from "~/lib/contracts/shared.server";
-import { resolveLockState } from "~/lib/contracts/lock.server";
+import { resolveLockState, type LockState } from "~/lib/contracts/lock.server";
 
 /**
  * Bridge between the cancel flow and the portal module: app-proxy signature
@@ -41,6 +41,14 @@ export interface CancelRouteContext {
   liquid: LiquidFn;
   /** Resolved ?toast= for preview sessions (mutation-blocked feedback). */
   previewToast: PortalToast | null;
+  /**
+   * Plan lock window state (v1.28.0, P3.8). `locked` is only ever true here
+   * when cancelFlow.scheduledCancelEnabled let a locked contract into the
+   * flow — the routes then run the SCHEDULED variant (no reducing saves, the
+   * confirm step schedules the cancel for `until`) instead of cancelling
+   * today. Preview sessions resolve it too (the admin walks the real UI).
+   */
+  lock: LockState;
 }
 
 /**
@@ -97,9 +105,32 @@ export async function requireCancelContext(
   // cancel). Redirect to the subscription page, whose lock notice shows the
   // unlock date. Admin previews pass — they are read-only everywhere anyway
   // and the merchant must be able to inspect the flow.
+  //
+  // Scheduled cancel (v1.28.0, P3.8): when cancelFlow.scheduledCancelEnabled
+  // (default ON) a locked contract is let INTO the flow instead — the
+  // routes hide every reducing save (LOCK_BLOCKED_SAVES, enforced by the
+  // engine too) and the confirm step schedules the cancellation for the
+  // unlock moment. Cancel stays reachable, honestly: "cancels on {date}".
+  const lock = await resolveLockState(shop.id, contract, shop.ianaTimezone);
   if (!portalSession.isPreview) {
-    const lock = await resolveLockState(shop.id, contract, shop.ianaTimezone);
-    if (lock.locked) {
+    let scheduledCancelEnabled = true;
+    // A contract that ALREADY carries a scheduled cancel must always reach
+    // its "cancels on {date} · keep" page (and the Keep POST), whatever the
+    // toggle says now — the routes redirect it there. Turning the toggle
+    // off after schedules exist must never strand a customer while the
+    // hourly job still executes the schedule.
+    if (lock.locked && !contract.cancelScheduledAt) {
+      try {
+        const { getSetting } = await import("~/lib/settings/settings.server");
+        scheduledCancelEnabled =
+          (await getSetting(shop.id, "cancelFlow") as { scheduledCancelEnabled?: boolean })
+            .scheduledCancelEnabled !== false;
+      } catch {
+        // Contained: a broken read keeps the classic redirect (enforcement).
+        scheduledCancelEnabled = false;
+      }
+    }
+    if (lock.locked && !scheduledCancelEnabled) {
       // Friendly variant (v1.19.0): carry the unlock day + countdown so the
       // toast explains WHEN instead of a bare refusal — same param contract
       // as the api dispatcher's lockedBack (resolveToast validates them).
@@ -156,6 +187,7 @@ export async function requireCancelContext(
     previewToast: portalSession.isPreview
       ? (resolveToast(request, locale)?.toast ?? null)
       : null,
+    lock,
   };
 }
 

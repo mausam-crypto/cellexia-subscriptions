@@ -506,6 +506,47 @@ const registry: JobDef[] = [
     },
   },
   {
+    // Scheduled cancels (v1.28.0, P3.8): the cancel_upcoming notice a few
+    // days ahead, then the cancel itself at the scheduled moment through the
+    // normal service path (fresh re-read under this lock — a kept
+    // subscription is never cancelled). The billing sweep independently
+    // refuses to bill past cancelScheduledAt, so a late run never charges.
+    name: "cancel_scheduled_run",
+    gatedInSetup: true,
+    everyMinutes: 60,
+    fn: async (now) => {
+      const { runScheduledCancels } = await import("~/lib/cancel/scheduled.server");
+      return runScheduledCancels(now);
+    },
+  },
+  {
+    // Concierge save follow-through (v1.28.0, P3.7): SLA-breach alert for
+    // unanswered save requests; SAVED_PENDING → SAVED once the merchant
+    // resolved the request while the customer still subscribes.
+    name: "concierge_sla_run",
+    everyMinutes: 60,
+    fn: async (now) => {
+      const { runConciergeSla } = await import("~/lib/cancel/scheduled.server");
+      return runConciergeSla(now);
+    },
+  },
+  {
+    // Abandoned cancel-intent follow-up (v1.28.0, P3.6): the reason-matched
+    // one-tap email 12–24h after the GC above closed a walked-away session.
+    // AFTER cancel_session_gc (registry position = run order) so a session
+    // closed this tick is seen on the next; gated in SETUP like every other
+    // customer-contacting job.
+    name: "cancel_intent_followup_run",
+    gatedInSetup: true,
+    everyMinutes: 60,
+    fn: async (now) => {
+      const { runCancelIntentFollowup } = await import(
+        "~/lib/cancel/intent-followup.server"
+      );
+      return runCancelIntentFollowup(now);
+    },
+  },
+  {
     name: "consolidation_run",
     gatedInSetup: true,
     everyMinutes: 1440,

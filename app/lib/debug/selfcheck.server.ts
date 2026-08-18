@@ -39,6 +39,7 @@ import {
   verifyPreviewToken,
 } from "~/lib/portal/previewToken.server";
 import { PORTAL_PROXY_BASE } from "~/lib/portal/proxy-path";
+import { auditPortalShell } from "~/lib/portal/a11y.server";
 import { verifyMailer } from "~/lib/notifications/mailer.server";
 import {
   isKlaviyoConfigured,
@@ -1095,6 +1096,35 @@ const CHECKS: CheckDef[] = [
       };
     },
   },
+  {
+    key: "portal_a11y",
+    label: "Portal accessibility contract",
+    category: "Customer portal",
+    remediation:
+      "Static audit of the portal shell (app/lib/portal/layout.server.ts): colour tokens must keep WCAG AA 4.5:1 contrast, and focus-visible outlines, the reduced-motion block, the skip link, toast live-region roles and inline confirms must stay in the markup — a token or template edit removed one. tests/portal-a11y.test.ts pins the same contract.",
+    run: async () => {
+      // In-process render of the shell (no network, no DB): the same HTML
+      // customers get, checked for the accessibility invariants v1.28.0
+      // introduced. A regression here is a WARN — the portal still works,
+      // it just no longer meets the contract for keyboard / screen-reader /
+      // low-vision customers.
+      const audit = auditPortalShell();
+      const failed = audit.findings.filter((f) => !f.ok);
+      if (failed.length > 0) {
+        return {
+          status: "WARN",
+          detail: `${failed.length} accessibility check(s) failed: ${failed
+            .map((f) => `${f.check} — ${f.detail}`)
+            .join("; ")}.`,
+        };
+      }
+      const contrast = audit.findings.filter((f) => f.check.startsWith("contrast:"));
+      return {
+        status: "PASS",
+        detail: `${contrast.length} colour pairs ≥ 4.5:1; focus-visible, reduced-motion, skip link, live-region toasts and inline confirms present (${audit.findings.length} checks).`,
+      };
+    },
+  },
 
   // ── Billing ────────────────────────────────────────────────────────────────
   {
@@ -1496,6 +1526,66 @@ const CHECKS: CheckDef[] = [
       return {
         status: "PASS",
         detail: `Ladder coherent: ${dunning.softRetryDays.length} retries, ${dunning.emailLadderDays.length} emails and the SMS all inside the ${dunning.cancelAfterFailedDays}-day window.`,
+      };
+    },
+  },
+
+  {
+    key: "payment_update_path",
+    label: "Card-update path knows every live instrument",
+    category: "Dunning & retries",
+    remediation:
+      "Run “Sync from Shopify” on the affected subscribers (or wait for the nightly full_sync_reconcile / the next payment-method webhook) so paymentInstrumentType is mirrored. Until then the portal / magic-link “Update card” button probes Shopify's hosted page first and falls back to the update email on INVALID_INSTRUMENT — one extra API round-trip, not a dead button.",
+    run: async (ctx) => {
+      // The card-update resolver (app/lib/payments/cardUpdate.server.ts)
+      // decides hosted URL (Shop Pay only) vs Shopify's update email from
+      // SubscriptionContract.paymentInstrumentType (migration 0027). Rows
+      // predating the column carry null until a sync/webhook refreshes the
+      // mirror; a large null count means the "Update card" surfaces are
+      // still probing blind for most subscribers.
+      const [live, unknown, revoked] = await Promise.all([
+        prisma.subscriptionContract.count({
+          where: {
+            shopId: ctx.shop.id,
+            status: { in: ["ACTIVE", "PAUSED", "FAILED"] },
+            isDemo: false,
+            ...OURS_ONLY,
+            paymentMethodId: { not: null },
+          },
+        }),
+        prisma.subscriptionContract.count({
+          where: {
+            shopId: ctx.shop.id,
+            status: { in: ["ACTIVE", "PAUSED", "FAILED"] },
+            isDemo: false,
+            ...OURS_ONLY,
+            paymentMethodId: { not: null },
+            paymentInstrumentType: null,
+          },
+        }),
+        prisma.subscriptionContract.count({
+          where: {
+            shopId: ctx.shop.id,
+            status: { in: ["ACTIVE", "PAUSED", "FAILED"] },
+            isDemo: false,
+            ...OURS_ONLY,
+            paymentMethodRevokedAt: { not: null },
+          },
+        }),
+      ]);
+      const revokedNote =
+        revoked > 0
+          ? ` ${revoked} contract(s) pay with a REMOVED method and show the “card removed” state.`
+          : "";
+      if (unknown > 0) {
+        return {
+          status: "WARN",
+          detail: `${unknown} of ${live} live contract(s) have no mirrored payment instrument type (mirror not backfilled) — their “Update card” button probes the Shop Pay-only hosted page before falling back to Shopify's update email.${revokedNote}`,
+        };
+      }
+      return {
+        status: "PASS",
+        detail: `Instrument type mirrored on all ${live} live contract(s) with a payment method — the card-update path is decided without probing.${revokedNote}`,
       };
     },
   },
@@ -2274,6 +2364,72 @@ const CHECKS: CheckDef[] = [
         status: "PASS",
         detail:
           "Every configured gift promise has an active rule or a stocked pool behind it.",
+      };
+    },
+  },
+  {
+    key: "delivery_tracking",
+    label: "Delivery tracking mirrored",
+    category: "Data integrity",
+    remediation:
+      "Run `npm run deploy` so the fulfillments/create, fulfillments/update and fulfillment_events/create topics in shopify.app.toml are registered — the portal's “Your deliveries” Track links and delivered states read only the local mirror (read_orders is 60-day limited, so there is no API backfill). If the topics are live, the carrier or fulfilment app is not attaching tracking to fulfillments.",
+    run: async (ctx) => {
+      // v1.28.0 (P4.2): the delivery mirror is fed by webhooks only. Renewal
+      // orders fulfilled in the last 14 days (fulfilledAt — written by
+      // orders/fulfilled, which predates the mirror) with neither a tracking
+      // url nor a number nor a delivered stamp = the fulfillment topics are
+      // most likely not deployed, or the store ships without tracking.
+      // Fulfillment-topic receipts in the window turn "not deployed" into
+      // "no tracking attached", so the detail names the right fix.
+      const since = hoursAgo(ctx.now, 14 * 24);
+      const [fulfilled, untracked, topicReceipts] = await Promise.all([
+        prisma.billingAttempt.count({
+          where: {
+            fulfilledAt: { gte: since },
+            contract: { shopId: ctx.shop.id, isDemo: false, ...OURS_ONLY },
+          },
+        }),
+        prisma.billingAttempt.count({
+          where: {
+            fulfilledAt: { gte: since },
+            trackingUrl: null,
+            trackingNumber: null,
+            deliveredAt: null,
+            contract: { shopId: ctx.shop.id, isDemo: false, ...OURS_ONLY },
+          },
+        }),
+        prisma.webhookReceipt.count({
+          where: {
+            topic: {
+              in: [
+                "FULFILLMENTS_CREATE",
+                "FULFILLMENTS_UPDATE",
+                "FULFILLMENT_EVENTS_CREATE",
+              ],
+            },
+            receivedAt: { gte: since },
+          },
+        }),
+      ]);
+      if (fulfilled === 0) {
+        return {
+          status: "PASS",
+          detail:
+            "No renewal order was fulfilled in the last 14 days — nothing to mirror yet.",
+        };
+      }
+      if (untracked > 0) {
+        return {
+          status: "WARN",
+          detail:
+            topicReceipts === 0
+              ? `${untracked} of ${fulfilled} renewal order(s) fulfilled in the last 14 days carry no tracking, and no fulfillments/* webhook arrived in that window — the fulfillment topics are probably not deployed.`
+              : `${untracked} of ${fulfilled} renewal order(s) fulfilled in the last 14 days carry no tracking although ${topicReceipts} fulfillment webhook(s) arrived — the fulfilments were created without tracking info (carrier / fulfilment app side).`,
+        };
+      }
+      return {
+        status: "PASS",
+        detail: `All ${fulfilled} renewal order(s) fulfilled in the last 14 days have tracking or a delivered stamp mirrored.`,
       };
     },
   },

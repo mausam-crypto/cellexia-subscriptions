@@ -117,6 +117,13 @@ vi.mock("~/lib/tagging/tags.server", () => ({
   maybeTagSubscriptionOrder: mocks.maybeTagSubscriptionOrder,
 }));
 
+// v1.28.0: the welcome-email hook runs after the design link on both create
+// paths; it is pinned in tests/subscription-started-email.test.ts and stays
+// out of this suite's console.error assertions.
+vi.mock("~/lib/notifications/subscription-started.server", () => ({
+  maybeSendSubscriptionStarted: vi.fn(async (): Promise<string> => "sent"),
+}));
+
 import { webhookHandlers } from "~/lib/webhooks/handlers.server";
 
 const SHOP = {

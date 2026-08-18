@@ -522,6 +522,12 @@ describe("self-check registry", () => {
       "design_facts",
       // v1.27.0: visit beacon ledger vs widget-exposed orders.
       "widget_visits",
+      // v1.28.0: card-update path needs the mirrored instrument type.
+      "payment_update_path",
+      // v1.28.0 (P5.3): static portal accessibility contract.
+      "portal_a11y",
+      // v1.28.0 (P4.2): fulfillment webhooks feeding the delivery mirror.
+      "delivery_tracking",
     ]) {
       expect(SELF_CHECK_KEYS).toContain(key);
     }
@@ -1477,6 +1483,76 @@ describe("the comprehensive live-store checks (v1.22.0)", () => {
     expect(check?.status).toBe("PASS");
     expect(check?.detail).toContain("setup mode");
     expect(mocks.widgetVisitorDayCount).not.toHaveBeenCalled();
+  });
+
+  it("delivery_tracking WARNs when fulfilled renewals in 14 days lack tracking, naming 'not deployed' vs 'no tracking attached' from the fulfillment-topic receipts (v1.28.0, P4.2)", async () => {
+    // Fulfilled-in-window count vs the untracked subset (trackingUrl null,
+    // trackingNumber null, deliveredAt null).
+    mocks.billingAttemptCount.mockImplementation(
+      async (args?: { where?: Record<string, unknown> }) => {
+        const w = args?.where ?? {};
+        if (!("fulfilledAt" in w)) return 0;
+        return "trackingUrl" in w ? 3 : 5;
+      },
+    );
+    mocks.webhookReceiptCount.mockResolvedValue(0);
+
+    let report = await runSelfCheck("cellexia.myshopify.com");
+    let check = report.checks.find((c) => c.key === "delivery_tracking");
+    expect(check?.status).toBe("WARN");
+    expect(check?.category).toBe("Data integrity");
+    expect(check?.detail).toContain("3 of 5 renewal order(s)");
+    expect(check?.detail).toContain("probably not deployed");
+    expect(check?.remediation).toContain("npm run deploy");
+    expect(check?.remediation).toContain("fulfillment_events/create");
+    // The untracked query is the tracking-null subset of the same window,
+    // owned + non-demo contracts only.
+    const untrackedQuery = (mocks.billingAttemptCount.mock.calls as unknown[][])
+      .map((c) => c[0] as { where: Record<string, unknown> })
+      .find((c) => "trackingUrl" in c.where);
+    expect(untrackedQuery?.where).toMatchObject({
+      trackingUrl: null,
+      trackingNumber: null,
+      deliveredAt: null,
+      fulfilledAt: { gte: expect.any(Date) },
+      contract: { shopId: "shop_1", isDemo: false },
+    });
+    // Fulfillment-topic receipts are counted by their handler keys.
+    const receiptQuery = (mocks.webhookReceiptCount.mock.calls as unknown[][])
+      .map((c) => c[0] as { where: { topic?: { in?: string[] } } })
+      .find((c) => Array.isArray(c.where?.topic?.in));
+    expect(receiptQuery?.where.topic?.in).toEqual([
+      "FULFILLMENTS_CREATE",
+      "FULFILLMENTS_UPDATE",
+      "FULFILLMENT_EVENTS_CREATE",
+    ]);
+
+    // Same gap but the topics ARE arriving: the fix is on the carrier side.
+    mocks.webhookReceiptCount.mockResolvedValue(9);
+    report = await runSelfCheck("cellexia.myshopify.com");
+    check = report.checks.find((c) => c.key === "delivery_tracking");
+    expect(check?.status).toBe("WARN");
+    expect(check?.detail).toContain("9 fulfillment webhook(s) arrived");
+
+    // Everything tracked: PASS.
+    mocks.billingAttemptCount.mockImplementation(
+      async (args?: { where?: Record<string, unknown> }) => {
+        const w = args?.where ?? {};
+        if (!("fulfilledAt" in w)) return 0;
+        return "trackingUrl" in w ? 0 : 5;
+      },
+    );
+    report = await runSelfCheck("cellexia.myshopify.com");
+    check = report.checks.find((c) => c.key === "delivery_tracking");
+    expect(check?.status).toBe("PASS");
+    expect(check?.detail).toContain("All 5 renewal order(s)");
+
+    // Nothing fulfilled in the window: PASS, nothing to mirror.
+    mocks.billingAttemptCount.mockResolvedValue(0);
+    report = await runSelfCheck("cellexia.myshopify.com");
+    check = report.checks.find((c) => c.key === "delivery_tracking");
+    expect(check?.status).toBe("PASS");
+    expect(check?.detail).toContain("nothing to mirror yet");
   });
 });
 

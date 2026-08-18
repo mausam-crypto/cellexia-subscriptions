@@ -1,6 +1,27 @@
 import { z } from "zod";
 
 /**
+ * Support-channel format checks — the SAME acceptance rules the runtime
+ * resolver applies (app/lib/support/channels.server.ts), duplicated here
+ * rather than imported because that module reads settings (cycle). Pinned
+ * together in tests/aud-v128-stage-c-review-fixes.test.ts.
+ */
+const SUPPORT_EMAIL_RE = /^[^\s@<>,;"]+@[^\s@<>,;"]+\.[^\s@<>,;"]+$/;
+function isSupportWhatsapp(value: string): boolean {
+  let s = value.trim().replace(/[\s.\-()]/g, "");
+  if (s.startsWith("00")) s = `+${s.slice(2)}`;
+  if (!s.startsWith("+")) s = `+${s}`;
+  return /^\d{8,15}$/.test(s.slice(1));
+}
+function isHttpsUrl(value: string): boolean {
+  try {
+    return new URL(value).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Typed settings registry. Every operational behavior that the spec says must be
  * "a setting, not an accident" lives here with an explicit default. Values are
  * stored per-shop in the Setting table as JSON; reads fall back to defaults.
@@ -34,6 +55,49 @@ const tagValueSchema = z
   .refine((v) => !v.includes(","), {
     message: "Shopify tags cannot contain commas",
   });
+
+/**
+ * Results timeline (v1.28.0, P4.1) — the phase list behind "Week N of your
+ * routine". Default phases carry NO text: empty title/body means "use the
+ * i18n default for this phase position" (portal.timeline.phase{n}.title /
+ * .body, generic daily-use-consumable copy — "many people notice…", never a
+ * claim), so a merchant override in the Settings page replaces the text
+ * while every locale keeps its translation for the untouched phases.
+ * `toWeek: null` = open-ended last phase.
+ */
+export const DEFAULT_RESULTS_TIMELINE_PHASES: ReadonlyArray<{
+  fromWeek: number;
+  toWeek: number | null;
+  title: string;
+  body: string;
+}> = [
+  { fromWeek: 0, toWeek: 4, title: "", body: "" },
+  { fromWeek: 4, toWeek: 8, title: "", body: "" },
+  { fromWeek: 8, toWeek: 12, title: "", body: "" },
+  { fromWeek: 12, toWeek: null, title: "", body: "" },
+];
+
+const resultsTimelinePhaseSchema = z.object({
+  fromWeek: z.number().int().min(0).max(520),
+  toWeek: z.number().int().min(1).max(520).nullable().default(null),
+  title: z.string().trim().max(120).default(""),
+  body: z.string().trim().max(1000).default(""),
+});
+
+/**
+ * The generic Settings renderer builds nested values from dot-paths
+ * ("resultsTimeline.phases.0.title" → {phases: {"0": {title}}}); accept that
+ * numeric-keyed record shape as the array it stands for. Anything else passes
+ * through untouched for zod to judge.
+ */
+function phasesFromRecord(value: unknown): unknown {
+  if (Array.isArray(value) || value == null || typeof value !== "object") return value;
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length === 0 || !entries.every(([k]) => /^\d+$/.test(k))) return value;
+  return entries
+    .sort((a, b) => Number(a[0]) - Number(b[0]))
+    .map(([, v]) => v);
+}
 
 export const settingsSchemas = {
   /**
@@ -149,6 +213,44 @@ export const settingsSchemas = {
       // What happens when the ladder is exhausted.
       exhaustedAction: z.enum(["PAUSE", "CANCEL"]),
       cancelAfterFailedDays: z.number().int().min(7).max(90),
+      /**
+       * Customer-initiated "Retry now" (portal / magic link / SMS RETRY,
+       * v1.28.0): minutes a case must wait between two customer retries.
+       * Field-level default keeps previously stored dunning values valid.
+       */
+      customerRetryCooldownMinutes: z
+        .number()
+        .int()
+        .min(5)
+        .max(1440)
+        .default(60),
+      /**
+       * Post-exhaustion touches (v1.28.0, P1.9): days after a case is
+       * EXHAUSTED on which a FAILED contract gets a "fix your payment"
+       * nudge (strictly increasing offsets; [] = none). Field-level default
+       * keeps previously stored dunning values valid.
+       */
+      postExhaustionTouchDays: z
+        .array(z.number().int().min(1).max(365))
+        .max(6)
+        .refine(
+          (days) => days.every((d, i) => i === 0 || d > days[i - 1]),
+          {
+            message:
+              "postExhaustionTouchDays must be strictly increasing (days after exhaustion)",
+          },
+        )
+        .default([7, 21]),
+      /**
+       * New-method detection (v1.28.0, P1.8): when the payment-method
+       * webhook shows a NEW vaulted method on a customer whose subscription
+       * is in trouble (open case / FAILED / removed or expiring card), tell
+       * them ("newer card on file — use it?") or, with `newMethodAutoSwitch`
+       * and a dead primary (removed / expired), move the subscription to it
+       * and say so. Field-level defaults keep stored values valid.
+       */
+      newMethodDetection: z.boolean().default(true),
+      newMethodAutoSwitch: z.boolean().default(true),
     })
     .default({
       softRetryDays: [0, 3, 7, 14],
@@ -161,6 +263,10 @@ export const settingsSchemas = {
       backupPaymentFallback: true,
       exhaustedAction: "PAUSE",
       cancelAfterFailedDays: 30,
+      customerRetryCooldownMinutes: 60,
+      postExhaustionTouchDays: [7, 21],
+      newMethodDetection: true,
+      newMethodAutoSwitch: true,
     }),
 
   /** Pause behavior. */
@@ -170,6 +276,30 @@ export const settingsSchemas = {
       resumeReminderDaysBefore: z.number().int().min(1).max(14),
     })
     .default({ maxMonths: 3, resumeReminderDaysBefore: 7 }),
+
+  /**
+   * Renewal charge timing (v1.28.0, P2.1). The sweep bills a due contract at
+   * or after `shopDayStartUtc(nextBillingDate) + chargeHourLocal` hours —
+   * hour 0 is the pre-v1.28 behaviour (first 5-minute run after shop
+   * midnight). The same instant is the customer's edit cut-off: every
+   * "you can make changes until …" line (portal, reminder) is derived from
+   * it via app/lib/billing/timing.server.ts, so copy and billing can never
+   * disagree. Overdue handling is unaffected — a contract past its charge
+   * moment stays due until billed.
+   *
+   * `preparingWindowHours`: how long after the charge moment an unbilled
+   * renewal with NO attempt is still shown as "Preparing your order" (portal
+   * schedule edits closed). Beyond it the classic controls return — a renewal
+   * the sweep cannot bill (cycle lookup failure, jobs runner down) must not
+   * lock the customer out indefinitely; the STUCK_CONTRACTS alert owns that
+   * case. An in-flight PENDING attempt is "preparing" for as long as it lasts.
+   */
+  billing: z
+    .object({
+      chargeHourLocal: z.number().int().min(0).max(23).default(0),
+      preparingWindowHours: z.number().int().min(1).max(72).default(6),
+    })
+    .default({ chargeHourLocal: 0, preparingWindowHours: 6 }),
 
   /** Customer portal. */
   portal: z
@@ -210,6 +340,79 @@ export const settingsSchemas = {
        * no intro pricing should turn this off.
        */
       friendlyLockMessaging: z.boolean().default(true),
+      /**
+       * Payment-issue banner impression event (portal.dunning_banner_shown,
+       * v1.28.0): logged at most once per dunning case per this many hours.
+       */
+      dunningBannerEventHours: z.number().int().min(1).max(168).default(6),
+      /**
+       * Delay semantics (v1.28.0, P2.2): when a customer delays their next
+       * order, move the whole schedule (true — the new date becomes the
+       * anchor every later order follows) or only the next order (false —
+       * one late delivery, then the original rhythm resumes).
+       */
+      delayReanchors: z.boolean().default(true),
+      /**
+       * Per-line cycle edits (v1.28.0, P2.5): the items card offers "Not
+       * this time" (skip ONE product from the next order) and a "Just this
+       * order" quantity tweak per recurring line. Off: the controls and the
+       * line_skip / line_unskip / line_qty_once actions are refused.
+       */
+      perLineCycleEdits: z.boolean().default(true),
+      /**
+       * Education hub (v1.28.0, P4.4): storefront URLs behind the portal's
+       * "Get the most from your routine" card and the cancel flow's
+       * EDUCATION save. Absolute (https://) or store-relative (/pages/…);
+       * an empty string hides that link — the card disappears when all
+       * three are empty. The cancel-flow guide button uses routineGuideUrl
+       * (falls back to howToUseUrl, then faqUrl) so both surfaces always
+       * point at the same place.
+       */
+      routineGuideUrl: z.string().trim().max(500).default(""),
+      howToUseUrl: z.string().trim().max(500).default(""),
+      faqUrl: z.string().trim().max(500).default(""),
+      /**
+       * Delivery instructions (v1.28.0, P2.8): longest customer note the
+       * portal accepts; written to the Shopify contract note (copied onto
+       * every renewal order) and mirrored on the contract.
+       */
+      deliveryInstructionsMaxChars: z.number().int().min(50).max(1000).default(250),
+      /**
+       * Pause exit ramp (v1.28.0, P2.6): the "need a little longer?" choices
+       * (weeks) offered by the resume-reminder EXTEND_PAUSE link and the
+       * portal's PAUSED banner. Every choice is still clamped by
+       * pause.maxMonths measured from the pause start.
+       */
+      pauseExtendChoicesWeeks: z
+        .array(z.number().int().min(1).max(26))
+        .min(1)
+        .max(4)
+        .default([2, 4]),
+      /**
+       * "Your deliveries" (v1.28.0, P4.2): a charged order with no
+       * fulfillment mirrored for longer than this reads "see the order page"
+       * instead of "being prepared" — the mirror cannot honestly claim an
+       * old order is still in preparation (most likely the fulfillment
+       * webhooks were not deployed for it).
+       */
+      deliveriesProcessingMaxDays: z.number().int().min(3).max(120).default(30),
+      /**
+       * "On its way" (v1.28.0, P4.2): the in-transit banner (detail hero) and
+       * the home-card line show only while the newest shipped order is at
+       * most this many days past its ship instant and has no delivered
+       * signal — a parcel shipped weeks ago is not honestly "on its way"
+       * (the store's carrier may simply never post delivered events).
+       */
+      deliveriesInTransitMaxDays: z.number().int().min(2).max(60).default(14),
+      /**
+       * Payment-methods list (v1.28.0, P1.7): the subscription page lists
+       * the customer's OTHER vaulted payment methods with "Use for this
+       * subscription" and "Set as backup", and the dunning emails carry
+       * "Use my card ····1234 instead" links when ≥2 methods exist. Off: the
+       * single-card section (update / manage in account) and the
+       * payment_select / payment_backup verbs are refused.
+       */
+      paymentMethodsList: z.boolean().default(true),
     })
     .default({
       contextualPrompts: true,
@@ -225,6 +428,17 @@ export const settingsSchemas = {
       contextualPromptBufferDays: 10,
       contextualPromptDelayWeeks: 3,
       friendlyLockMessaging: true,
+      dunningBannerEventHours: 6,
+      delayReanchors: true,
+      perLineCycleEdits: true,
+      routineGuideUrl: "",
+      howToUseUrl: "",
+      faqUrl: "",
+      deliveryInstructionsMaxChars: 250,
+      pauseExtendChoicesWeeks: [2, 4],
+      deliveriesProcessingMaxDays: 30,
+      deliveriesInTransitMaxDays: 14,
+      paymentMethodsList: true,
     }),
 
   // NOTE deliberately NO "buyBox" group here: buy-box presentation (savings
@@ -283,6 +497,14 @@ export const settingsSchemas = {
           },
         )
         .default(""),
+      // Welcome-email heal window (v1.28.0): a checkout contract whose
+      // mirror landed UNKNOWN (own-plan evidence unreadable at the create
+      // moment) has its welcome SUPPRESSED(foreign_contract) by the router;
+      // when a later sync proves it ours, the welcome is sent late — but
+      // only while the contract is at most this many days old (a months-old
+      // subscriber must never be "welcomed"). 0 disables the heal. Field-
+      // level default keeps previously stored values valid (additive change).
+      welcomeHealMaxDays: z.number().int().min(0).max(30).default(7),
       channels: z.object({
         email: z.boolean(),
         sms: z.boolean(),
@@ -292,6 +514,7 @@ export const settingsSchemas = {
       upcomingOrderDaysBefore: 3,
       addonSuggestionEnabled: true,
       addonSuggestionVariantId: "",
+      welcomeHealMaxDays: 7,
       channels: { email: true, sms: true },
     }),
 
@@ -325,6 +548,55 @@ export const settingsSchemas = {
       // previously stored values valid (additive change).
       giftSaveEnabled: z.boolean().default(true),
       giftSaveCooldownDays: z.number().int().min(0).max(720).default(180),
+      // Downsize save (v1.28.0): fewer units / a smaller size / a cheaper
+      // product from the same catalog group, each with its concrete new
+      // per-order total — a lower-ARPU alternative to a discount for
+      // TOO_EXPENSIVE and to a plain skip for TOO_MUCH_PRODUCT. Field-level
+      // default keeps previously stored values valid (additive change).
+      downsizeSaveEnabled: z.boolean().default(true),
+      // DELAY save (v1.28.0, P3.3): "push my next order to {predicted empty
+      // date}" for TOO_MUCH_PRODUCT — offered before SKIP, only when the
+      // churn model's predicted-empty day is after the next charge and at
+      // most delaySaveMaxDays out; applied through the portal's own delay
+      // semantics (portal.delayReanchors).
+      delaySaveEnabled: z.boolean().default(true),
+      delaySaveMaxDays: z.number().int().min(1).max(180).default(42),
+      // Concierge save (v1.28.0, P3.7): the SUPPORT save's request may also
+      // HOLD the next order by this many days (0 = never) so nothing charges
+      // while a human sorts the problem out — only when the charge is more
+      // than 48h away.
+      conciergeHoldDays: z.number().int().min(0).max(30).default(7),
+      // The hold applies only when the next charge is more than this many
+      // hours away (a hold inside the cut-off would edit a cycle being
+      // prepared). Golden rule 7: a merchant with a 24h cut-off may lower it.
+      conciergeHoldMinLeadHours: z.number().int().min(1).max(240).default(48),
+      // Scheduled cancel for locked contracts (v1.28.0, P3.8): inside the
+      // plan lock window the flow offers "schedule my cancellation for
+      // {unlock date}" instead of turning the customer away; the hourly job
+      // cancels at that moment. Off = the pre-v1.28.0 redirect.
+      scheduledCancelEnabled: z.boolean().default(true),
+      // Days before the scheduled moment the cancel_upcoming email (with the
+      // one-tap KEEP link) goes out.
+      scheduledCancelNoticeDays: z.number().int().min(1).max(14).default(3),
+      // How long the one-tap KEEP link in cancel_scheduled / cancel_upcoming
+      // stays valid — must outlive the longest plan lock window (the sibling
+      // of winback.restartLinkTtlDays).
+      keepLinkTtlDays: z.number().int().min(1).max(365).default(60),
+      // Abandoned cancel-intent follow-up (v1.28.0, P3.6): a customer who
+      // walked into the cancel flow and left without deciding gets ONE
+      // email `intentFollowupHours` after the session closes (the GC's
+      // cancel.aborted), carrying reason-matched one-tap saves — never
+      // inside `intentFollowupChargeBufferHours` before the next charge
+      // moment, never more than once per customer (email) per
+      // `intentFollowupCooldownDays`. `intentBannerDays` is how long the
+      // portal home shows the matching "thinking of pausing?" options after
+      // the abandoned session (0 = never). Field-level defaults keep
+      // previously stored values valid (additive change).
+      intentFollowupEnabled: z.boolean().default(true),
+      intentFollowupHours: z.number().int().min(1).max(72).default(18),
+      intentFollowupChargeBufferHours: z.number().int().min(0).max(240).default(48),
+      intentFollowupCooldownDays: z.number().int().min(0).max(365).default(30),
+      intentBannerDays: z.number().int().min(0).max(60).default(14),
     })
     .default({
       enabled: true,
@@ -340,6 +612,19 @@ export const settingsSchemas = {
       sessionFreshMinutes: 60,
       giftSaveEnabled: true,
       giftSaveCooldownDays: 180,
+      downsizeSaveEnabled: true,
+      delaySaveEnabled: true,
+      delaySaveMaxDays: 42,
+      conciergeHoldDays: 7,
+      conciergeHoldMinLeadHours: 48,
+      scheduledCancelEnabled: true,
+      scheduledCancelNoticeDays: 3,
+      keepLinkTtlDays: 60,
+      intentFollowupEnabled: true,
+      intentFollowupHours: 18,
+      intentFollowupChargeBufferHours: 48,
+      intentFollowupCooldownDays: 30,
+      intentBannerDays: 14,
     }),
 
   /** Lifecycle & milestones. */
@@ -369,6 +654,64 @@ export const settingsSchemas = {
       // email is copy with no economics behind it — the truth-in-emails rule
       // (the rewards email only promises the product when a grant exists).
       rewardsGiftEnabled: z.boolean().default(true),
+      /**
+       * Results timeline (v1.28.0, P4.1): the phase content behind the
+       * portal's "Week N of your routine" card, the cancel flow's EDUCATION
+       * save and the week-N check-in email. `enabled` is the content master
+       * switch; all three surfaces additionally obey portalGrowth
+       * .resultsTimeline and the experiment holdout. `checkinWeek` is the
+       * routine week the one-time check-in email goes out (default 4 — the
+       * LAST week of phase 1: "getting started" copy with "from week 5" as
+       * the next-phase line; week N sits in the phase whose fromWeek ≤ N−1).
+       * `expectationLine` adds the survey expectedSpeed sentence (P4.1
+       * survey_personalisation) when the answer is known. Phases are
+       * merchant-editable; empty text = the i18n default. `toWeek` is
+       * DERIVED (the next phase's fromWeek; null on the last) — the
+       * boundaries are the fromWeek list, so an edited "ends at" can never
+       * disagree with the next phase's start.
+       */
+      resultsTimeline: z
+        .object({
+          enabled: z.boolean().default(true),
+          checkinWeek: z.number().int().min(1).max(52).default(4),
+          expectationLine: z.boolean().default(true),
+          phases: z
+            .preprocess(
+              phasesFromRecord,
+              z
+                .array(resultsTimelinePhaseSchema)
+                .min(1)
+                .max(8)
+                // Issue anchored on the offending phase's fromWeek so the
+                // Settings page shows it inline on that field.
+                .superRefine((arr, ctx) => {
+                  arr.forEach((p, i) => {
+                    if (i > 0 && p.fromWeek <= arr[i - 1].fromWeek) {
+                      ctx.addIssue({
+                        code: z.ZodIssueCode.custom,
+                        message: "Phase start weeks must be strictly increasing",
+                        path: [i, "fromWeek"],
+                      });
+                    }
+                  });
+                })
+                // toWeek is derived from the next phase's start (null on the
+                // last): the runtime reads fromWeek only, so a stored/edited
+                // toWeek that disagrees would be a silent no-op otherwise.
+                .transform((arr) =>
+                  arr.map((p, i) => ({
+                    ...p,
+                    toWeek: i < arr.length - 1 ? arr[i + 1].fromWeek : null,
+                  })),
+                ),
+            )
+            .default([...DEFAULT_RESULTS_TIMELINE_PHASES]),
+        })
+        .default({
+          enabled: true,
+          checkinWeek: 4,
+          phases: [...DEFAULT_RESULTS_TIMELINE_PHASES],
+        }),
     })
     .default({
       surpriseGiftOnCycle2: true,
@@ -378,6 +721,11 @@ export const settingsSchemas = {
       earlyCycleIncentivesEnabled: true,
       milestoneLadder: [12, 18, 24],
       rewardsGiftEnabled: true,
+      resultsTimeline: {
+        enabled: true,
+        checkinWeek: 4,
+        phases: [...DEFAULT_RESULTS_TIMELINE_PHASES],
+      },
     }),
 
   /**
@@ -524,6 +872,9 @@ export const settingsSchemas = {
       // Promoted from code constants (defaults = old constants).
       reactivationBillDelayDays: z.number().int().min(1).max(14).default(3),
       linkGraceDays: z.number().int().min(0).max(60).default(14),
+      // v1.28.0 (P3.2): lifetime of the signed one-tap `restart_url` minted
+      // into cancel_confirmed / winback_soft (no offer, single use).
+      restartLinkTtlDays: z.number().int().min(1).max(365).default(60),
     })
     .superRefine((v, ctx) => {
       // The sweep's skip-ahead loop assumes the stages happen in order; a
@@ -554,6 +905,7 @@ export const settingsSchemas = {
       discountCycles: 2,
       reactivationBillDelayDays: 3,
       linkGraceDays: 14,
+      restartLinkTtlDays: 60,
     }),
 
   /**
@@ -734,6 +1086,26 @@ export const settingsSchemas = {
    * - runoutPrompt: when the churn model predicts the customer runs out
    *   BEFORE the next delivery, offer move-it-up / add-one-more — the
    *   inverse of the standing "running low later? push it back" prompt.
+   *   Its "already out" branch (v1.28.0, P2.7) offers to send the next
+   *   order tomorrow once the predicted-empty day has passed.
+   * - supplyMeter (v1.28.0, P2.9): "about {n} days of product left" on the
+   *   subscription page, from the same churn-model prediction — shown as an
+   *   estimate, never as a fact.
+   * - resultsTimeline (v1.28.0, P4.1): "Week N of your routine" progress
+   *   card (detail) + compact line (home) from lifecycle.resultsTimeline;
+   *   also the results_timeline experiment's decision point (holdout arm
+   *   sees nothing) so its retention effect is measurable.
+   * - rewardsRoadmap (v1.28.0, P4.3): the home rewards strip lists every
+   *   milestone rung + the day-N reward with projected "around {date}"
+   *   dates, naming a gift only when the pick is committed; holdout-safe.
+   * - onboardingCard (v1.28.0, P4.5): "What happens next" on the detail
+   *   page until the second order has billed.
+   * - deliveriesList (v1.28.0, P4.2): "Your deliveries" on the Account tab
+   *   and the subscription page (last 5), the "on its way" in-transit banner
+   *   under the hero and the home card's "On its way · Track" line — the
+   *   local order mirror (date, order, amount, shipped/delivered, Track /
+   *   View order links to Shopify's order-status page, which also carries
+   *   the receipt). Trust surface for "was I charged / did it ship".
    */
   portalGrowth: z
     .object({
@@ -743,6 +1115,11 @@ export const settingsSchemas = {
       concessionLadder: z.boolean().default(true),
       cadenceNudge: z.boolean().default(true),
       runoutPrompt: z.boolean().default(true),
+      supplyMeter: z.boolean().default(true),
+      resultsTimeline: z.boolean().default(true),
+      rewardsRoadmap: z.boolean().default(true),
+      onboardingCard: z.boolean().default(true),
+      deliveriesList: z.boolean().default(true),
     })
     .default({
       homeValueCard: true,
@@ -751,6 +1128,11 @@ export const settingsSchemas = {
       concessionLadder: true,
       cadenceNudge: true,
       runoutPrompt: true,
+      supplyMeter: true,
+      resultsTimeline: true,
+      rewardsRoadmap: true,
+      onboardingCard: true,
+      deliveriesList: true,
     }),
 
   /**
@@ -1164,6 +1546,77 @@ export const settingsSchemas = {
       privateApiKey: z.string().default(""),
     })
     .default({ privateApiKey: "" }),
+
+  /**
+   * Support channels (v1.28.0, P5.1) — where the portal's Get-help card, the
+   * cancel-flow SUPPORT/EDUCATION cards and every outgoing email point a
+   * customer who needs a human. Resolved by getSupportChannels()
+   * (app/lib/support/channels.server.ts): `email` "" → the Shop record's
+   * contactEmail (mirrored at install / SHOP_UPDATE); `replyTo` "" → the
+   * resolved email; empty channels are HIDDEN, never shown as dead links —
+   * the pre-v1.28.0 hard-coded `mailto:support@cellexia.com` (a domain the
+   * store does not own) is exactly the failure this group exists to remove.
+   * `slaBusinessDays` is the reply promise the confirmation toast makes; the
+   * merchant owns keeping it true.
+   */
+  support: z
+    .object({
+      // Format-checked at SAVE time with the same rules the resolver applies
+      // (channels.server.ts normalizeSupportEmail / normalizeWhatsapp /
+      // normalizeChatUrl): a value the resolver would silently drop to null
+      // must never be accepted — otherwise the merchant believes the inbox
+      // is set while requests route to the Shop contact email (or the
+      // button is silently hidden). "" always means "not set".
+      email: z
+        .string()
+        .trim()
+        .max(200)
+        .refine((v) => v === "" || SUPPORT_EMAIL_RE.test(v), {
+          message:
+            "Enter a plain email address (name@domain.tld) — no display name, no angle brackets",
+        })
+        .default(""),
+      replyTo: z
+        .string()
+        .trim()
+        .max(200)
+        .refine((v) => v === "" || SUPPORT_EMAIL_RE.test(v), {
+          message:
+            "Enter a plain email address (name@domain.tld) — no display name, no angle brackets",
+        })
+        .default(""),
+      /** E.164 (e.g. "+41791234567") or "" — normalized by the resolver. */
+      whatsapp: z
+        .string()
+        .trim()
+        .max(32)
+        .refine((v) => v === "" || isSupportWhatsapp(v), {
+          message:
+            "Enter the number in international format with 8–15 digits (e.g. +41 79 123 45 67)",
+        })
+        .default(""),
+      chatUrl: z
+        .string()
+        .trim()
+        .max(500)
+        .refine((v) => v === "" || isHttpsUrl(v), {
+          message: "Chat URL must start with https://",
+        })
+        .default(""),
+      hoursNote: z.string().trim().max(300).default(""),
+      slaBusinessDays: z.number().int().min(1).max(30).default(1),
+      /** Get-help submits per rolling hour per customer (stricter than portal.mutationsPerHour). */
+      requestsPerHour: z.number().int().min(1).max(50).default(3),
+    })
+    .default({
+      email: "",
+      replyTo: "",
+      whatsapp: "",
+      chatUrl: "",
+      hoursNote: "",
+      slaBusinessDays: 1,
+      requestsPerHour: 3,
+    }),
 
   /** Monitoring & alerting. */
   alerts: z

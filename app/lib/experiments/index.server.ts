@@ -83,6 +83,29 @@ export const EXPERIMENTS: readonly ExperimentDef[] = [
     defaultEnabled: true,
   },
   {
+    key: "results_timeline",
+    name: "Results timeline card",
+    hypothesis:
+      "Showing subscribers where they are in the routine ('Week N', what many people notice in this phase, what comes next) — on the portal, in the cancel flow's education save and in the week-N check-in email — reduces early NOT_SEEING_RESULTS churn. Like the cycle-2 gift, the holdout must exist from subscriber #1 or the effect can never be measured.",
+    arms: [
+      {
+        key: "shown",
+        share: 87.5,
+        description:
+          "Sees the 'Week N of your routine' card, the phase-aware education save and the check-in email",
+      },
+      {
+        key: "holdout",
+        share: 12.5,
+        description:
+          "No timeline card, generic education copy, no check-in email — the comparison group",
+      },
+    ],
+    primaryMetric:
+      "Survival through week 12 (cycles 2–4) and NOT_SEEING_RESULTS cancel share",
+    defaultEnabled: true,
+  },
+  {
     key: "final_offer_depth",
     name: "Final offer: 25% vs 20%",
     hypothesis:
@@ -281,4 +304,25 @@ export async function surpriseGiftArmFor(contract: {
     contractId: contract.id,
   });
   return arm === "no_gift" ? "no_gift" : "gift";
+}
+
+/**
+ * The results-timeline arm for a contract's customer (v1.28.0, P4.1) — the
+ * portal card, the cancel flow's phase-aware EDUCATION copy and the routine
+ * check-in email all skip the "holdout" arm. Call it only where the card /
+ * copy / email would otherwise render (that IS the divergence point);
+ * disabled resolves to "shown" with no exposure row.
+ */
+export async function resultsTimelineArmFor(contract: {
+  shopId: string;
+  id: string;
+  email: string;
+}): Promise<"shown" | "holdout"> {
+  const arm = await assignedArm({
+    shopId: contract.shopId,
+    experimentKey: "results_timeline",
+    email: contract.email,
+    contractId: contract.id,
+  });
+  return arm === "holdout" ? "holdout" : "shown";
 }

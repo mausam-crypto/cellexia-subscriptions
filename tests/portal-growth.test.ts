@@ -69,6 +69,14 @@ describe("portalGrowth settings group", () => {
       concessionLadder: true,
       cadenceNudge: true,
       runoutPrompt: true,
+      // v1.28.0 (P2.9): days-of-supply meter.
+      supplyMeter: true,
+      // v1.28.0 (P4.1 / P4.3 / P4.5): value cards.
+      resultsTimeline: true,
+      rewardsRoadmap: true,
+      onboardingCard: true,
+      // v1.28.0 (P4.2): "Your deliveries" on the Account tab.
+      deliveriesList: true,
     });
     // A partially stored value keeps parsing (field-level defaults).
     const partial = settingsSchemas.portalGrowth.safeParse({
@@ -246,7 +254,9 @@ describe("growth copy hygiene", () => {
         key === "portal.add.every_time" ||
         key === "portal.add.popular",
     );
-    expect(growthKeys.length).toBe(24);
+    // 30 (v1.20.0–v1.27.0) + 3 (v1.28.0 P2.7 "already out" branch:
+    // portal.nudge.already_out / _cta / _hint).
+    expect(growthKeys.length).toBe(33);
     for (const key of growthKeys) {
       expect(catalog[key], key).not.toMatch(/cancel/i);
       expect(catalog[key], key).not.toMatch(/hurry|last chance|only \d/i);

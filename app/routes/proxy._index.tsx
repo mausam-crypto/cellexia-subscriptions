@@ -2,7 +2,7 @@ import type { LoaderFunctionArgs } from "@remix-run/node";
 import { redirect } from "@remix-run/node";
 import type { ContractStatus } from "@prisma/client";
 import prisma from "~/db.server";
-import { authenticate } from "~/shopify.server";
+import { authenticate, adminClientForShop } from "~/shopify.server";
 import { requireShop } from "~/lib/shop/install.server";
 import { getSetting } from "~/lib/settings/settings.server";
 import { t } from "~/lib/i18n/i18n.server";
@@ -31,9 +31,51 @@ import { contractFrequency, formatFrequency } from "~/lib/frequency";
 import { OURS_ONLY } from "~/lib/ownership/ownership.server";
 import { getLockRules, lockStateFor } from "~/lib/contracts/lock.server";
 import {
+  buildRewardsRoadmap,
   memberSavingsCents,
   milestoneRemaining,
+  teaserPromisedFor,
+  type RewardsRoadmap,
 } from "~/lib/portal/growth.server";
+import {
+  resolveTimeline,
+  resolveTimelineArm,
+  timelineLineHtml,
+  timelinePosition,
+} from "~/lib/portal/timeline.server";
+import {
+  inTransitLineHtml,
+  latestDeliveryByContract,
+  latestInTransit,
+} from "~/lib/portal/deliveries.server";
+import { safeHandoffNext } from "~/lib/portal/handoff-next.server";
+import {
+  dunningSortRank,
+  loadPortalDunningMany,
+  logDunningBannerShown,
+  type PortalDunningView,
+} from "~/lib/portal/dunning.server";
+import {
+  derivePortalPaymentState,
+  nextChargeLine,
+  paymentChipKey,
+  paymentMethodShortLabel,
+  type PortalPaymentView,
+} from "~/lib/portal/payment.server";
+import { newCardBannerHits, type NewCardBannerHit } from "~/lib/dunning/new-method.server";
+import { listLivePaymentMethodsCached } from "~/lib/portal/payment-methods.server";
+import { getActiveDiscountForCycle } from "~/lib/billing/discounts.server";
+import { nextCycleIndex, type NextChargeEstimate } from "~/lib/billing/estimate.server";
+import { resolveChargeTiming } from "~/lib/billing/timing.server";
+import {
+  contractCutoff,
+  cutoffLabel,
+  preparingOrderDateByContract,
+  safeEstimateNextCharge,
+} from "~/lib/portal/next-delivery.server";
+import { renderIntentBanner } from "~/lib/cancel/intent-banner.server";
+import { getSupportChannels } from "~/lib/support/channels.server";
+import { hasFurtherOrders } from "~/lib/cancel/further-orders";
 
 /**
  * Portal home: every subscription the signed-in customer has, with one-tap
@@ -61,14 +103,6 @@ const STATUS_CHIP_CLASS: Record<ContractStatus, string> = {
   CANCELLED: "cxs-chip--cancelled",
   EXPIRED: "cxs-chip--expired",
 };
-
-function contractTotalCents(contract: LocalContractWithLines): number {
-  const items = contract.lines.reduce(
-    (sum, line) => sum + line.currentPriceCents * line.quantity,
-    0,
-  );
-  return items + contract.deliveryPriceCents;
-}
 
 function apiPath(
   locale: string,
@@ -98,15 +132,33 @@ function postForm(
   return `<form method="post" action="${escapeHtml(actionUrl)}">${hidden}<button type="submit" class="${buttonClass}">${escapeHtml(buttonLabel)}</button></form>`;
 }
 
-function itemsHtml(contract: LocalContractWithLines, locale: string): string {
-  return contract.lines
+/**
+ * The card's line rows come from THE next-order estimate (P2.4 / P2.5): a
+ * line the customer marked "not this time" is struck through and bills 0, a
+ * one-order quantity tweak shows the billed count "(usually N)", so the
+ * visible rows − discount + delivery always add up to the card's total.
+ * (Rendering the mirror's plan quantity × price used to list a skipped
+ * product as shipping and sum to a different number than the total.)
+ */
+function itemsHtml(
+  contract: Pick<LocalContractWithLines, "currencyCode">,
+  locale: string,
+  estimate: Pick<NextChargeEstimate, "lines" | "currency">,
+): string {
+  const currency = estimate.currency || contract.currencyCode;
+  return estimate.lines
+    .filter((line) => line.kind !== "scheduled_gift")
     .map((line) => {
       const thumb = line.imageUrl
         ? `<img class="cxs-thumb" src="${escapeHtml(line.imageUrl)}" alt="" loading="lazy">`
         : `<div class="cxs-thumb cxs-thumb--placeholder">C</div>`;
       const badges: string[] = [];
-      if (line.isGift) badges.push(t(locale, "portal.item.gift"));
-      if (line.isOneTimeAddon) badges.push(t(locale, "portal.item.one_time"));
+      if (line.kind === "gift") badges.push(t(locale, "portal.item.gift"));
+      if (line.kind === "one_time_addon") badges.push(t(locale, "portal.item.one_time"));
+      if (line.skippedThisCycle) badges.push(t(locale, "portal.next.not_this_time"));
+      if (line.planQuantity != null && !line.skippedThisCycle) {
+        badges.push(t(locale, "portal.next.qty_once", { plan: line.planQuantity }));
+      }
       const meta = [
         line.variantTitle && line.variantTitle !== "Default Title"
           ? line.variantTitle
@@ -116,16 +168,14 @@ function itemsHtml(contract: LocalContractWithLines, locale: string): string {
       ]
         .filter(Boolean)
         .join(" · ");
-      const price = line.isGift
+      const price = line.free
         ? escapeHtml(t(locale, "portal.item.free"))
-        : escapeHtml(
-            formatMoney(
-              line.currentPriceCents * line.quantity,
-              contract.currencyCode,
-              locale,
-            ),
-          );
-      return `<div class="cxs-item">${thumb}<div class="cxs-item__body"><p class="cxs-item__title">${escapeHtml(line.title)}</p><p class="cxs-item__meta">${escapeHtml(meta)}</p></div><span class="cxs-price">${price}</span></div>`;
+        : escapeHtml(formatMoney(line.lineTotalCents, currency, locale));
+      const skippedCls = line.skippedThisCycle ? " cxs-item--skipped" : "";
+      const titleHtml = line.skippedThisCycle
+        ? `<s>${escapeHtml(line.title)}</s>`
+        : escapeHtml(line.title);
+      return `<div class="cxs-item${skippedCls}">${thumb}<div class="cxs-item__body"><p class="cxs-item__title">${titleHtml}</p><p class="cxs-item__meta">${escapeHtml(meta)}</p></div><span class="cxs-price">${price}</span></div>`;
     })
     .join("");
 }
@@ -150,8 +200,43 @@ function contractCardHtml(params: {
   savedCents: number;
   /** Deliveries to the milestone gift; null = off/reached. */
   milestoneAway: number | null;
+  /** Payment issue (v1.28.0): the contract's open / exhausted dunning case. */
+  dunning: PortalDunningView | null;
+  /** Mirrored payment method state (v1.28.0, P1.5): chip + next-charge line. */
+  payment: PortalPaymentView;
+  /**
+   * THE next-order estimate (v1.28.0, P2.4) — the discounted total the
+   * hero, the reminder and this card all state. No money is computed here.
+   */
+  estimate: NextChargeEstimate;
+  /** editCutoff(nextBillingDate) — "changes until {date}" (null = none). */
+  cutoff: Date | null;
+  /** Billing day reached / attempt in flight (P2.1): chip + no one-taps. */
+  preparing: boolean;
+  /**
+   * The order date being prepared (`preparingOrderDate`) — while an attempt
+   * is in flight the mirror's nextBillingDate is already the FOLLOWING cycle,
+   * so the card prints this date instead. Optional; null = mirror date.
+   */
+  preparingOrderDate?: Date | null;
+  /**
+   * Results timeline compact line (v1.28.0, P4.1 — portalGrowth.resultsTimeline
+   * + the results_timeline experiment's "shown" arm): pre-rendered HTML or "".
+   */
+  timelineLine?: string;
+  /**
+   * "On its way · Track" (v1.28.0, P4.2 — portalGrowth.deliveriesList): the
+   * newest shipped-not-delivered order's one-liner, pre-rendered HTML or "".
+   */
+  inTransitLine?: string;
+  /**
+   * "You have a newer card on file" (v1.28.0, P1.8): the method the
+   * new_card_detected notice named, still not this contract's primary — one
+   * tap posts payment_select (the service re-validates the id). Null = none.
+   */
+  newCard?: NewCardBannerHit | null;
 }): string {
-  const { contract, locale, tz, csrf, preview } = params;
+  const { contract, locale, tz, csrf, preview, dunning } = params;
   const api = (action: string) => apiPath(locale, action, preview);
   // Server-side double-submit dedupe: one-tap forms carry the cycle date they
   // target, so a duplicate POST for an already-advanced cycle is a no-op.
@@ -171,20 +256,107 @@ function contractCardHtml(params: {
     locale,
     `portal.status.${contract.status.toLowerCase()}`,
   );
+  // ACTIVE with an open case (v1.28.0): the chip says "Payment issue" (today
+  // keyed on status alone, so a held order looked healthy for weeks) and the
+  // header names the hold instead of promising a next order.
+  const activeIssue = contract.status === "ACTIVE" && dunning != null;
+  // Card chip (v1.28.0, P1.5): "Card expiring" / "Card expired" / "Card
+  // removed" from the mirrored method state — the payment-issue chip wins.
+  const cardChip = paymentChipKey(params.payment.state, {
+    status: contract.status,
+    hasIssue: dunning != null,
+  });
+  // Preparing (P2.1): billing day reached — the chip says so and the
+  // one-tap skip/delay leave the card (the api action is the backstop).
+  const preparing = params.preparing && contract.status === "ACTIVE" && !activeIssue;
+  const chipClass = activeIssue
+    ? "cxs-chip--failed"
+    : cardChip
+      ? params.payment.state === "EXPIRING"
+        ? "cxs-chip--warn"
+        : "cxs-chip--failed"
+      : preparing
+        ? "cxs-chip--warn cxs-next__preparing"
+        : STATUS_CHIP_CLASS[contract.status];
+  const chipLabel = activeIssue
+    ? t(locale, "portal.dunning.chip")
+    : cardChip
+      ? t(locale, cardChip)
+      : preparing
+        ? t(locale, "portal.next.preparing_chip")
+        : statusLabel;
+  // The DISCOUNTED total from the shared estimate (P2.4 money-true rule).
+  const total = formatMoney(
+    params.estimate.totalCents,
+    contract.currencyCode,
+    locale,
+  );
+  // The line rows print the estimate's effective lines (skips / one-order
+  // quantities applied); when a grant applies, the discount row reconciles
+  // them with the total (as the detail page does) so the customer's own
+  // arithmetic never disagrees with the card.
+  const discountRowHtml =
+    params.estimate.discountCents > 0 && params.estimate.discountLabel
+      ? `<div class="cxs-row cxs-row--between cxs-small cxs-next__discount" style="margin-top:4px"><span>${escapeHtml(params.estimate.discountLabel)}</span><span>${escapeHtml(`−${formatMoney(params.estimate.discountCents, contract.currencyCode, locale)}`)}</span></div>`
+      : "";
 
+  // Scheduled cancel whose end falls before the mirror's next pointer: the
+  // sweep will never bill that order (further-orders.ts) — "Next order
+  // {date} · {amount}" would be a false promise. The card says so instead.
+  const noFurtherOrders =
+    contract.status !== "CANCELLED" &&
+    contract.cancelScheduledAt != null &&
+    !hasFurtherOrders(contract);
   let scheduleHtml = "";
-  if (contract.status === "ACTIVE" && contract.nextBillingDate) {
-    scheduleHtml = `<div><span class="cxs-label">${escapeHtml(t(locale, "portal.index.next_order"))}</span><strong>${escapeHtml(formatShopDate(contract.nextBillingDate, tz, locale))}</strong></div>`;
+  if (activeIssue && dunning) {
+    scheduleHtml = `<div><span class="cxs-label">${escapeHtml(t(locale, "portal.dunning.held_since"))}</span><strong>${escapeHtml(formatShopDate(dunning.openedAt, tz, locale))}</strong></div>`;
+  } else if (noFurtherOrders && contract.cancelScheduledAt) {
+    scheduleHtml = `<div><span class="cxs-label">${escapeHtml(t(locale, "portal.index.cancels_on"))}</span><strong>${escapeHtml(formatShopDate(contract.cancelScheduledAt, tz, locale))}</strong><p class="cxs-muted cxs-small cxs-no-further-orders" style="margin:4px 0 0">${escapeHtml(t(locale, "portal.index.no_further_orders"))}</p></div>`;
+  } else if (contract.status === "ACTIVE" && contract.nextBillingDate) {
+    // Next-charge line (P1.5): "{amount} on {date} · Visa ····4242" — the
+    // reminder's estimate (plan pricing − live grant + delivery), so the
+    // figure framed as "what will be charged" is the same one the upcoming-
+    // order email states. The card label is the estimate's too: revoke-aware
+    // (blank once the card was removed — the chip already says so) and
+    // brand-capitalised, so the home line, the hero and the reminder agree.
+    // Under "Preparing" with an attempt in flight the mirror's pointer is
+    // already the following cycle: print the order being prepared instead
+    // (the estimate's lines/total describe that order).
+    const shownDate =
+      preparing &&
+      params.preparingOrderDate != null &&
+      params.preparingOrderDate.getTime() < contract.nextBillingDate.getTime()
+        ? params.preparingOrderDate
+        : contract.nextBillingDate;
+    const nextDate = formatShopDate(shownDate, tz, locale);
+    const chargeLine = nextChargeLine(locale, {
+      amount: total,
+      date: nextDate,
+      cardLabel: params.estimate.cardLabel || null,
+    });
+    // Cut-off (P2.1): "Changes until {date, time}" — the charge moment the
+    // sweep reads; while preparing, the chip carries the state instead.
+    const cutoffLine =
+      params.cutoff && !preparing
+        ? `<p class="cxs-muted cxs-small cxs-next__cutoff" style="margin:2px 0 0">${escapeHtml(t(locale, "portal.next.cutoff_short", { cutoff: cutoffLabel(locale, params.cutoff, tz) }))}</p>`
+        : "";
+    scheduleHtml = `<div><span class="cxs-label">${escapeHtml(t(locale, "portal.index.next_order"))}</span><strong>${escapeHtml(nextDate)}</strong><p class="cxs-muted cxs-small cxs-next-charge" style="margin:4px 0 0">${escapeHtml(chargeLine)}</p>${cutoffLine}</div>`;
   } else if (contract.status === "PAUSED" && contract.resumeAt) {
     scheduleHtml = `<div><span class="cxs-label">${escapeHtml(t(locale, "portal.index.resumes"))}</span><strong>${escapeHtml(formatShopDate(contract.resumeAt, tz, locale))}</strong></div>`;
   } else {
     scheduleHtml = `<div><span class="cxs-label">${escapeHtml(t(locale, "portal.index.status_label"))}</span><strong>${escapeHtml(statusLabel)}</strong></div>`;
+  }
+  // Scheduled cancel (v1.28.0, P3.8): the card says so under the schedule
+  // ("Cancels on {date}"); the detail page carries the keep button.
+  if (contract.cancelScheduledAt && contract.status !== "CANCELLED" && !noFurtherOrders) {
+    scheduleHtml += `<p class="cxs-muted cxs-small cxs-cancel-scheduled" style="margin:4px 0 0">${escapeHtml(t(locale, "portal.index.cancels_on"))} ${escapeHtml(formatShopDate(contract.cancelScheduledAt, tz, locale))}</p>`;
   }
 
   let promptHtml = "";
   if (
     params.contextualPrompts &&
     !params.locked &&
+    !preparing &&
     contract.status === "ACTIVE" &&
     contract.nextBillingDate &&
     contract.predictedEmptyDate &&
@@ -192,15 +364,40 @@ function contractCardHtml(params: {
       contract.nextBillingDate.getTime() +
         params.promptBufferDays * 24 * 3600_000
   ) {
+    // The run-out prompt's rationale is THIS order's stock ("not running
+    // low?") — it posts mode=once so a tap never re-anchors every later
+    // order (review fix; the toast and Undo follow the once semantics).
     promptHtml = `<div class="cxs-banner"><p>${escapeHtml(t(locale, "portal.index.contextual_prompt"))}</p>${postForm(
       api("delay"),
       [
         ...baseFields,
         { name: "weeks", value: String(params.promptDelayWeeks) },
+        { name: "mode", value: "once" },
         { name: "expected_next", value: expectedNext },
       ],
       t(locale, "portal.index.contextual_prompt_cta"),
     )}</div>`;
+  }
+
+  // Newer card on file (P1.8): rendered above the value grid so a payment
+  // fix outranks growth copy; the button is the same payment_select verb the
+  // detail page's list uses, the quiet link opens the payment section.
+  let newCardHtml = "";
+  if (params.newCard && ["ACTIVE", "PAUSED", "FAILED"].includes(contract.status)) {
+    const cardLabel = paymentMethodShortLabel(locale, {
+      paymentInstrumentType: params.newCard.instrumentType,
+      cardBrand: params.newCard.cardBrand,
+      cardLast4: params.newCard.cardLast4,
+    });
+    const text = cardLabel
+      ? t(locale, "portal.index.new_card_banner_labelled", { card: cardLabel })
+      : t(locale, "portal.index.new_card_banner");
+    newCardHtml = `<div class="cxs-banner cxs-newcard" data-payment-method="${escapeHtml(params.newCard.paymentMethodId)}"><p>${escapeHtml(text)}</p>${postForm(
+      api("payment_select"),
+      [...baseFields, { name: "paymentMethodId", value: params.newCard.paymentMethodId }],
+      t(locale, "portal.index.new_card_cta"),
+      "cxs-btn cxs-btn--small",
+    )}<a class="cxs-link cxs-small cxs-newcard__more" href="${manageHref}#cxs-payment">${escapeHtml(t(locale, "portal.index.new_card_more"))}</a></div>`;
   }
 
   // Value-first card (portalGrowth.homeValueCard, v1.20.0): the list card
@@ -229,6 +426,11 @@ function contractCardHtml(params: {
     }
     valueHtml = `<div class="cxs-rewards__grid" style="margin-top:12px">${cells.join("")}</div>`;
   }
+  // "Week N of your routine" line rides under the value grid on ACTIVE cards
+  // only — the timeline is about a routine that is running.
+  if (contract.status === "ACTIVE" && params.timelineLine) {
+    valueHtml += params.timelineLine;
+  }
 
   const actions: string[] = [];
   // Lock window: the one-tap skip/delay are hidden while it runs (the api
@@ -238,7 +440,7 @@ function contractCardHtml(params: {
     actions.push(
       `<a class="cxs-btn cxs-btn--small" href="${manageHref}#cxs-add">${escapeHtml(t(locale, "portal.actions.add_products"))}</a>`,
     );
-  } else if (contract.status === "ACTIVE" && !params.locked) {
+  } else if (contract.status === "ACTIVE" && !params.locked && !preparing) {
     actions.push(
       postForm(
         api("skip"),
@@ -268,17 +470,23 @@ function contractCardHtml(params: {
       ),
     );
   }
-  if (contract.status === "CANCELLED") {
-    // A cancelled subscription must never be a dead end: one tap restarts it
-    // through the win-back reactivation service (no discount unless a
-    // win-back grant already exists).
+  if (dunning && (contract.status === "FAILED" || activeIssue)) {
+    // Payment issue (v1.28.0): the primary action IS fixing the payment —
+    // straight to the detail banner, which carries the category-specific
+    // verbs (retry / update / confirm with the bank).
     actions.push(
-      postForm(
-        api("reactivate"),
-        baseFields,
-        t(locale, "portal.actions.restart"),
-        "cxs-btn cxs-btn--small",
-      ),
+      `<a class="cxs-btn cxs-btn--small cxs-dunning__fix" href="${manageHref}#cxs-dunning">${escapeHtml(t(locale, "portal.dunning.fix_payment"))}</a>`,
+    );
+  }
+  if (contract.status === "CANCELLED" && contract.cancelReason !== "MERGED") {
+    // A cancelled subscription must never be a dead end (a MERGED source is
+    // the exception: its lines continue in the primary contract, restarting
+    // it would double-bill — no Restart door): Restart opens the
+    // welcome-back landing (v1.28.0, P3.5 — what is preserved + the CURRENT
+    // win-back offer, re-derived server-side), one tap from there through
+    // the win-back reactivation service.
+    actions.push(
+      `<a class="cxs-btn cxs-btn--small" href="${withLocale(`${PORTAL_BASE_PATH}/subscription/${contract.id}/restart`, locale, preview)}">${escapeHtml(t(locale, "portal.actions.restart"))}</a>`,
     );
   }
   actions.push(
@@ -294,23 +502,20 @@ function contractCardHtml(params: {
       contractFrequency(contract),
     ),
   });
-  const total = formatMoney(
-    contractTotalCents(contract),
-    contract.currencyCode,
-    locale,
-  );
-
   return `<section class="cxs-card">
   <div class="cxs-row cxs-row--between" style="margin-bottom:14px">
     <p class="cxs-muted cxs-small" style="margin:0">${escapeHtml(frequency)}</p>
-    <span class="cxs-chip ${STATUS_CHIP_CLASS[contract.status]}">${escapeHtml(statusLabel)}</span>
+    <span class="cxs-chip ${chipClass}">${escapeHtml(chipLabel)}</span>
   </div>
-  ${itemsHtml(contract, locale)}
+  ${itemsHtml(contract, locale, params.estimate)}
+  ${discountRowHtml}
   <hr class="cxs-divider">
   <div class="cxs-row cxs-row--between cxs-row--wrap">
     ${scheduleHtml}
     <div><span class="cxs-label">${escapeHtml(t(locale, "portal.index.order_total"))}</span><strong class="cxs-price">${escapeHtml(total)}</strong></div>
   </div>
+  ${params.inTransitLine ?? ""}
+  ${newCardHtml}
   ${valueHtml}
   ${promptHtml}
   <div class="cxs-actions">${actions.join("")}</div>
@@ -346,7 +551,7 @@ function rewardsStripHtml(params: {
   const ordersRemaining = Math.max(1, milestoneCycle - maxOrders);
   const milestoneCell = milestoneReached
     ? `<div class="cxs-rewards__num">&#10003;</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.rewards.milestone_reached", { orders: milestoneCycle }))}</div>`
-    : `<div class="cxs-rewards__num">${maxOrders}&thinsp;/&thinsp;${milestoneCycle}</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.rewards.milestone_next", { count: ordersRemaining }))}</div><div class="cxs-progress"><span style="width:${milestonePct}%"></span></div>`;
+    : `<div class="cxs-rewards__num">${maxOrders}&thinsp;/&thinsp;${milestoneCycle}</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.rewards.milestone_next", { count: ordersRemaining }))}</div><div class="cxs-progress" role="progressbar" aria-label="${escapeHtml(t(locale, "portal.a11y.progress_milestone"))}" aria-valuemin="0" aria-valuemax="${milestoneCycle}" aria-valuenow="${Math.min(maxOrders, milestoneCycle)}"><span style="width:${milestonePct}%"></span></div>`;
 
   const unlockPct = Math.min(
     100,
@@ -356,7 +561,7 @@ function rewardsStripHtml(params: {
   const daysRemaining = Math.max(1, rewardsUnlockDay - daysSubscribed);
   const rewardsCell = rewardsUnlocked
     ? `<div class="cxs-rewards__num">&#10003;</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.rewards.unlocked"))}</div>`
-    : `<div class="cxs-rewards__num">${daysSubscribed}&thinsp;/&thinsp;${rewardsUnlockDay}</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.rewards.unlock_next", { days: daysRemaining }))}</div><div class="cxs-progress"><span style="width:${unlockPct}%"></span></div>`;
+    : `<div class="cxs-rewards__num">${daysSubscribed}&thinsp;/&thinsp;${rewardsUnlockDay}</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.rewards.unlock_next", { days: daysRemaining }))}</div><div class="cxs-progress" role="progressbar" aria-label="${escapeHtml(t(locale, "portal.a11y.progress_rewards"))}" aria-valuemin="0" aria-valuemax="${rewardsUnlockDay}" aria-valuenow="${Math.min(daysSubscribed, rewardsUnlockDay)}"><span style="width:${unlockPct}%"></span></div>`;
 
   return `<section class="cxs-rewards">
   <h2>${escapeHtml(t(locale, "portal.rewards.title"))}</h2>
@@ -368,13 +573,75 @@ function rewardsStripHtml(params: {
 </section>`;
 }
 
+/**
+ * Rewards roadmap (v1.28.0, P4.3 — portalGrowth.rewardsRoadmap): every
+ * milestone rung + the day-N reward as a list with a projected "around
+ * {date}" each, and two tiles (deliveries so far / gifts received) from
+ * local data. Gift NAMES only when the roadmap builder proved the pick is
+ * committed; "a free product" when a gift will ship but the pick is dynamic;
+ * nothing at all when no gift is behind a rung. Holdout-safe by
+ * construction: the "surprise" row exists only when the teaser was sent.
+ */
+function rewardsRoadmapHtml(params: {
+  locale: string;
+  tz: string;
+  roadmap: RewardsRoadmap;
+  daysSubscribed: number;
+}): string {
+  const { locale, tz, roadmap } = params;
+  const giftText = (row: RewardsRoadmap["rows"][number]): string => {
+    if (row.gift.kind === "named") {
+      return t(locale, "portal.roadmap.gift_named", { title: row.gift.title });
+    }
+    if (row.gift.kind === "generic") return t(locale, "portal.roadmap.gift_generic");
+    return "";
+  };
+  const items = roadmap.rows
+    .map((row) => {
+      const label =
+        row.kind === "surprise"
+          ? t(locale, "portal.roadmap.surprise", { order: row.orderNumber ?? 2 })
+          : row.kind === "milestone"
+            ? t(locale, "portal.roadmap.milestone", { order: row.orderNumber ?? 0 })
+            : t(locale, "portal.roadmap.rewards");
+      const when = row.reached
+        ? t(locale, "portal.roadmap.reached")
+        : row.aroundDate
+          ? t(locale, "portal.roadmap.around", {
+              date: formatShopDate(row.aroundDate, tz, locale),
+            })
+          : "";
+      const gift = row.kind === "surprise" ? "" : giftText(row);
+      const meta = [when, gift].filter(Boolean).join(" · ");
+      const mark = row.reached ? "&#10003;" : "&#9675;";
+      return `<li class="cxs-roadmap__row${row.reached ? " cxs-roadmap__row--done" : ""}"><span class="cxs-roadmap__mark" aria-hidden="true">${mark}</span><span class="cxs-roadmap__label">${escapeHtml(label)}</span>${meta ? `<span class="cxs-muted cxs-small cxs-roadmap__meta">${escapeHtml(meta)}</span>` : ""}</li>`;
+    })
+    .join("");
+  return `<section class="cxs-rewards cxs-roadmap">
+  <h2>${escapeHtml(t(locale, "portal.rewards.title"))}</h2>
+  <div class="cxs-rewards__grid">
+    <div class="cxs-rewards__cell"><div class="cxs-rewards__num">${params.daysSubscribed}</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.rewards.days_subscribed"))}</div></div>
+    <div class="cxs-rewards__cell"><div class="cxs-rewards__num">${roadmap.deliveriesSoFar}</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.roadmap.deliveries_so_far"))}</div></div>
+    <div class="cxs-rewards__cell"><div class="cxs-rewards__num">${roadmap.giftsReceived}</div><div class="cxs-muted cxs-small">${escapeHtml(t(locale, "portal.roadmap.gifts_received"))}</div></div>
+  </div>
+  <ul class="cxs-roadmap__list" style="list-style:none;margin:14px 0 0;padding:0;display:grid;gap:6px" aria-label="${escapeHtml(t(locale, "portal.roadmap.list_label"))}">${items}</ul>
+</section>`;
+}
+
 async function buildToast(
   request: Request,
   locale: string,
   session: PortalSessionContext,
   contractIds: Set<string>,
 ): Promise<PortalToast | null> {
-  const resolved = resolveToast(request, locale);
+  // Undo context (v1.28.0, P2.2): delayed / date_changed / frequency_changed
+  // toasts carry a signed undo token — rendered as a form only for a
+  // contract this page lists, with this session's CSRF.
+  const resolved = resolveToast(request, locale, {
+    csrfToken: session.csrfToken,
+    previewToken: session.previewToken,
+    contractIds,
+  });
   if (!resolved) return null;
 
   // "Order skipped" carries a one-tap undo for the affected contract.
@@ -407,7 +674,11 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const handoffCode = requestUrl.searchParams.get("handoff");
   if (handoffCode) {
     const previewToken = requestUrl.searchParams.get("cx_pp");
-    const cleanUrl = withLocale(`${PORTAL_BASE_PATH}/`, locale, previewToken);
+    // Optional in-portal landing (v1.28.0, CHECKIN): a strictly validated
+    // relative subscription path with whitelisted query keys — anything else
+    // lands on the home page as before.
+    const nextPath = safeHandoffNext(requestUrl.searchParams.get("next"));
+    const cleanUrl = withLocale(`${PORTAL_BASE_PATH}${nextPath ?? "/"}`, locale, previewToken);
     const handoff = await exchangeLoginHandoff(handoffCode, shop.id);
     if (!handoff && !previewToken) {
       throw redirect(
@@ -476,7 +747,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }
   }
 
-  const [contracts, portalSettings, lifecycle, growth, lockRules] =
+  const [contracts, portalSettings, lifecycle, growth, lockRules, dunningSettings] =
     await Promise.all([
     prisma.subscriptionContract.findMany({
       // OURS_ONLY: a customer who also subscribes through the store's other
@@ -494,8 +765,23 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     getSetting(shop.id, "portalGrowth"),
     // Plan lock window rules, fetched once and applied per contract card.
     getLockRules(shop.id),
+    // dunning.preExpiryNoticeDays drives the "Card expiring" chip.
+    getSetting(shop.id, "dunning"),
   ]);
-  contracts.sort((a, b) => STATUS_ORDER[a.status] - STATUS_ORDER[b.status]);
+  // Payment issues (v1.28.0): open case on an ACTIVE/PAUSED contract, or the
+  // exhausted case of a FAILED one — read once for the page. Contained: a
+  // failed read renders the classic cards.
+  let dunningByContract = new Map<string, PortalDunningView>();
+  try {
+    dunningByContract = await loadPortalDunningMany(contracts);
+  } catch (err) {
+    console.error("[portal] dunning views failed", err);
+  }
+  contracts.sort(
+    (a, b) =>
+      dunningSortRank(dunningByContract.has(a.id), STATUS_ORDER[a.status]) -
+      dunningSortRank(dunningByContract.has(b.id), STATUS_ORDER[b.status]),
+  );
 
   const toast = await buildToast(
     request,
@@ -542,7 +828,48 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       }),
     ]);
 
-    body += rewardsStripHtml({
+    // Rewards roadmap (v1.28.0, P4.3, portalGrowth.rewardsRoadmap): the
+    // strip becomes the full ladder with projected dates, anchored on the
+    // customer's primary contract (the ACTIVE one furthest along — rung
+    // dates are per contract). Off, or the roadmap failing: the classic
+    // three-tile strip.
+    let roadmapHtml = "";
+    if (growth.rewardsRoadmap) {
+      const primary =
+        [...contracts]
+          .filter((c) => c.status === "ACTIVE" || c.status === "PAUSED")
+          .sort((a, b) => b.ordersCount - a.ordersCount)[0] ?? contracts[0];
+      try {
+        // The upcoming Shopify cycle index (THE hint every per-cycle read
+        // uses) lets the builder name a rung whose gift is already
+        // SCHEDULED/ADDED on the next order; contained — null keeps the
+        // config-based label.
+        let upcomingCycleIndex: number | null = null;
+        try {
+          upcomingCycleIndex = await nextCycleIndex(primary);
+        } catch (err) {
+          console.error("[portal] roadmap: upcoming cycle index failed", primary.id, err);
+        }
+        const roadmap = await buildRewardsRoadmap({
+          shopId: shop.id,
+          tz: shop.ianaTimezone,
+          contract: primary,
+          lifecycle,
+          teaserPromised: await teaserPromisedFor(primary.id),
+          rewardsUnlockedEvent: rewardsEvent !== null,
+          upcomingCycleIndex,
+        });
+        roadmapHtml = rewardsRoadmapHtml({
+          locale,
+          tz: shop.ianaTimezone,
+          roadmap,
+          daysSubscribed,
+        });
+      } catch (err) {
+        console.error("[portal] rewards roadmap failed", err);
+      }
+    }
+    body += roadmapHtml || rewardsStripHtml({
       locale,
       daysSubscribed,
       maxOrders,
@@ -553,6 +880,70 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       milestoneReached:
         milestoneGrant !== null || maxOrders >= lifecycle.milestoneGiftCycle,
     });
+
+    // Results timeline compact line (v1.28.0, P4.1): per ACTIVE contract,
+    // behind portalGrowth.resultsTimeline + lifecycle.resultsTimeline.enabled
+    // + the results_timeline "shown" arm (the arm is per customer; resolved
+    // once and recorded as exposure only when a card would actually render).
+    const timelineLines = new Map<string, string>();
+    if (growth.resultsTimeline && !portalSession.isPreview) {
+      try {
+        const timeline = await resolveTimeline(shop.id, locale);
+        if (timeline.enabled) {
+          const active = contracts.filter((c) => c.status === "ACTIVE" && !c.isDemo);
+          if (active.length > 0) {
+            const arm = await resolveTimelineArm(active[0]);
+            if (arm === "shown") {
+              const now = new Date();
+              for (const c of active) {
+                const pos = timelinePosition(timeline, c, now, shop.ianaTimezone);
+                if (pos) timelineLines.set(c.id, timelineLineHtml(locale, pos));
+              }
+            }
+          }
+        }
+      } catch (err) {
+        console.error("[portal] results timeline (home) failed", err);
+      }
+    } else if (growth.resultsTimeline && portalSession.isPreview) {
+      // Admin preview: render the line without touching the experiment.
+      try {
+        const timeline = await resolveTimeline(shop.id, locale);
+        if (timeline.enabled) {
+          const now = new Date();
+          for (const c of contracts) {
+            if (c.status !== "ACTIVE") continue;
+            const pos = timelinePosition(timeline, c, now, shop.ianaTimezone);
+            if (pos) timelineLines.set(c.id, timelineLineHtml(locale, pos));
+          }
+        }
+      } catch (err) {
+        console.error("[portal] results timeline (preview) failed", err);
+      }
+    }
+
+    // "On its way · Track" (v1.28.0, P4.2, portalGrowth.deliveriesList): one
+    // batched read of each contract's newest charge; the line renders only
+    // while that order is shipped, not delivered and within the in-transit
+    // window (portal.deliveriesInTransitMaxDays). Contained.
+    const inTransitLines = new Map<string, string>();
+    if (growth.deliveriesList) {
+      try {
+        const latest = await latestDeliveryByContract(
+          contracts.map((c) => c.id),
+          { processingMaxDays: portalSettings.deliveriesProcessingMaxDays },
+        );
+        for (const c of contracts) {
+          const row = latest.get(c.id);
+          const transit = row
+            ? latestInTransit([row], { maxDays: portalSettings.deliveriesInTransitMaxDays })
+            : null;
+          if (transit) inTransitLines.set(c.id, inTransitLineHtml({ locale, row: transit }));
+        }
+      } catch (err) {
+        console.error("[portal] in-transit lines (home) failed", err);
+      }
+    }
 
     // Value-first cards (portalGrowth.homeValueCard, v1.20.0): the card
     // leads with captured member savings + milestone proximity instead of
@@ -566,6 +957,92 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       } catch (err) {
         console.error("[portal] member savings scan failed", err);
       }
+    }
+    // THE next-order estimate per contract (P2.4): lines-free (money only —
+    // the card lists the mirror's lines itself), live grant applied inside.
+    // Charge timing once per page; preparing state from one attempts query.
+    const timing = await resolveChargeTiming(shop.id, shop.ianaTimezone);
+    // One attempts query answers both "preparing?" and the ORDER DATE being
+    // prepared (the in-flight attempt's own date — the mirror pointer is
+    // already the following cycle at that moment).
+    const preparingDates = await preparingOrderDateByContract(contracts, timing);
+    const preparingMap = new Map<string, boolean>();
+    for (const [id, date] of preparingDates) preparingMap.set(id, date != null);
+    const estimates = new Map<string, NextChargeEstimate>();
+    for (const contract of contracts) {
+      let grant: Awaited<ReturnType<typeof getActiveDiscountForCycle>> | undefined;
+      try {
+        grant = await getActiveDiscountForCycle(contract.id);
+      } catch (err) {
+        console.error("[portal] discount grant lookup failed", contract.id, err);
+      }
+      estimates.set(
+        contract.id,
+        await safeEstimateNextCharge(
+          { id: shop.id, ianaTimezone: shop.ianaTimezone },
+          contract,
+          {
+            includeScheduledGifts: false,
+            ...(grant !== undefined ? { grant } : {}),
+          },
+        ),
+      );
+    }
+
+    // Newer card on file (v1.28.0, P1.8): contracts the webhook TOLD about a
+    // new method (dunning.new_method_detected, action notified, ≤30 days)
+    // that still pay with another one. Rides the payment-methods list
+    // switch (the button IS that list's verb); real customers only;
+    // contained (empty map on failure).
+    let newCardHits = new Map<string, NewCardBannerHit>();
+    if (portalSettings.paymentMethodsList && !portalSession.isPreview) {
+      newCardHits = await newCardBannerHits(contracts, {
+        preExpiryNoticeDays: dunningSettings.preExpiryNoticeDays,
+        tz: shop.ianaTimezone,
+        // Liveness re-check through the detail page's 60 s memo (one Shopify
+        // read per customer at most); null on failure keeps the hit.
+        liveMethodIds: async (customerGid) => {
+          try {
+            const admin = await adminClientForShop(session.shop);
+            const live = await listLivePaymentMethodsCached(admin, customerGid);
+            return new Set(live.map((m) => m.id));
+          } catch (err) {
+            console.error("[portal] new-card banner method read failed", err);
+            return null;
+          }
+        },
+      });
+    }
+
+    // Cancel-intent banner (v1.28.0, P3.6): for cancelFlow.intentBannerDays
+    // after a walked-away cancel session, the reason-matched options — the
+    // same truth the follow-up email carries. Above the cards, outside the
+    // growth helpers (this is cancel-flow context, not growth copy).
+    // Contained: renders nothing on any failure.
+    try {
+      const cancelFlow = await getSetting(shop.id, "cancelFlow");
+      if (cancelFlow.enabled && cancelFlow.intentBannerDays > 0) {
+        let supportAvailable = false;
+        try {
+          supportAvailable = (await getSupportChannels(shop.id)).hasAny;
+        } catch {
+          supportAvailable = false;
+        }
+        body += await renderIntentBanner(contracts, {
+          shopId: shop.id,
+          tz: shop.ianaTimezone,
+          locale,
+          csrf: portalSession.csrfToken,
+          preview: portalSession.previewToken,
+          isPreview: portalSession.isPreview,
+          bannerDays: cancelFlow.intentBannerDays,
+          downsizeEnabled: cancelFlow.downsizeSaveEnabled,
+          preparingByContract: preparingMap,
+          supportAvailable,
+        });
+      }
+    } catch (err) {
+      console.error("[portal] cancel-intent banner failed", err);
     }
 
     for (const contract of contracts) {
@@ -586,7 +1063,35 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
           lifecycle.milestoneGiftCycle,
           lifecycle.milestoneLadder,
         ),
+        dunning: dunningByContract.get(contract.id) ?? null,
+        payment: derivePortalPaymentState(contract, {
+          preExpiryNoticeDays: dunningSettings.preExpiryNoticeDays,
+          tz: shop.ianaTimezone,
+        }),
+        estimate: estimates.get(contract.id)!,
+        cutoff: contractCutoff(contract.nextBillingDate, timing),
+        preparing: preparingMap.get(contract.id) ?? false,
+        preparingOrderDate: preparingDates.get(contract.id) ?? null,
+        timelineLine: timelineLines.get(contract.id) ?? "",
+        inTransitLine: inTransitLines.get(contract.id) ?? "",
+        newCard: newCardHits.get(contract.id) ?? null,
       });
+    }
+
+    // Impression event for every payment-issue card — real customers only,
+    // once per case per window (shared with the detail banner).
+    if (!portalSession.isPreview) {
+      for (const contract of contracts) {
+        const view = dunningByContract.get(contract.id);
+        if (!view || contract.isDemo) continue;
+        await logDunningBannerShown({
+          shopId: shop.id,
+          contract,
+          view,
+          surface: "home",
+          windowHours: portalSettings.dunningBannerEventHours,
+        });
+      }
     }
   }
 

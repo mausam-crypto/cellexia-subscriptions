@@ -1,6 +1,8 @@
 import prisma from "~/db.server";
-import { approxWeeks, type Frequency } from "~/lib/frequency";
+import { addDaysTz, addIntervalTz } from "~/lib/dates.server";
+import { approxWeeks, contractFrequency, type Frequency } from "~/lib/frequency";
 import { OURS_ONLY } from "~/lib/ownership/ownership.server";
+import { getSetting } from "~/lib/settings/settings.server";
 
 /**
  * Portal growth helpers (v1.20.0, `portalGrowth` settings group — every
@@ -200,5 +202,309 @@ export async function popularAddonProductIds(
   } catch (err) {
     console.error("[portal] popular add-on scan failed", err);
     return new Set();
+  }
+}
+
+// ── Rewards roadmap (v1.28.0, P4.3) ──────────────────────────────────────────
+
+/** Contract fields the roadmap math reads (a LocalContract satisfies it). */
+export interface RoadmapContract {
+  id: string;
+  ordersCount: number;
+  nextBillingDate: Date | null;
+  firstChargeAt: Date | null;
+  createdAt: Date;
+  intervalWeeks: number;
+  billingIntervalUnit?: string | null;
+  billingIntervalCount?: number | null;
+}
+
+export type RoadmapGiftLabel =
+  /** The exact product is committed (FIXED rule variant / scheduled grant). */
+  | { kind: "named"; title: string }
+  /** A gift will ship but the pick is dynamic — "a free product". */
+  | { kind: "generic" }
+  /** No gift is behind this rung — a milestone only, never a promise. */
+  | { kind: "none" };
+
+export interface RoadmapRow {
+  kind: "surprise" | "milestone" | "rewards";
+  /** Order number for milestone / surprise rows. */
+  orderNumber: number | null;
+  /** Reached already (✓) — the engine's own >= rules. */
+  reached: boolean;
+  /** Projected calendar moment ("around {date}"); null when unknowable. */
+  aroundDate: Date | null;
+  gift: RoadmapGiftLabel;
+}
+
+export interface RewardsRoadmap {
+  rows: RoadmapRow[];
+  /** Successful deliveries so far (local ordersCount — the billed truth). */
+  deliveriesSoFar: number;
+  /** Free gifts that actually shipped (SHIPPED, or the settlement stamp). */
+  giftsReceived: number;
+}
+
+/**
+ * The calendar moment order `orderNumber` is expected to bill: the SAME
+ * schedule math the gift engine uses to date a rung (order-number space,
+ * intervals from the next billing date, shop timezone). Null when the
+ * contract has no next date or the order is already behind it.
+ */
+export function projectOrderDate(
+  contract: RoadmapContract,
+  orderNumber: number,
+  tz: string,
+): Date | null {
+  if (!contract.nextBillingDate) return null;
+  const upcoming = contract.ordersCount + 1;
+  const delta = orderNumber - upcoming;
+  if (delta < 0) return null;
+  if (delta === 0) return contract.nextBillingDate;
+  const freq = contractFrequency(contract);
+  return addIntervalTz(contract.nextBillingDate, freq.unit, freq.count, tz, delta);
+}
+
+/**
+ * Build the roadmap. Truth gates (load-bearing):
+ *  - a gift is NAMED only when the pick is deterministic and committed: the
+ *    base milestone's ORDER_INDEX rule is FIXED with a variant title, or a
+ *    SCHEDULED/ADDED grant already sits on the upcoming cycle for that rung
+ *    (title from its own scheduling event);
+ *  - a ladder rung says "a free product" only when the engine can actually
+ *    grant one (a non-empty gift pool, or the base rule as its fallback);
+ *  - the day-N reward says "a free product" only with rewardsGiftEnabled;
+ *  - the cycle-2 surprise appears ONLY when the teaser email was actually
+ *    sent for this contract (`teaserPromised`) — holdout arms never got one,
+ *    and even treatment arms are told nothing the teaser did not already say;
+ *    a base rung ON order 2 (milestoneGiftCycle 2) is the same gift2 slice
+ *    and follows the same rule (no teaser ⇒ no promise; never a duplicate
+ *    row next to the surprise row);
+ *  - REACHED rows are labelled from EVIDENCE of a grant, never from config:
+ *    the day-N row from a source REWARDS GiftGrant, a milestone rung from
+ *    its lifecycle.milestone_reached event's `giftGranted` (the engine's own
+ *    truth gate for the milestone email) — a reached rung whose box carried
+ *    no gift reads "reached" with no product, exactly like the email.
+ * Every read is contained: a failed lookup degrades to the generic / none
+ * label, never to a bolder promise.
+ */
+export async function buildRewardsRoadmap(input: {
+  shopId: string;
+  tz: string;
+  contract: RoadmapContract;
+  lifecycle: {
+    milestoneGiftCycle: number;
+    milestoneLadder: readonly number[];
+    rewardsUnlockDay: number;
+    rewardsGiftEnabled?: boolean;
+  };
+  now?: Date;
+  /** gift_teaser SENT for cycle 2 (the caller checks the NotificationLog). */
+  teaserPromised?: boolean;
+  /** Shopify cycle index of the upcoming order, when the caller knows it. */
+  upcomingCycleIndex?: number | null;
+  /** lifecycle.rewards_unlocked already logged for this customer. */
+  rewardsUnlockedEvent?: boolean;
+}): Promise<RewardsRoadmap> {
+  const { contract, lifecycle, tz } = input;
+  const now = input.now ?? new Date();
+  const rows: RoadmapRow[] = [];
+
+  // Reads (each contained).
+  let baseRule: { selection: string; variantTitle: string | null; variantId: string } | null = null;
+  let poolSize = 0;
+  let giftsReceived = 0;
+  let scheduledTitle: string | null = null;
+  let scheduledOnUpcoming = false;
+  let rewardsGrant = false;
+  /** ordersCount → giftGranted from lifecycle.milestone_reached (reached rungs). */
+  const milestoneGranted = new Map<number, boolean>();
+  try {
+    baseRule = await prisma.giftRule.findFirst({
+      where: {
+        shopId: input.shopId,
+        active: true,
+        trigger: "ORDER_INDEX",
+        orderIndex: lifecycle.milestoneGiftCycle,
+      },
+      select: { selection: true, variantTitle: true, variantId: true },
+    });
+  } catch (err) {
+    console.error("[portal] roadmap: base milestone rule read failed", err);
+  }
+  try {
+    const gifts = (await getSetting(input.shopId, "gifts")) as { pool?: unknown[] };
+    poolSize = Array.isArray(gifts.pool) ? gifts.pool.length : 0;
+  } catch (err) {
+    console.error("[portal] roadmap: gifts settings read failed", err);
+  }
+  try {
+    giftsReceived = await prisma.giftGrant.count({
+      where: {
+        contractId: contract.id,
+        OR: [{ status: "SHIPPED" }, { shippedAt: { not: null } }],
+      },
+    });
+  } catch (err) {
+    console.error("[portal] roadmap: gift count failed", err);
+  }
+  try {
+    const rewards = await prisma.giftGrant.findFirst({
+      where: { contractId: contract.id, source: "REWARDS" },
+      select: { id: true },
+    });
+    rewardsGrant = rewards != null;
+  } catch (err) {
+    console.error("[portal] roadmap: rewards grant read failed", err);
+  }
+  if (contract.ordersCount > 0) {
+    try {
+      const events = await prisma.subscriberEvent.findMany({
+        where: { contractId: contract.id, type: "lifecycle.milestone_reached" },
+        select: { payload: true },
+      });
+      for (const ev of events) {
+        const p = ev.payload as { ordersCount?: unknown; giftGranted?: unknown } | null;
+        const n = typeof p?.ordersCount === "number" ? p.ordersCount : null;
+        if (n != null && !milestoneGranted.get(n)) {
+          milestoneGranted.set(n, p?.giftGranted === true);
+        }
+      }
+    } catch (err) {
+      console.error("[portal] roadmap: milestone events read failed", err);
+    }
+  }
+  if (input.upcomingCycleIndex != null) {
+    try {
+      const grant = await prisma.giftGrant.findFirst({
+        where: {
+          contractId: contract.id,
+          cycleIndex: input.upcomingCycleIndex,
+          status: { in: ["SCHEDULED", "ADDED"] },
+          source: { in: ["RULE", "LADDER"] },
+        },
+        orderBy: { createdAt: "desc" },
+        select: { id: true },
+      });
+      if (grant) {
+        scheduledOnUpcoming = true;
+        const ev = await prisma.subscriberEvent.findFirst({
+          where: {
+            contractId: contract.id,
+            type: "lifecycle.gift_scheduled",
+            payload: { path: ["grantId"], equals: grant.id },
+          },
+          select: { payload: true },
+        });
+        const title = (ev?.payload as { variantTitle?: unknown } | null)?.variantTitle;
+        scheduledTitle = typeof title === "string" && title.trim() ? title.trim() : null;
+      }
+    } catch (err) {
+      console.error("[portal] roadmap: scheduled grant read failed", err);
+    }
+  }
+
+  // Cycle-2 surprise — only what the teaser already promised.
+  const surpriseRow = input.teaserPromised === true && contract.ordersCount < 2;
+  if (surpriseRow) {
+    rows.push({
+      kind: "surprise",
+      orderNumber: 2,
+      reached: false,
+      aroundDate: projectOrderDate(contract, 2, tz),
+      gift: { kind: "generic" },
+    });
+  }
+
+  // Milestone rungs — the base cycle + every ladder rung, ascending.
+  const rungs = [...new Set([lifecycle.milestoneGiftCycle, ...lifecycle.milestoneLadder])]
+    .filter((c) => c > 0)
+    .sort((a, b) => a - b);
+  const upcomingOrder = contract.ordersCount + 1;
+  for (const rung of rungs) {
+    const isBase = rung === lifecycle.milestoneGiftCycle;
+    const reached = contract.ordersCount >= rung;
+    // Order 2 is the gift2 experiment's slice: the surprise row (teaser
+    // gated) already covers it; without a teaser nothing is promised.
+    if (rung === 2 && !reached) {
+      if (surpriseRow) continue;
+      rows.push({
+        kind: "milestone",
+        orderNumber: rung,
+        reached: false,
+        aroundDate: projectOrderDate(contract, rung, tz),
+        gift: { kind: "none" },
+      });
+      continue;
+    }
+    let gift: RoadmapGiftLabel;
+    if (reached) {
+      // Evidence only: the engine's milestone event says whether a gift rode
+      // along. No event / no grant ⇒ no product claim.
+      gift = milestoneGranted.get(rung) === true ? { kind: "generic" } : { kind: "none" };
+    } else if (rung === upcomingOrder && scheduledOnUpcoming) {
+      gift = scheduledTitle ? { kind: "named", title: scheduledTitle } : { kind: "generic" };
+    } else if (isBase) {
+      gift = !baseRule
+        ? { kind: "none" }
+        : baseRule.selection === "FIXED" && baseRule.variantTitle
+          ? { kind: "named", title: baseRule.variantTitle }
+          : { kind: "generic" };
+    } else {
+      gift = poolSize > 0 || baseRule ? { kind: "generic" } : { kind: "none" };
+    }
+    rows.push({
+      kind: "milestone",
+      orderNumber: rung,
+      reached,
+      aroundDate: reached ? null : projectOrderDate(contract, rung, tz),
+      gift,
+    });
+  }
+
+  // Day-N rewards unlock.
+  const start = contract.firstChargeAt ?? contract.createdAt;
+  const unlockAt = addDaysTz(start, lifecycle.rewardsUnlockDay, tz);
+  const unlocked = input.rewardsUnlockedEvent === true || unlockAt.getTime() <= now.getTime();
+  rows.push({
+    kind: "rewards",
+    orderNumber: null,
+    reached: unlocked,
+    aroundDate: unlocked ? null : unlockAt,
+    // Reached: only an actual REWARDS grant is a gift (the sweep is
+    // best-effort — empty pool / no admin client ⇒ no grant, and the email
+    // already omitted the product line). Ahead: the config prediction.
+    gift: unlocked
+      ? rewardsGrant
+        ? { kind: "generic" }
+        : { kind: "none" }
+      : lifecycle.rewardsGiftEnabled !== false
+        ? { kind: "generic" }
+        : { kind: "none" },
+  });
+
+  return { rows, deliveriesSoFar: Math.max(0, contract.ordersCount), giftsReceived };
+}
+
+/**
+ * Was the cycle-2 teaser actually SENT for this contract? The only source
+ * of a "surprise" row (holdout arms never receive one). Contained.
+ */
+export async function teaserPromisedFor(contractId: string): Promise<boolean> {
+  try {
+    const row = await prisma.notificationLog.findFirst({
+      where: {
+        contractId,
+        template: "gift_teaser",
+        status: "SENT",
+        payload: { path: ["cycleIndex"], equals: 2 },
+      },
+      select: { id: true },
+    });
+    return row != null;
+  } catch (err) {
+    console.error("[portal] roadmap: teaser lookup failed", contractId, err);
+    return false;
   }
 }

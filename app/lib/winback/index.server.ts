@@ -14,3 +14,10 @@ export {
   type ReactivateOptions,
   type WinbackSweepStats,
 } from "./engine.server";
+export {
+  buildRestartUrl,
+  deriveCurrentWinbackOffer,
+  reactivateWithCurrentOffer,
+  restartLinkVars,
+  type WinbackOffer,
+} from "./restart.server";

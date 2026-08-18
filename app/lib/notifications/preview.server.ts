@@ -30,8 +30,12 @@ const SAMPLE_LINKS: TemplateVars = {
   delay_3w_url: "https://example.com/delay-3-weeks",
   pause_url: "https://example.com/pause",
   update_card_url: "https://example.com/update-card",
+  retry_payment_url: "https://example.com/retry-payment",
   addon_url: "https://example.com/add-to-next-order",
+  resume_url: "https://example.com/resume-now",
+  extend_pause_url: "https://example.com/extend-pause",
   reactivate_url: "https://example.com/restart",
+  restart_url: "https://example.com/restart-my-subscription",
   tracking_url: "https://example.com/track/CH1029384756",
 };
 
@@ -56,14 +60,65 @@ const SAMPLE_BY_TEMPLATE: Partial<Record<TemplateKey, TemplateVars>> = {
     discount_percent: 20,
     addon_title: "Cellexia Eye Contour",
     addon_price_formatted: "CHF 42.00",
+    card_label: "Visa ····4242",
+    payment_line: "Payment method: Visa ····4242",
+    card_expiry_warning: "",
+    edit_cutoff: "12 September 2026, 00:00",
+    edit_cutoff_iso: "2026-09-11T22:00:00.000Z",
+    edit_cutoff_line: "You can make changes until 12 September 2026, 00:00.",
+    following_date: "7 November 2026",
+    following_date_iso: "2026-11-07",
   },
   resume_reminder: {
     resume_date: "12 September 2026",
     resume_date_iso: "2026-09-12",
   },
+  // v1.28.0 (P2.6): the pause confirmation quotes the exact resume day via
+  // the contract snapshot's resume_line (empty for an external pause).
+  pause_confirmed: {
+    resume_date: "12 September 2026",
+    resume_date_iso: "2026-09-12",
+    resume_line: "Deliveries resume on 12 September 2026.",
+  },
+  // v1.28.0 (P3.8): scheduled cancel on a locked contract — the exact end
+  // date + the one-tap KEEP link.
+  cancel_scheduled: {
+    cancel_date: "30 September 2026",
+    cancel_date_iso: "2026-09-30",
+    keep_url: "https://example.com/keep-my-subscription",
+    cta_url: "https://example.com/keep-my-subscription",
+  },
+  cancel_upcoming: {
+    cancel_date: "30 September 2026",
+    cancel_date_iso: "2026-09-30",
+    keep_url: "https://example.com/keep-my-subscription",
+    cta_url: "https://example.com/keep-my-subscription",
+  },
   order_confirmed: { order_name: "#2148", amount: "CHF 132.00" },
   order_shipped: { order_name: "#2148", tracking_number: "CH1029384756" },
-  payment_method_updated: { card_brand: "Visa", card_last4: "4242" },
+  payment_method_updated: {
+    card_brand: "Visa",
+    card_last4: "4242",
+    card_label: "Visa ····4242",
+    previous_card_label: "Visa ····0000",
+    change_line:
+      "Thank you — your subscription now uses Visa ····4242, and everything is set for your next order.",
+    next_line: "Your next order of CHF 132.00 is scheduled for 12 September 2026.",
+    amount: "CHF 132.00",
+    cta_url: "https://example.com/account",
+  },
+  // v1.28.0 (P1.8): a newer card on the account while a payment is on hold.
+  new_card_detected: {
+    card_label: "Mastercard ····8210",
+    current_card_label: "Visa ····4242",
+    intro_line:
+      "We noticed a new card on your account — Mastercard ····8210 — while a payment for your subscription is on hold. Switching to it retries that payment straight away.",
+    backup_line:
+      "Prefer to keep Visa ····4242? Set the new card as your backup instead, and we'll only use it if a payment fails: https://example.com/set-as-backup",
+    use_url: "https://example.com/use-new-card",
+    backup_url: "https://example.com/set-as-backup",
+    cta_url: "https://example.com/use-new-card",
+  },
   payment_failed_1: {
     amount: "CHF 132.00",
     decline_human: "the card was declined",
@@ -81,6 +136,8 @@ const SAMPLE_BY_TEMPLATE: Partial<Record<TemplateKey, TemplateVars>> = {
     card_last4: "4242",
     cta_url: "https://example.com/update-card",
     cta_label: "Review or update card",
+    other_cards_block:
+      "Or switch in one tap: [Use my card Mastercard ····8888 instead](https://example.com/use-method)\n\n",
   },
   payment_failed_3: {
     amount: "CHF 132.00",
@@ -89,8 +146,31 @@ const SAMPLE_BY_TEMPLATE: Partial<Record<TemplateKey, TemplateVars>> = {
     card_last4: "4242",
     cta_url: "https://example.com/update-card",
     cta_label: "Review or update card",
+    other_cards_block:
+      "Or switch in one tap: [Use my card Mastercard ····8888 instead](https://example.com/use-method)\n\n",
+  },
+  payment_failed_parked: {
+    amount: "CHF 132.00",
+    decline_human: "the card was declined",
+    days_since_failure: 37,
+    card_last4: "4242",
+    cta_url: "https://example.com/update-card",
+    cta_label: "Update my card",
+    skip_resume_url: "https://example.com/skip-and-continue",
+    resume_date: "3 October 2026",
+    // The "ways to continue" block is composed by the touch (live card:
+    // three exits; hard-dead card: update-only) — the sample shows the
+    // three-exit variant with its links resolved.
+    ways_intro:
+      "Whichever suits you takes one tap:\n\n1. **Update your card** (or pick another one from your account):",
+    ways_more:
+      "2. **Retry with the same card** — sorted it with your bank? [Retry the payment now](https://example.com/retry-payment).\n\n3. **Skip that order and simply continue** from 3 October 2026: [Skip it and continue](https://example.com/skip-and-continue) — nothing is charged today.",
   },
   payment_failed_sms: { amount: "CHF 132.00" },
+  threeds_action_sms: {
+    amount: "CHF 132.00",
+    confirm_url: "https://example.com/confirm-payment",
+  },
   card_expiring: {
     card_brand: "Visa",
     card_last4: "4242",
@@ -111,6 +191,45 @@ const SAMPLE_BY_TEMPLATE: Partial<Record<TemplateKey, TemplateVars>> = {
     gift_date_line: "It arrives with your delivery on 12 September 2026.",
   },
   gift_teaser: {},
+  routine_checkin: {
+    week: 5,
+    phase_title: "Settling into the rhythm",
+    phase_body:
+      "By now the routine is part of your day. Many people say this is when it starts to feel automatic — keep going, consistency is what makes the difference.",
+    next_phase_line: "From week 9: When people start to notice",
+    expectation_line:
+      "You told us you were hoping to see something within a few weeks. Many people find it takes a couple of months to settle in, so week 5 is right on track.",
+    checkin_great_url: "https://example.com/checkin-great",
+    checkin_unsure_url: "https://example.com/checkin-unsure",
+    cta_url: "https://example.com/account",
+  },
+  cancel_intent_followup: {
+    reason: "TOO_MUCH_PRODUCT",
+    step: "saves",
+    reason_line: "You mentioned you have more product than you need right now.",
+    options_block:
+      "- Skip my next order: https://example.com/skip-next-order\n- Push my next order back 3 weeks: https://example.com/delay-3-weeks\n- Switch to every 12 weeks: https://example.com/set-frequency\n- Make my next order smaller: https://example.com/subscription",
+    support_line: "Rather talk it through? Reach us at https://example.com/account#cxs-support — a real person reads every message.",
+    set_frequency_url: "https://example.com/set-frequency",
+    manage_url: "https://example.com/subscription",
+    support_url: "https://example.com/account#cxs-support",
+    cancel_url: "https://example.com/cancel",
+    cta_url: "https://example.com/subscription",
+  },
+  subscription_started: {
+    product: "Cellexia Renewal Serum",
+    order_name: "#2148",
+    first_order_line: "Your first order #2148 is placed and being prepared.",
+    next_line:
+      "Your next order of about CHF 132.00 is scheduled for 12 September 2026 (every 8 weeks).",
+    amount: "CHF 132.00",
+    edit_cutoff: "12 September 2026, 00:00",
+    edit_cutoff_iso: "2026-09-11T22:00:00.000Z",
+    changes_line: "You can change, skip or delay it until 12 September 2026, 00:00.",
+    support_email: "hello@example.com",
+    support_line: "Questions? Write to us at hello@example.com — we're happy to help.",
+    cta_url: "https://example.com/account",
+  },
   milestone_gift: {
     milestone_cycle: 6,
     gift_line: "To say thank you, this delivery includes a free Cellexia Night Cream — on us.",

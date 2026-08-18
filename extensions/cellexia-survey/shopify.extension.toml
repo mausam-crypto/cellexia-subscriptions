@@ -12,7 +12,9 @@
 #      setting to the app host (same value as SHOPIFY_APP_URL, no trailing
 #      slash).
 #   2. Repeat in the checkout-and-accounts editor for the Order status page.
-# The block renders nothing until the App URL is set.
+# The survey renders nothing until the App URL is set; the "Manage your
+# subscription" card (v1.28.0, src/manage-link.jsx) needs no setting — it
+# renders on subscription orders as soon as the block is placed.
 
 # Checkout UI extension versions are only accepted while supported (~4
 # quarters); this MUST track a current version and stay in lockstep with the
@@ -44,4 +46,4 @@ type = "ui_extension"
     key = "app_url"
     type = "single_line_text_field"
     name = "App URL"
-    description = "The Cellexia Subscriptions app host, e.g. https://your-app.fly.dev — same value as SHOPIFY_APP_URL, without a trailing slash. The survey stays hidden until this is set."
+    description = "The Cellexia Subscriptions app host, e.g. https://your-app.fly.dev — same value as SHOPIFY_APP_URL, without a trailing slash. The survey stays hidden until this is set (the Manage your subscription card shows regardless)."

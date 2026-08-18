@@ -204,6 +204,10 @@ model SubscriptionContract {
   cancelledAt                     DateTime?
   cancelReason                    String?
   cancelSource                    String? // CUSTOMER | ADMIN | DUNNING | SYSTEM
+  // Cancel scheduled for the END of the current (prepaid / committed) term
+  // (migration 0028) instead of immediately — the contract stays ACTIVE
+  // until the scheduler honours it. Null = no scheduled cancel.
+  cancelScheduledAt               DateTime?
   // Expiry state (migration 0016): stamped when the mirror flips status
   // EXPIRED (Shopify ends a contract whose billingMaxCycles ran out), so
   // lifecycle analytics can date the expiry the way cancelledAt dates a
@@ -224,10 +228,25 @@ model SubscriptionContract {
   cardLast4                       String?
   cardExpiryMonth                 Int?
   cardExpiryYear                  Int?
+  // Normalized instrument kind behind paymentMethodId (migration 0027):
+  // CREDIT_CARD | SHOP_PAY | PAYPAL | UNKNOWN. Null = mirror not backfilled.
+  // Decides the card-update path (hosted URL is Shop Pay only) and the
+  // instrument-aware portal label.
+  paymentInstrumentType           String?
+  // Stamped by the revoke webhook when the primary was revoked and no backup
+  // promotion happened; cleared whenever the mirror refreshes to a live
+  // method. cardLast4 is kept for copy.
+  paymentMethodRevokedAt          DateTime?
+  // Who last set backupPaymentMethodId (CUSTOMER | ADMIN | ENGINE) and when.
+  backupSetBy                     String?
+  backupSetAt                     DateTime?
   // Delivery
   deliveryAddress                 Json?
   deliveryPriceCents              Int       @default(0)
   deliveryMethodTitle             String?
+  // Customer-entered delivery note (migration 0028, P2.8), mirrored to the
+  // Shopify contract note / custom attributes by setDeliveryInstructions.
+  deliveryInstructions            String?
   // Lock window commitment as SUBSCRIBED UNDER (v1.13.0): the covering
   // plan's lockDays at mirror creation, stamped once on the webhook-create
   // path and never rewritten. Null = row predates the feature, was imported,
@@ -465,6 +484,20 @@ model ContractLine {
   // Null on non-add-on lines and on legacy add-on rows (cleared on any
   // settlement, the old behavior).
   addonCycleIndex     Int?
+  // Per-cycle line edits (migration 0028) — billing-cycle contract drafts
+  // that touch ONE upcoming cycle while the contract line stays intact.
+  // `skippedCycleIndex`: the Shopify cycle index the customer chose "not
+  // this time" for (line removed from that cycle's draft) — the estimate
+  // marks the line skippedThisCycle and bills 0 when it equals the upcoming
+  // cycle index. `cycleQuantityOverride` / `cycleQuantityOverrideIndex`: a
+  // one-cycle quantity tweak staged on that index — the estimate bills the
+  // override quantity when the index equals the upcoming cycle; `quantity`
+  // keeps the plan quantity. Values below the upcoming index are stale
+  // (settled / whole-cycle skip / re-anchor) and are nulled by
+  // clearStaleCycleOverrides (estimate.server.ts). Null = ships as usual.
+  skippedCycleIndex          Int?
+  cycleQuantityOverride      Int?
+  cycleQuantityOverrideIndex Int?
   addedVia            String   @default("CHECKOUT") // CHECKOUT | PORTAL | MAGIC_LINK | ADMIN | GIFT_ENGINE | SWAP
   // Atomic add claim (migration 0009): addOneTimeAddon / addLine create the
   // mirror row FIRST, keyed "addon:{contractId}:{variantId}" respectively
@@ -534,6 +567,9 @@ model BillingAttempt {
   dunningClaimedAt  DateTime?
   originatingAction String               @default("SCHEDULER") // SCHEDULER | DUNNING_RETRY | ADMIN_MANUAL | BACKUP_FALLBACK
   usedBackupPayment Boolean              @default(false)
+  // Last 3DS challenge URL observed for this attempt (migration 0027) —
+  // the portal's "Confirm with my bank" re-uses it.
+  challengeUrl      String?
   // Σ cents refunded against this attempt's order (REFUNDS_CREATE webhook).
   // amountCents keeps the amount originally charged; analytics report
   // revenue net of this column, so the charge history is never rewritten.
@@ -554,6 +590,17 @@ model BillingAttempt {
   // originOrderProcessedAt / originOrderFulfilledAt).
   orderProcessedAt  DateTime?
   fulfilledAt       DateTime?
+  // Renewal-order shipping facts (migration 0028) from FULFILLMENTS webhooks
+  // / order reads: the portal's "track your parcel" and the shipped /
+  // delivered emails read these instead of calling the admin API.
+  // fulfilledAt stays the analytics first-fulfillment instant; shippedAt /
+  // deliveredAt are the customer-facing milestones. Null until captured.
+  trackingUrl       String?
+  trackingCompany   String?
+  trackingNumber    String?
+  orderStatusUrl    String?
+  shippedAt         DateTime?
+  deliveredAt       DateTime?
   // Per-charge cost basis (migration 0016): {v:1, cogsCents,
   // estimatedCogsCents, shippingCostCents, fulfillmentCostCents,
   // deliveriesPerCharge, lines[]} captured at settlement through the shared
@@ -606,7 +653,10 @@ model DunningCase {
   smsSent                  Int          @default(0)
   lastNotifiedAt           DateTime?
   resolvedAt               DateTime?
-  resolution               String? // RECOVERED | CUSTOMER_FIXED | CANCELLED | EXHAUSTED
+  // CUSTOMER_SKIPPED (v1.28.0) = the customer skipped the held cycle on an
+  // exhausted case and continued: resolved, but deliberately NOT "recovered"
+  // in dunningRecoveryRate (no money came in) — see ARCHITECTURE Dunning row.
+  resolution               String? // RECOVERED | CUSTOMER_FIXED | CUSTOMER_SKIPPED | CANCELLED | EXHAUSTED
   recoveredAttemptId       String?
   recoveredCents           Int?
   // Amount at risk (migration 0016): the ESTIMATED cycle amount at case-open,
@@ -627,6 +677,9 @@ model DunningCase {
   // edit cannot replay or skip steps. Null = pre-0016 case; the engine falls
   // back to ladderStep.
   ladderCursor             Int?
+  // Last customer-initiated "Retry now" on this case (migration 0027) —
+  // per-case throttle for the portal retry verb.
+  customerRetryAt          DateTime?
 
   contract SubscriptionContract @relation(fields: [contractId], references: [id], onDelete: Cascade)
 
@@ -860,6 +913,9 @@ model WinbackState {
   // which compliance reviews and win-back reporting both need. Null on rows
   // that opted out before 0016.
   optedOutAt         DateTime?
+  // Cancel reason snapshotted when the episode opened (migration 0028) so
+  // touches can be reason-aware without re-reading contract.cancelReason.
+  reason             String?
   createdAt          DateTime  @default(now())
 
   @@index([status, nextTouchAt])

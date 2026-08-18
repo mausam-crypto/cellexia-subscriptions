@@ -4,6 +4,525 @@ All notable changes to Cellexia Subscriptions. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [SemVer](https://semver.org) as contracted in [docs/UPDATE.md](docs/UPDATE.md).
 
+## [1.28.0] — 2026-08-17
+
+**The portal churn pack: a subscriber can now fix a failed payment, see and
+shape their next order, reach a human, and leave (or come back) on their own
+terms — every one of those from the portal, an email or a text, with copy
+that is true.** Before this release the customer portal read no dunning case
+(an ACTIVE subscription with a held payment looked healthy for up to 30 days
+and the "Update card" button called a Shopify page that only supports Shop
+Pay, so card payers hit a dead button), showed a next-order total that
+ignored the discount the customer had just accepted, delayed "one cycle" or
+"the whole schedule" without saying which, offered no way to skip one line
+of a multi-product box, no delivery instructions, no tracking, no cut-off
+time, no support path except a `mailto:` on a domain the store does not
+own, and went silent forever on a subscription the dunning ladder had given
+up on. Now: **payments** — one server-side card-update resolver (Shop Pay →
+hosted page; card / PayPal → Shopify's own 48-hour update email + a link to
+the account page), a payment-issue banner on the home card and the detail
+page with the state of the case and one or two honest actions per decline
+category (Retry now, Confirm with my bank, Update / Use another card, Pause
+instead, Skip that order and continue), instrument-aware labels and
+expiring / expired / removed states, a list of the customer's other vaulted
+methods with "Use for this subscription" and "Set as backup", a closed loop
+after every card change (email + immediate retry), new-card detection on the
+payment-method webhook, and post-exhaustion touches so a parked FAILED
+subscription is offered three exits instead of none. **Truth & timing** —
+`billing.chargeHourLocal` and one `timing.server.ts` so the sweep, the
+portal and the reminder agree on the charge moment and the "you can make
+changes until" line; a "Preparing your order" state that hides the schedule
+controls the API would refuse; ONE next-order estimate (`estimateNextCharge`)
+feeding the new "Your next delivery" hero, the home card, the reminder, the
+cancel flow and the dunning amounts; delay that re-anchors by default with an
+explicit "just this once", both dates in the copy and an Undo for delay,
+next-date and frequency (portal toast + SMS `UNDO`); a price-lock pill, a
+saving line and a price-change banner. **Flexibility** — per-line "Not this
+time" and "just N this order" through billing-cycle contract drafts, a
+vacation hold with a real resume date and an exit ramp (Resume now / extend
+by N weeks / change the date; one-tap `RESUME` and `EXTEND_PAUSE` links in
+the reminder), an "already out → send my next order tomorrow" branch, a
+days-of-supply meter, delivery instructions + company + country/region
+selects on the address form. **Value** — "Your deliveries" with tracking from
+the fulfillment webhooks, a "Week N of your routine" results timeline that
+also powers the cancel-flow education card and a week-N check-in email, a
+rewards roadmap that names every rung with a date and a gift only when one
+is committed, a first-cycle onboarding card and a welcome email. **Cancel,
+save, win-back** — DOWNSIZE and DELAY saves with concrete totals, a concierge
+save that holds the order and promises the SLA the merchant configured,
+per-line skip as a save, saves for already-paused cancellers, a scheduled
+cancellation for locked contracts (KEEP link, reminder before the end date),
+a reason-matched follow-up for customers who opened the cancel flow and
+walked away (email + 14-day home banner + a new one-tap slower-cadence link),
+a signed one-tap `restart_url` in the cancel and soft win-back emails whose
+offer is re-derived server-side (portal parity) and a welcome-back landing
+page. **Support & trust** — a `support` settings group (email, Reply-To,
+WhatsApp, chat, hours, SLA), a Get-help card on the account page, every
+subscription page and the payment banner (topic, message, order picker,
+"push my order back a week"), Reply-To on every app email and on the
+auto-created Klaviyo flows, a "Manage your subscription" card on the
+Thank-you and Order-status pages, an accessibility pass with its own
+self-check, and education links reused by the cancel flow. Every claim in
+the new copy is computed from captured data, every new behaviour is a
+setting with a default equal to the old behaviour where one existed, and
+every new sending job is gated in Setup mode. **144 adversarially-verified
+review findings were confirmed across the seven build stages and 136 fixed
+with pinning tests** (8 low-severity findings deliberately left and
+documented in the stage records). **Requires `npm run setup` (migrations
+0027 + 0028, additive) AND `npm run deploy` (three new webhook topics in
+`shopify.app.toml` and the survey extension's new "Manage your subscription"
+card).** No new scopes, no new env vars, no `.liquid` change.
+
+> Update notes: `npm ci` → `npm run setup` (0027, 0028) → deploy / restart
+> the server → `npm run deploy` (webhook topics + checkout extension) →
+> Settings: fill **Support** (email at minimum), review **Billing timing**
+> (`chargeHourLocal`, default 0 = unchanged), the education URLs, the
+> results timeline and the dunning post-exhaustion touch days → Debug:
+> `payment_update_path`, `delivery_tracking`, `portal_a11y` → **before
+> subscriber #1, test the card-update path on the dev store with a real test
+> card** (the Shop-Pay-only hosted page vs Shopify's update email) and the
+> `/account` link. Full checklist in
+> [docs/RELEASE_NOTES_v1.28.0.md](docs/RELEASE_NOTES_v1.28.0.md).
+
+### Added
+
+**Payments & dunning**
+
+- **Card-update path resolver** `app/lib/payments/cardUpdate.server.ts`
+  (`resolveCardUpdatePath`): SHOP_PAY → `customerPaymentMethodGetUpdateUrl`
+  (302, as before); CREDIT_CARD / PAYPAL → `customerPaymentMethodSendUpdateEmail`
+  (Shopify's "Confirm payment for your subscription" mail, valid 48 h, same
+  method id) with the toast "we've emailed you a secure link" and a "Manage
+  payment methods in your account" link to `/account`; null / UNKNOWN type
+  tries the hosted URL and falls back on `INVALID_INSTRUMENT` (the userError
+  `code` is now selected). Used by the portal button, the `UPDATE_CARD` magic
+  link, the dunning SMS and the admin "Open secure page". Every path logs
+  `contract.card_update_link_sent {channel, source, actor}`; the portal logs
+  `portal.payment_update_clicked`. `SubscriptionContract.paymentInstrumentType`
+  (CREDIT_CARD | SHOP_PAY | PAYPAL | UNKNOWN) is mirrored wherever brand/last4
+  are.
+- **Payment-issue banner** (`app/lib/portal/dunning.server.ts` view-model +
+  `dunning-banner.server.ts` HTML) on the detail page and the home card
+  ("Payment issue" / "Card expiring" / "Card expired" / "Card removed" chips,
+  "Order held since {date}" instead of "Next order {date}"): what was
+  declined, where the case stands (RETRYING with the next retry day,
+  AWAITING_CUSTOMER, AWAITING_3DS, EXHAUSTED / FAILED "on hold"), the held
+  amount from the shared next-order estimate, and CTAs by decline category —
+  Retry now, Confirm with my bank, Update card / Use another card, Pause
+  instead, Skip that order and continue from {date} (FAILED, card not
+  hard-dead), Get help. `portal.dunning_banner_shown` once per case per
+  `portal.dunningBannerEventHours` (default 6).
+- **Customer retry** `POST /api/payment_retry` (also magic verb
+  `RETRY_PAYMENT` in `payment_failed_2/3` and SMS keyword `RETRY`): reopens a
+  FAILED contract's newest EXHAUSTED case exactly like a card update, throttled
+  per case by `DunningCase.customerRetryAt` +
+  `dunning.customerRetryCooldownMinutes` (default 60), never consumes a
+  ladder rung (`dunning.retry_scheduled {trigger: "customer"}`); a RETRYING
+  case now retries immediately when the mirrored card actually changed
+  (`onPaymentMethodUpdated` early return fixed).
+- **3DS from the portal** `POST /api/payment_3ds` (`threeds.server.ts`): the
+  challenged attempt's fresh `nextActionUrl` (stored `BillingAttempt.challengeUrl`
+  as fallback), gated by `isTrustedShopifyRedirect`, or "already settled" with
+  the real outcome; new SMS leg `threeds_action_sms` on challenge day 0
+  (same metric "Cellexia 3DS Action Required").
+- **Instrument-aware payment section** (`portal/payment.server.ts`): "Visa
+  ····4242 · expires 09/2026", "Shop Pay ····4242", "PayPal"; expired (red,
+  "your next order on {date} will fail"), expiring before the next charge /
+  within `dunning.preExpiryNoticeDays` (amber), removed
+  (`paymentMethodRevokedAt`, "choose or add another"), on-backup ("we're
+  using your backup card while ····4242 is fixed"); next-charge line with the
+  card on the home card and detail header; the pre-expiry job now includes
+  PAUSED contracts whose card expires before `resumeAt`.
+- **Other payment methods** (`portal/payment-methods.server.ts`,
+  `portal.paymentMethodsList` default on): the customer's other live vaulted
+  methods (60 s memo, GID re-validated against the live list — the form is
+  never trusted) with "Use for this subscription" (`POST /api/payment_select`
+  → `changePaymentMethod`, trigger `select`) and "Set as backup"
+  (`POST /api/payment_backup` → `setBackupPaymentMethod`, `backupSetBy:
+  CUSTOMER`); honest "Add another payment method" block when ≤ 1 method (no
+  in-app card entry exists — account page / secure email / any checkout);
+  magic verb `USE_METHOD`; `payment_failed_2/3` carry `{other_cards_block}`
+  ("Use my card ····1234 instead") for customers with ≥ 2 live methods.
+- **Closed loop after a card change**: the payment-method upsert webhook
+  sends `payment_method_updated` (24 h dedupe per contract + last4) and
+  Klaviyo `Cellexia Payment Method Updated`; `revokedReason: MERGED` is
+  "moved", not "removed"; the customer is told when the revoke path promotes
+  the backup (`contract.backup_promoted`).
+- **New-method detection** (`dunning/new-method.server.ts`,
+  `dunning.newMethodDetection` / `newMethodAutoSwitch`, both default on):
+  when a customer in payment trouble saves a NEW method, auto-switch if the
+  primary is removed / expired (ownership-gated, `changePaymentMethod` trigger
+  `new_method`), else `new_card_detected` email (metric "Cellexia New Card
+  Detected") with one-tap `USE_METHOD` + `SET_BACKUP`; home banner "you have
+  a newer card on file"; `dunning.new_method_detected` is the idempotency
+  ledger.
+- **FAILED-contract exits**: `POST /api/payment_skip_and_resume`
+  (`dunning/skip-resume.server.ts`, magic verb `SKIP_FAILED_CYCLE`) resolves
+  the newest EXHAUSTED case as `CUSTOMER_SKIPPED`, skips the held cycle on
+  Shopify, activates, sets the next date and logs `contract.activated
+  {reason: "skip_failed_cycle"}` — refused for hard-dead cards; the home
+  card's FAILED state gets a "Fix payment" primary button; **post-exhaustion
+  touches** (`dunning/post-exhaustion.server.ts`, inside `dunning_run`,
+  `dunning.postExhaustionTouchDays` default `[7, 21]`) send
+  `payment_failed_parked` (metric "Cellexia Payment Parked") with update-card
+  / `RETRY_PAYMENT` / `SKIP_FAILED_CYCLE` — a hard-dead card gets the single
+  honest exit; `dunning.parked_touch` per send.
+- Reminder `upcoming_order` gains `{payment_line}` and `{card_expiry_warning}`;
+  case reconciliation on skip / delay (`onCycleSkipped` / `onCycleDelayed`,
+  `dunning.case_closed`, `dunning.retry_deferred`); `fireRetry` claim lease.
+
+**Portal timing & truth**
+
+- **`app/lib/billing/timing.server.ts`**: `chargeMoment(d) = shopDayStartUtc(d)
+  + billing.chargeHourLocal h` (default 0 = byte-identical to the old sweep),
+  `editCutoff` (= the charge moment), `isChargeDue`, `isPreparingOrder`
+  (bounded by `billing.preparingWindowHours`, default 6). The billing sweep,
+  the portal, magic links, SMS and the reminder all read it. "Preparing your
+  order" hides schedule controls (dispatcher, magic and SMS refuse too).
+- **`app/lib/billing/estimate.server.ts` `estimateNextCharge`** — the ONE
+  money source: recurring lines + one-time add-ons + committed SCHEDULED
+  gifts "(free)", the live `DiscountGrant` (or the parked
+  `cycle_discount_applied` marker for a failed cycle), delivery, per-line
+  cycle overrides, following date, card label, address. `reminders.server.ts`
+  is refactored onto it (parity pinned).
+- **"Your next delivery" hero** (`portal/next-delivery.server.ts`): date +
+  "you can make changes until {cut-off}", lines as they will bill, "{k}
+  discounted orders left", the DISCOUNTED total, ships-to (with delivery
+  instructions), card, "After that: {date}", "line up with your other
+  delivery" CTA, stock-out / price-change lines; the home card shows the same
+  total.
+- **Delay semantics** (`portal/schedule.server.ts`, `portal.delayReanchors`
+  default true): "Delay by N weeks" re-anchors the whole schedule via
+  `setNextBillingDate`; "Just this once" moves one cycle; both dates in the
+  copy; a frequency-change consequence preview.
+- **Undo** (`portal/undo.server.ts`, `POST /api/undo`, SMS `UNDO`) for delay,
+  next-date and frequency: signed token in the toast (TTL =
+  `portal.magicLinkTtlDays`), stale-state and past-charge-moment guards,
+  mode-faithful restore (`cycle.delay_reverted`, `portal.undo`).
+- **Price lock** (`portal/price-lock.server.ts`): "Member price · locked"
+  pill (grandfathered and no pending notice), "you pay {member} instead of
+  {one-off}" only when every recurring line mirrors a higher compare-at, and
+  a price-change banner restating the notice email's old → new prices.
+- `upcoming_order`: truthful subject ("your order is on {date}", not
+  "ships"), `{edit_cutoff_line}`, "(free)" gift markers, `following_date` /
+  `following_date_iso` vars.
+
+**Flexibility**
+
+- **Per-line cycle edits** (`portal.perLineCycleEdits` default on):
+  `skipLineThisCycle` / `unskipLineThisCycle` / `setLineQuantityThisCycle`
+  through billing-cycle contract drafts (a cycle can never be emptied —
+  typed refusal; `ContractEditBlockedError` for contract-level edits while a
+  cycle edit is pending), mirror flags `ContractLine.skippedCycleIndex` /
+  `cycleQuantityOverride(Index)` invalidated on whole-cycle skip, re-anchor,
+  frequency change and settlement (`clearStaleCycleOverrides`); portal actions
+  `line_skip` / `line_unskip` / `line_qty_once` ("Not this time", "Just for
+  this order" stepper) with undo; events `cycle.line_skipped|line_unskipped|
+  line_quantity_set`; Klaviyo "Cellexia Product Skipped Once" / "Skip Undone"
+  / "Quantity Once".
+- **Vacation hold with dates + pause exit ramp**: `pauseUntil(resumeAt,
+  reason)` / `extendPause` / resume-on-date (drift fixed: bills at the charge
+  moment of `resumeAt`); pause form date picker + reason; PAUSED banner with
+  Resume now, extend choices (`portal.pauseExtendChoicesWeeks` default
+  `[2, 4]`), "Change resume date" (`pause_until` / `pause_extend` /
+  `pause_resume_date`); resume reminder re-sent after an extension; magic
+  verbs `RESUME` (now minted) and `EXTEND_PAUSE`; `contract.pause_extended`
+  (Klaviyo "Cellexia Pause Extended"), `contract.paused` carries `until`.
+- **Send my next order tomorrow** (`sendNextOrderTomorrow`, `send_tomorrow`)
+  — the run-out prompt's "already out" branch, honest charge-day copy;
+  `cycle.rushed` (Klaviyo "Cellexia Order Rushed").
+- **Delivery instructions** (`setDeliveryInstructions`, contract custom
+  attribute `_cellexia_delivery_instructions`, `portal.deliveryInstructionsMaxChars`
+  default 250; `contract.delivery_instructions_updated`), company field,
+  country and region selects (`portal/countries.ts`: ISO codes +
+  `Intl.DisplayNames`, Shopify province tables) on the address form.
+- **Supply meter** ("About {n} days of {product} left", `portalGrowth.supplyMeter`)
+  linked to the run-out prompt.
+
+**Cancel / save / win-back**
+
+- Save kinds **DOWNSIZE** (fewer units / smaller size / cheaper product with
+  concrete totals; TOO_EXPENSIVE first, TOO_MUCH_PRODUCT after SKIP;
+  `cancelFlow.downsizeSaveEnabled`), **DELAY** ("push my next order to
+  {predicted empty date}", `cancelFlow.delaySaveEnabled` / `delaySaveMaxDays`
+  default 42), **EXTEND_PAUSE** + a paused FREQUENCY variant for PAUSED
+  cancellers, per-line SKIP option; SWAP sorted by price and one swap-pricing
+  helper for the items card and the save card; a ladder DOWNSIZE row on the
+  schedule card.
+- **Concierge save**: the SUPPORT / EDUCATION cards carry the Get-help form
+  inline; accepting REQUIRES a submitted request (a mailto click was counted
+  as SAVED before); a one-cycle hold when more than
+  `cancelFlow.conciergeHoldMinLeadHours` (48) before the charge
+  (`conciergeHoldDays` 7); the SLA promise from `support.slaBusinessDays`;
+  outcome `SAVED_PENDING` → `SAVED` (`cancel.save_confirmed`) when the
+  merchant resolves the request while the customer still subscribes
+  (`concierge_sla_run`, hourly; `SUPPORT_SLA_BREACH` alert after the SLA).
+- **Scheduled cancellation** for locked contracts
+  (`cancelFlow.scheduledCancelEnabled` default on): `cancelScheduledAt` =
+  the unlock moment; hourly `cancel_scheduled_run` sends `cancel_upcoming`
+  `scheduledCancelNoticeDays` (3) before with a one-tap `KEEP_SUBSCRIPTION`
+  link (`keepLinkTtlDays` 60) then cancels through `cancelContract`
+  (re-read under the lock — a kept subscription is never cancelled); the
+  billing sweep never bills past the moment; portal "Cancels on {date} ·
+  Keep"; templates `cancel_scheduled` / `cancel_upcoming`; events
+  `cancel.scheduled` / `cancel.schedule_kept`; admin badge + Keep button.
+- **Cancel-intent follow-up** (`cancel/intent-followup.server.ts`, job
+  `cancel_intent_followup_run`, `cancelFlow.intentFollowupEnabled` default
+  on): one reason-matched email `intentFollowupHours` (18) after a
+  walked-away session, never within `intentFollowupChargeBufferHours` (48)
+  of the charge, one per customer per `intentFollowupCooldownDays` (30);
+  template `cancel_intent_followup` (metric "Cellexia Cancel Intent") with
+  one-tap saves incl. the new `SET_FREQUENCY` verb (slower only), support and
+  a plain cancel link; home banner for `intentBannerDays` (14);
+  `cancel.intent_followup_sent` / `cancel.intent_banner_shown`.
+- **Win-back parity + one-tap restart**: signed `restart_url`
+  (`APPLY_WINBACK {percent: 0, restart: true}`, `winback.restartLinkTtlDays`
+  60) in `cancel_confirmed` and `winback_soft` and on the Klaviyo
+  `contract.cancelled` event; `winback/restart.server.ts` re-derives the
+  CURRENT offer server-side for every door (`/api/reactivate` parity);
+  welcome-back landing `/subscription/:id/restart` (preserved benefits +
+  the derived offer + one Restart button); the dead skip/delay bundle is gone
+  from `winback_soft`; `WinbackState.reason` written at `scheduleWinback` and
+  shown in admin.
+- Money-true, ladder-aware retention summary (locked price, subscriber and
+  member savings, discounted cycles left, next ladder milestone, gifts,
+  rewards, tenure).
+
+**Value & engagement**
+
+- **Your deliveries** (`webhooks/fulfillment-tracking.server.ts` +
+  `portal/deliveries.server.ts`, `portalGrowth.deliveriesList`): webhook
+  topics `fulfillments/create`, `fulfillments/update`,
+  `fulfillment_events/create` (new in `shopify.app.toml`) + `orders/fulfilled`
+  + settlement write `BillingAttempt.trackingUrl / trackingCompany /
+  trackingNumber / orderStatusUrl / shippedAt / deliveredAt`; Account tab
+  list (last 10 incl. the origin order), detail card (last 5), in-transit
+  banner, home line; states processing / shipped / delivered / refunded /
+  unknown (`portal.deliveriesProcessingMaxDays` 30,
+  `deliveriesInTransitMaxDays` 14); events `contract.delivery_shipped|
+  delivery_delivered|delivery_shipment_cancelled`; self-check
+  `delivery_tracking`.
+- **Results timeline** (`lifecycle.resultsTimeline` {enabled, checkinWeek 4,
+  expectationLine, phases 0–4 / 4–8 / 8–12 / 12+ weeks, merchant-editable};
+  `portalGrowth.resultsTimeline` + `results_timeline` experiment arm): "Week
+  N of your routine" card + home line, the cancel EDUCATION save's phase copy,
+  and the `routine_checkin` email (metric "Cellexia Routine Check-in") with
+  one-tap `CHECKIN` answers (`lifecycle.checkin_answered`, Klaviyo "Cellexia
+  Routine Check-in Answered").
+- **Rewards roadmap** (`portalGrowth.rewardsRoadmap`): every ladder rung and
+  the day-90 reward with "around {date}", gift names only when a grant is
+  committed, holdout-safe; deliveries / gifts-received tiles.
+- **First-cycle onboarding card** (`portalGrowth.onboardingCard`) and the
+  **`subscription_started` welcome email** (rides metric "Cellexia
+  Subscription Started" with `cellexia_send`; genuinely new checkout
+  contracts only — never imports / backfills; heals UNKNOWN→OURS within
+  `notifications.welcomeHealMaxDays`, default 7).
+
+**Support & trust**
+
+- **`support` settings group** (`email`, `replyTo`, `whatsapp`, `chatUrl`,
+  `hoursNote`, `slaBusinessDays` 1, `requestsPerHour` 3) +
+  `app/lib/support/channels.server.ts` (`getSupportChannels`: settings →
+  `Shop.contactEmail` → hidden — never a dead `mailto:`); the hard-coded
+  `support@cellexia.com` is gone from all 22 locales; Reply-To on every SMTP
+  send and on Klaviyo flows created from now on.
+- **Get-help card** (Account, every subscription page, dunning banner) →
+  `POST /api/support`: topic, message, order picker (last 5 billed cycles),
+  optional 1-week push-back → `support.requested` event (record of truth),
+  `SUPPORT_REQUEST` alert (deduped per contract per day), Klaviyo "Cellexia
+  Support Requested" (no `cellexia_send`, no dedupe), email to the support
+  inbox; admin subscriber page "Support requests" card.
+- **Portal entry points**: the survey checkout extension renders a
+  "Manage your subscription" card on Thank-you / Order-status for
+  subscription orders (`extensions/cellexia-survey/src/manage-link.jsx`, no
+  App URL needed; INSTALL.md §7e menu-link step).
+- **Accessibility contract** (`portal/a11y.server.ts`): AA contrast tokens,
+  `:focus-visible`, `prefers-reduced-motion`, skip link, `role=progressbar`,
+  live-region toasts, inline Remove confirm; self-check `portal_a11y`.
+- **Education hub** (`portal.routineGuideUrl / howToUseUrl / faqUrl`): "Get
+  the most from your routine" card reused by the cancel EDUCATION save.
+
+**Admin**
+
+- Subscriber page: instrument type + expiry, "Payment method removed" note,
+  **Make primary** per vaulted method, "Backup set by {who} on {date}" chip,
+  scheduled-cancel badge + **Keep**, "Cancel now" wording, Support requests
+  card, win-back reason; Cancel-flow page exposes every new `cancelFlow.*`
+  knob (downsize, delay save, concierge hold, scheduled cancel, intent
+  follow-up); Settings gains **Support** and **Billing timing** sections;
+  Debug gains `payment_update_path`, `delivery_tracking`, `portal_a11y`
+  (44 checks).
+
+**Data**
+
+- Migration `0027_portal_payments`: `SubscriptionContract.paymentInstrumentType`,
+  `paymentMethodRevokedAt`, `backupSetBy`, `backupSetAt`;
+  `DunningCase.customerRetryAt`; `BillingAttempt.challengeUrl`.
+- Migration `0028_flexibility_deliveries`: `ContractLine.skippedCycleIndex`,
+  `cycleQuantityOverride`, `cycleQuantityOverrideIndex`;
+  `SubscriptionContract.deliveryInstructions`, `cancelScheduledAt`;
+  `BillingAttempt.trackingUrl`, `trackingCompany`, `trackingNumber`,
+  `orderStatusUrl`, `shippedAt`, `deliveredAt`; `WinbackState.reason`.
+
+**Ops reference**
+
+- Settings added (defaults): `billing.chargeHourLocal` 0,
+  `billing.preparingWindowHours` 6; `dunning.customerRetryCooldownMinutes` 60,
+  `dunning.postExhaustionTouchDays` [7,21], `dunning.newMethodDetection` true,
+  `dunning.newMethodAutoSwitch` true; `portal.dunningBannerEventHours` 6,
+  `portal.delayReanchors` true, `portal.perLineCycleEdits` true,
+  `portal.paymentMethodsList` true, `portal.pauseExtendChoicesWeeks` [2,4],
+  `portal.deliveryInstructionsMaxChars` 250, `portal.deliveriesProcessingMaxDays`
+  30, `portal.deliveriesInTransitMaxDays` 14, `portal.routineGuideUrl` /
+  `howToUseUrl` / `faqUrl` ""; `portalGrowth.supplyMeter` /
+  `resultsTimeline` / `rewardsRoadmap` / `onboardingCard` / `deliveriesList`
+  true; `lifecycle.resultsTimeline` {enabled true, checkinWeek 4,
+  expectationLine true, 4 phases}; `notifications.welcomeHealMaxDays` 7;
+  `cancelFlow.downsizeSaveEnabled` true, `delaySaveEnabled` true,
+  `delaySaveMaxDays` 42, `conciergeHoldDays` 7, `conciergeHoldMinLeadHours`
+  48, `scheduledCancelEnabled` true, `scheduledCancelNoticeDays` 3,
+  `keepLinkTtlDays` 60, `intentFollowupEnabled` true, `intentFollowupHours`
+  18, `intentFollowupChargeBufferHours` 48, `intentFollowupCooldownDays` 30,
+  `intentBannerDays` 14; `winback.restartLinkTtlDays` 60; `support.*` (above).
+- New events: `contract.backup_payment_set|backup_payment_cleared|
+  backup_promoted|card_update_link_sent|pause_extended|
+  delivery_instructions_updated|delivery_shipped|delivery_delivered|
+  delivery_shipment_cancelled`, `cycle.line_skipped|line_unskipped|
+  line_quantity_set|rushed|delay_reverted`, `dunning.case_closed|
+  retry_deferred|new_method_detected|parked_touch`, `cancel.scheduled|
+  schedule_kept|save_confirmed|intent_followup_sent|intent_banner_shown`,
+  `lifecycle.checkin_answered`, `portal.dunning_banner_shown|
+  payment_update_clicked|payment_retry|payment_3ds|payment_select|
+  payment_backup_set|payment_skip_resume|undo`, `support.requested`.
+- New Klaviyo metrics: Cellexia Payment Method Updated, Payment Parked, New
+  Card Detected, Cancellation Scheduled, Cancellation Upcoming, Cancel Intent,
+  Routine Check-in, Routine Check-in Answered, Product Skipped Once, Product
+  Skip Undone, Product Quantity Once, Pause Extended, Order Rushed, Support
+  Requested (segmentation only); `subscription_started` now rides
+  "Cellexia Subscription Started" as a content-carrying leg;
+  `threeds_action_sms` shares "Cellexia 3DS Action Required".
+- New templates: `subscription_started`, `payment_failed_parked`,
+  `new_card_detected`, `threeds_action_sms`, `cancel_scheduled`,
+  `cancel_upcoming`, `cancel_intent_followup`, `routine_checkin`
+  (`payment_method_updated` is now actually sent).
+- New magic verbs: `RETRY_PAYMENT`, `USE_METHOD`, `SET_BACKUP`,
+  `SKIP_FAILED_CYCLE`, `EXTEND_PAUSE`, `KEEP_SUBSCRIPTION`, `SET_FREQUENCY`,
+  `CHECKIN` (`RESUME` is minted for the first time). SMS keywords: `RETRY`,
+  `UNDO`.
+- New portal API actions: `payment_retry`, `payment_3ds`, `payment_select`,
+  `payment_backup`, `payment_skip_and_resume`, `undo`, `line_skip`,
+  `line_unskip`, `line_qty_once`, `pause_until`, `pause_extend`,
+  `pause_resume_date`, `send_tomorrow`, `delivery_instructions`, `support`;
+  route `/subscription/:id/restart`.
+- New jobs: `cancel_scheduled_run` (hourly, gated in SETUP),
+  `concierge_sla_run` (hourly), `cancel_intent_followup_run` (hourly, gated);
+  post-exhaustion touches ride inside `dunning_run`. New alerts:
+  `SUPPORT_REQUEST`, `SUPPORT_SLA_BREACH`. New self-checks:
+  `payment_update_path`, `delivery_tracking`, `portal_a11y`. New webhook
+  topics: `fulfillments/create`, `fulfillments/update`,
+  `fulfillment_events/create`.
+
+### Changed
+
+- The portal home card sorts contracts with an open dunning case first and
+  says "Order held since {date}"; the FAILED card leads with "Fix payment".
+- "Delay" in the portal, magic links and SMS re-anchors the schedule unless
+  the customer picks "just this once" (`portal.delayReanchors` off restores
+  the one-cycle behaviour everywhere).
+- The `upcoming_order` reminder is skipped while a dunning case is open (the
+  ladder is the reminder) and its subject says "your order is on {date}".
+- The retention summary, the cancel intro and the items card quote the same
+  discounted next-order total as the reminder; the swap price shown in the
+  items card and the SWAP save card is one helper (grandfathered contracts no
+  longer see two different prices).
+- The `winback_soft` email no longer carries skip/delay links for a cancelled
+  contract; it carries `restart_url`.
+- Cancel-flow SUPPORT / EDUCATION saves are recorded only when a request was
+  actually submitted; the cancel route applies the same support budget.
+- Locale keys `cancel.saves.education.consult` / `cancel.saves.support.contact`
+  are subject-only (`*_subject`) — the mail address comes from `support.email`.
+- Portal colours: muted `#6f6a62`, amber `#7a5c2a` (AA contrast); toasts are
+  live regions; Remove confirms inline.
+- `customerPaymentMethodGetUpdateUrl` is called only for Shop Pay
+  instruments (or unknown, with fallback); the Admin "Open secure page" says
+  which path it took.
+- Debug self-check count 41 → 44.
+
+### Fixed
+
+- Card payers hit a dead "Update card" button (Shop-Pay-only hosted URL) —
+  now Shopify's update email + the account link.
+- A revoked primary left `paymentMethodId` pointing at the dead method (portal
+  kept showing it; the button failed with `PAYMENT_METHOD_DOES_NOT_EXIST`).
+- The upsert webhook sent nothing after a successful card change; the revoke
+  path promoted the backup silently; `MERGED` was announced as "removed".
+- The pre-expiry notice skipped PAUSED contracts whose card expires before
+  `resumeAt`.
+- The portal total ignored the live `DiscountGrant` the customer had just
+  accepted; the reminder and the cancel summary disagreed with it.
+- Resume-on-date drifted three days past the chosen day.
+- A one-cycle delay's "after that" date was computed as next + interval; the
+  following-date is now schedule-aware (`billing/following-date.server.ts`).
+- The engine's "on backup" marker collapsed after a successful backup charge
+  (`contract.backup_promoted`); auto-switch was not ownership-gated;
+  expired target methods could be switched onto.
+- The dunning-held amount quoted the undiscounted plan sum.
+- `applyGrantToCycle` failed for a re-added (unskipped) line
+  (`contracts/draft-lines.ts` resolves the draft line).
+- `NotificationLog.payload` could carry signed magic-link tokens (`*_url` vars
+  and pre-composed blocks embedding them); never persisted now.
+- Post-exhaustion "ways to continue" touches skip contracts with a scheduled
+  cancel (a scheduled cancel is a decision, as the ladder and the intent
+  follow-up already read it).
+- A magic `SET_FREQUENCY` / `USE_METHOD` / `SWAP` refused by Shopify while
+  one-off changes are staged on the next order (`ContractEditBlockedError`)
+  now lands on "undo your one-off changes first" + the portal link instead of
+  the generic "try again" (the tap is consumed); the cancel-intent follow-up
+  no longer mints a `SET_FREQUENCY` one-tap for such a contract.
+- The per-customer payment-methods memo evicts expired entries (bounded Map);
+  the restart link's GET confirm page memoizes the derived offer for 60 s so
+  inbox scanners no longer trigger an Admin gift pick per fetch.
+- `DunningCase.resolution` schema comment lists `CUSTOMER_SKIPPED` (resolved,
+  deliberately not "recovered" in `dunningRecoveryRate`).
+- `customers/redact` now also erases the release's customer-authored free
+  text: `deliveryInstructions`, the `support.requested` event payload
+  (message / cancel-survey text / order ref) and the `SUPPORT_REQUEST` alert
+  line (name, email, excerpt); the structural facts the concierge SLA job
+  reads survive.
+- A scheduled cancel that ends before the mirror's next pointer no longer
+  promises a next order: the upcoming-order reminder skips it and the portal
+  home card / detail hero say "no further orders — ends on {date}"
+  (`cancel/further-orders.ts`, the sweep's own comparison).
+- The detail schedule card is hidden while a dunning case is open, and the
+  dispatcher refuses skip / delay / next_date / frequency / per-line edits
+  mid-case with a typed toast (they targeted cycle N+1 while cycle N was
+  still retrying).
+- SMS `SKIP` / `DELAY` / `UNDO` refuse in SETUP mode like every other
+  customer surface (audited `setup_mode`, portal setup copy).
+- A `MERGED` (auto-consolidated) source has no restart door: the welcome-back
+  landing redirects, the reactivate verb and `reactivateFromWinback` refuse,
+  the home / detail Restart is hidden (the detail note explains the merge).
+- `KLAVIYO_SETUP.md` metric catalog, one-tap link reference (§2.2 / §5) and
+  the win-back recipe now cover every v1.28.0 metric and link property (a test
+  pins the doc against the code).
+
+### Migration notes
+
+- Both migrations are additive (nullable columns, no new tables, no
+  indexes); v1.27 code runs unchanged against them. Deploy order: `npm run
+  setup` → server → `npm run deploy` (a v1.27 server ignores the new webhook
+  topics and the extension card links to a portal that already exists).
+- Rollout note (post-exhaustion touches): on the first `dunning_run` after
+  deploy, every parked FAILED contract older than the last offset in
+  `dunning.postExhaustionTouchDays` receives ONE `payment_failed_parked`
+  email. Set the array to `[]` before deploying to suppress it.
+- Klaviyo: flows created before v1.28.0 keep their sender; the Reply-To
+  applies to flows created from now on (edit or recreate in Klaviyo).
+- Unverified on a dev store (documented as such): billing-cycle skip on a
+  FAILED contract before activate; set-next-date on FAILED; the exact
+  `/account` → profile redirect on new customer accounts. Test the
+  card-update path with a real test card before subscriber #1.
+
 ## [1.27.0] — 2026-08-16
 
 **Conversion per widget design, measured by the app itself.** v1.26.0 gave

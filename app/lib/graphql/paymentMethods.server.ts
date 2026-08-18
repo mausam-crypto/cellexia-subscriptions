@@ -124,6 +124,7 @@ const GET_UPDATE_URL_MUTATION = `#graphql
       userErrors {
         field
         message
+        code
       }
     }
   }
@@ -205,9 +206,13 @@ export async function listCustomerPaymentMethods(
 }
 
 /**
- * Shopify-hosted secure card-update URL for this payment method. Used by
- * UPDATE_CARD magic links and dunning emails — the customer fixes their card
- * without logging in and without the app ever seeing card data.
+ * Shopify-hosted secure card-update URL for this payment method. Per the
+ * Admin API reference this mutation "currently only supports Shop Pay":
+ * card instruments come back as userError code INVALID_INSTRUMENT, surfaced
+ * on the thrown ShopifyUserError (`code` is selected below) so
+ * `resolveCardUpdatePath` (app/lib/payments/cardUpdate.server.ts) can fall
+ * back to `sendPaymentMethodUpdateEmail`. Callers should go through the
+ * resolver rather than calling this directly.
  */
 export async function getPaymentMethodUpdateUrl(
   admin: AdminClient,

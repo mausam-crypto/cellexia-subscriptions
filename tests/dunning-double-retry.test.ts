@@ -31,6 +31,8 @@ const mocks = vi.hoisted(() => ({
   dunningCaseFindMany: vi.fn(async (_a?: unknown): Promise<unknown[]> => []),
   dunningCaseFindFirst: vi.fn(async (_a?: unknown): Promise<unknown> => null),
   dunningCaseUpdate: vi.fn(async (args: unknown): Promise<unknown> => args),
+  // fireRetry's atomic claim (v1.28.0) — count 1 = this caller owns the fire.
+  dunningCaseUpdateMany: vi.fn(async (_a?: unknown) => ({ count: 1 })),
   contractFindUnique: vi.fn(async (_a?: unknown): Promise<unknown> => null),
   attemptFindUnique: vi.fn(async (_a?: unknown): Promise<unknown> => null),
   attemptFindFirst: vi.fn(async (_a?: unknown): Promise<unknown> => null),
@@ -50,6 +52,7 @@ vi.mock("~/db.server", () => ({
       findMany: mocks.dunningCaseFindMany,
       findFirst: mocks.dunningCaseFindFirst,
       update: mocks.dunningCaseUpdate,
+      updateMany: mocks.dunningCaseUpdateMany,
     },
     subscriptionContract: { findUnique: mocks.contractFindUnique },
     billingAttempt: {
@@ -202,6 +205,7 @@ beforeEach(() => {
     attemptId: "gid://shopify/SubscriptionBillingAttempt/900",
   });
   mocks.dunningCaseFindMany.mockResolvedValue([]);
+  mocks.dunningCaseUpdateMany.mockResolvedValue({ count: 1 });
   mocks.subscriberEventCount.mockResolvedValue(0);
   mocks.attemptCount.mockResolvedValue(2);
 });

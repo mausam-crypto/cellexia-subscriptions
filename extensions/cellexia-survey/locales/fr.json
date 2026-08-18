@@ -3,6 +3,11 @@
   "progress": "Question {{current}} sur {{total}} — une seule pression",
   "doneTitle": "Merci !",
   "doneBody": "Vos réponses servent à tout personnaliser pour vous.",
+  "manage": {
+    "title": "Gérez votre abonnement",
+    "body": "Changez de produits, sautez ou décalez une livraison, mettez à jour votre adresse ou votre carte — à tout moment, depuis votre espace abonnement.",
+    "cta": "Gérer mon abonnement"
+  },
   "q": {
     "plannedDuration": {
       "title": "Comment envisagez-vous d'utiliser ce produit ?",

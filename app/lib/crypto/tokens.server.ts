@@ -37,9 +37,43 @@ export type MagicAction =
   | "UPDATE_CARD"
   | "PAUSE"
   | "RESUME"
+  /** Pause exit ramp (v1.28.0): landing page offering week choices. */
+  | "EXTEND_PAUSE"
   | "SWAP"
   | "CONFIRM_3DS"
   | "APPLY_WINBACK"
+  | "RETRY_PAYMENT"
+  /** Routine check-in answer (v1.28.0): logs the answer, lands on the portal. */
+  | "CHECKIN"
+  /** Keep a subscription whose cancellation was scheduled (v1.28.0, P3.8):
+   * clears cancelScheduledAt — a recovery, never lock-blocked. */
+  | "KEEP_SUBSCRIPTION"
+  /**
+   * One-tap slower cadence (v1.28.0, P3.6): the cancel-intent follow-up's
+   * "every N weeks instead" — params {unit, count}; the option is re-derived
+   * against the plan's offered list at execution time.
+   */
+  | "SET_FREQUENCY"
+  /**
+   * Switch the contract to another vaulted payment method (v1.28.0, P1.7):
+   * params {paymentMethodId, label?}; the id is re-validated against the
+   * customer's live methods at execution time (never trusted). Single-use.
+   */
+  | "USE_METHOD"
+  /**
+   * Set another vaulted method as the contract's BACKUP (v1.28.0, P1.8 —
+   * the new_card_detected email's "keep my card, use the new one only if a
+   * payment fails"): params {paymentMethodId, label?}; re-validated at
+   * execution time like USE_METHOD. Single-use.
+   */
+  | "SET_BACKUP"
+  /**
+   * Skip the held (unbilled, dunning-exhausted) order and reactivate the
+   * FAILED contract from the following date (v1.28.0, P1.9): the
+   * post-exhaustion touches' third exit. No params; the held cycle and the
+   * resume date are re-derived at execution time. Single-use.
+   */
+  | "SKIP_FAILED_CYCLE"
   | "LOGIN"
   | "PREVIEW";
 
@@ -147,6 +181,69 @@ export async function verifyAndConsumeMagicToken(
     return { ok: false, reason: "USED" };
   }
 
+  return { ok: true, payload };
+}
+
+// ── Stateless signed payloads (portal Undo tokens, v1.28.0) ──────────────────
+//
+// Same format and secret as magic tokens (base64url(json) "." hmac), but NO
+// database row: these ride inside a page the customer already holds (the
+// portal toast's Undo form) and carry the exact restore they may perform,
+// which the consumer re-validates against the contract's current state —
+// replay after a successful undo is a harmless "nothing to undo".
+
+export interface SignedPayload<T> {
+  v: 1;
+  kind: string;
+  data: T;
+  exp: number; // unix seconds
+  nonce: string;
+}
+
+export function createSignedPayload<T>(
+  kind: string,
+  data: T,
+  ttlSeconds: number,
+): string {
+  const payload: SignedPayload<T> = {
+    v: 1,
+    kind,
+    data,
+    exp: Math.floor(Date.now() / 1000) + Math.max(1, Math.floor(ttlSeconds)),
+    nonce: crypto.randomBytes(9).toString("base64url"),
+  };
+  const body = b64url(Buffer.from(JSON.stringify(payload)));
+  return `${body}.${hmac(body)}`;
+}
+
+export type SignedPayloadResult<T> =
+  | { ok: true; payload: SignedPayload<T> }
+  | { ok: false; reason: "MALFORMED" | "BAD_SIGNATURE" | "EXPIRED" | "WRONG_KIND" };
+
+export function verifySignedPayload<T>(
+  token: string,
+  kind: string,
+): SignedPayloadResult<T> {
+  const parts = token.split(".");
+  if (parts.length !== 2) return { ok: false, reason: "MALFORMED" };
+  const [body, sig] = parts;
+  const expected = hmac(body);
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    return { ok: false, reason: "BAD_SIGNATURE" };
+  }
+  let payload: SignedPayload<T>;
+  try {
+    payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
+  } catch {
+    return { ok: false, reason: "MALFORMED" };
+  }
+  if (!payload || payload.v !== 1 || typeof payload.exp !== "number") {
+    return { ok: false, reason: "MALFORMED" };
+  }
+  if (payload.kind !== kind) return { ok: false, reason: "WRONG_KIND" };
+  if (payload.exp * 1000 < Date.now()) return { ok: false, reason: "EXPIRED" };
   return { ok: true, payload };
 }
 

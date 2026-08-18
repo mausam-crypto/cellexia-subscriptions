@@ -127,11 +127,45 @@ export const TEMPLATES = {
     i18nKey: "email.cancel_confirmed",
     critical: false,
   },
+  // v1.28.0 (P3.8) — scheduled cancel on a locked contract: sent the moment
+  // the customer schedules it (states the exact end date; nothing else
+  // changes until then) with a one-tap KEEP link.
+  cancel_scheduled: {
+    channel: "EMAIL",
+    klaviyoMetric: "Cellexia Cancellation Scheduled",
+    i18nKey: "email.cancel_scheduled",
+    critical: false,
+    ctaLabelKey: "email.cta.keep_subscription",
+  },
+  // v1.28.0 (P3.8) — N days before the scheduled moment (settings.
+  // cancelFlow.scheduledCancelNoticeDays): the last honest reminder with
+  // the one-tap KEEP link; the hourly job then cancels as promised.
+  cancel_upcoming: {
+    channel: "EMAIL",
+    klaviyoMetric: "Cellexia Cancellation Upcoming",
+    i18nKey: "email.cancel_upcoming",
+    critical: false,
+    ctaLabelKey: "email.cta.keep_subscription",
+  },
   payment_method_updated: {
     channel: "EMAIL",
     klaviyoMetric: "Cellexia Payment Method Updated",
     i18nKey: "email.payment_method_updated",
     critical: false,
+    ctaLabelKey: "email.cta.back_to_subscription",
+  },
+  // v1.28.0 (P1.8) — a NEW vaulted method appeared on the account of a
+  // subscriber in payment trouble (held payment / expiring card) whose own
+  // card is still live: "use it for this subscription?" with the one-tap
+  // USE_METHOD link as the button and a SET_BACKUP line. When the primary is
+  // dead (removed / expired) the webhook switches instead and the closed
+  // loop rides payment_method_updated (reason new_method).
+  new_card_detected: {
+    channel: "EMAIL",
+    klaviyoMetric: "Cellexia New Card Detected",
+    i18nKey: "email.new_card_detected",
+    critical: false,
+    ctaLabelKey: "email.cta.use_new_card",
   },
   payment_failed_1: {
     channel: "EMAIL",
@@ -151,6 +185,18 @@ export const TEMPLATES = {
     channel: "EMAIL",
     klaviyoMetric: "Cellexia Payment Failed",
     i18nKey: "email.payment_failed_3",
+    critical: false,
+    ctaLabelKey: "email.cta.update_card",
+  },
+  // v1.28.0 (P1.9) — post-exhaustion touches: N days after the ladder gave
+  // up (settings.dunning.postExhaustionTouchDays) while the contract is
+  // still FAILED, the three ways back: update the card / retry / skip the
+  // held order and continue (SKIP_FAILED_CYCLE one-tap). Its own metric —
+  // the ladder flow must not re-fire on a parked contract.
+  payment_failed_parked: {
+    channel: "EMAIL",
+    klaviyoMetric: "Cellexia Payment Parked",
+    i18nKey: "email.payment_failed_parked",
     critical: false,
     ctaLabelKey: "email.cta.update_card",
   },
@@ -174,6 +220,17 @@ export const TEMPLATES = {
     critical: true,
     ctaLabelKey: "email.cta.confirm_payment",
   },
+  // v1.28.0 — the day-0 SMS leg of a 3-D Secure challenge (P1.6). Rides the
+  // same metric as threeds_action so a merchant's SMS flow keys off the one
+  // 3DS moment; the outbox tells the legs apart by content shape (SMS =
+  // content_text without content_subject). Not critical: SMS has no direct
+  // transport, and the critical EMAIL twin already guarantees delivery.
+  threeds_action_sms: {
+    channel: "SMS",
+    klaviyoMetric: "Cellexia 3DS Action Required",
+    i18nKey: "sms.threeds_action_sms",
+    critical: false,
+  },
   gift_announcement: {
     channel: "EMAIL",
     klaviyoMetric: "Cellexia Gift Scheduled",
@@ -185,6 +242,47 @@ export const TEMPLATES = {
     klaviyoMetric: "Cellexia Gift Teaser",
     i18nKey: "email.gift_teaser",
     critical: false,
+  },
+  // v1.28.0 — the welcome email (P4.5 / P5.2): sent once per genuinely new
+  // contract from the create-webhook path (subscription-started.server.ts),
+  // never for imports/backfills. Rides the CANONICAL contract.created metric
+  // ("Cellexia Subscription Started", events-map) rather than a second one:
+  // the outbox graft supersedes the content-less canonical leg with this
+  // content-carrying leg exactly like billing.attempt_failed × payment_failed_1,
+  // so a merchant's existing onboarding flow on that metric keeps working and
+  // the auto-created flow (cellexia_send = "true") delivers this email.
+  subscription_started: {
+    channel: "EMAIL",
+    klaviyoMetric: "Cellexia Subscription Started",
+    i18nKey: "email.subscription_started",
+    critical: false,
+    ctaLabelKey: "email.cta.manage_mine",
+  },
+  // v1.28.0 (P4.1) — the week-N routine check-in: the results-timeline
+  // phase copy for the customer's routine week + two one-tap answers
+  // (CHECKIN great / unsure). Sent once per contract by the lifecycle
+  // sweep at lifecycle.resultsTimeline.checkinWeek; gated by the timeline
+  // toggle and the results_timeline holdout arm.
+  routine_checkin: {
+    channel: "EMAIL",
+    klaviyoMetric: "Cellexia Routine Check-in",
+    i18nKey: "email.routine_checkin",
+    critical: false,
+    ctaLabelKey: "email.cta.manage_mine",
+  },
+  // v1.28.0 (P3.6) — abandoned cancel-intent follow-up: the customer opened
+  // the cancel flow and walked away undecided; 12–24h later (settings.
+  // cancelFlow.intentFollowupHours) ONE email with reason-matched one-tap
+  // saves (skip / delay / slower cadence via SET_FREQUENCY), "talk to us"
+  // and a plain link to the cancel page (honesty — cancelling stays one
+  // tap away). Sent by the cancel_intent_followup_run job; never inside the
+  // pre-charge buffer, never twice per customer per cooldown.
+  cancel_intent_followup: {
+    channel: "EMAIL",
+    klaviyoMetric: "Cellexia Cancel Intent",
+    i18nKey: "email.cancel_intent_followup",
+    critical: false,
+    ctaLabelKey: "email.cta.manage_mine",
   },
   milestone_gift: {
     channel: "EMAIL",

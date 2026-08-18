@@ -15,8 +15,37 @@ dispatcher gates), `tests/cancel-save-guards.test.ts`,
 `tests/dunning-send-dedupe.test.ts`, `tests/origin-revenue.test.ts`,
 `tests/acquisition.test.ts` + `tests/acquisition-capture.test.ts`, and
 `tests/risk-learning.test.ts` — so the manual passes below confirm reality;
-they are not the only line of defense. The rest of this document is the
-*manual* E2E plan.
+they are not the only line of defense. The v1.28.0 portal churn pack added
+its own families (about 90 files, every adversarially-verified review fix
+pinned by a test): `tests/payments-card-update-path.test.ts` +
+`tests/portal-payment-*.test.ts` (path resolver, banner states, retry / 3DS
+/ skip-and-resume, methods list, labels), `tests/webhooks-payment-method-*`
+and `tests/webhooks-new-method-*` (closed loop, mirror, new-card detection),
+`tests/dunning-post-exhaustion.test.ts` / `dunning-3ds-sms` /
+`dunning-retry-link-templates`, `tests/billing-timing.test.ts` +
+`tests/billing-estimate*.test.ts` (charge moment, the one next-order estimate,
+per-line overrides, reminder parity), `tests/portal-delay-*` /
+`portal-undo` / `portal-preparing-guard` / `portal-next-delivery-hero` /
+`portal-price-lock` / `portal-swap-price`, `tests/contracts-pause-until` /
+`contracts-send-tomorrow` / `contracts-delivery-instructions` /
+`portal-line-*` / `portal-flex-*` / `portal-pause-until-ui` /
+`portal-supply-meter`, `tests/webhooks-fulfillment-tracking.test.ts` +
+`portal-deliveries-*`, `tests/portal-results-timeline` /
+`lifecycle-routine-checkin` / `portal-rewards-roadmap` /
+`portal-onboarding-card` / `subscription-started-email`, the cancel families
+`tests/cancel-downsize-save` / `cancel-delay-save` / `cancel-concierge-save`
+/ `cancel-scheduled*` / `cancel-intent-followup` / `cancel-paused-*` /
+`cancel-skip-line-save` / `cancel-support-save-truth` /
+`cancel-retention-summary`, `tests/winback-restart-*` /
+`winback-portal-parity` / `winback-reason`, `tests/support-channels` /
+`portal-support-request` / `mailer-reply-to`, `tests/portal-a11y.test.ts`,
+`tests/portal-education-card`, `tests/extension-manage-link.test.ts` (pins
+the checkout card's portal path to `PORTAL_PROXY_SUBPATH`), the magic-verb
+suites `tests/magic-retry-payment` / `magic-use-method` /
+`magic-skip-failed-cycle` / `magic-resume-extend`, and the cross-stage
+audits `tests/aud-v128-*.test.ts` (money/date agreement across hero, reminder,
+cancel summary and dunning; truth rules; retry refusals; payment copy;
+webhook card paths). The rest of this document is the *manual* E2E plan.
 
 The buy-box theme extension has its own suite under `tests/liquid/`: a
 harness that renders the real `.liquid` files with Shopify's theme-app-extension
@@ -98,6 +127,17 @@ event, (c) the Klaviyo event arrived (or `NotificationLog` row exists).
 | 16 | Cancel — complete the full flow | Portal | see §6 |
 | 17 | Magic link misuse: expired token, re-used single-use token, tampered token | Browser | Friendly error page, no action performed, nothing logged as used |
 | 18 | Restart a cancelled subscription (portal home card, subscription detail, cancel "done" page — all three) | Portal | `winback.reactivated`; contract active again, no discount granted |
+| 19 | (v1.28.0) Update card with a **card** instrument (not Shop Pay) | Portal payment section → toast "we've emailed you a secure link" → Shopify email → replace card | `contract.card_update_link_sent {channel: shopify_email}`, then `contract.payment_method_updated` via webhook, `payment_method_updated` email sent, open case retries at once |
+| 20 | (v1.28.0) Failed payment: Retry now / Pause instead / (exhausted) Skip that order and continue | Portal banner (+ SMS `RETRY`, magic `RETRY_PAYMENT`) | `portal.payment_retry` + `dunning.retry_scheduled {trigger: "customer"}`; `portal.payment_skip_resume` + `contract.activated {reason: "skip_failed_cycle"}` |
+| 21 | (v1.28.0) Use another card / Set as backup (customer with two vaulted methods) | Portal payment section | `contract.payment_method_updated {trigger: "select"}` / `contract.backup_payment_set {setBy: CUSTOMER}` |
+| 22 | (v1.28.0) Delay by 2 weeks, then **Undo**; then "just this once" | Portal (+ SMS `UNDO`) | `cycle.delayed {mode: "reanchor"}` → `cycle.delay_reverted` / `portal.undo`; `cycle.delayed {mode: "once"}` with "after that" back on the old anchor |
+| 23 | (v1.28.0) Per-line "Not this time" / "just 1 this order" on a two-line contract | Portal items card | `cycle.line_skipped` / `cycle.line_quantity_set`; the hero and the next `upcoming_order` reflect it; undo → `cycle.line_unskipped` |
+| 24 | (v1.28.0) Pause until a date, extend by 2 weeks, resume on an earlier date | Portal pause form + PAUSED banner (+ `RESUME` / `EXTEND_PAUSE` links in the resume reminder) | `contract.paused {until}`, `contract.pause_extended`, `contract.resumed`; the resume date bills at the charge moment (no drift) |
+| 25 | (v1.28.0) "Send my next order tomorrow" (run-out prompt, already-out branch) | Portal | `cycle.rushed`; next date = tomorrow's charge moment |
+| 26 | (v1.28.0) Delivery instructions + company + country/region selects | Portal address form | `contract.delivery_instructions_updated`; the next renewal order carries `_cellexia_delivery_instructions` |
+| 27 | (v1.28.0) Get-help form with "push my order back a week" | Portal Account / subscription page / payment banner | `support.requested {pushBackApplied: true}`, `SUPPORT_REQUEST` alert, support inbox email, Klaviyo "Cellexia Support Requested" |
+| 28 | (v1.28.0) Scheduled cancel on a locked plan, then Keep | Cancel flow → portal "Cancels on {date} · Keep" (+ `KEEP_SUBSCRIPTION` in `cancel_upcoming`) | `cancel.scheduled` → `cancel.schedule_kept`; without Keep, `contract.cancelled` at the unlock moment |
+| 29 | (v1.28.0) One-tap restart from `cancel_confirmed` / `winback_soft` `restart_url` and the `/subscription/:id/restart` landing | Email → landing → Restart | `winback.reactivated`; the offer applied equals what the landing showed |
 
 While on row 1: the OTP screen must answer identically (same neutral copy,
 similar response time) for a subscriber email and a stranger email — the
@@ -470,7 +510,7 @@ vite:build` in cheap-to-expensive order. The final production-build step
 exists because typecheck and all tests once passed on a tree whose
 `remix vite:build` failed (a route component referenced a `.server` module —
 something neither tsc nor Vitest exercises); green tests alone do not prove a
-shippable build. Then re-run §3 rows 1/2/12/16/18, one §4 recovery, and one
+shippable build. Then re-run §3 rows 1/2/12/16/18/19/20/22, one §4 recovery, and one
 renewal end-to-end on the dev store. Quarterly: the full document.
 
 A green `vitest run` prints **no stderr at all**: `vitest.config.ts`

@@ -165,6 +165,7 @@ async function createFreshDemoContract(
       cardLast4: "4242",
       cardExpiryMonth: 12,
       cardExpiryYear: now.getFullYear() + 1,
+      paymentInstrumentType: "CREDIT_CARD",
       lines: {
         create: [
           ...lines,

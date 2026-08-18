@@ -55,13 +55,31 @@ const LINK_BUNDLE_TEMPLATES: ReadonlySet<TemplateKey> = new Set<TemplateKey>([
   "payment_failed_1",
   "payment_failed_2",
   "payment_failed_3",
+  // v1.28.0 (P1.9): the parked-contract touches carry update-card / retry
+  // from the bundle (+ their own skip_resume_url var).
+  "payment_failed_parked",
   "payment_failed_sms",
   "card_expiring",
   "threeds_action",
   "resume_reminder",
+  // winback_soft / winback_perk / winback_discount dropped in v1.28.0 (P3.2):
+  // a cancelled contract cannot skip / delay / pause — the bundle was six
+  // dead tokens per send. winback_soft carries the signed one-tap
+  // `restart_url` instead (RESTART_LINK_TEMPLATES below); the perk and
+  // discount touches carry their own offer link as `cta_url` (engine-minted).
+]);
+
+/**
+ * Templates that carry the signed one-tap `restart_url` (v1.28.0, P3.2):
+ * the two win-back moments with no offer of their own. Minted here only when
+ * the caller did not already provide one (the win-back engine mints its own
+ * for winback_soft; the confirmation bridge sends cancel_confirmed with the
+ * event payload only). Contained — a failed mint leaves the email on
+ * portal_url.
+ */
+const RESTART_LINK_TEMPLATES: ReadonlySet<TemplateKey> = new Set<TemplateKey>([
+  "cancel_confirmed",
   "winback_soft",
-  "winback_perk",
-  "winback_discount",
 ]);
 
 /** Merchant-facing templates: recipients come from settings, not a contract. */
@@ -103,6 +121,22 @@ function toTemplateVars(vars: Record<string, unknown>): TemplateVars {
   for (const [k, v] of Object.entries(vars)) {
     if (typeof v === "string" || typeof v === "number") out[k] = v;
     else if (typeof v === "boolean") out[k] = String(v);
+  }
+  return out;
+}
+
+/**
+ * The vars persisted on a NotificationLog row: every scalar EXCEPT values
+ * carrying a signed magic-link token (`/magic/<token>` URLs — skip_url,
+ * pause_url, restart_url, keep_url, cta_url…, and pre-composed blocks that
+ * embed them). Magic-link tokens must never be persisted in NotificationLog:
+ * anyone with DB read access could otherwise lift live single-use tokens and
+ * mutate a contract without login. Dedupe keys and dates stay.
+ */
+function persistedVars(vars: Record<string, unknown>): TemplateVars {
+  const out = toTemplateVars(vars);
+  for (const [k, v] of Object.entries(out)) {
+    if (typeof v === "string" && v.includes("/magic/")) delete out[k];
   }
   return out;
 }
@@ -269,7 +303,7 @@ export async function sendNotification(
         template: input.template,
         status: "FAILED",
         error: "No recipient (email/phone) could be resolved",
-        payload: { cycleIndex, vars: toTemplateVars(vars) },
+        payload: { cycleIndex, vars: persistedVars(vars) },
       });
       return result;
     }
@@ -382,6 +416,10 @@ export async function sendNotification(
           email: email ?? undefined,
           createdVia: "KLAVIYO_FLOW",
           addonVariantId,
+          // resume_reminder (v1.28.0, P2.6): one-tap "resume now" + the
+          // "need a little longer?" landing page ride in the same bundle.
+          pauseControls: input.template === "resume_reminder",
+          shopId: input.shopId,
         });
         Object.assign(properties, bundle);
       } catch (err) {
@@ -390,6 +428,39 @@ export async function sendNotification(
           contract.id,
           err,
         );
+      }
+    }
+    if (
+      contract &&
+      RESTART_LINK_TEMPLATES.has(input.template) &&
+      typeof properties.restart_url !== "string"
+    ) {
+      try {
+        const { restartLinkVars } = await import("~/lib/winback/links.server");
+        Object.assign(
+          properties,
+          await restartLinkVars(contract, { createdVia: "KLAVIYO_FLOW" }),
+        );
+      } catch (err) {
+        console.error("[notifications] restart link failed", contract.id, err);
+      }
+      // The bodies reference {restart_url} unconditionally ("restarting
+      // takes one tap: {restart_url}"): a failed mint must degrade to the
+      // portal link, never print the literal placeholder.
+      if (
+        typeof properties.restart_url !== "string" &&
+        typeof properties.portal_url === "string"
+      ) {
+        properties.restart_url = properties.portal_url;
+      }
+      // winback_soft's button IS the restart link (ctaLabelKey
+      // email.cta.reactivate); cancel_confirmed keeps its body link only.
+      if (
+        input.template === "winback_soft" &&
+        typeof properties.cta_url !== "string" &&
+        typeof properties.restart_url === "string"
+      ) {
+        properties.cta_url = properties.restart_url;
       }
     }
 
@@ -451,7 +522,7 @@ export async function sendNotification(
         ...contentVars,
       };
       const logPayload: Record<string, unknown> = tmpl.klaviyoMetric
-        ? { cycleIndex, vars: toTemplateVars(vars) }
+        ? { cycleIndex, vars: persistedVars(vars) }
         : { cycleIndex };
       try {
         const rendered = renderEmail(
@@ -562,7 +633,7 @@ export async function sendNotification(
             status: "SENT",
             klaviyoEventName: tmpl.klaviyoMetric,
             outboxId: outboxRow.id,
-            payload: { cycleIndex, vars: toTemplateVars(vars) },
+            payload: { cycleIndex, vars: persistedVars(vars) },
           });
         } else {
           // The enqueue itself was dropped (DB error): no row will ever

@@ -305,6 +305,62 @@ const SECTION_DEFS: SectionDef[] = [
         min: 7,
         max: 90,
       },
+      {
+        path: "customerRetryCooldownMinutes",
+        label: "Customer “Retry now” cooldown (minutes)",
+        helpText:
+          "How long a subscriber must wait between two self-service payment retries (portal, email link, SMS RETRY). Each retry is a real charge attempt.",
+        type: "int",
+        min: 5,
+        max: 1440,
+      },
+      {
+        path: "postExhaustionTouchDays",
+        label: "Post-exhaustion touches (days after the last retry)",
+        helpText:
+          "Comma-separated, e.g. 7, 21. After the retry ladder is exhausted, a subscription on hold gets a “fix your payment” nudge on each of these days. Empty = none.",
+        type: "intList",
+      },
+      {
+        path: "newMethodDetection",
+        label: "Notice a new card on the account",
+        helpText:
+          "When a subscriber in payment trouble (held payment, removed or expiring card) saves a new payment method on their account, tell them it can be used for the subscription in one tap.",
+        type: "toggle",
+      },
+      {
+        path: "newMethodAutoSwitch",
+        label: "Move to the new card automatically",
+        helpText:
+          "When the subscription's own card has been removed or has expired and a new method appears, switch to it right away and confirm by email — otherwise the subscriber is only asked.",
+        type: "toggle",
+      },
+    ],
+  },
+  {
+    key: "billing",
+    title: "Billing timing",
+    description:
+      "When renewals are charged. The same instant is the customer's edit cut-off everywhere (portal, reminder emails).",
+    fields: [
+      {
+        path: "chargeHourLocal",
+        label: "Charge hour (shop time)",
+        helpText:
+          "Hour of the shop day when renewals are charged; customers can make changes until that moment — with 0 (the previous behaviour, first run after midnight) changes close at the end of the previous day. A later hour gives customers who read the reminder in the morning a real window to skip or edit before the charge. Careful when LOWERING it during the day: renewals due today are billed at the next run, before the cut-off already shown in reminder emails and the portal — lower it at the end of the shop day (or right after the current hour has passed).",
+        type: "int",
+        min: 0,
+        max: 23,
+      },
+      {
+        path: "preparingWindowHours",
+        label: "\"Preparing your order\" window (hours)",
+        helpText:
+          "How long after the charge hour an unbilled renewal that no charge attempt has claimed yet still shows as being prepared (skip / delay / date / frequency closed). After that the controls come back so a renewal billing cannot process never locks the customer out; the stuck-contract alert flags such cases.",
+        type: "int",
+        min: 1,
+        max: 72,
+      },
     ],
   },
   {
@@ -359,6 +415,50 @@ const SECTION_DEFS: SectionDef[] = [
         type: "toggle",
       },
       {
+        path: "routineGuideUrl",
+        label: "Routine guide URL",
+        helpText:
+          "Store page with the routine guide, e.g. /pages/routine-guide or a full https:// link. Shown in the portal's routine card and as the cancel flow's “Read the routine guide” button. Blank hides it.",
+        type: "text",
+      },
+      {
+        path: "howToUseUrl",
+        label: "How-to-use URL",
+        helpText:
+          "Page explaining how to use the products (usage, order, frequency). Shown as “How to use {product}” on each subscription page. Blank hides it.",
+        type: "text",
+      },
+      {
+        path: "faqUrl",
+        label: "FAQ URL",
+        helpText:
+          "Your subscription FAQ page. Blank hides the FAQ link; when all three URLs are blank the routine card is not shown at all.",
+        type: "text",
+      },
+      {
+        path: "delayReanchors",
+        label: "Delay moves the whole schedule",
+        helpText:
+          "When a customer delays, move the whole schedule (on) or only the next order (off). On: the delayed date becomes the anchor every later order follows. Off: one late delivery, then the original rhythm resumes.",
+        type: "toggle",
+      },
+      {
+        path: "perLineCycleEdits",
+        label: "Per-product “Not this time” and “Just this order” quantity",
+        helpText:
+          "On: each recurring product on the subscription page gets a “Not this time” link (skip only that product from the next order) and a one-order quantity tweak next to the permanent quantity. Off: only whole-order skip and permanent quantity changes are offered.",
+        type: "toggle",
+      },
+      {
+        path: "dunningBannerEventHours",
+        label: "Payment-issue banner event window (hours)",
+        helpText:
+          "The portal logs one “payment issue banner shown” event per dunning case per this many hours — a measurement window, not a display setting.",
+        type: "int",
+        min: 1,
+        max: 168,
+      },
+      {
         path: "otpCodeTtlMinutes",
         label: "OTP code lifetime (minutes)",
         helpText: "Login code validity (5–30).",
@@ -382,6 +482,47 @@ const SECTION_DEFS: SectionDef[] = [
         type: "int",
         min: 1,
         max: 30,
+      },
+      {
+        path: "deliveryInstructionsMaxChars",
+        label: "Delivery instructions max length",
+        helpText:
+          "Longest delivery note a subscriber can save (50–1000 characters). It is written to the Shopify contract note and copied onto every renewal order for your fulfilment team.",
+        type: "int",
+        min: 50,
+        max: 1000,
+      },
+      {
+        path: "pauseExtendChoicesWeeks",
+        label: "Pause extension choices (weeks)",
+        helpText:
+          "Comma-separated, e.g. 2, 4. The “need a little longer?” options offered in the resume reminder and on a paused subscription. Each is still capped by the maximum pause.",
+        type: "intList",
+      },
+      {
+        path: "deliveriesProcessingMaxDays",
+        label: "Deliveries: “being prepared” window (days)",
+        helpText:
+          "In “Your deliveries”, a charged order with no shipment mirrored for longer than this reads “see the order page” instead of “being prepared” — the app will not claim an old order is still in preparation.",
+        type: "int",
+        min: 3,
+        max: 120,
+      },
+      {
+        path: "deliveriesInTransitMaxDays",
+        label: "Deliveries: “on its way” window (days)",
+        helpText:
+          "The “Your order is on its way — Track” banner and the home-card line show only while the newest shipped order is at most this many days past shipping and has no delivered signal.",
+        type: "int",
+        min: 2,
+        max: 60,
+      },
+      {
+        path: "paymentMethodsList",
+        label: "List the customer's other payment methods",
+        helpText:
+          "On: the subscription page lists the other cards saved on the customer's Shopify account with “Use for this subscription” and “Set as backup”, and the second/third payment-failed emails offer “Use my card ····1234 instead” links when at least two methods exist. Off: only the single-card update path is offered.",
+        type: "toggle",
       },
     ],
   },
@@ -473,6 +614,15 @@ const SECTION_DEFS: SectionDef[] = [
         helpText:
           "Variant GID (gid://shopify/ProductVariant/…) or numeric ID to suggest. Leave empty to auto-pick the top subscribable product the customer doesn't already receive.",
         type: "text",
+      },
+      {
+        path: "welcomeHealMaxDays",
+        label: "Late welcome window (days)",
+        helpText:
+          "A brand-new subscription is sometimes proven ours only a little after checkout (the mirror first lands as \"not proven ours\", so the welcome email is held back). If ownership resolves within this many days of the subscription's creation, the welcome email is still sent; older subscriptions are never welcomed late. 0 turns the late send off.",
+        type: "int",
+        min: 0,
+        max: 30,
       },
       {
         path: "channels.email",
@@ -589,6 +739,157 @@ const SECTION_DEFS: SectionDef[] = [
           "Puts a dynamically picked free product behind the day-90 'rewards unlocked' email — without it the email is copy with nothing behind it.",
         type: "toggle",
       },
+      {
+        path: "resultsTimeline.enabled",
+        label: "Results timeline content",
+        helpText:
+          "The phase content behind “Week N of your routine” on the portal, the cancel flow's education save and the week-N check-in email. Off: none of the three shows timeline copy. The Portal growth → results timeline toggle switches the same three surfaces off too (and records no experiment exposure while off).",
+        type: "toggle",
+      },
+      {
+        path: "resultsTimeline.checkinWeek",
+        label: "Check-in email week",
+        helpText:
+          "The routine week the one-time “how is it going?” email goes out (default 4 — the last week of phase 1, so the email leads with the getting-started copy and points to phase 2 “from week 5”; set 5 to lead with phase 2). One tap answers Great / Not sure yet and lands on the subscription page.",
+        type: "int",
+        min: 1,
+        max: 52,
+      },
+      {
+        path: "resultsTimeline.expectationLine",
+        label: "Expectation line from the survey",
+        helpText:
+          "When the customer's post-purchase survey said they hoped to see something within days / weeks / a month or two, the timeline card, the check-in email and the cancel flow's education copy add one sentence naming the routine's real horizon (“week N is right on track”). Generic wording, no claims; never shown to the survey holdout group.",
+        type: "toggle",
+      },
+      {
+        path: "resultsTimeline.phases.0.fromWeek",
+        label: "Phase 1 (getting started) — starts after week",
+        helpText:
+          "Routine weeks completed when this phase begins (0 = from day one). Must increase phase to phase.",
+        type: "int",
+        min: 0,
+        max: 520,
+      },
+      {
+        path: "resultsTimeline.phases.0.toWeek",
+        label: "Phase 1 (getting started) — ends at week",
+        helpText:
+          "Shown for reference — derived from the next phase's “starts after week” on save (empty on the last, open-ended phase). Move a boundary by editing the next phase's start week.",
+        type: "int",
+        min: 1,
+        max: 520,
+      },
+      {
+        path: "resultsTimeline.phases.0.title",
+        label: "Phase 1 (getting started) — title",
+        helpText:
+          "Leave empty to use the built-in translated title.",
+        type: "text",
+      },
+      {
+        path: "resultsTimeline.phases.0.body",
+        label: "Phase 1 (getting started) — text",
+        helpText:
+          "Leave empty for the built-in translated text (generic, no claims). Whatever you write here is shown verbatim in every language — keep it honest: 'many people notice…', never a medical or efficacy claim.",
+        type: "text",
+      },
+      {
+        path: "resultsTimeline.phases.1.fromWeek",
+        label: "Phase 2 (settling in) — starts after week",
+        helpText:
+          "Routine weeks completed when this phase begins (0 = from day one). Must increase phase to phase.",
+        type: "int",
+        min: 0,
+        max: 520,
+      },
+      {
+        path: "resultsTimeline.phases.1.toWeek",
+        label: "Phase 2 (settling in) — ends at week",
+        helpText:
+          "Shown for reference — derived from the next phase's “starts after week” on save (empty on the last, open-ended phase). Move a boundary by editing the next phase's start week.",
+        type: "int",
+        min: 1,
+        max: 520,
+      },
+      {
+        path: "resultsTimeline.phases.1.title",
+        label: "Phase 2 (settling in) — title",
+        helpText:
+          "Leave empty to use the built-in translated title.",
+        type: "text",
+      },
+      {
+        path: "resultsTimeline.phases.1.body",
+        label: "Phase 2 (settling in) — text",
+        helpText:
+          "Leave empty for the built-in translated text (generic, no claims). Whatever you write here is shown verbatim in every language — keep it honest: 'many people notice…', never a medical or efficacy claim.",
+        type: "text",
+      },
+      {
+        path: "resultsTimeline.phases.2.fromWeek",
+        label: "Phase 3 (noticing) — starts after week",
+        helpText:
+          "Routine weeks completed when this phase begins (0 = from day one). Must increase phase to phase.",
+        type: "int",
+        min: 0,
+        max: 520,
+      },
+      {
+        path: "resultsTimeline.phases.2.toWeek",
+        label: "Phase 3 (noticing) — ends at week",
+        helpText:
+          "Shown for reference — derived from the next phase's “starts after week” on save (empty on the last, open-ended phase). Move a boundary by editing the next phase's start week.",
+        type: "int",
+        min: 1,
+        max: 520,
+      },
+      {
+        path: "resultsTimeline.phases.2.title",
+        label: "Phase 3 (noticing) — title",
+        helpText:
+          "Leave empty to use the built-in translated title.",
+        type: "text",
+      },
+      {
+        path: "resultsTimeline.phases.2.body",
+        label: "Phase 3 (noticing) — text",
+        helpText:
+          "Leave empty for the built-in translated text (generic, no claims). Whatever you write here is shown verbatim in every language — keep it honest: 'many people notice…', never a medical or efficacy claim.",
+        type: "text",
+      },
+      {
+        path: "resultsTimeline.phases.3.fromWeek",
+        label: "Phase 4 (part of the routine) — starts after week",
+        helpText:
+          "Routine weeks completed when this phase begins (0 = from day one). Must increase phase to phase.",
+        type: "int",
+        min: 0,
+        max: 520,
+      },
+      {
+        path: "resultsTimeline.phases.3.toWeek",
+        label: "Phase 4 (part of the routine) — ends at week",
+        helpText:
+          "Shown for reference — derived from the next phase's “starts after week” on save (empty on the last, open-ended phase). Move a boundary by editing the next phase's start week.",
+        type: "int",
+        min: 1,
+        max: 520,
+      },
+      {
+        path: "resultsTimeline.phases.3.title",
+        label: "Phase 4 (part of the routine) — title",
+        helpText:
+          "Leave empty to use the built-in translated title.",
+        type: "text",
+      },
+      {
+        path: "resultsTimeline.phases.3.body",
+        label: "Phase 4 (part of the routine) — text",
+        helpText:
+          "Leave empty for the built-in translated text (generic, no claims). Whatever you write here is shown verbatim in every language — keep it honest: 'many people notice…', never a medical or efficacy claim.",
+        type: "text",
+      },
     ],
   },
   {
@@ -672,6 +973,15 @@ const SECTION_DEFS: SectionDef[] = [
         type: "int",
         min: 0,
         max: 60,
+      },
+      {
+        path: "restartLinkTtlDays",
+        label: "One-tap restart link lifetime (days)",
+        helpText:
+          "The signed 'restart my subscription' link in the cancellation confirmation and the soft-touch email stays valid this long (single use; it applies whatever win-back offer is current when tapped).",
+        type: "int",
+        min: 1,
+        max: 365,
       },
     ],
   },
@@ -815,7 +1125,42 @@ const SECTION_DEFS: SectionDef[] = [
         path: "runoutPrompt",
         label: "Running-out prompt",
         helpText:
-          "When the churn model predicts the customer runs out BEFORE the next delivery, offer to move it up or add one more unit — the inverse of the standing “running low later?” prompt.",
+          "When the churn model predicts the customer runs out BEFORE the next delivery, offer to move it up or add one more unit — the inverse of the standing “running low later?” prompt. Once the predicted-empty day has passed, the same prompt offers to send the next order tomorrow.",
+        type: "toggle",
+      },
+      {
+        path: "supplyMeter",
+        label: "Days-of-supply meter",
+        helpText:
+          "Shows “about N days of product left” on the subscription page from the churn model's predicted-empty date — labelled as an estimate. Hidden when there is no prediction.",
+        type: "toggle",
+      },
+      {
+        path: "resultsTimeline",
+        label: "“Week N of your routine” card",
+        helpText:
+          "Progress card on the subscription page (and a line on the home card) with the phase copy for the customer's routine week — content from Lifecycle → results timeline. Off switches the whole surface set off: the card, the week-N check-in email and the cancel flow's phase-aware education copy (no experiment exposure is recorded while off). Also the results_timeline experiment's decision point: the holdout group never sees it, so its retention effect stays measurable (Experiments page).",
+        type: "toggle",
+      },
+      {
+        path: "rewardsRoadmap",
+        label: "Rewards roadmap",
+        helpText:
+          "Turns the home rewards strip into the full ladder — every milestone order and the rewards unlock with a projected “around {date}” — plus deliveries-so-far and gifts-received tiles. Names a gift only when the pick is fixed and committed; otherwise “a free product”. Off: the classic three-tile strip.",
+        type: "toggle",
+      },
+      {
+        path: "onboardingCard",
+        label: "First-cycle “What happens next” card",
+        helpText:
+          "Shown on the subscription page until the second order has billed: first order date/status, next order date and change cut-off, how to make changes, and the routine guide links.",
+        type: "toggle",
+      },
+      {
+        path: "deliveriesList",
+        label: "“Your deliveries” (Account tab, subscription page, on-its-way banner)",
+        helpText:
+          "Lists the customer's subscription orders from the app's own order mirror (last 10 on the Account tab, last 5 on the subscription page) — date, order number, amount, shipped/delivered status and Track / View order links to Shopify's order-status page (which also carries the receipt) — plus the “Your order is on its way — Track” banner and the home-card line while a parcel is in transit. Needs the fulfillment webhooks deployed to show tracking.",
         type: "toggle",
       },
     ],
@@ -866,6 +1211,68 @@ const SECTION_DEFS: SectionDef[] = [
         type: "int",
         min: 100,
         max: 20000,
+        suffix: "/hour",
+      },
+    ],
+  },
+  {
+    key: "support",
+    title: "Support channels",
+    description:
+      "Where customers reach a human — the portal's Get-help card (Account, every subscription page, the payment-issue banner), the cancel-flow support cards and the Reply-To of every email the app sends. Empty channels are hidden, never shown as dead links. Requests submitted through the form land as a SUPPORT_REQUEST alert, a Klaviyo “Cellexia Support Requested” event and (when an email is set) a message to that inbox.",
+    fields: [
+      {
+        path: "email",
+        label: "Support email",
+        helpText:
+          "Blank = the store's contact email from Shopify. Also the default Reply-To for every email the app sends itself, so a customer who hits Reply reaches you. Klaviyo-delivered flows take the Reply-To only when the app creates them — for flows that already exist, change the sender in Klaviyo (or delete and recreate the flow from the guided setup).",
+        type: "text",
+      },
+      {
+        path: "replyTo",
+        label: "Reply-To override",
+        helpText:
+          "Only if replies should land somewhere other than the support email (e.g. a helpdesk intake address). Blank = the support email. Same Klaviyo caveat as above: applies to flows the app creates after you set it.",
+        type: "text",
+      },
+      {
+        path: "whatsapp",
+        label: "WhatsApp number",
+        helpText:
+          "International format, e.g. +41791234567. Blank hides the WhatsApp button.",
+        type: "text",
+      },
+      {
+        path: "chatUrl",
+        label: "Live chat URL",
+        helpText:
+          "https:// link that opens your chat (Gorgias, Crisp, Intercom…). Blank hides the chat button.",
+        type: "text",
+      },
+      {
+        path: "hoursNote",
+        label: "Hours note",
+        helpText:
+          "Shown under the channels, e.g. “Mon–Fri 9:00–17:00 CET”. Free text; blank hides it.",
+        type: "text",
+      },
+      {
+        path: "slaBusinessDays",
+        label: "Reply promise (business days)",
+        helpText:
+          "The confirmation says “we'll get back to you within N business day(s)”. Set only what the team keeps.",
+        type: "int",
+        min: 1,
+        max: 30,
+      },
+      {
+        path: "requestsPerHour",
+        label: "Requests per hour",
+        helpText:
+          "Get-help submits accepted per customer per rolling hour (spam guard). The general portal limit still applies on top.",
+        type: "int",
+        min: 1,
+        max: 50,
         suffix: "/hour",
       },
     ],
@@ -932,7 +1339,7 @@ const SECTION_DEFS: SectionDef[] = [
         path: "from",
         label: "From address",
         helpText:
-          "e.g. “Cellexia <care@cellexia.com>” — use a domain your SMTP provider is verified to send for (SPF/DKIM). Blank = the MAIL_FROM environment variable.",
+          "e.g. “Cellexia <care@your-store-domain.com>” — use a domain your SMTP provider is verified to send for (SPF/DKIM). Blank = the MAIL_FROM environment variable, then the support email.",
         type: "text",
       },
       {
@@ -1282,12 +1689,20 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     // Verifies the EFFECTIVE saved transport (Settings layer + env fallback)
     // with a real SMTP round-trip — save first, then test.
     const status = await verifyMailer(shop.id);
+    // transport.verify() never checks the sender: when the From is the
+    // support email standing in for a missing From address, say so — a
+    // relay that verifies senders (SES, SendGrid, Postmark…) would reject
+    // every send while the connection test stays green.
+    const fromNote =
+      status.fromFallback === "support_email"
+        ? ` — no From address is set, so mail is sent as ${status.from} (your support email); make sure your provider allows sending as that address, or set a From address above`
+        : "";
     return json<ActionData>({
       intent,
       ok: status.ok,
       toast: status.ok
         ? status.provider === "smtp"
-          ? `SMTP verified (${status.source === "settings" ? "Settings" : "environment"} configuration)`
+          ? `SMTP verified (${status.source === "settings" ? "Settings" : "environment"} configuration)${fromNote}`
           : "Console transport active — emails are logged, not delivered"
         : `Mail transport failed: ${status.error ?? "verification failed"}`,
     });

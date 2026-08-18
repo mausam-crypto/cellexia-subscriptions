@@ -532,7 +532,9 @@ describe("static source pins", () => {
 
   it("the api dispatcher gates address to editable statuses and dedupes cycles", () => {
     const source = read("app/routes/proxy.api.$action.tsx");
-    expect(source).toContain('EDITABLE_ONLY = new Set(["address"])');
+    // v1.28.0 (P2.8): delivery_instructions joins address as a delivery-detail
+    // edit on ACTIVE || PAUSED.
+    expect(source).toContain('EDITABLE_ONLY = new Set(["address", "delivery_instructions"])');
     expect(source).toContain("isDuplicateCycleSubmit");
     expect(source).toContain('case "reactivate"');
     // Insert-then-count rate limiting on a dedicated attempt event.
@@ -543,11 +545,17 @@ describe("static source pins", () => {
     expect(countIndex).toBeGreaterThan(attemptLogIndex);
   });
 
-  it("cancelled contracts get a one-tap restart on home card and detail page", () => {
-    expect(read("app/routes/proxy._index.tsx")).toContain('"reactivate"');
-    expect(read("app/routes/proxy.subscription.$id.tsx")).toContain(
-      'api(ctx, "reactivate")',
-    );
+  it("cancelled contracts get a Restart on home card and detail page (welcome-back landing → one-tap /api/reactivate)", () => {
+    // v1.28.0 (P3.5): the Restart buttons open the welcome-back landing
+    // (what is preserved + the CURRENT win-back offer), whose single form
+    // posts to /api/reactivate. Never a dead end.
+    for (const file of ["app/routes/proxy._index.tsx", "app/routes/proxy.subscription.$id.tsx"]) {
+      const source = read(file);
+      expect(source).toContain('t(locale, "portal.actions.restart")');
+      expect(source).toContain("/subscription/${contract.id}/restart");
+    }
+    expect(read("app/routes/proxy.subscription.$id.restart.tsx")).toContain("api/reactivate");
+    expect(read("app/routes/proxy.api.$action.tsx")).toContain('case "reactivate"');
   });
 
   it("the portal home logs a daily-throttled portal.visit (never for previews)", () => {
